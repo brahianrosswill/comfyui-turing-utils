@@ -924,7 +924,7 @@ class BerniniContextWindowsCore:
                 "anchor_length": (
                     "INT",
                     {
-                        "default": 0,
+                        "default": 16,
                         "min": 0,
                         "max": 4096,
                         "step": 4,
@@ -939,7 +939,7 @@ class BerniniContextWindowsCore:
                 "anchor_write_back": (
                     "BOOLEAN",
                     {
-                        "default": False,
+                        "default": True,
                         "tooltip": (
                             "anchor_sparse only: softly write anchor predictions back as global sync points. "
                             "Disabled keeps anchors read-only."
@@ -983,8 +983,8 @@ class BerniniContextWindowsCore:
         context_schedule: str,
         fuse_method: str,
         freenoise: bool,
-        anchor_length: int = 0,
-        anchor_write_back: bool = False,
+        anchor_length: int = 16,
+        anchor_write_back: bool = True,
         context_stride: int = 1,
         first_frame_sink: bool = True,
     ):
