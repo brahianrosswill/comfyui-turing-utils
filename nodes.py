@@ -578,9 +578,10 @@ class BerniniAnchorContextHandler(BerniniContextHandlerBase):
         self.anchor_latents = int(anchor_latents)
         self.first_frame_anchor_included = bool(first_frame_anchor_included)
         self._anchor_indices: tuple[int, ...] = ()
+        self._anchor_scores: dict[int, float] = {}
 
     def execute(self, calc_cond_batch, model, conds, x_in, timestep, model_options):
-        self._anchor_indices = _select_anchor_indices_from_conds(
+        self._anchor_indices, self._anchor_scores = _select_anchor_indices_from_conds(
             conds,
             x_in,
             self.dim,
@@ -591,6 +592,7 @@ class BerniniAnchorContextHandler(BerniniContextHandlerBase):
             return super().execute(calc_cond_batch, model, conds, x_in, timestep, model_options)
         finally:
             self._anchor_indices = ()
+            self._anchor_scores = {}
 
     def get_context_windows(self, model, x_in: torch.Tensor, model_options: dict[str]):
         full_length = x_in.size(self.dim)
@@ -602,7 +604,14 @@ class BerniniAnchorContextHandler(BerniniContextHandlerBase):
             target_set = set(target_indices)
             budget = self.anchor_latents
             candidates = tuple(index for index in self._anchor_indices if index not in target_set)
-            chosen = _choose_anchor_subset(candidates, target_indices[0], target_indices[-1] + 1, budget, full_length)
+            chosen = _choose_anchor_subset(
+                candidates,
+                target_indices[0],
+                target_indices[-1] + 1,
+                budget,
+                full_length,
+                self._anchor_scores,
+            )
             windows.append(
                 self._build_context_window(
                     target_indices=target_indices,
@@ -621,7 +630,9 @@ def _select_anchor_indices_from_conds(
     anchor_latents: int,
     *,
     include_first_frame: bool,
-) -> tuple[int, ...]:
+) -> tuple[tuple[int, ...], dict[int, float]]:
+    if anchor_latents <= 0:
+        return (), {}
     context_latents = _extract_context_latents_from_conds(conds)
     source = None
     reference = None
@@ -662,21 +673,42 @@ def _select_frame_anchors(
     anchor_latents: int,
     *,
     include_first_frame: bool,
-) -> tuple[int, ...]:
+) -> tuple[tuple[int, ...], dict[int, float]]:
     source = _as_tchw(source_latents)
     frame_count = int(source.shape[0])
     if frame_count == 0 or anchor_latents <= 0:
-        return ()
-    target_count = min(int(anchor_latents), frame_count)
+        return (), {}
+    target_count = _anchor_candidate_pool_size(frame_count, int(anchor_latents), include_first_frame)
     if target_count <= 0:
-        return ()
+        return (), {}
     reference = _as_tchw(reference_latents) if reference_latents is not None else None
     scores = _score_anchor_frames(source, reference)
     initial = (0,) if include_first_frame else ()
     excluded = () if include_first_frame else (0,)
-    if frame_count > 1 and target_count > 1:
+    if frame_count > 1 and target_count > len(initial):
         initial = initial + (frame_count - 1,)
-    return tuple(_select_with_gap(scores, target_count, min_gap=8, initial_indices=initial, excluded_indices=excluded))
+    min_gap = max(1, min(8, frame_count // max(target_count, 1)))
+    selected = tuple(
+        _select_with_coverage(
+            scores,
+            target_count,
+            min_gap=min_gap,
+            initial_indices=initial,
+            excluded_indices=excluded,
+        )
+    )
+    score_map = {index: float(scores[index].item()) for index in selected}
+    return selected, score_map
+
+
+def _anchor_candidate_pool_size(frame_count: int, anchor_latents: int, include_first_frame: bool) -> int:
+    if frame_count <= 0 or anchor_latents <= 0:
+        return 0
+    available = frame_count if include_first_frame else max(frame_count - 1, 0)
+    per_window_budget = min(anchor_latents, available)
+    if per_window_budget <= 0:
+        return 0
+    return min(available, max(per_window_budget, per_window_budget * 3, per_window_budget + 4))
 
 
 def _as_tchw(latents: torch.Tensor) -> torch.Tensor:
@@ -731,7 +763,7 @@ def _robust_z(values: torch.Tensor) -> torch.Tensor:
     return (values - median) / (mad + 1e-6)
 
 
-def _select_with_gap(
+def _select_with_coverage(
     scores: torch.Tensor,
     target_count: int,
     min_gap: int,
@@ -741,22 +773,59 @@ def _select_with_gap(
     frame_count = int(scores.numel())
     excluded = set(int(index) for index in excluded_indices)
     selected: list[int] = []
-    for index in initial_indices:
-        if 0 <= index < frame_count and index not in excluded and index not in selected:
-            selected.append(int(index))
-        if len(selected) >= target_count:
-            break
-    for index in torch.argsort(scores, descending=True).tolist():
-        if len(selected) >= target_count:
-            break
+
+    def can_select(index: int, *, enforce_gap: bool) -> bool:
+        if index < 0 or index >= frame_count:
+            return False
         if index in excluded or index in selected:
-            continue
-        if all(abs(index - other) >= min_gap for other in selected):
+            return False
+        if enforce_gap and any(abs(index - other) < min_gap for other in selected):
+            return False
+        return True
+
+    def add_best(indices: list[int], *, enforce_gap: bool) -> bool:
+        best_index = None
+        best_score = None
+        for index in indices:
+            if not can_select(index, enforce_gap=enforce_gap):
+                continue
+            score = float(scores[index].item())
+            if best_score is None or score > best_score:
+                best_index = index
+                best_score = score
+        if best_index is None:
+            return False
+        selected.append(int(best_index))
+        return True
+
+    for index in initial_indices:
+        if can_select(int(index), enforce_gap=False):
             selected.append(int(index))
+        if len(selected) >= target_count:
+            break
+
+    remaining = target_count - len(selected)
+    for bucket in range(remaining):
+        if len(selected) >= target_count:
+            break
+        start = int(bucket * frame_count / max(remaining, 1))
+        end = int((bucket + 1) * frame_count / max(remaining, 1))
+        if end <= start:
+            end = min(start + 1, frame_count)
+        indices = list(range(start, end))
+        if not add_best(indices, enforce_gap=True):
+            add_best(indices, enforce_gap=False)
+
     for index in torch.argsort(scores, descending=True).tolist():
         if len(selected) >= target_count:
             break
-        if index not in excluded and index not in selected:
+        if can_select(int(index), enforce_gap=True):
+            selected.append(int(index))
+
+    for index in torch.argsort(scores, descending=True).tolist():
+        if len(selected) >= target_count:
+            break
+        if can_select(int(index), enforce_gap=False):
             selected.append(int(index))
     return sorted(selected)
 
@@ -767,14 +836,20 @@ def _choose_anchor_subset(
     center_end: int,
     budget: int,
     frame_count: int,
+    score_map: dict[int, float],
 ) -> tuple[int, ...]:
     if budget <= 0 or not candidates:
         return ()
     center = (center_start + center_end - 1) / 2.0
+    frame_scale = max(frame_count - 1, 1)
     ranked = []
     for index in candidates:
         is_edge = index == 0 or index == frame_count - 1
-        ranked.append((0 if is_edge else 1, abs(index - center), index))
+        distance = abs(index - center)
+        score_bonus = math.tanh(float(score_map.get(index, 0.0)))
+        edge_bonus = 0.25 if is_edge else 0.0
+        utility = score_bonus + edge_bonus - 0.35 * (distance / frame_scale)
+        ranked.append((-utility, distance, index))
     return tuple(sorted(item[2] for item in sorted(ranked)[:budget]))
 
 
