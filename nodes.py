@@ -445,14 +445,24 @@ class BerniniContextHandlerBase(comfy.context_windows.IndexListContextHandler):
         context_indices: tuple[int, ...],
         full_length: int,
         context_overlap: int,
+        anchor_write_indices: tuple[int, ...] = (),
+        anchor_write_weight: float = 0.15,
+        allow_first_frame_sink: bool = True,
     ):
         target_indices = tuple(int(index) for index in target_indices)
         if not target_indices:
             raise ValueError("Bernini context windows require at least one write-back latent index.")
 
+        target_set = set(target_indices)
+        anchor_write_indices = tuple(
+            int(index)
+            for index in anchor_write_indices
+            if 0 <= int(index) < full_length and int(index) not in target_set
+        )
         model_indices = set(int(index) for index in context_indices)
         model_indices.update(target_indices)
-        if self.first_frame_sink and full_length > 0 and 0 not in target_indices:
+        model_indices.update(anchor_write_indices)
+        if allow_first_frame_sink and self.first_frame_sink and full_length > 0 and 0 not in target_indices:
             model_indices.add(0)
         model_indices = tuple(sorted(model_indices))
 
@@ -466,6 +476,9 @@ class BerniniContextHandlerBase(comfy.context_windows.IndexListContextHandler):
         window.svdint4_write_latent_indices = target_indices
         window.svdint4_write_model_positions = tuple(model_indices.index(index) for index in target_indices)
         window.svdint4_write_context_overlap = int(context_overlap)
+        window.svdint4_anchor_write_latent_indices = anchor_write_indices
+        window.svdint4_anchor_write_model_positions = tuple(model_indices.index(index) for index in anchor_write_indices)
+        window.svdint4_anchor_write_weight = float(anchor_write_weight)
         return window
 
     def combine_context_window_results(
@@ -513,6 +526,7 @@ class BerniniContextHandlerBase(comfy.context_windows.IndexListContextHandler):
                     src = tuple([slice(None)] * self.dim + [pos])
                     conds_final[i][dst] = conds_final[i][dst] * prev_weight + sub_conds_out[i][src] * new_weight
                     biases_final[i][index] = bias_total + bias
+            self._combine_anchor_writeback_results(sub_conds_out, window, conds_final, counts_final, biases_final)
             return
 
         weights = comfy.context_windows.get_context_weights(
@@ -531,6 +545,40 @@ class BerniniContextHandlerBase(comfy.context_windows.IndexListContextHandler):
                 weight_src = tuple([slice(None)] * self.dim + [weight_pos])
                 final[dst] += output[src] * weights_tensor[weight_src]
                 count[dst] += weights_tensor[weight_src]
+        self._combine_anchor_writeback_results(sub_conds_out, window, conds_final, counts_final, biases_final)
+
+    def _combine_anchor_writeback_results(
+        self,
+        sub_conds_out,
+        window,
+        conds_final: list[torch.Tensor],
+        counts_final: list[torch.Tensor],
+        biases_final: list[torch.Tensor],
+    ):
+        anchor_indices = getattr(window, "svdint4_anchor_write_latent_indices", ())
+        anchor_positions = getattr(window, "svdint4_anchor_write_model_positions", ())
+        anchor_weight = float(getattr(window, "svdint4_anchor_write_weight", 0.0))
+        if not anchor_indices or not anchor_positions or anchor_weight <= 0.0:
+            return
+
+        if self.fuse_method.name == comfy.context_windows.ContextFuseMethods.RELATIVE:
+            for pos, index in zip(anchor_positions, anchor_indices):
+                for i in range(len(sub_conds_out)):
+                    bias_total = biases_final[i][index]
+                    prev_weight = bias_total / (bias_total + anchor_weight)
+                    new_weight = anchor_weight / (bias_total + anchor_weight)
+                    dst = tuple([slice(None)] * self.dim + [index])
+                    src = tuple([slice(None)] * self.dim + [pos])
+                    conds_final[i][dst] = conds_final[i][dst] * prev_weight + sub_conds_out[i][src] * new_weight
+                    biases_final[i][index] = bias_total + anchor_weight
+            return
+
+        for output, final, count in zip(sub_conds_out, conds_final, counts_final):
+            for pos, index in zip(anchor_positions, anchor_indices):
+                dst = tuple([slice(None)] * self.dim + [index])
+                src = tuple([slice(None)] * self.dim + [pos])
+                final[dst] += output[src] * anchor_weight
+                count[dst] += anchor_weight
 
 
 class BerniniScheduledContextHandler(BerniniContextHandlerBase):
@@ -557,60 +605,74 @@ class BerniniAnchorContextHandler(BerniniContextHandlerBase):
         window_latents: int,
         overlap_latents: int,
         anchor_latents: int,
+        anchor_write_back: bool,
         first_frame_sink: bool,
         first_frame_anchor_included: bool,
         **kwargs,
     ):
         if window_latents <= 0:
-            raise ValueError("anchor_sparse mode requires context_length/window_latents > 0.")
+            raise ValueError("anchor_sparse mode requires context_length/model_latents > 0.")
         if overlap_latents < 0:
             raise ValueError("anchor_sparse mode requires context_overlap/overlap_latents >= 0.")
         if anchor_latents < 0:
             raise ValueError("anchor_sparse mode requires anchor_latents >= 0.")
+        local_window_latents = window_latents - anchor_latents
+        if local_window_latents <= 0:
+            raise ValueError(
+                "anchor_sparse mode requires context_length to be larger than anchor_length "
+                f"after latent conversion; got model_latents={window_latents}, anchor_latents={anchor_latents}."
+            )
+        if local_window_latents <= overlap_latents:
+            raise ValueError(
+                "anchor_sparse mode requires context_length - anchor_length > context_overlap "
+                f"after latent conversion; got model_latents={window_latents}, "
+                f"anchor_latents={anchor_latents}, overlap_latents={overlap_latents}."
+            )
         super().__init__(
-            context_length=window_latents,
+            context_length=local_window_latents,
             context_overlap=overlap_latents,
             first_frame_sink=first_frame_sink,
             **kwargs,
         )
-        self.window_latents = int(window_latents)
+        self.model_latents = int(window_latents)
+        self.window_latents = int(local_window_latents)
         self.overlap_latents = int(overlap_latents)
         self.anchor_latents = int(anchor_latents)
+        self.anchor_write_back = bool(anchor_write_back)
         self.first_frame_anchor_included = bool(first_frame_anchor_included)
-        self._anchor_indices: tuple[int, ...] = ()
-        self._anchor_scores: dict[int, float] = {}
+        self._anchor_scores: torch.Tensor | None = None
 
     def execute(self, calc_cond_batch, model, conds, x_in, timestep, model_options):
-        self._anchor_indices, self._anchor_scores = _select_anchor_indices_from_conds(
+        self._anchor_scores = _select_anchor_scores_from_conds(
             conds,
             x_in,
             self.dim,
             self.anchor_latents,
-            include_first_frame=self.first_frame_anchor_included,
         )
         try:
             return super().execute(calc_cond_batch, model, conds, x_in, timestep, model_options)
         finally:
-            self._anchor_indices = ()
-            self._anchor_scores = {}
+            self._anchor_scores = None
 
     def get_context_windows(self, model, x_in: torch.Tensor, model_options: dict[str]):
         full_length = x_in.size(self.dim)
         windows = []
-        for base_window in super().get_context_windows(model, x_in, model_options):
+        base_windows = list(super().get_context_windows(model, x_in, model_options))
+        window_count = len(base_windows)
+        for window_idx, base_window in enumerate(base_windows):
             target_indices = tuple(int(index) for index in base_window.index_list)
             if not target_indices:
                 continue
-            target_set = set(target_indices)
-            budget = self.anchor_latents
-            candidates = tuple(index for index in self._anchor_indices if index not in target_set)
-            chosen = _choose_anchor_subset(
-                candidates,
-                target_indices[0],
-                target_indices[-1] + 1,
-                budget,
-                full_length,
-                self._anchor_scores,
+            sink_uses_anchor_slot = self.first_frame_sink and full_length > 0 and 0 not in target_indices
+            anchor_count = self.anchor_latents - (1 if sink_uses_anchor_slot else 0)
+            chosen = _choose_stratified_anchors(
+                window_idx=window_idx,
+                window_count=window_count,
+                frame_count=full_length,
+                anchor_count=max(anchor_count, 0),
+                target_indices=target_indices,
+                scores=self._anchor_scores,
+                include_first_frame=self.first_frame_anchor_included,
             )
             windows.append(
                 self._build_context_window(
@@ -618,28 +680,28 @@ class BerniniAnchorContextHandler(BerniniContextHandlerBase):
                     context_indices=tuple(sorted(target_indices + chosen)),
                     full_length=full_length,
                     context_overlap=base_window.context_overlap,
+                    anchor_write_indices=chosen if self.anchor_write_back else (),
+                    allow_first_frame_sink=sink_uses_anchor_slot and self.anchor_latents > 0,
                 )
             )
         return windows
 
 
-def _select_anchor_indices_from_conds(
+def _select_anchor_scores_from_conds(
     conds,
     x_in: torch.Tensor,
     dim: int,
     anchor_latents: int,
-    *,
-    include_first_frame: bool,
-) -> tuple[tuple[int, ...], dict[int, float]]:
+) -> torch.Tensor | None:
     if anchor_latents <= 0:
-        return (), {}
+        return None
     context_latents = _extract_context_latents_from_conds(conds)
     source = None
     reference = None
     for latent in context_latents:
-        if not isinstance(latent, torch.Tensor) or latent.ndim <= dim:
+        if not isinstance(latent, torch.Tensor):
             continue
-        if latent.shape[dim] != x_in.shape[dim]:
+        if _latent_temporal_length(latent, dim) != x_in.shape[dim]:
             continue
         if source is None:
             source = latent
@@ -651,7 +713,9 @@ def _select_anchor_indices_from_conds(
             "anchor_sparse mode requires BerniniConditioning context_latents matching the target latent length. "
             "Connect Bernini Conditioning to the sampler so the model conds include context_latents."
         )
-    return _select_frame_anchors(source, reference, anchor_latents, include_first_frame=include_first_frame)
+    source = _as_tchw(source)
+    reference = _as_tchw(reference) if reference is not None else None
+    return _score_anchor_frames(source, reference)
 
 
 def _extract_context_latents_from_conds(conds) -> list[torch.Tensor]:
@@ -667,48 +731,12 @@ def _extract_context_latents_from_conds(conds) -> list[torch.Tensor]:
     return []
 
 
-def _select_frame_anchors(
-    source_latents: torch.Tensor,
-    reference_latents: torch.Tensor | None,
-    anchor_latents: int,
-    *,
-    include_first_frame: bool,
-) -> tuple[tuple[int, ...], dict[int, float]]:
-    source = _as_tchw(source_latents)
-    frame_count = int(source.shape[0])
-    if frame_count == 0 or anchor_latents <= 0:
-        return (), {}
-    target_count = _anchor_candidate_pool_size(frame_count, int(anchor_latents), include_first_frame)
-    if target_count <= 0:
-        return (), {}
-    reference = _as_tchw(reference_latents) if reference_latents is not None else None
-    scores = _score_anchor_frames(source, reference)
-    initial = (0,) if include_first_frame else ()
-    excluded = () if include_first_frame else (0,)
-    if frame_count > 1 and target_count > len(initial):
-        initial = initial + (frame_count - 1,)
-    min_gap = max(1, min(8, frame_count // max(target_count, 1)))
-    selected = tuple(
-        _select_with_coverage(
-            scores,
-            target_count,
-            min_gap=min_gap,
-            initial_indices=initial,
-            excluded_indices=excluded,
-        )
-    )
-    score_map = {index: float(scores[index].item()) for index in selected}
-    return selected, score_map
-
-
-def _anchor_candidate_pool_size(frame_count: int, anchor_latents: int, include_first_frame: bool) -> int:
-    if frame_count <= 0 or anchor_latents <= 0:
-        return 0
-    available = frame_count if include_first_frame else max(frame_count - 1, 0)
-    per_window_budget = min(anchor_latents, available)
-    if per_window_budget <= 0:
-        return 0
-    return min(available, max(per_window_budget, per_window_budget * 3, per_window_budget + 4))
+def _latent_temporal_length(latent: torch.Tensor, dim: int) -> int | None:
+    if latent.ndim == 4:
+        return int(latent.shape[0])
+    if latent.ndim > dim:
+        return int(latent.shape[dim])
+    return None
 
 
 def _as_tchw(latents: torch.Tensor) -> torch.Tensor:
@@ -763,94 +791,78 @@ def _robust_z(values: torch.Tensor) -> torch.Tensor:
     return (values - median) / (mad + 1e-6)
 
 
-def _select_with_coverage(
-    scores: torch.Tensor,
-    target_count: int,
-    min_gap: int,
-    initial_indices: tuple[int, ...] = (),
-    excluded_indices: tuple[int, ...] = (),
-) -> list[int]:
-    frame_count = int(scores.numel())
-    excluded = set(int(index) for index in excluded_indices)
+def _choose_stratified_anchors(
+    *,
+    window_idx: int,
+    window_count: int,
+    frame_count: int,
+    anchor_count: int,
+    target_indices: tuple[int, ...],
+    scores: torch.Tensor | None,
+    include_first_frame: bool,
+) -> tuple[int, ...]:
+    if anchor_count <= 0 or window_count <= 0 or frame_count <= 0:
+        return ()
+    excluded = set(int(index) for index in target_indices)
+    if not include_first_frame:
+        excluded.add(0)
+
+    total_slots = anchor_count * window_count
     selected: list[int] = []
+    for anchor_idx in range(anchor_count):
+        slot = int(window_idx) + anchor_idx * window_count
+        chosen = _choose_anchor_from_slot(slot, total_slots, frame_count, scores, excluded)
+        if chosen is not None:
+            selected.append(chosen)
+            excluded.add(chosen)
+    return tuple(sorted(selected))
 
-    def can_select(index: int, *, enforce_gap: bool) -> bool:
-        if index < 0 or index >= frame_count:
-            return False
-        if index in excluded or index in selected:
-            return False
-        if enforce_gap and any(abs(index - other) < min_gap for other in selected):
-            return False
-        return True
 
-    def add_best(indices: list[int], *, enforce_gap: bool) -> bool:
-        best_index = None
-        best_score = None
-        for index in indices:
-            if not can_select(index, enforce_gap=enforce_gap):
-                continue
-            score = float(scores[index].item())
-            if best_score is None or score > best_score:
-                best_index = index
-                best_score = score
-        if best_index is None:
-            return False
-        selected.append(int(best_index))
-        return True
+def _choose_anchor_from_slot(
+    slot: int,
+    total_slots: int,
+    frame_count: int,
+    scores: torch.Tensor | None,
+    excluded: set[int],
+) -> int | None:
+    if total_slots <= 0:
+        return None
+    slot = slot % total_slots
+    candidate_slots = [slot]
+    for delta in range(1, total_slots):
+        candidate_slots.append((slot + delta) % total_slots)
+        candidate_slots.append((slot - delta) % total_slots)
 
-    for index in initial_indices:
-        if can_select(int(index), enforce_gap=False):
-            selected.append(int(index))
-        if len(selected) >= target_count:
-            break
-
-    remaining = target_count - len(selected)
-    for bucket in range(remaining):
-        if len(selected) >= target_count:
-            break
-        start = int(bucket * frame_count / max(remaining, 1))
-        end = int((bucket + 1) * frame_count / max(remaining, 1))
+    for candidate_slot in candidate_slots:
+        start = int(candidate_slot * frame_count / total_slots)
+        end = int((candidate_slot + 1) * frame_count / total_slots)
         if end <= start:
             end = min(start + 1, frame_count)
-        indices = list(range(start, end))
-        if not add_best(indices, enforce_gap=True):
-            add_best(indices, enforce_gap=False)
-
-    for index in torch.argsort(scores, descending=True).tolist():
-        if len(selected) >= target_count:
-            break
-        if can_select(int(index), enforce_gap=True):
-            selected.append(int(index))
-
-    for index in torch.argsort(scores, descending=True).tolist():
-        if len(selected) >= target_count:
-            break
-        if can_select(int(index), enforce_gap=False):
-            selected.append(int(index))
-    return sorted(selected)
+        chosen = _best_anchor_in_range(start, end, frame_count, scores, excluded)
+        if chosen is not None:
+            return chosen
+    return None
 
 
-def _choose_anchor_subset(
-    candidates: tuple[int, ...],
-    center_start: int,
-    center_end: int,
-    budget: int,
+def _best_anchor_in_range(
+    start: int,
+    end: int,
     frame_count: int,
-    score_map: dict[int, float],
-) -> tuple[int, ...]:
-    if budget <= 0 or not candidates:
-        return ()
-    center = (center_start + center_end - 1) / 2.0
-    frame_scale = max(frame_count - 1, 1)
-    ranked = []
-    for index in candidates:
-        is_edge = index == 0 or index == frame_count - 1
-        distance = abs(index - center)
-        score_bonus = math.tanh(float(score_map.get(index, 0.0)))
-        edge_bonus = 0.25 if is_edge else 0.0
-        utility = score_bonus + edge_bonus - 0.35 * (distance / frame_scale)
-        ranked.append((-utility, distance, index))
-    return tuple(sorted(item[2] for item in sorted(ranked)[:budget]))
+    scores: torch.Tensor | None,
+    excluded: set[int],
+) -> int | None:
+    center = (start + end - 1) / 2.0
+    best_index = None
+    best_key = None
+    for index in range(max(0, start), min(frame_count, end)):
+        if index in excluded:
+            continue
+        score = float(scores[index].item()) if scores is not None and index < int(scores.numel()) else 0.0
+        key = (score, -abs(index - center), -index)
+        if best_key is None or key > best_key:
+            best_index = index
+            best_key = key
+    return best_index
 
 
 class BerniniContextWindowsCore:
@@ -867,7 +879,8 @@ class BerniniContextWindowsCore:
                         "max": 16385,
                         "step": 4,
                         "tooltip": (
-                            "Context window length in real video frames. Must be 4*n+1; "
+                            "Context length in real video frames. Must be 4*n+1. "
+                            "For anchor_sparse this is the total model context budget including anchors; "
                             "81 frames maps to 21 Wan latent frames."
                         ),
                     },
@@ -895,7 +908,7 @@ class BerniniContextWindowsCore:
                     {
                         "default": _ANCHOR_SCHEDULE,
                         "tooltip": (
-                            "anchor_sparse uses standard_static windows plus adaptive global anchor latents; "
+                            "anchor_sparse uses standard_static local windows plus stratified anchor latents; "
                             "anchor_length=0 matches standard_static. "
                             "other schedules use ComfyUI's standard context windows."
                         ),
@@ -911,13 +924,25 @@ class BerniniContextWindowsCore:
                 "anchor_length": (
                     "INT",
                     {
-                        "default": 16,
+                        "default": 0,
                         "min": 0,
                         "max": 4096,
                         "step": 4,
                         "tooltip": (
-                            "anchor_sparse only: adaptive global anchor budget in real video frames. "
-                            "Must be 0 or 4*n; 16 frames maps to 4 anchor latents. Excludes first_frame_sink."
+                            "anchor_sparse only: per-window anchor budget in real video frames. "
+                            "Must be 0 or 4*n; 16 frames maps to 4 anchor latents. "
+                            "Local write window is context_length - anchor_length. "
+                            "first_frame_sink consumes one anchor slot when inserted."
+                        ),
+                    },
+                ),
+                "anchor_write_back": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "anchor_sparse only: softly write anchor predictions back as global sync points. "
+                            "Disabled keeps anchors read-only."
                         ),
                     },
                 ),
@@ -936,6 +961,7 @@ class BerniniContextWindowsCore:
                         "default": True,
                         "tooltip": (
                             "Use latent frame 0 as a context-only sink for windows that do not already include it. "
+                            "For anchor_sparse this consumes one anchor slot and is inactive when anchor_length=0. "
                             "The first window still writes frame 0 normally."
                         ),
                     },
@@ -957,7 +983,8 @@ class BerniniContextWindowsCore:
         context_schedule: str,
         fuse_method: str,
         freenoise: bool,
-        anchor_length: int = 16,
+        anchor_length: int = 0,
+        anchor_write_back: bool = False,
         context_stride: int = 1,
         first_frame_sink: bool = True,
     ):
@@ -973,6 +1000,7 @@ class BerniniContextWindowsCore:
                 window_latents=latent_context_length,
                 overlap_latents=latent_context_overlap,
                 anchor_latents=anchor_latents,
+                anchor_write_back=anchor_write_back,
                 first_frame_sink=first_frame_sink,
                 first_frame_anchor_included=not first_frame_sink,
                 context_stride=1,
@@ -1028,7 +1056,7 @@ class BerniniContextWindowsCore:
         LOG.info(
             "Bernini context windows enabled: schedule=%s, length=%s -> %s latent frames, "
             "overlap=%s -> %s latent frames, anchor_length=%s -> %s anchor latents, "
-            "first_frame_sink=%s, fuse=%s",
+            "local_window_latents=%s, anchor_write_back=%s, first_frame_sink=%s, fuse=%s",
             context_schedule,
             context_length,
             latent_context_length,
@@ -1036,6 +1064,8 @@ class BerniniContextWindowsCore:
             latent_context_overlap,
             anchor_length if context_schedule == _ANCHOR_SCHEDULE else 0,
             anchor_latents if context_schedule == _ANCHOR_SCHEDULE else 0,
+            (latent_context_length - anchor_latents) if context_schedule == _ANCHOR_SCHEDULE else latent_context_length,
+            anchor_write_back if context_schedule == _ANCHOR_SCHEDULE else False,
             first_frame_sink,
             effective_fuse_method,
         )
