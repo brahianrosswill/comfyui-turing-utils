@@ -47,7 +47,7 @@ class WanVideoFramesPadding:
         }
 
     RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT", "INT", "INT")
-    RETURN_NAMES = ("image", "mask", "width", "height", "length", "target_length")
+    RETURN_NAMES = ("image", "mask", "width", "height", "length", "input_length")
     FUNCTION = "pad"
     CATEGORY = "SVDInt4/video"
     TITLE = "Wan Video Frames Padding"
@@ -68,7 +68,7 @@ class WanVideoFramesPadding:
         image = _pad_first_dim(image, pad_count)
         if mask is not None:
             mask = _pad_first_dim(mask, pad_count)
-        return (image, mask, width, height, frame_count, output_length)
+        return (image, mask, width, height, output_length, frame_count)
 
     @staticmethod
     def _target_length(frame_count: int, target_frame_count: int) -> int:
