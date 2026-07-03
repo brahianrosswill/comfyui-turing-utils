@@ -18,12 +18,6 @@ def _is_wan_frame_count(frame_count: int) -> bool:
     return frame_count >= 1 and (frame_count - 1) % 4 == 0
 
 
-def _ceil_wan_frame_count(frame_count: int) -> int:
-    if frame_count < 1:
-        raise ValueError("Video must contain at least one frame.")
-    return ((frame_count - 1 + 3) // 4) * 4 + 1
-
-
 def _validate_context_window_frames(context_length: int, context_overlap: int) -> tuple[int, int]:
     context_length = int(context_length)
     context_overlap = int(context_overlap)
@@ -44,66 +38,6 @@ def _validate_anchor_length_frames(anchor_length: int) -> int:
     if anchor_length < 0 or anchor_length % 4 != 0:
         raise ValueError(f"anchor_length must be 0 or a positive 4*n real-frame count; got {anchor_length}.")
     return anchor_length // 4
-
-
-class BerniniPadVideoLength:
-    @classmethod
-    def INPUT_TYPES(cls):
-        target_frame_count = (
-            "INT",
-            {
-                "default": 0,
-                "min": 0,
-                "max": 16385,
-                "step": 1,
-                "tooltip": (
-                    "Target real-frame count. Use 0 to round the input length up "
-                    "to the next 4*n+1 frame count."
-                ),
-            },
-        )
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "target_frame_count": target_frame_count,
-            }
-        }
-
-    RETURN_TYPES = ("IMAGE", "INT", "INT", "INT", "INT")
-    RETURN_NAMES = ("image", "width", "height", "length", "target_length")
-    FUNCTION = "pad"
-    CATEGORY = "SVDInt4/video"
-    TITLE = "Bernini Pad Video Length"
-
-    def pad(self, image, target_frame_count: int):
-        if image.ndim < 3:
-            raise ValueError(f"Expected IMAGE tensor shaped [frames, height, width, channels], got {tuple(image.shape)}.")
-        frame_count = int(image.shape[0])
-        if frame_count < 1:
-            raise ValueError("Bernini Pad Video Length requires at least one input frame.")
-        height = int(image.shape[1])
-        width = int(image.shape[2])
-
-        if target_frame_count == 0:
-            output_length = _ceil_wan_frame_count(frame_count)
-        else:
-            output_length = int(target_frame_count)
-            if not _is_wan_frame_count(output_length):
-                raise ValueError(
-                    f"target_frame_count must be 0 or 4*n+1; got {target_frame_count}."
-                )
-            if output_length < frame_count:
-                raise ValueError(
-                    f"target_frame_count={output_length} is shorter than the input video "
-                    f"({frame_count} frames). This node only pads; trim upstream if needed."
-                )
-
-        pad_count = output_length - frame_count
-        if pad_count <= 0:
-            return (image, width, height, frame_count, output_length)
-
-        tail = image[-1:].repeat(pad_count, *([1] * (image.ndim - 1)))
-        return (torch.cat((image, tail), dim=0), width, height, frame_count, output_length)
 
 
 def _window_start_and_stride(window) -> tuple[float, float]:
