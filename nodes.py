@@ -12,6 +12,8 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
+from .dreamidv import DreamIDVConditioning, DreamIDVDiTLoader
+
 
 LOG = logging.getLogger("comfyui-svdint4")
 FOLDER_NAME = "diffusion_models"
@@ -1074,12 +1076,16 @@ class BerniniContextWindowsCore:
 
 NODE_CLASS_MAPPINGS = {
     "SVDInt4DiffusionModelLoader": SVDInt4DiffusionModelLoader,
+    "SVDInt4DreamIDVDiTLoader": DreamIDVDiTLoader,
+    "SVDInt4DreamIDVConditioning": DreamIDVConditioning,
     "SVDInt4BerniniPadVideoLength": BerniniPadVideoLength,
     "SVDInt4BerniniContextWindowsCore": BerniniContextWindowsCore,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "SVDInt4DiffusionModelLoader": "Load SVDInt4 DiT",
+    "SVDInt4DreamIDVDiTLoader": "Load DreamID-V DiT",
+    "SVDInt4DreamIDVConditioning": "DreamID-V Conditioning",
     "SVDInt4BerniniPadVideoLength": "Bernini Pad Video Length",
     "SVDInt4BerniniContextWindowsCore": "Bernini Context Windows",
 }
