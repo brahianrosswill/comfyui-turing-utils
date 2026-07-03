@@ -229,12 +229,6 @@ def _resize_image(image: torch.Tensor, width: int, height: int) -> torch.Tensor:
 def _encode_vae_raw(
     vae,
     pixels: torch.Tensor,
-    *,
-    tiled: bool = False,
-    tile_size: int = 256,
-    tile_overlap: int = 64,
-    temporal_size: int = 64,
-    temporal_overlap: int = 8,
 ) -> torch.Tensor:
     vae.throw_exception_if_invalid()
     pixel_samples = vae.vae_encode_crop_pixels(pixels).movedim(-1, 1)
@@ -245,46 +239,68 @@ def _encode_vae_raw(
             pixel_samples = pixel_samples.unsqueeze(2)
 
     with comfy.model_management.cuda_device_context(vae.device):
-        memory_used = vae.memory_used_encode(pixel_samples.shape, vae.vae_dtype)
-        comfy.model_management.load_models_gpu(
-            [vae.patcher],
-            memory_required=memory_used,
-            force_full_load=vae.disable_offload,
-        )
-        if tiled and vae.latent_dim == 3:
-            encode_fn = lambda a: vae.first_stage_model.encode(a.to(vae.vae_dtype).to(vae.device)).to(  # noqa: E731
-                dtype=vae.vae_output_dtype()
-            )
-            return comfy.utils.tiled_scale_multidim(
-                pixel_samples,
-                encode_fn,
-                tile=(max(1, temporal_size), tile_size, tile_size),
-                overlap=(max(1, temporal_overlap), tile_overlap, tile_overlap),
-                upscale_amount=vae.downscale_ratio,
-                out_channels=vae.latent_channels,
-                downscale=True,
-                index_formulas=vae.downscale_index_formula,
-                output_device=vae.output_device,
-            )
+        try:
+            return _encode_vae_raw_batched(vae, pixel_samples)
+        except Exception as e:
+            comfy.model_management.raise_non_oom(e)
+            LOG.warning("DreamID-V mask raw VAE encode ran out of memory; retrying with tiled raw VAE encode.")
 
-        free_memory = vae.patcher.get_free_memory(vae.device)
-        batch_number = max(1, int(free_memory / max(1, memory_used)))
-        samples = None
-        for index in range(0, pixel_samples.shape[0], batch_number):
-            pixels_in = pixel_samples[index:index + batch_number].to(device=vae.device, dtype=vae.vae_dtype)
-            if getattr(vae.first_stage_model, "comfy_has_chunked_io", False):
-                out = vae.first_stage_model.encode(pixels_in, device=vae.device)
-            else:
-                out = vae.first_stage_model.encode(pixels_in)
-            out = out.to(vae.output_device).to(dtype=vae.vae_output_dtype())
-            if samples is None:
-                samples = torch.empty(
-                    (pixel_samples.shape[0],) + tuple(out.shape[1:]),
-                    device=vae.output_device,
-                    dtype=vae.vae_output_dtype(),
-                )
-            samples[index:index + batch_number] = out
+        comfy.model_management.soft_empty_cache()
+        return _encode_vae_raw_tiled(vae, pixel_samples)
+
+
+def _encode_vae_raw_batched(vae, pixel_samples: torch.Tensor) -> torch.Tensor:
+    memory_used = vae.memory_used_encode(pixel_samples.shape, vae.vae_dtype)
+    comfy.model_management.load_models_gpu(
+        [vae.patcher],
+        memory_required=memory_used,
+        force_full_load=vae.disable_offload,
+    )
+    free_memory = vae.patcher.get_free_memory(vae.device)
+    batch_number = max(1, int(free_memory / max(1, memory_used)))
+    samples = None
+    for index in range(0, pixel_samples.shape[0], batch_number):
+        pixels_in = pixel_samples[index:index + batch_number].to(device=vae.device, dtype=vae.vae_dtype)
+        if getattr(vae.first_stage_model, "comfy_has_chunked_io", False):
+            out = vae.first_stage_model.encode(pixels_in, device=vae.device)
+        else:
+            out = vae.first_stage_model.encode(pixels_in)
+        out = out.to(vae.output_device).to(dtype=vae.vae_output_dtype())
+        if samples is None:
+            samples = torch.empty(
+                (pixel_samples.shape[0],) + tuple(out.shape[1:]),
+                device=vae.output_device,
+                dtype=vae.vae_output_dtype(),
+            )
+        samples[index:index + batch_number] = out
     return samples
+
+
+def _encode_vae_raw_tiled(vae, pixel_samples: torch.Tensor) -> torch.Tensor:
+    if vae.latent_dim != 3:
+        raise RuntimeError("DreamID-V mask raw VAE tiled fallback currently requires a video VAE.")
+    tile = 256
+    overlap = tile // 4
+    memory_used = vae.memory_used_encode(pixel_samples.shape, vae.vae_dtype)
+    comfy.model_management.load_models_gpu(
+        [vae.patcher],
+        memory_required=memory_used,
+        force_full_load=vae.disable_offload,
+    )
+    encode_fn = lambda a: vae.first_stage_model.encode(a.to(vae.vae_dtype).to(vae.device)).to(  # noqa: E731
+        dtype=vae.vae_output_dtype()
+    )
+    return comfy.utils.tiled_scale_multidim(
+        pixel_samples,
+        encode_fn,
+        tile=(9999, tile, tile),
+        overlap=(1, overlap, overlap),
+        upscale_amount=vae.downscale_ratio,
+        out_channels=vae.latent_channels,
+        downscale=True,
+        index_formulas=vae.downscale_index_formula,
+        output_device=vae.output_device,
+    )
 
 
 class DreamIDVDiTLoader:
@@ -378,17 +394,6 @@ class DreamIDVConditioning:
                         "tooltip": "Enable when the incoming MASK uses black for the edited face area.",
                     },
                 ),
-                "vae_tiling": (
-                    "BOOLEAN",
-                    {
-                        "default": True,
-                        "tooltip": "Use tiled VAE encode for the raw mask latent path. Source/reference use ComfyUI VAE encode.",
-                    },
-                ),
-                "tile_size": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 64, "advanced": True}),
-                "tile_overlap": ("INT", {"default": 64, "min": 0, "max": 4096, "step": 32, "advanced": True}),
-                "temporal_size": ("INT", {"default": 64, "min": 8, "max": 4096, "step": 4, "advanced": True}),
-                "temporal_overlap": ("INT", {"default": 8, "min": 1, "max": 4096, "step": 1, "advanced": True}),
             }
         }
 
@@ -409,11 +414,6 @@ class DreamIDVConditioning:
         length: int,
         batch_size: int,
         invert_mask: bool,
-        vae_tiling: bool,
-        tile_size: int,
-        tile_overlap: int,
-        temporal_size: int,
-        temporal_overlap: int,
     ):
         width = int(width)
         height = int(height)
@@ -423,17 +423,6 @@ class DreamIDVConditioning:
             raise ValueError(f"DreamID-V length must be 4*n+1 real frames; got {length}.")
         if width <= 0 or height <= 0:
             raise ValueError(f"DreamID-V width/height must be positive; got {width}x{height}.")
-        if vae_tiling:
-            if tile_size <= 0:
-                raise ValueError("tile_size must be positive.")
-            if tile_overlap < 0 or tile_overlap >= tile_size:
-                raise ValueError(f"tile_overlap must be non-negative and smaller than tile_size; got {tile_overlap}/{tile_size}.")
-            if temporal_size <= 0:
-                raise ValueError("temporal_size must be positive.")
-            if temporal_overlap < 0 or temporal_overlap >= temporal_size:
-                raise ValueError(
-                    f"temporal_overlap must be non-negative and smaller than temporal_size; got {temporal_overlap}/{temporal_size}."
-                )
 
         spacial_scale = vae.spacial_compression_encode()
         if width % spacial_scale != 0 or height % spacial_scale != 0:
@@ -449,15 +438,7 @@ class DreamIDVConditioning:
 
         source_latent = vae.encode(source)
         reference_latent = vae.encode(reference)
-        mask_latent = _encode_vae_raw(
-            vae,
-            mask_rgb,
-            tiled=bool(vae_tiling),
-            tile_size=int(tile_size),
-            tile_overlap=int(tile_overlap),
-            temporal_size=int(temporal_size),
-            temporal_overlap=int(temporal_overlap),
-        )
+        mask_latent = _encode_vae_raw(vae, mask_rgb)
 
         latent_t = ((length - 1) // 4) + 1
         if source_latent.shape[2] != latent_t:
