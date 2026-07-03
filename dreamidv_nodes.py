@@ -336,9 +336,9 @@ class DreamIDVConditioning:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "reference_image": ("IMAGE",),
                 "vae": ("VAE",),
                 "source_video": ("IMAGE",),
-                "reference_image": ("IMAGE",),
                 "face_mask": ("MASK",),
                 "width": (
                     "INT",
@@ -400,9 +400,9 @@ class DreamIDVConditioning:
 
     def apply(
         self,
+        reference_image,
         vae,
         source_video,
-        reference_image,
         face_mask,
         width: int,
         height: int,
