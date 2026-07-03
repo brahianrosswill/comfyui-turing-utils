@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .bernini_nodes import BerniniContextWindowsCore, BerniniPadVideoLength
-from .dreamidv import DreamIDVConditioning, DreamIDVDiTLoader
+from .dreamidv_nodes import DreamIDVConditioning, DreamIDVDiTLoader
 from .svdint4_nodes import SVDInt4DiffusionModelLoader
 
 
