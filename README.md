@@ -185,6 +185,13 @@ The script writes original metadata and basic provenance to
   Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
   returns a ComfyUI `MODEL`.
 
+- `Bernini Context Windows`
+  Uses the same controls and defaults as ComfyUI's Wan Context Windows node,
+  including `standard_uniform`, `context_overlap=30`, `retain_first_frame`,
+  `split_conds_to_windows`, FreeNoise, looped schedules, and the official
+  causal window fix. Internally it adds Bernini-compatible absolute temporal
+  RoPE indices for each context window, including the causal fix frame.
+
 The loader always runs the SVDInt4 kernel in FP16. This keeps the runtime path
 compatible with Turing GPUs and avoids accidental BF16 dispatch on cards that do
 not support it.
