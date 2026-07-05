@@ -23,6 +23,7 @@ MODEL_EXTENSIONS = {".safetensors", ".sft"}
 KNOWN_VAE_MODEL_NAMES = {"ema_vae_fp16.safetensors"}
 ATTENTION_BACKENDS = ["sdpa", "sage_attn", "flash_attn"]
 SEEDVR2_VAE_TILE_SIZES = (1024, 768, 512, 384, 256)
+SEEDVR2_AUTO_VAE_TILE_SIZES = (768, 512, 384, 256)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -126,6 +127,81 @@ def _tile_overlap(tile_size: int) -> int:
     return max(64, int(tile_size) // 4)
 
 
+def _vae_work_budget_mb(free_gb: float) -> float:
+    if free_gb <= 0:
+        return 4 * 1024.0
+    return max(1024.0, free_gb * 1024.0 * 0.70 - 1024.0)
+
+
+def _estimate_vae_peak_mb(
+    *,
+    kind: str,
+    frames: int,
+    height: int,
+    width: int,
+    tile_size: int | None,
+) -> float:
+    frames = max(1, int(frames))
+    megapixels = max(1.0 / 1024.0, float(height * width) / 1_000_000.0)
+    if tile_size is None:
+        if kind == "encode":
+            return 1800.0 + 1600.0 * megapixels * frames
+        return 3000.0 + 2500.0 * megapixels * frames
+
+    if kind == "encode":
+        table = {
+            768: (3000.0, 950.0),
+            512: (1600.0, 530.0),
+            384: (1150.0, 310.0),
+            256: (800.0, 150.0),
+        }
+    else:
+        table = {
+            768: (4300.0, 900.0),
+            512: (2500.0, 750.0),
+            384: (1700.0, 560.0),
+            256: (1100.0, 280.0),
+        }
+    base, per_extra_frame = table.get(int(tile_size), table[256])
+    spatial_overhead = 250.0 * megapixels
+    return base + per_extra_frame * max(0, frames - 1) + spatial_overhead
+
+
+def _choose_vae_tiling(
+    *,
+    kind: str,
+    frames: int,
+    height: int,
+    width: int,
+    free_gb: float,
+) -> tuple[bool, int, int]:
+    budget_mb = _vae_work_budget_mb(free_gb)
+    regular_mb = _estimate_vae_peak_mb(
+        kind=kind,
+        frames=frames,
+        height=height,
+        width=width,
+        tile_size=None,
+    )
+    if regular_mb <= budget_mb:
+        tile = SEEDVR2_VAE_TILE_SIZES[0]
+        return False, tile, _tile_overlap(tile)
+
+    for tile in SEEDVR2_AUTO_VAE_TILE_SIZES:
+        tiled_mb = _estimate_vae_peak_mb(
+            kind=kind,
+            frames=frames,
+            height=height,
+            width=width,
+            tile_size=tile,
+        )
+        if tiled_mb <= budget_mb:
+            return True, tile, _tile_overlap(tile)
+
+    tile = SEEDVR2_AUTO_VAE_TILE_SIZES[-1]
+    return True, tile, _tile_overlap(tile)
+
+
 def _auto_batch_size(frame_count: int, height: int, width: int, free_gb: float) -> int:
     if frame_count <= 1:
         return 1
@@ -157,15 +233,29 @@ def _build_plan(
 
     chosen_batch = _valid_4n1(batch_size) if batch_size > 0 else _auto_batch_size(frames, target_h, target_w, free_gb)
     chosen_batch = max(1, min(chosen_batch, _valid_4n1(frames)))
+    encode_tiled, encode_tile, encode_overlap = _choose_vae_tiling(
+        kind="encode",
+        frames=chosen_batch,
+        height=target_h,
+        width=target_w,
+        free_gb=free_gb,
+    )
+    decode_tiled, decode_tile, decode_overlap = _choose_vae_tiling(
+        kind="decode",
+        frames=chosen_batch,
+        height=target_h,
+        width=target_w,
+        free_gb=free_gb,
+    )
 
     return SeedVR2Plan(
         batch_size=chosen_batch,
-        encode_tiled=False,
-        encode_tile_size=SEEDVR2_VAE_TILE_SIZES[0],
-        encode_tile_overlap=_tile_overlap(SEEDVR2_VAE_TILE_SIZES[0]),
-        decode_tiled=False,
-        decode_tile_size=SEEDVR2_VAE_TILE_SIZES[0],
-        decode_tile_overlap=_tile_overlap(SEEDVR2_VAE_TILE_SIZES[0]),
+        encode_tiled=encode_tiled,
+        encode_tile_size=encode_tile,
+        encode_tile_overlap=encode_overlap,
+        decode_tiled=decode_tiled,
+        decode_tile_size=decode_tile,
+        decode_tile_overlap=decode_overlap,
     )
 
 
@@ -182,14 +272,15 @@ def _fallback_plans(plan: SeedVR2Plan) -> list[SeedVR2Plan]:
         if plans[-1].decode_tiled and tile >= plans[-1].decode_tile_size:
             continue
         overlap = _tile_overlap(tile)
+        encode_tile = min(tile, plan.encode_tile_size) if plan.encode_tiled else plan.encode_tile_size
         plans.append(
             dataclasses.replace(
                 plans[-1],
-                encode_tiled=True,
+                encode_tiled=plan.encode_tiled,
                 decode_tiled=True,
-                encode_tile_size=tile,
+                encode_tile_size=encode_tile,
                 decode_tile_size=tile,
-                encode_tile_overlap=overlap,
+                encode_tile_overlap=_tile_overlap(encode_tile),
                 decode_tile_overlap=overlap,
             )
         )
