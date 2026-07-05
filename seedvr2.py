@@ -14,7 +14,6 @@ from safetensors import safe_open
 import comfy.model_management as model_management
 import comfy.ops
 import comfy.model_patcher
-import comfy.patcher_extension
 import comfy.sample
 import comfy.samplers
 import comfy.utils
@@ -158,20 +157,17 @@ def _format_tensor_counter(counter: Counter[str]) -> str:
     return ", ".join(f"{key}={value / (1024 * 1024):.2f} MB" for key, value in counter.most_common())
 
 
-def _assert_module_device(module: torch.nn.Module, expected: torch.device, label: str) -> None:
-    mismatches: list[str] = []
+def _log_module_placement(module: torch.nn.Module, label: str) -> None:
     device_bytes: Counter[str] = Counter()
     dtype_bytes: Counter[str] = Counter()
 
-    for prefix, iterator in (("param", module.named_parameters()), ("buffer", module.named_buffers())):
-        for name, tensor in iterator:
+    for iterator in (module.parameters(), module.buffers()):
+        for tensor in iterator:
             if tensor is None:
                 continue
             size = tensor.nelement() * tensor.element_size()
             device_bytes[str(tensor.device)] += size
             dtype_bytes[str(tensor.dtype)] += size
-            if tensor.device != expected and len(mismatches) < 8:
-                mismatches.append(f"{prefix}:{name}={tensor.device}/{tensor.dtype}")
 
     if not device_bytes:
         return
@@ -181,13 +177,10 @@ def _assert_module_device(module: torch.nn.Module, expected: torch.device, label
         _format_tensor_counter(device_bytes),
         _format_tensor_counter(dtype_bytes),
     )
-    if not mismatches:
-        return
-    raise RuntimeError(
-        f"SeedVR2 {label} is not on the expected ComfyUI device. "
-        f"Expected all tensors on {expected}. First mismatches: {mismatches}. "
-        "Free VRAM or use a smaller checkpoint; refusing to fall back to CPU inference."
-    )
+
+
+def _set_runtime_device(module: torch.nn.Module, device: torch.device) -> None:
+    module.device = torch.device(device)
 
 
 def _ensure_finite(tensor: torch.Tensor, label: str) -> None:
@@ -234,26 +227,6 @@ def _unload_patcher(patcher: comfy.model_patcher.ModelPatcher | None) -> None:
         patcher.detach()
     except Exception:
         LOG.debug("SeedVR2 patcher detach failed", exc_info=True)
-
-
-def _seedvr2_force_full_load_prepare_sampling(
-    executor,
-    model,
-    noise_shape,
-    conds,
-    model_options=None,
-    force_full_load=False,
-    force_offload=False,
-):
-    del force_full_load
-    return executor(
-        model,
-        noise_shape,
-        conds,
-        model_options=model_options,
-        force_full_load=True,
-        force_offload=force_offload,
-    )
 
 
 def _infer_dit_template(path: str, model_name: str) -> str:
@@ -433,18 +406,21 @@ def _is_float8_dtype(dtype: torch.dtype) -> bool:
     return dtype in _FLOAT8_DTYPES
 
 
-def _replace_fp8_linears_with_comfy_ops(model: torch.nn.Module) -> int:
+def _replace_fp8_linears_with_comfy_ops(model: torch.nn.Module, load_device: torch.device) -> tuple[int, str]:
+    fp8_compute = load_device.type == "cuda" and model_management.supports_fp8_compute(load_device)
+    linear_cls = comfy.ops.fp8_ops.Linear if fp8_compute else comfy.ops.manual_cast.Linear
+    op_name = "fp8_ops" if fp8_compute else "manual_cast"
     replacements = 0
     for name, module in list(model.named_modules()):
         if not isinstance(module, torch.nn.Linear):
             continue
-        if isinstance(module, comfy.ops.fp8_ops.Linear):
+        if isinstance(module, linear_cls):
             continue
         if module.weight is None or not _is_float8_dtype(module.weight.dtype):
             continue
 
         parent, attr = _parent_module(model, name)
-        replacement = comfy.ops.fp8_ops.Linear(
+        replacement = linear_cls(
             module.in_features,
             module.out_features,
             bias=module.bias is not None,
@@ -461,7 +437,7 @@ def _replace_fp8_linears_with_comfy_ops(model: torch.nn.Module) -> int:
         replacement.train(module.training)
         setattr(parent, attr, replacement)
         replacements += 1
-    return replacements
+    return replacements, op_name
 
 
 def _parent_module(model: torch.nn.Module, name: str) -> tuple[torch.nn.Module, str]:
@@ -472,41 +448,75 @@ def _parent_module(model: torch.nn.Module, name: str) -> tuple[torch.nn.Module, 
     return parent, parts[-1]
 
 
-def _load_weights(model: torch.nn.Module, path: str, *, dtype: torch.dtype | None = None) -> torch.nn.Module:
-    svdint4 = is_svdint4_file(path)
-    if svdint4:
-        state, _metadata, packed, w4 = build_loader_state_dict(path)
-        model = _replace_svdint4_linears(model, packed, w4)
-    else:
-        state = comfy.utils.load_torch_file(path, safe_load=True, device=torch.device("cpu"))
+def _load_standard_state(
+    model: torch.nn.Module,
+    path: str,
+    *,
+    dtype: torch.dtype | None = None,
+    assign: bool = True,
+) -> torch.nn.Module:
+    state = comfy.utils.load_torch_file(path, safe_load=True, device=torch.device("cpu"))
     if dtype is not None:
         for key, value in list(state.items()):
             if torch.is_tensor(value) and value.is_floating_point():
                 state[key] = value.to(dtype=dtype)
-    missing, unexpected = model.load_state_dict(state, strict=False, assign=True)
+    missing, unexpected = model.load_state_dict(state, strict=False, assign=assign)
+    if missing:
+        LOG.warning("SeedVR2 missing %d key(s) while loading %s", len(missing), os.path.basename(path))
+    if unexpected:
+        LOG.warning("SeedVR2 unexpected %d key(s) while loading %s", len(unexpected), os.path.basename(path))
+    return model
+
+
+def _load_weights(
+    model: torch.nn.Module,
+    path: str,
+    *,
+    dtype: torch.dtype | None = None,
+    load_device: torch.device | None = None,
+) -> torch.nn.Module:
+    svdint4 = is_svdint4_file(path)
+    if svdint4:
+        state, _metadata, packed, w4 = build_loader_state_dict(path)
+        model = _replace_svdint4_linears(model, packed, w4)
+        if dtype is not None:
+            for key, value in list(state.items()):
+                if torch.is_tensor(value) and value.is_floating_point():
+                    state[key] = value.to(dtype=dtype)
+        missing, unexpected = model.load_state_dict(state, strict=False, assign=True)
+    else:
+        model = _load_standard_state(model, path, dtype=dtype, assign=True)
+        missing, unexpected = [], []
     if missing:
         LOG.warning("SeedVR2 missing %d key(s) while loading %s", len(missing), os.path.basename(path))
     if unexpected:
         LOG.warning("SeedVR2 unexpected %d key(s) while loading %s", len(unexpected), os.path.basename(path))
     if not svdint4:
-        fp8_linears = _replace_fp8_linears_with_comfy_ops(model)
+        fp8_linears, op_name = _replace_fp8_linears_with_comfy_ops(
+            model,
+            load_device if load_device is not None else model_management.get_torch_device(),
+        )
         if fp8_linears:
             LOG.info(
-                "SeedVR2 routed %d FP8 Linear layer(s) through ComfyUI fp8_ops; FP8 weight storage is preserved.",
+                "SeedVR2 routed %d FP8 Linear layer(s) through ComfyUI %s; FP8 weight storage is preserved.",
                 fp8_linears,
+                op_name,
             )
     return model
 
 
 class SeedVR2VAE:
     def __init__(self, path: str, load_device: torch.device, offload_device: torch.device, dtype: torch.dtype):
-        core = _load_weights(_instantiate_vae(), path, dtype=dtype)
+        core = _instantiate_vae()
+        core.to(dtype)
+        _load_standard_state(core, path, dtype=None, assign=True)
+        model_management.archive_model_dtypes(core)
         core.to(offload_device)
         self.model = _PatchableVAE(core, offload_device)
         self.dtype = dtype
         self.load_device = load_device
         self.offload_device = offload_device
-        self.patcher = comfy.model_patcher.ModelPatcher(
+        self.patcher = comfy.model_patcher.CoreModelPatcher(
             self.model,
             load_device=load_device,
             offload_device=offload_device,
@@ -517,10 +527,10 @@ class SeedVR2VAE:
         model_management.load_models_gpu(
             [self.patcher],
             memory_required=memory_required,
-            force_full_load=True,
         )
         self.model.device = self.patcher.load_device
-        _assert_module_device(self.model.core, self.patcher.load_device, "VAE")
+        _set_runtime_device(self.model.core, self.patcher.load_device)
+        _log_module_placement(self.model.core, "VAE")
 
     @torch.no_grad()
     def encode(self, video_tchw: torch.Tensor, seed: int, tiled: bool, tile_size: int, tile_overlap: int) -> torch.Tensor:
@@ -562,13 +572,14 @@ class _PatchableVAE(torch.nn.Module):
         super().__init__()
         self.core = core
         self.device = device
+        _set_runtime_device(self.core, device)
 
     def encode(self, *args, **kwargs):
-        _assert_module_device(self.core, self.device, "VAE")
+        _set_runtime_device(self.core, self.device)
         return self.core.encode(*args, **kwargs)
 
     def decode(self, *args, **kwargs):
-        _assert_module_device(self.core, self.device, "VAE")
+        _set_runtime_device(self.core, self.device)
         return self.core.decode(*args, **kwargs)
 
 
@@ -651,7 +662,6 @@ class SeedVR2ComfyModel(torch.nn.Module):
                 f"SeedVR2 DiT input is on {x_t.device}, but the model is registered on {self.device}. "
                 "This indicates ComfyUI did not prepare the model on the expected load device."
             )
-        _assert_module_device(self.diffusion_model, x_t.device, "DiT")
         try:
             model_dtype = next(self.diffusion_model.parameters()).dtype
         except StopIteration:
@@ -739,7 +749,7 @@ class SeedVR2DiT:
         template = _infer_dit_template(path, model_name)
         LOG.info("SeedVR2 DiT template selected: %s for %s", template.upper(), os.path.basename(path))
         dit, na_module = _instantiate_dit(template, attention_mode)
-        dit = _load_weights(dit, path, dtype=None)
+        dit = _load_weights(dit, path, dtype=None, load_device=load_device)
         from .seedvr2_common import CompatibleDiT, validate_attention_mode
 
         requested_attention_mode = attention_mode
@@ -769,15 +779,6 @@ class SeedVR2DiT:
             offload_device=offload_device,
             size=_model_size_bytes(model),
         )
-        self.patcher.remove_wrappers_with_key(
-            comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING,
-            "SeedVR2_force_full_load",
-        )
-        self.patcher.add_wrapper_with_key(
-            comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING,
-            "SeedVR2_force_full_load",
-            _seedvr2_force_full_load_prepare_sampling,
-        )
         LOG.info(
             "SeedVR2 DiT patcher ready: load=%s, offload=%s, dtype=%s, size=%.2f MB",
             _device_label(load_device),
@@ -800,10 +801,9 @@ class SeedVR2DiT:
         model_management.load_models_gpu(
             [self.patcher],
             memory_required=memory_required,
-            force_full_load=True,
         )
         self.model.device = self.patcher.load_device
-        _assert_module_device(self.model.diffusion_model, self.patcher.load_device, "DiT")
+        _log_module_placement(self.model.diffusion_model, "DiT")
 
     def sample(self, latent: torch.Tensor, seed: int, *, show_pbar: bool = True) -> torch.Tensor:
         _seed_everything(seed)

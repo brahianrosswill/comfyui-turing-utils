@@ -20,7 +20,7 @@ SEEDVR2_FOLDER_NAME = "SEEDVR2"
 SEEDVR2_MODEL_TYPE = "seedvr2"
 MODEL_EXTENSIONS = {".safetensors", ".sft"}
 KNOWN_VAE_MODEL_NAMES = {"ema_vae_fp16.safetensors"}
-ATTENTION_BACKENDS = ["auto", "sdpa", "sage_attn", "flash_attn"]
+ATTENTION_BACKENDS = ["sdpa", "sage_attn", "flash_attn"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -120,18 +120,16 @@ def _estimate_free_vram_gb(device: str) -> float:
         return 0.0
 
 
-def _choose_tile_size(height: int, width: int, memory_mode: str, free_gb: float) -> tuple[bool, int, int]:
+def _choose_tile_size(height: int, width: int, free_gb: float) -> tuple[bool, int, int]:
     longest = max(height, width)
-    if memory_mode == "fastest":
+    if free_gb >= 18.0 and longest <= 1536:
         return False, 0, 0
-    if memory_mode == "balanced" and free_gb >= 18.0 and longest <= 1536:
+    if free_gb >= 12.0 and longest <= 1280:
         return False, 0, 0
-    if memory_mode == "balanced" and free_gb >= 12.0 and longest <= 1280:
+    if free_gb >= 10.0 and longest <= 1024:
         return False, 0, 0
 
     candidates = [1536, 1280, 1024, 768, 640, 512]
-    if memory_mode == "low_vram":
-        candidates = [1024, 768, 640, 512]
     if free_gb < 8.0:
         candidates = [768, 640, 512]
     if free_gb < 6.0:
@@ -142,26 +140,18 @@ def _choose_tile_size(height: int, width: int, memory_mode: str, free_gb: float)
     return True, tile, overlap
 
 
-def _auto_batch_size(frame_count: int, height: int, width: int, memory_mode: str, free_gb: float) -> int:
+def _auto_batch_size(frame_count: int, height: int, width: int, free_gb: float) -> int:
     if frame_count <= 1:
         return 1
     megapixels = (height * width) / 1_000_000.0
-    if memory_mode == "low_vram":
-        target = 5 if free_gb >= 10.0 and megapixels <= 1.5 else 1
-    elif memory_mode == "fastest":
-        if free_gb >= 22.0 and megapixels <= 1.5:
-            target = 21
-        elif free_gb >= 16.0 and megapixels <= 2.0:
-            target = 13
-        else:
-            target = 9
+    if free_gb >= 18.0 and megapixels <= 1.5:
+        target = 13
+    elif free_gb >= 12.0 and megapixels <= 2.0:
+        target = 9
+    elif free_gb >= 10.0 and megapixels <= 1.5:
+        target = 5
     else:
-        if free_gb >= 18.0 and megapixels <= 1.5:
-            target = 13
-        elif free_gb >= 12.0 and megapixels <= 2.0:
-            target = 9
-        else:
-            target = 5
+        target = 1
     return min(_valid_4n1(target), _valid_4n1(frame_count))
 
 
@@ -170,7 +160,6 @@ def _build_plan(
     *,
     resolution: int,
     max_resolution: int,
-    memory_mode: str,
 ) -> SeedVR2Plan:
     frames = int(image.shape[0])
     height = int(image.shape[1])
@@ -179,14 +168,11 @@ def _build_plan(
     main_device = str(model_management.get_torch_device())
     free_gb = _estimate_free_vram_gb(main_device)
 
-    chosen_batch = _auto_batch_size(frames, target_h, target_w, memory_mode, free_gb)
+    chosen_batch = _auto_batch_size(frames, target_h, target_w, free_gb)
     chosen_batch = max(1, min(chosen_batch, _valid_4n1(frames)))
 
-    encode_tiled, encode_tile, encode_overlap = _choose_tile_size(target_h, target_w, memory_mode, free_gb)
-    decode_tiled, decode_tile, decode_overlap = _choose_tile_size(target_h, target_w, memory_mode, free_gb)
-    if memory_mode == "fastest":
-        encode_tiled = False
-        decode_tiled = False
+    encode_tiled, encode_tile, encode_overlap = _choose_tile_size(target_h, target_w, free_gb)
+    decode_tiled, decode_tile, decode_overlap = _choose_tile_size(target_h, target_w, free_gb)
 
     return SeedVR2Plan(
         batch_size=chosen_batch,
@@ -263,8 +249,7 @@ class SeedVR2Upscaler:
                 "resolution": ("INT", {"default": 1080, "min": 16, "max": 16384, "step": 2}),
                 "max_resolution": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 2}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 2**32 - 1, "step": 1}),
-                "memory_mode": (["balanced", "fastest", "low_vram"], {"default": "balanced"}),
-                "attention_backend": (ATTENTION_BACKENDS, {"default": "auto"}),
+                "attention_backend": (ATTENTION_BACKENDS, {"default": "sdpa"}),
             },
         }
 
@@ -282,7 +267,6 @@ class SeedVR2Upscaler:
         resolution: int,
         max_resolution: int,
         seed: int,
-        memory_mode: str,
         attention_backend: str,
     ):
         if image.ndim != 4 or int(image.shape[-1]) not in (3, 4):
@@ -292,7 +276,6 @@ class SeedVR2Upscaler:
             image,
             resolution=resolution,
             max_resolution=max_resolution,
-            memory_mode=memory_mode,
         )
         LOG.info("SeedVR2 planner selected: %s", plan.describe())
 

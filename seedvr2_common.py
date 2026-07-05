@@ -472,21 +472,8 @@ def validate_attention_mode(requested_mode: str, debug=None) -> str:
             return "sageattn"
         return "sdpa"
 
-    def best_auto() -> str:
-        if FLASH_ATTN_3_AVAILABLE:
-            return "flash_attn_3"
-        if SAGE_ATTN_3_AVAILABLE:
-            return "sageattn_3"
-        if FLASH_ATTN_2_AVAILABLE:
-            return "flash_attn_2"
-        if SAGE_ATTN_2_AVAILABLE:
-            return "sageattn_2"
-        if SAGE_ATTN_1_AVAILABLE:
-            return "sageattn"
+    if requested_mode == "sdpa":
         return "sdpa"
-
-    if requested_mode == "auto":
-        return fallback(requested_mode, best_auto())
     if requested_mode == "flash_attn":
         return fallback(requested_mode, best_flash())
     if requested_mode == "sage_attn":
@@ -501,7 +488,10 @@ def validate_attention_mode(requested_mode: str, debug=None) -> str:
         return fallback(requested_mode, "sageattn_2" if SAGE_ATTN_2_AVAILABLE else ("sageattn" if SAGE_ATTN_1_AVAILABLE else "sdpa"))
     if requested_mode == "sageattn":
         return fallback(requested_mode, "sageattn" if SAGE_ATTN_1_AVAILABLE else ("sageattn_2" if SAGE_ATTN_2_AVAILABLE else "sdpa"))
-    return requested_mode
+    raise ValueError(
+        f"Unsupported SeedVR2 attention backend: {requested_mode!r}. "
+        "Use one of: sdpa, sage_attn, flash_attn."
+    )
 
 
 def _as_int(value):
