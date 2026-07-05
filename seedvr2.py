@@ -25,6 +25,8 @@ LOG = logging.getLogger("comfyui-svdint4")
 SEEDVR2_SCALING_FACTOR = 0.9152
 SEEDVR2_T = 1000.0
 SEEDVR2_VAE_TILE_SIZES = (1024, 768, 512, 384, 256)
+SEEDVR2_VAE_PAGING_GUARD_MIN_BYTES = 256 * 1024 * 1024
+SEEDVR2_VAE_PAGING_GUARD_RATIO = 0.15
 _FLOAT8_DTYPES = tuple(
     getattr(torch, name)
     for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz")
@@ -207,6 +209,16 @@ def _vae_tile_candidates(preferred_tile_size: int) -> list[tuple[int, int]]:
         seen.add(size)
         candidates.append((size, _vae_tile_overlap(size)))
     return candidates
+
+
+def _vae_required_headroom(memory_required: int) -> int:
+    memory_required = max(0, int(memory_required))
+    margin = max(SEEDVR2_VAE_PAGING_GUARD_MIN_BYTES, int(memory_required * SEEDVR2_VAE_PAGING_GUARD_RATIO))
+    return memory_required + margin
+
+
+def _format_mb(num_bytes: int | float) -> str:
+    return f"{float(num_bytes) / (1024 * 1024):.2f} MB"
 
 
 def _require_accelerator_device(device: torch.device, label: str) -> torch.device:
@@ -601,6 +613,26 @@ class SeedVR2VAE:
     def execution_device(self) -> torch.device:
         return torch.device(getattr(self.model, "device", self.patcher.load_device))
 
+    def _has_execution_headroom(self, memory_required: int, label: str) -> bool:
+        device = self.execution_device()
+        if model_management.is_device_cpu(device):
+            return True
+        try:
+            free = int(model_management.get_free_memory(device))
+        except Exception:
+            return True
+        required = _vae_required_headroom(memory_required)
+        if free >= required:
+            return True
+        LOG.warning(
+            "SeedVR2 VAE %s needs %s dedicated headroom, but only %s is currently free; "
+            "using a smaller tiled path to avoid Windows shared GPU memory paging.",
+            label,
+            _format_mb(required),
+            _format_mb(free),
+        )
+        return False
+
     def _encode_memory(self, samples: torch.Tensor, tile_size: int | None = None) -> int:
         if tile_size is None:
             active = samples
@@ -645,10 +677,15 @@ class SeedVR2VAE:
 
     def _encode_tiled_with_retries(self, samples: torch.Tensor, preferred_tile_size: int) -> torch.Tensor:
         last_exc: BaseException | None = None
+        skipped_for_headroom = False
         for tile_size, tile_overlap in _vae_tile_candidates(preferred_tile_size):
             try:
                 LOG.info("SeedVR2 VAE encode tiled retry: tile=%d, overlap=%d", tile_size, tile_overlap)
-                self._load(self._encode_memory(samples, tile_size))
+                memory_required = self._encode_memory(samples, tile_size)
+                self._load(memory_required)
+                if not self._has_execution_headroom(memory_required, f"tiled encode tile={tile_size}"):
+                    skipped_for_headroom = True
+                    continue
                 return self._run_encode(samples, tiled=True, tile_size=tile_size, tile_overlap=tile_overlap)
             except BaseException as exc:
                 model_management.raise_non_oom(exc)
@@ -658,14 +695,21 @@ class SeedVR2VAE:
                     model_management.soft_empty_cache(force=True)
                 except Exception:
                     model_management.soft_empty_cache()
+        if skipped_for_headroom and last_exc is None:
+            raise RuntimeError("SeedVR2 VAE encode needs more dedicated GPU memory even at the smallest tile size.")
         raise RuntimeError(f"SeedVR2 VAE encode failed after tiled retries. Last error: {last_exc}") from last_exc
 
     def _decode_tiled_with_retries(self, z: torch.Tensor, preferred_tile_size: int) -> torch.Tensor:
         last_exc: BaseException | None = None
+        skipped_for_headroom = False
         for tile_size, tile_overlap in _vae_tile_candidates(preferred_tile_size):
             try:
                 LOG.info("SeedVR2 VAE decode tiled retry: tile=%d, overlap=%d", tile_size, tile_overlap)
-                self._load(self._decode_memory(z, tile_size))
+                memory_required = self._decode_memory(z, tile_size)
+                self._load(memory_required)
+                if not self._has_execution_headroom(memory_required, f"tiled decode tile={tile_size}"):
+                    skipped_for_headroom = True
+                    continue
                 return self._run_decode(z, tiled=True, tile_size=tile_size, tile_overlap=tile_overlap)
             except BaseException as exc:
                 model_management.raise_non_oom(exc)
@@ -675,6 +719,8 @@ class SeedVR2VAE:
                     model_management.soft_empty_cache(force=True)
                 except Exception:
                     model_management.soft_empty_cache()
+        if skipped_for_headroom and last_exc is None:
+            raise RuntimeError("SeedVR2 VAE decode needs more dedicated GPU memory even at the smallest tile size.")
         raise RuntimeError(f"SeedVR2 VAE decode failed after tiled retries. Last error: {last_exc}") from last_exc
 
     @torch.no_grad()
@@ -687,8 +733,12 @@ class SeedVR2VAE:
             do_tile = False
             encoded = None
             try:
-                self._load(self._encode_memory(samples))
-                encoded = self._run_encode(samples, tiled=False, tile_size=tile_size, tile_overlap=tile_overlap)
+                memory_required = self._encode_memory(samples)
+                self._load(memory_required)
+                if self._has_execution_headroom(memory_required, "regular encode"):
+                    encoded = self._run_encode(samples, tiled=False, tile_size=tile_size, tile_overlap=tile_overlap)
+                else:
+                    do_tile = True
             except BaseException as exc:
                 model_management.raise_non_oom(exc)
                 LOG.warning("SeedVR2 VAE regular encoding hit OOM; retrying with tiled VAE encoding.")
@@ -710,8 +760,12 @@ class SeedVR2VAE:
             do_tile = False
             decoded = None
             try:
-                self._load(self._decode_memory(z))
-                decoded = self._run_decode(z, tiled=False, tile_size=tile_size, tile_overlap=tile_overlap)
+                memory_required = self._decode_memory(z)
+                self._load(memory_required)
+                if self._has_execution_headroom(memory_required, "regular decode"):
+                    decoded = self._run_decode(z, tiled=False, tile_size=tile_size, tile_overlap=tile_overlap)
+                else:
+                    do_tile = True
             except BaseException as exc:
                 model_management.raise_non_oom(exc)
                 LOG.warning("SeedVR2 VAE regular decoding hit OOM; retrying with tiled VAE decoding.")
