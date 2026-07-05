@@ -180,7 +180,12 @@ def _log_module_placement(module: torch.nn.Module, label: str) -> None:
 
 
 def _set_runtime_device(module: torch.nn.Module, device: torch.device) -> None:
-    module.device = torch.device(device)
+    try:
+        module.device = torch.device(device)
+    except AttributeError:
+        # Some imported modules expose device as a read-only property derived
+        # from their tensors. ComfyUI moves those tensors through the patcher.
+        return
 
 
 def _ensure_finite(tensor: torch.Tensor, label: str) -> None:
