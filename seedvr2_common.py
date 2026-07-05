@@ -1,7 +1,7 @@
-"""Native SeedVR2 support helpers for the ComfyUI SVDInt4 plugin.
+"""SeedVR2 support helpers for the ComfyUI SVDInt4 plugin.
 
 This module keeps only the single-process inference surface needed by the
-native SeedVR2 node. Distributed functions are intentionally no-ops so the DiT
+SeedVR2 node. Distributed functions are intentionally no-ops so the DiT
 and VAE definitions can stay close to the official architecture without pulling
 in the original runtime framework.
 """

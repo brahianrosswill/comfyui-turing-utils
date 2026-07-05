@@ -1,4 +1,4 @@
-"""Native SeedVR2 7B DiT architecture used by the ComfyUI SVDInt4 plugin."""
+"""SeedVR2 7B DiT architecture used by the ComfyUI SVDInt4 plugin."""
 
 from __future__ import annotations
 

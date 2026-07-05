@@ -12,7 +12,7 @@ import torch
 import comfy.model_management as model_management
 import folder_paths
 
-from .seedvr2_native import SeedVR2NativePipeline
+from .seedvr2 import SeedVR2Pipeline
 
 
 LOG = logging.getLogger("comfyui-svdint4")
@@ -30,11 +30,10 @@ DEFAULT_DIT_MODELS = [
 ]
 DEFAULT_VAE_MODELS = ["ema_vae_fp16.safetensors"]
 AUTO_BATCH = "auto"
-_AUTO_NODE_ID = "svdint4_seedvr2_auto"
 
 
 @dataclasses.dataclass(frozen=True)
-class SeedVR2AutoPlan:
+class SeedVR2Plan:
     batch_size: int
     temporal_overlap: int
     encode_tiled: bool
@@ -224,7 +223,7 @@ def _build_plan(
     tensor_offload_device: str,
     dit_offload_device: str,
     vae_offload_device: str,
-) -> SeedVR2AutoPlan:
+) -> SeedVR2Plan:
     frames = int(image.shape[0])
     height = int(image.shape[1])
     width = int(image.shape[2])
@@ -256,7 +255,7 @@ def _build_plan(
         if tensor_offload == "none":
             tensor_offload = "cpu"
 
-    return SeedVR2AutoPlan(
+    return SeedVR2Plan(
         batch_size=chosen_batch,
         temporal_overlap=overlap,
         encode_tiled=encode_tiled,
@@ -272,7 +271,7 @@ def _build_plan(
     )
 
 
-def _fallback_plans(plan: SeedVR2AutoPlan) -> list[SeedVR2AutoPlan]:
+def _fallback_plans(plan: SeedVR2Plan) -> list[SeedVR2Plan]:
     plans = [plan]
     batch = plan.batch_size
     while batch > 1:
@@ -300,7 +299,7 @@ def _fallback_plans(plan: SeedVR2AutoPlan) -> list[SeedVR2AutoPlan]:
             )
         )
 
-    unique: list[SeedVR2AutoPlan] = []
+    unique: list[SeedVR2Plan] = []
     seen: set[tuple[Any, ...]] = set()
     for item in plans:
         key = dataclasses.astuple(item)
@@ -328,7 +327,7 @@ def _clear_after_oom() -> None:
         model_management.soft_empty_cache()
 
 
-class SeedVR2AutoUpscaler:
+class SeedVR2Upscaler:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -361,7 +360,7 @@ class SeedVR2AutoUpscaler:
     RETURN_NAMES = ("image",)
     FUNCTION = "upscale"
     CATEGORY = "SVDInt4/SeedVR2"
-    TITLE = "SeedVR2 Auto Upscale"
+    TITLE = "SeedVR2 Upscale"
 
     def upscale(
         self,
@@ -386,7 +385,7 @@ class SeedVR2AutoUpscaler:
         enable_debug: bool = False,
     ):
         if image.ndim != 4 or int(image.shape[-1]) not in (3, 4):
-            raise ValueError(f"SeedVR2 Auto Upscale expects IMAGE shaped [frames,h,w,3/4], got {tuple(image.shape)}")
+            raise ValueError(f"SeedVR2 Upscale expects IMAGE shaped [frames,h,w,3/4], got {tuple(image.shape)}")
 
         dit_device = _resolve_auto_device(dit_device)
         vae_device = _resolve_auto_device(vae_device)
@@ -403,12 +402,12 @@ class SeedVR2AutoUpscaler:
             dit_offload_device=dit_offload_device,
             vae_offload_device=vae_offload_device,
         )
-        LOG.info("SeedVR2 auto planner selected: %s", plan.describe())
+        LOG.info("SeedVR2 planner selected: %s", plan.describe())
 
         last_exc: BaseException | None = None
         for attempt, candidate in enumerate(_fallback_plans(plan), start=1):
             try:
-                LOG.info("SeedVR2 auto attempt %d: %s", attempt, candidate.describe())
+                LOG.info("SeedVR2 attempt %d: %s", attempt, candidate.describe())
                 return (
                     self._run_once(
                         image=image,
@@ -431,10 +430,10 @@ class SeedVR2AutoUpscaler:
                 if not _is_oom(exc):
                     raise
                 last_exc = exc
-                LOG.warning("SeedVR2 auto attempt %d hit OOM; retrying with a smaller plan.", attempt)
+                LOG.warning("SeedVR2 attempt %d hit OOM; retrying with a smaller plan.", attempt)
                 _clear_after_oom()
 
-        raise RuntimeError(f"SeedVR2 Auto Upscale failed after all memory fallback plans. Last error: {last_exc}") from last_exc
+        raise RuntimeError(f"SeedVR2 Upscale failed after all memory fallback plans. Last error: {last_exc}") from last_exc
 
     def _run_once(
         self,
@@ -452,11 +451,11 @@ class SeedVR2AutoUpscaler:
         vae_device: str,
         attention_mode: str,
         enable_debug: bool,
-        plan: SeedVR2AutoPlan,
+        plan: SeedVR2Plan,
     ) -> torch.Tensor:
         self._validate_model_files_exist(dit_model, vae_model)
         del color_correction
-        pipeline = SeedVR2NativePipeline(
+        pipeline = SeedVR2Pipeline(
             model_dir=_seedvr2_model_dir(),
             dit_model=dit_model,
             vae_model=vae_model,

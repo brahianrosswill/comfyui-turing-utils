@@ -30,7 +30,7 @@ class _LogShim:
 
     def log(self, message: str, level: str = "INFO", **_: Any) -> None:
         if self.enabled or level in {"WARNING", "ERROR"}:
-            getattr(LOG, level.lower(), LOG.info)("SeedVR2 native: %s", message)
+            getattr(LOG, level.lower(), LOG.info)("SeedVR2: %s", message)
 
     def start_timer(self, *_: Any, **__: Any) -> None:
         return
@@ -93,7 +93,7 @@ def _pad_4n1(video_tchw: torch.Tensor) -> tuple[torch.Tensor, int]:
 
 def _resize_normalize(images: torch.Tensor, resolution: int, max_resolution: int) -> tuple[torch.Tensor, tuple[int, int]]:
     if images.ndim != 4 or int(images.shape[-1]) not in (3, 4):
-        raise ValueError(f"SeedVR2 native expects IMAGE [frames,h,w,3/4], got {tuple(images.shape)}")
+        raise ValueError(f"SeedVR2 expects IMAGE [frames,h,w,3/4], got {tuple(images.shape)}")
     rgb = images[..., :3].to(torch.float32).clamp(0.0, 1.0)
     frames, height, width, _channels = rgb.shape
     target_h, target_w = _target_dimensions(height, width, resolution, max_resolution)
@@ -126,7 +126,7 @@ def _seedvr2_latent_to_comfy(latent: torch.Tensor) -> torch.Tensor:
 
 def _comfy_latent_to_seedvr2(latent: torch.Tensor) -> torch.Tensor:
     if latent.ndim != 5 or latent.shape[0] != 1:
-        raise ValueError(f"SeedVR2 native currently samples one 4n+1 window at a time, got {tuple(latent.shape)}")
+        raise ValueError(f"SeedVR2 currently samples one 4n+1 window at a time, got {tuple(latent.shape)}")
     return latent.squeeze(0).permute(1, 2, 3, 0).contiguous()
 
 
@@ -283,7 +283,7 @@ def _replace_svdint4_linears(
     if not target_names:
         return model
     linear_cls = type(
-        f"SeedVR2NativeSVDInt4Linear_{id(packed_layer_tensors):x}",
+        f"SeedVR2SVDInt4Linear_{id(packed_layer_tensors):x}",
         (SVDInt4LinearOp,),
         {
             "packed_layer_names": frozenset(packed_layer_tensors),
@@ -333,9 +333,9 @@ def _load_weights(model: torch.nn.Module, path: str, *, dtype: torch.dtype | Non
                 state[key] = value.to(dtype=dtype)
     missing, unexpected = model.load_state_dict(state, strict=False, assign=True)
     if missing:
-        LOG.warning("SeedVR2 native missing %d key(s) while loading %s", len(missing), os.path.basename(path))
+        LOG.warning("SeedVR2 missing %d key(s) while loading %s", len(missing), os.path.basename(path))
     if unexpected:
-        LOG.warning("SeedVR2 native unexpected %d key(s) while loading %s", len(unexpected), os.path.basename(path))
+        LOG.warning("SeedVR2 unexpected %d key(s) while loading %s", len(unexpected), os.path.basename(path))
     return model
 
 
@@ -461,7 +461,7 @@ class SeedVR2ComfyModel(torch.nn.Module):
     def apply_model(self, x: torch.Tensor, t: torch.Tensor, **kwargs) -> torch.Tensor:
         del kwargs
         if self.current_condition is None:
-            raise RuntimeError("SeedVR2 native condition latent was not prepared")
+            raise RuntimeError("SeedVR2 condition latent was not prepared")
         sigma = t.reshape((-1,) + (1,) * (x.ndim - 1)).to(device=x.device, dtype=x.dtype)
         x_model = x.to(dtype=self.dtype)
         pred = self._predict_v(_comfy_latent_to_seedvr2(x_model), t)
@@ -610,10 +610,10 @@ class SeedVR2DiT:
         try:
             patcher.detach()
         except Exception:
-            LOG.debug("SeedVR2 native DiT patcher detach failed", exc_info=True)
+            LOG.debug("SeedVR2 DiT patcher detach failed", exc_info=True)
 
 
-class SeedVR2NativePipeline:
+class SeedVR2Pipeline:
     def __init__(
         self,
         *,
@@ -656,7 +656,7 @@ class SeedVR2NativePipeline:
         try:
             patcher.detach()
         except Exception:
-            LOG.debug("SeedVR2 native VAE patcher detach failed", exc_info=True)
+            LOG.debug("SeedVR2 VAE patcher detach failed", exc_info=True)
         finally:
             self.vae = None
 

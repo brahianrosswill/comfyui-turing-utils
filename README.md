@@ -232,14 +232,14 @@ The node category is:
 SVDInt4/loaders
 ```
 
-## SeedVR2 Auto Upscale
+## SeedVR2 Upscale
 
-This plugin also includes a native SeedVR2 node implemented on ComfyUI's model
+This plugin also includes a SeedVR2 node implemented on ComfyUI's model
 patcher and sampler path. The compact architecture adapters live in the
 `seedvr2_*.py` modules; SeedVR2 text embeddings and the original Apache-2.0
 license are preserved under `seedvr2_assets/`.
 
-The `SeedVR2 Auto Upscale` node is a single high-level node. It takes only
+The `SeedVR2 Upscale` node is a single high-level node. It takes only
 `IMAGE` input and exposes the DiT/VAE files as node parameters instead of
 requiring separate SeedVR2 loader nodes. Place SeedVR2 weights in:
 
@@ -264,10 +264,10 @@ instead of starting downloads from inside a workflow.
 
 The node retries on CUDA OOM by reducing the 4n+1 batch size first, then falling
 back to progressively smaller VAE tiles and CPU tensor/model offload. This is
-intended to behave closer to ComfyUI's native VAE fallback path: try the fastest
+intended to behave closer to ComfyUI's VAE fallback path: try the fastest
 non-tiled path first, then tile only when memory pressure requires it.
 
-The SeedVR2 native runtime only needs the lightweight tensor/file helpers listed
+The SeedVR2 runtime only needs the lightweight tensor/file helpers listed
 in `requirements.txt`: `einops`, `safetensors`, and `tqdm`. PyTorch is
 intentionally not listed to avoid replacing ComfyUI's installed Torch build.
 The small RoPE helper used by SeedVR2 is implemented locally, and the SeedVR2
