@@ -15,6 +15,7 @@ sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 import comfy.model_patcher  # noqa: E402
+import comfy.ops  # noqa: E402
 
 
 PACKAGE_NAME = "comfyui_svdint4_testpkg"
@@ -77,6 +78,56 @@ class SeedVR2RuntimeContractTest(unittest.TestCase):
         self.assertIs(model.current_patcher, patcher)
         patcher.cleanup()
         self.assertIsNone(model.current_patcher)
+
+    @unittest.skipUnless(hasattr(torch, "float8_e4m3fn"), "torch build has no float8 dtype")
+    def test_fp8_storage_model_reports_runtime_dtype(self):
+        class _FP8StorageModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.empty((1, 1), dtype=torch.float8_e4m3fn),
+                    requires_grad=False,
+                )
+
+        model = SeedVR2ComfyModel(
+            dit=_FP8StorageModule(),
+            na_module=_DummyNa(),
+            text_pos=torch.zeros(1, 1),
+            text_neg=torch.zeros(1, 1),
+            dtype=torch.float16,
+        )
+
+        self.assertEqual(model.get_dtype(), torch.float16)
+        self.assertEqual(model.model_dtype(), torch.float16)
+
+    @unittest.skipUnless(hasattr(torch, "float8_e4m3fn"), "torch build has no float8 dtype")
+    def test_non_linear_fp8_tensors_are_cast_without_expanding_linear_storage(self):
+        class _MixedFP8Module(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = comfy.ops.manual_cast.Linear(2, 2, bias=False, dtype=torch.float16)
+                self.linear.weight = torch.nn.Parameter(
+                    torch.empty((2, 2), dtype=torch.float8_e4m3fn),
+                    requires_grad=False,
+                )
+                self.linear.weight_comfy_model_dtype = torch.float8_e4m3fn
+                self.norm = torch.nn.Module()
+                self.norm.weight = torch.nn.Parameter(
+                    torch.empty((2,), dtype=torch.float8_e4m3fn),
+                    requires_grad=False,
+                )
+                self.register_buffer("scale", torch.empty((1,), dtype=torch.float8_e4m3fn))
+
+        model = _MixedFP8Module()
+        converted, _converted_bytes = seedvr2._cast_unhandled_fp8_tensors(model, torch.float16)
+
+        self.assertEqual(converted, 2)
+        self.assertEqual(model.linear.weight.dtype, torch.float8_e4m3fn)
+        self.assertEqual(model.linear.weight_comfy_model_dtype, torch.float8_e4m3fn)
+        self.assertEqual(model.norm.weight.dtype, torch.float16)
+        self.assertEqual(model.norm.weight_comfy_model_dtype, torch.float16)
+        self.assertEqual(model.scale.dtype, torch.float16)
+        self.assertEqual(model.scale_comfy_model_dtype, torch.float16)
 
 
 if __name__ == "__main__":

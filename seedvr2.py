@@ -175,6 +175,20 @@ def _device_label(device: torch.device) -> str:
         return str(device)
 
 
+def _module_device(module: torch.nn.Module, fallback: torch.device) -> torch.device:
+    try:
+        device = getattr(module, "device")
+        if device is not None:
+            return torch.device(device)
+    except Exception:
+        pass
+    for tensor in module.parameters(recurse=True):
+        return tensor.device
+    for tensor in module.buffers(recurse=True):
+        return tensor.device
+    return fallback
+
+
 def _require_accelerator_device(device: torch.device, label: str) -> torch.device:
     if model_management.is_device_cpu(device):
         raise RuntimeError(
@@ -375,6 +389,10 @@ def _is_float8_dtype(dtype: torch.dtype) -> bool:
     return dtype in _FLOAT8_DTYPES
 
 
+def _is_comfy_cast_linear(module: torch.nn.Module) -> bool:
+    return isinstance(module, comfy.ops.manual_cast.Linear)
+
+
 def _replace_fp8_linears_with_comfy_ops(model: torch.nn.Module, load_device: torch.device) -> tuple[int, str]:
     fp8_compute = load_device.type == "cuda" and model_management.supports_fp8_compute(load_device)
     linear_cls = comfy.ops.fp8_ops.Linear if fp8_compute else comfy.ops.manual_cast.Linear
@@ -407,6 +425,39 @@ def _replace_fp8_linears_with_comfy_ops(model: torch.nn.Module, load_device: tor
         setattr(parent, attr, replacement)
         replacements += 1
     return replacements, op_name
+
+
+def _replace_local_parameter(module: torch.nn.Module, name: str, value: torch.Tensor) -> None:
+    old = module._parameters[name]
+    module._parameters[name] = torch.nn.Parameter(value, requires_grad=old.requires_grad)
+
+
+def _cast_unhandled_fp8_tensors(model: torch.nn.Module, target_dtype: torch.dtype) -> tuple[int, int]:
+    if not _FLOAT8_DTYPES:
+        return 0, 0
+    converted = 0
+    converted_bytes = 0
+    for module in model.modules():
+        skip_linear_weight = _is_comfy_cast_linear(module)
+        for name, param in list(module.named_parameters(recurse=False)):
+            if param is None or not _is_float8_dtype(param.dtype):
+                continue
+            if skip_linear_weight and name in {"weight", "bias"}:
+                continue
+            tensor = param.detach().to(dtype=target_dtype)
+            _replace_local_parameter(module, name, tensor)
+            setattr(module, f"{name}_comfy_model_dtype", target_dtype)
+            converted += 1
+            converted_bytes += tensor.nelement() * tensor.element_size()
+        for name, buffer in list(module.named_buffers(recurse=False)):
+            if buffer is None or not _is_float8_dtype(buffer.dtype):
+                continue
+            tensor = buffer.detach().to(dtype=target_dtype)
+            module._buffers[name] = tensor
+            setattr(module, f"{name}_comfy_model_dtype", target_dtype)
+            converted += 1
+            converted_bytes += tensor.nelement() * tensor.element_size()
+    return converted, converted_bytes
 
 
 def _parent_module(model: torch.nn.Module, name: str) -> tuple[torch.nn.Module, str]:
@@ -443,6 +494,7 @@ def _load_weights(
     *,
     dtype: torch.dtype | None = None,
     load_device: torch.device | None = None,
+    runtime_dtype: torch.dtype | None = None,
 ) -> torch.nn.Module:
     svdint4 = is_svdint4_file(path)
     if svdint4:
@@ -471,6 +523,15 @@ def _load_weights(
                 fp8_linears,
                 op_name,
             )
+        if fp8_linears and runtime_dtype is not None:
+            converted, converted_bytes = _cast_unhandled_fp8_tensors(model, runtime_dtype)
+            if converted:
+                LOG.info(
+                    "SeedVR2 converted %d non-Linear FP8 tensor(s) to %s for regular PyTorch ops (%.2f MB runtime storage).",
+                    converted,
+                    runtime_dtype,
+                    converted_bytes / (1024 * 1024),
+                )
     return model
 
 
@@ -485,6 +546,7 @@ class SeedVR2VAE:
         self.dtype = dtype
         self.load_device = load_device
         self.offload_device = offload_device
+        self._last_logged_device: torch.device | None = None
         self.patcher = comfy.model_patcher.CoreModelPatcher(
             self.model,
             load_device=load_device,
@@ -497,13 +559,25 @@ class SeedVR2VAE:
             [self.patcher],
             memory_required=memory_required,
         )
+        core_device = self.execution_device()
+        if self._last_logged_device != core_device:
+            LOG.info(
+                "SeedVR2 VAE loaded through ComfyUI: core=%s, wrapper=%s",
+                _device_label(core_device),
+                _device_label(torch.device(getattr(self.model, "device", core_device))),
+            )
+            self._last_logged_device = core_device
+
+    def execution_device(self) -> torch.device:
+        return _module_device(self.model.core, self.patcher.load_device)
 
     @torch.no_grad()
     def encode(self, video_tchw: torch.Tensor, seed: int, tiled: bool, tile_size: int, tile_overlap: int) -> torch.Tensor:
         _seed_everything(seed + 1_000_000)
-        samples = _video_to_vae_input(video_tchw).to(device=self.load_device, dtype=self.dtype)
+        samples = _video_to_vae_input(video_tchw).to(dtype=self.dtype)
         memory = int(samples.nelement() * samples.element_size() * 60)
         self._load(memory)
+        samples = samples.to(device=self.execution_device(), dtype=self.dtype)
         encoded = self.model.encode(
             samples,
             tiled=tiled,
@@ -516,10 +590,11 @@ class SeedVR2VAE:
 
     @torch.no_grad()
     def decode(self, latent: torch.Tensor, tiled: bool, tile_size: int, tile_overlap: int) -> torch.Tensor:
-        latent = (latent / SEEDVR2_SCALING_FACTOR).to(device=self.load_device, dtype=self.dtype)
+        latent = (latent / SEEDVR2_SCALING_FACTOR).to(dtype=self.dtype)
         z = latent.permute(3, 0, 1, 2).unsqueeze(0).contiguous()
         memory = int(z.nelement() * z.element_size() * 900)
         self._load(memory)
+        z = z.to(device=self.execution_device(), dtype=self.dtype)
         decoded = self.model.decode(
             z,
             tiled=tiled,
@@ -576,10 +651,7 @@ class SeedVR2ComfyModel(torch.nn.Module):
         return getattr(self, name)
 
     def get_dtype(self) -> torch.dtype:
-        try:
-            return next(self.diffusion_model.parameters()).dtype
-        except StopIteration:
-            return self.dtype
+        return self.dtype
 
     def model_dtype(self) -> torch.dtype:
         return self.get_dtype()
@@ -620,24 +692,19 @@ class SeedVR2ComfyModel(torch.nn.Module):
                 "SeedVR2 DiT received CPU latents. "
                 "This indicates the model was not prepared on an accelerator device."
             )
-        try:
-            model_dtype = next(self.diffusion_model.parameters()).dtype
-        except StopIteration:
-            model_dtype = self.dtype
-        autocast_enabled = x_t.device.type == "cuda" and model_dtype != self.dtype
+        x_t = x_t.to(dtype=self.dtype)
         cond = self.current_condition.to(device=x_t.device, dtype=x_t.dtype)
         vid = torch.cat([x_t, cond], dim=-1)
         vid_flat, vid_shape = self.na.flatten([vid])
         txt, txt_shape = self.na.flatten([self.text_pos.to(device=x_t.device, dtype=x_t.dtype)])
         timestep = (t[:1].to(device=x_t.device, dtype=torch.float32) * SEEDVR2_T).repeat(1)
-        with torch.autocast(x_t.device.type, self.dtype, enabled=autocast_enabled):
-            out = self.diffusion_model(
-                vid=vid_flat,
-                txt=txt,
-                vid_shape=vid_shape,
-                txt_shape=txt_shape,
-                timestep=timestep,
-            ).vid_sample
+        out = self.diffusion_model(
+            vid=vid_flat,
+            txt=txt,
+            vid_shape=vid_shape,
+            txt_shape=txt_shape,
+            timestep=timestep,
+        ).vid_sample
         out = self.na.unflatten(out, vid_shape)[0]
         _ensure_finite(out, "DiT forward")
         return out
@@ -707,7 +774,7 @@ class SeedVR2DiT:
         template = _infer_dit_template(path, model_name)
         LOG.info("SeedVR2 DiT template selected: %s for %s", template.upper(), os.path.basename(path))
         dit, na_module = _instantiate_dit(template, attention_mode)
-        dit = _load_weights(dit, path, dtype=None, load_device=load_device)
+        dit = _load_weights(dit, path, dtype=None, load_device=load_device, runtime_dtype=dtype)
         from .seedvr2_common import CompatibleDiT, validate_attention_mode
 
         requested_attention_mode = attention_mode
