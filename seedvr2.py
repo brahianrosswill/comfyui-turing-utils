@@ -4,7 +4,6 @@ import logging
 import math
 import os
 from pathlib import Path
-from collections import Counter
 from typing import Any
 
 import torch
@@ -151,41 +150,6 @@ def _model_size_bytes(model: torch.nn.Module) -> int:
         if tensor is not None:
             total += tensor.nelement() * tensor.element_size()
     return total
-
-
-def _format_tensor_counter(counter: Counter[str]) -> str:
-    return ", ".join(f"{key}={value / (1024 * 1024):.2f} MB" for key, value in counter.most_common())
-
-
-def _log_module_placement(module: torch.nn.Module, label: str) -> None:
-    device_bytes: Counter[str] = Counter()
-    dtype_bytes: Counter[str] = Counter()
-
-    for iterator in (module.parameters(), module.buffers()):
-        for tensor in iterator:
-            if tensor is None:
-                continue
-            size = tensor.nelement() * tensor.element_size()
-            device_bytes[str(tensor.device)] += size
-            dtype_bytes[str(tensor.dtype)] += size
-
-    if not device_bytes:
-        return
-    LOG.info(
-        "SeedVR2 %s tensor placement: devices=[%s], dtypes=[%s]",
-        label,
-        _format_tensor_counter(device_bytes),
-        _format_tensor_counter(dtype_bytes),
-    )
-
-
-def _set_runtime_device(module: torch.nn.Module, device: torch.device) -> None:
-    try:
-        module.device = torch.device(device)
-    except AttributeError:
-        # Some imported modules expose device as a read-only property derived
-        # from their tensors. ComfyUI moves those tensors through the patcher.
-        return
 
 
 def _ensure_finite(tensor: torch.Tensor, label: str) -> None:
@@ -533,9 +497,6 @@ class SeedVR2VAE:
             [self.patcher],
             memory_required=memory_required,
         )
-        self.model.device = self.patcher.load_device
-        _set_runtime_device(self.model.core, self.patcher.load_device)
-        _log_module_placement(self.model.core, "VAE")
 
     @torch.no_grad()
     def encode(self, video_tchw: torch.Tensor, seed: int, tiled: bool, tile_size: int, tile_overlap: int) -> torch.Tensor:
@@ -577,14 +538,11 @@ class _PatchableVAE(torch.nn.Module):
         super().__init__()
         self.core = core
         self.device = device
-        _set_runtime_device(self.core, device)
 
     def encode(self, *args, **kwargs):
-        _set_runtime_device(self.core, self.device)
         return self.core.encode(*args, **kwargs)
 
     def decode(self, *args, **kwargs):
-        _set_runtime_device(self.core, self.device)
         return self.core.decode(*args, **kwargs)
 
 
@@ -602,7 +560,6 @@ class SeedVR2ComfyModel(torch.nn.Module):
         self.na = na_module
         self.dtype = dtype
         self.device = torch.device("cpu")
-        self.current_patcher = None
         self.current_condition: torch.Tensor | None = None
         self.register_buffer("text_pos", text_pos.to(dtype=dtype), persistent=False)
         self.register_buffer("text_neg", text_neg.to(dtype=dtype), persistent=False)
@@ -661,11 +618,6 @@ class SeedVR2ComfyModel(torch.nn.Module):
             raise RuntimeError(
                 "SeedVR2 DiT received CPU latents. "
                 "This indicates the model was not prepared on an accelerator device."
-            )
-        if x_t.device != self.device:
-            raise RuntimeError(
-                f"SeedVR2 DiT input is on {x_t.device}, but the model is registered on {self.device}. "
-                "This indicates ComfyUI did not prepare the model on the expected load device."
             )
         try:
             model_dtype = next(self.diffusion_model.parameters()).dtype
@@ -807,8 +759,6 @@ class SeedVR2DiT:
             [self.patcher],
             memory_required=memory_required,
         )
-        self.model.device = self.patcher.load_device
-        _log_module_placement(self.model.diffusion_model, "DiT")
 
     def sample(self, latent: torch.Tensor, seed: int, *, show_pbar: bool = True) -> torch.Tensor:
         _seed_everything(seed)
