@@ -127,21 +127,25 @@ class SeedVR2RuntimeContractTest(unittest.TestCase):
         self.assertNotIn((1536, 384), candidates)
 
     def test_vae_paging_guard_rejects_near_limit_headroom(self):
+        class _Patcher:
+            load_device = torch.device("cuda:0")
+
+            def __init__(self, free_memory):
+                self.free_memory = free_memory
+
+            def get_free_memory(self, _device):
+                return self.free_memory
+
         vae = seedvr2.SeedVR2VAE.__new__(seedvr2.SeedVR2VAE)
         vae.model = types.SimpleNamespace(device=torch.device("cuda:0"))
-        vae.patcher = types.SimpleNamespace(load_device=torch.device("cuda:0"))
 
         memory_required = 1024 * 1024 * 1024
         required_headroom = seedvr2._vae_required_headroom(memory_required)
-        original_get_free_memory = seedvr2.model_management.get_free_memory
-        try:
-            seedvr2.model_management.get_free_memory = lambda _device: required_headroom - 1
-            self.assertFalse(vae._has_execution_headroom(memory_required, "test"))
+        vae.patcher = _Patcher(required_headroom - 1)
+        self.assertFalse(vae._has_execution_headroom(memory_required, "test"))
 
-            seedvr2.model_management.get_free_memory = lambda _device: required_headroom
-            self.assertTrue(vae._has_execution_headroom(memory_required, "test"))
-        finally:
-            seedvr2.model_management.get_free_memory = original_get_free_memory
+        vae.patcher = _Patcher(required_headroom)
+        self.assertTrue(vae._has_execution_headroom(memory_required, "test"))
 
     @unittest.skipUnless(hasattr(torch, "float8_e4m3fn"), "torch build has no float8 dtype")
     def test_fp8_storage_model_reports_runtime_dtype(self):

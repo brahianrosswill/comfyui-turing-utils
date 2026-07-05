@@ -618,7 +618,7 @@ class SeedVR2VAE:
         if model_management.is_device_cpu(device):
             return True
         try:
-            free = int(model_management.get_free_memory(device))
+            free = int(self.patcher.get_free_memory(device))
         except Exception:
             return True
         required = _vae_required_headroom(memory_required)
