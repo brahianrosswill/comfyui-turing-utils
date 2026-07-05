@@ -460,6 +460,17 @@ def _cast_unhandled_fp8_tensors(model: torch.nn.Module, target_dtype: torch.dtyp
     return converted, converted_bytes
 
 
+def _infer_runtime_dtype(model: torch.nn.Module, fallback: torch.dtype) -> torch.dtype:
+    totals: dict[torch.dtype, int] = {}
+    for param in model.parameters():
+        if param is None or not param.is_floating_point() or _is_float8_dtype(param.dtype):
+            continue
+        totals[param.dtype] = totals.get(param.dtype, 0) + param.nelement()
+    if not totals:
+        return fallback
+    return max(totals.items(), key=lambda item: item[1])[0]
+
+
 def _parent_module(model: torch.nn.Module, name: str) -> tuple[torch.nn.Module, str]:
     parts = name.split(".")
     parent = model
@@ -538,8 +549,7 @@ def _load_weights(
 class SeedVR2VAE:
     def __init__(self, path: str, load_device: torch.device, offload_device: torch.device, dtype: torch.dtype):
         core = _instantiate_vae()
-        core.to(dtype)
-        _load_standard_state(core, path, dtype=None, assign=True)
+        _load_standard_state(core, path, dtype=dtype, assign=True)
         model_management.archive_model_dtypes(core)
         core.to(offload_device)
         self.model = _PatchableVAE(core, offload_device)
@@ -724,8 +734,18 @@ class _SeedVR2LatentFormat:
 
 
 class _SeedVR2FlowSampling(torch.nn.Module):
-    sigma_min = torch.tensor(0.0)
-    sigma_max = torch.tensor(1.0)
+    def __init__(self, timesteps: int = 1000):
+        super().__init__()
+        sigmas = torch.arange(1, int(timesteps) + 1, dtype=torch.float32) / float(timesteps)
+        self.register_buffer("sigmas", sigmas, persistent=False)
+
+    @property
+    def sigma_min(self) -> torch.Tensor:
+        return self.sigmas[0]
+
+    @property
+    def sigma_max(self) -> torch.Tensor:
+        return self.sigmas[-1]
 
     def percent_to_sigma(self, percent: float) -> float:
         if percent <= 0.0:
@@ -775,6 +795,10 @@ class SeedVR2DiT:
         LOG.info("SeedVR2 DiT template selected: %s for %s", template.upper(), os.path.basename(path))
         dit, na_module = _instantiate_dit(template, attention_mode)
         dit = _load_weights(dit, path, dtype=None, load_device=load_device, runtime_dtype=dtype)
+        inferred_dtype = _infer_runtime_dtype(dit, dtype)
+        if inferred_dtype != dtype:
+            LOG.info("SeedVR2 DiT runtime dtype adjusted from %s to checkpoint dtype %s.", dtype, inferred_dtype)
+            dtype = inferred_dtype
         from .seedvr2_common import CompatibleDiT, validate_attention_mode
 
         requested_attention_mode = attention_mode
@@ -828,7 +852,18 @@ class SeedVR2DiT:
             memory_required=memory_required,
         )
 
-    def sample(self, latent: torch.Tensor, seed: int, *, show_pbar: bool = True) -> torch.Tensor:
+    def sample(
+        self,
+        latent: torch.Tensor,
+        seed: int,
+        *,
+        steps: int,
+        cfg: float,
+        sampler_name: str,
+        scheduler: str,
+        denoise: float,
+        show_pbar: bool = True,
+    ) -> torch.Tensor:
         _seed_everything(seed)
         self._load(latent)
         latent = latent.to(device=self.patcher.load_device, dtype=self.model.dtype)
@@ -837,13 +872,22 @@ class SeedVR2DiT:
         self.model.current_condition = condition
         noise = _seedvr2_latent_to_comfy(base_noise)
         latent_image = torch.zeros_like(noise)
-        sigmas = torch.tensor([1.0, 0.0], device=self.patcher.load_device, dtype=torch.float32)
-        sampler = comfy.samplers.sampler_object("euler")
+        ksampler = comfy.samplers.KSampler(
+            self.patcher,
+            steps=max(1, int(steps)),
+            device=self.patcher.load_device,
+            sampler=sampler_name,
+            scheduler=scheduler,
+            denoise=float(denoise),
+            model_options=self.model.model_options,
+        )
+        sigmas = ksampler.sigmas.to(device=self.patcher.load_device, dtype=torch.float32)
+        sampler = comfy.samplers.sampler_object(ksampler.sampler)
         try:
             out = comfy.sample.sample_custom(
                 self.patcher,
                 noise,
-                cfg=1.0,
+                cfg=float(cfg),
                 sampler=sampler,
                 sigmas=sigmas,
                 positive=[(None, {})],
@@ -885,16 +929,21 @@ class SeedVR2Pipeline:
         self.offload_device = model_management.unet_offload_device()
         self.vae_offload_device = model_management.vae_offload_device()
         self.dtype = _compute_dtype(self.dit_device)
+        self.vae_dtype = model_management.vae_dtype(
+            self.vae_device,
+            allowed_dtypes=[torch.float16, torch.bfloat16, torch.float32],
+        )
         LOG.info(
-            "SeedVR2 devices: dit=%s, dit_offload=%s, vae=%s, vae_offload=%s, dtype=%s",
+            "SeedVR2 devices: dit=%s, dit_offload=%s, vae=%s, vae_offload=%s, dit_dtype=%s, vae_dtype=%s",
             _device_label(self.dit_device),
             _device_label(self.offload_device),
             _device_label(self.vae_device),
             _device_label(self.vae_offload_device),
             self.dtype,
+            self.vae_dtype,
         )
         script_dir = Path(__file__).resolve().parent / "seedvr2_assets"
-        self.vae = SeedVR2VAE(str(self.model_dir / vae_model), self.vae_device, self.vae_offload_device, self.dtype)
+        self.vae = SeedVR2VAE(str(self.model_dir / vae_model), self.vae_device, self.vae_offload_device, self.vae_dtype)
         self.dit = SeedVR2DiT(
             str(self.model_dir / dit_model),
             dit_model,
@@ -925,6 +974,11 @@ class SeedVR2Pipeline:
         resolution: int,
         max_resolution: int,
         seed: int,
+        steps: int,
+        cfg: float,
+        sampler_name: str,
+        scheduler: str,
+        denoise: float,
         batch_size: int,
         encode_tiled: bool,
         encode_tile_size: int,
@@ -939,11 +993,21 @@ class SeedVR2Pipeline:
         pbar.update_absolute(0)
         output_batches: list[torch.Tensor] = []
         original_lengths: list[int] = []
-        for batch in batches:
+        for batch_index, batch in enumerate(batches):
+            batch_seed = int(seed) + batch_index * 1_000_003
             original_lengths.append(int(batch.shape[0]))
-            latent = self.vae.encode(batch, seed, encode_tiled, encode_tile_size, encode_tile_overlap)
+            latent = self.vae.encode(batch, batch_seed, encode_tiled, encode_tile_size, encode_tile_overlap)
             pbar.update(1)
-            upscaled = self.dit.sample(latent, seed, show_pbar=True)
+            upscaled = self.dit.sample(
+                latent,
+                batch_seed,
+                steps=steps,
+                cfg=cfg,
+                sampler_name=sampler_name,
+                scheduler=scheduler,
+                denoise=denoise,
+                show_pbar=True,
+            )
             pbar.update(1)
             decoded = self.vae.decode(upscaled, decode_tiled, decode_tile_size, decode_tile_overlap)
             pbar.update(1)

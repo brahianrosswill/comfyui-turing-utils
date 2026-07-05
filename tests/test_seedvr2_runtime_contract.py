@@ -79,6 +79,24 @@ class SeedVR2RuntimeContractTest(unittest.TestCase):
         patcher.cleanup()
         self.assertIsNone(model.current_patcher)
 
+    def test_flow_sampling_exposes_scheduler_sigmas(self):
+        sampling = seedvr2._SeedVR2FlowSampling()
+
+        self.assertEqual(tuple(sampling.sigmas.shape), (1000,))
+        self.assertAlmostEqual(float(sampling.sigmas[0]), 0.001, places=6)
+        self.assertAlmostEqual(float(sampling.sigmas[-1]), 1.0, places=6)
+        self.assertAlmostEqual(float(sampling.sigma_min), float(sampling.sigmas[0]), places=6)
+        self.assertAlmostEqual(float(sampling.sigma_max), float(sampling.sigmas[-1]), places=6)
+        self.assertEqual(float(sampling.percent_to_sigma(0.0)), 1.0)
+        self.assertEqual(float(sampling.percent_to_sigma(1.0)), 0.0)
+
+    def test_runtime_dtype_follows_non_fp8_checkpoint_weights(self):
+        module = torch.nn.Module()
+        module.fp16 = torch.nn.Linear(4, 4, dtype=torch.float16)
+        module.fp32 = torch.nn.LayerNorm(4, dtype=torch.float32)
+
+        self.assertEqual(seedvr2._infer_runtime_dtype(module, torch.bfloat16), torch.float16)
+
     @unittest.skipUnless(hasattr(torch, "float8_e4m3fn"), "torch build has no float8 dtype")
     def test_fp8_storage_model_reports_runtime_dtype(self):
         class _FP8StorageModule(torch.nn.Module):
@@ -99,6 +117,18 @@ class SeedVR2RuntimeContractTest(unittest.TestCase):
 
         self.assertEqual(model.get_dtype(), torch.float16)
         self.assertEqual(model.model_dtype(), torch.float16)
+
+    @unittest.skipUnless(hasattr(torch, "float8_e4m3fn"), "torch build has no float8 dtype")
+    def test_runtime_dtype_uses_fallback_for_fp8_only_weights(self):
+        class _FP8StorageModule(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.empty((4, 4), dtype=torch.float8_e4m3fn),
+                    requires_grad=False,
+                )
+
+        self.assertEqual(seedvr2._infer_runtime_dtype(_FP8StorageModule(), torch.bfloat16), torch.bfloat16)
 
     @unittest.skipUnless(hasattr(torch, "float8_e4m3fn"), "torch build has no float8 dtype")
     def test_non_linear_fp8_tensors_are_cast_without_expanding_linear_storage(self):

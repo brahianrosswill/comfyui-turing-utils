@@ -263,23 +263,23 @@ filename when it contains `3b` or `7b`; otherwise it inspects checkpoint block
 keys to infer the template. Unsupported layouts fail with a clear error instead
 of being silently loaded as the wrong model.
 
-The node does not expose device, offload-device, or attention-backend controls.
-DiT loading uses ComfyUI's current torch device and UNet offload device; VAE
-loading uses ComfyUI's VAE device and VAE offload device. Attention stays on
-the built-in PyTorch SDPA path so workflow behavior follows ComfyUI's default
-runtime expectations without extra per-node backend switches.
+The node does not expose device or offload-device controls. DiT loading uses
+ComfyUI's current torch device and UNet offload device; VAE loading uses
+ComfyUI's VAE device and VAE offload device. FP8 DiT weights are routed through
+ComfyUI's manual-cast path so FP8 storage is preserved when the local GPU cannot
+run native FP8 matmuls.
 
-`memory_mode` controls the automatic plan:
+Sampling controls are exposed on the node: `steps`, `cfg`, `sampler_name`,
+`scheduler`, `denoise`, and `seed`. The attention backend can be selected from
+`sdpa`, `sage_attn`, and `flash_attn`; unsupported requested backends resolve
+through the vendored SeedVR2 compatibility layer with a warning.
 
-- `balanced`: default. Uses ComfyUI's current torch device, estimates free VRAM,
-  chooses a 4n+1 frame batch, and enables large VAE tiles only when needed.
-- `fastest`: avoids VAE tiling when possible and favors larger frame batches.
-- `low_vram`: favors smaller frame batches and VAE tiling.
-
-The node retries on CUDA OOM by reducing the 4n+1 batch size first, then falling
-back to progressively smaller VAE tiles. This is intended to behave closer to
-ComfyUI's VAE fallback path: try the fastest non-tiled path first, then tile
-only when memory pressure requires it.
+Batching and VAE tiling are planned automatically from the current input shape
+and estimated free VRAM. `batch_size=0` keeps the automatic 4n+1 frame batch
+selection; a positive `batch_size` manually caps the working window. The node
+retries on CUDA OOM by reducing the 4n+1 batch size first, then falling back to
+progressively smaller VAE tiles. Disable `retry_on_oom` only when profiling a
+specific plan.
 
 The SeedVR2 runtime only needs the lightweight tensor/file helpers listed
 in `requirements.txt`: `einops`, `safetensors`, and `tqdm`. PyTorch is

@@ -9,6 +9,7 @@ from typing import Any
 import torch
 
 import comfy.model_management as model_management
+import comfy.samplers
 import folder_paths
 
 from .seedvr2 import SeedVR2Pipeline
@@ -160,6 +161,7 @@ def _build_plan(
     *,
     resolution: int,
     max_resolution: int,
+    batch_size: int = 0,
 ) -> SeedVR2Plan:
     frames = int(image.shape[0])
     height = int(image.shape[1])
@@ -168,7 +170,7 @@ def _build_plan(
     main_device = str(model_management.get_torch_device())
     free_gb = _estimate_free_vram_gb(main_device)
 
-    chosen_batch = _auto_batch_size(frames, target_h, target_w, free_gb)
+    chosen_batch = _valid_4n1(batch_size) if batch_size > 0 else _auto_batch_size(frames, target_h, target_w, free_gb)
     chosen_batch = max(1, min(chosen_batch, _valid_4n1(frames)))
 
     encode_tiled, encode_tile, encode_overlap = _choose_tile_size(target_h, target_w, free_gb)
@@ -249,6 +251,13 @@ class SeedVR2Upscaler:
                 "resolution": ("INT", {"default": 1080, "min": 16, "max": 16384, "step": 2}),
                 "max_resolution": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 2}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 2**32 - 1, "step": 1}),
+                "steps": ("INT", {"default": 1, "min": 1, "max": 100, "step": 1}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.1, "round": 0.01}),
+                "sampler_name": (comfy.samplers.KSampler.SAMPLERS, {"default": "euler"}),
+                "scheduler": (comfy.samplers.KSampler.SCHEDULERS, {"default": "simple"}),
+                "denoise": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "batch_size": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 1}),
+                "retry_on_oom": ("BOOLEAN", {"default": True}),
                 "attention_backend": (ATTENTION_BACKENDS, {"default": "sdpa"}),
             },
         }
@@ -267,6 +276,13 @@ class SeedVR2Upscaler:
         resolution: int,
         max_resolution: int,
         seed: int,
+        steps: int,
+        cfg: float,
+        sampler_name: str,
+        scheduler: str,
+        denoise: float,
+        batch_size: int,
+        retry_on_oom: bool,
         attention_backend: str,
     ):
         if image.ndim != 4 or int(image.shape[-1]) not in (3, 4):
@@ -276,11 +292,13 @@ class SeedVR2Upscaler:
             image,
             resolution=resolution,
             max_resolution=max_resolution,
+            batch_size=batch_size,
         )
         LOG.info("SeedVR2 planner selected: %s", plan.describe())
 
         last_exc: BaseException | None = None
-        for attempt, candidate in enumerate(_fallback_plans(plan), start=1):
+        plans = _fallback_plans(plan) if retry_on_oom else [plan]
+        for attempt, candidate in enumerate(plans, start=1):
             try:
                 LOG.info("SeedVR2 attempt %d: %s", attempt, candidate.describe())
                 return (
@@ -291,6 +309,11 @@ class SeedVR2Upscaler:
                         resolution=resolution,
                         max_resolution=max_resolution,
                         seed=seed,
+                        steps=steps,
+                        cfg=cfg,
+                        sampler_name=sampler_name,
+                        scheduler=scheduler,
+                        denoise=denoise,
                         attention_backend=attention_backend,
                         plan=candidate,
                     ),
@@ -313,6 +336,11 @@ class SeedVR2Upscaler:
         resolution: int,
         max_resolution: int,
         seed: int,
+        steps: int,
+        cfg: float,
+        sampler_name: str,
+        scheduler: str,
+        denoise: float,
         attention_backend: str,
         plan: SeedVR2Plan,
     ) -> torch.Tensor:
@@ -329,6 +357,11 @@ class SeedVR2Upscaler:
                 resolution=resolution,
                 max_resolution=max_resolution,
                 seed=seed,
+                steps=steps,
+                cfg=cfg,
+                sampler_name=sampler_name,
+                scheduler=scheduler,
+                denoise=denoise,
                 batch_size=plan.batch_size,
                 encode_tiled=plan.encode_tiled,
                 encode_tile_size=plan.encode_tile_size,

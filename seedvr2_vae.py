@@ -70,6 +70,24 @@ class MemoryState(Enum):
     UNSET = 3
 
 
+def _tile_starts(length: int, tile: int, overlap: int) -> list[int]:
+    length = max(1, int(length))
+    tile = max(1, int(tile))
+    overlap = max(0, min(int(overlap), tile - 1))
+    if length <= tile:
+        return [0]
+    stride = max(1, tile - overlap)
+    starts = [0]
+    while starts[-1] + tile < length:
+        next_start = starts[-1] + stride
+        if next_start + tile >= length:
+            next_start = max(0, length - tile)
+        if next_start <= starts[-1]:
+            break
+        starts.append(next_start)
+    return starts
+
+
 class QuantizerOutput(NamedTuple):
     latent: torch.Tensor
     extra_loss: torch.Tensor
@@ -2473,17 +2491,15 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
         latent_overlap_h = max(0, min((overlap_h // scale_factor), latent_tile_h - 1))
         latent_overlap_w = max(0, min((overlap_w // scale_factor), latent_tile_w - 1))
 
-        stride_h = max(1, latent_tile_h - latent_overlap_h)
-        stride_w = max(1, latent_tile_w - latent_overlap_w)
-
         H_lat_total = (H + scale_factor - 1) // scale_factor
         W_lat_total = (W + scale_factor - 1) // scale_factor
 
         result = None
         count = None
+        y_starts = _tile_starts(H_lat_total, latent_tile_h, latent_overlap_h)
+        x_starts = _tile_starts(W_lat_total, latent_tile_w, latent_overlap_w)
 
-        num_tiles = ((max(H_lat_total - latent_overlap_h, 1) + stride_h - 1) // stride_h) \
-                  * ((max(W_lat_total - latent_overlap_w, 1) + stride_w - 1) // stride_w)
+        num_tiles = len(y_starts) * len(x_starts)
 
         # Log once at start instead of per-tile
         if debug:
@@ -2502,9 +2518,9 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
             ramp_cache['w'] = 0.5 - 0.5 * torch.cos(t_w * torch.pi)
 
         tile_id = 0
-        for y_lat in range(0, H_lat_total, stride_h):
+        for y_lat in y_starts:
             y_lat_end = min(y_lat + latent_tile_h, H_lat_total)
-            for x_lat in range(0, W_lat_total, stride_w):
+            for x_lat in x_starts:
                 x_lat_end = min(x_lat + latent_tile_w, W_lat_total)
 
                 # Skip if fully within overlap of previous tiles
@@ -2556,9 +2572,9 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
                     result = torch.zeros(
                         (b_out, c_out, f_lat, H_lat_total, W_lat_total),
                         device=device,
-                        dtype=encoded_tile.dtype,
+                        dtype=torch.float32,
                     )
-                    count = torch.zeros((1, 1, 1, H_lat_total, W_lat_total), device=device, dtype=encoded_tile.dtype)
+                    count = torch.zeros((1, 1, 1, H_lat_total, W_lat_total), device=device, dtype=torch.float32)
 
                 eff_h_lat = min(y_lat_end - y_lat, encoded_tile.shape[3], result.shape[3] - y_lat)
                 eff_w_lat = min(x_lat_end - x_lat, encoded_tile.shape[4], result.shape[4] - x_lat)
@@ -2569,8 +2585,8 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
                 ov_h = max(0, min(latent_overlap_h, eff_h_lat - 1))
                 ov_w = max(0, min(latent_overlap_w, eff_w_lat - 1))
 
-                weight_h = torch.ones((eff_h_lat,), device=encoded_tile.device, dtype=encoded_tile.dtype)
-                weight_w = torch.ones((eff_w_lat,), device=encoded_tile.device, dtype=encoded_tile.dtype)
+                weight_h = torch.ones((eff_h_lat,), device=encoded_tile.device, dtype=torch.float32)
+                weight_w = torch.ones((eff_w_lat,), device=encoded_tile.device, dtype=torch.float32)
 
                 # Apply fades only on interior edges using cached ramps (avoid fading on outer image borders)
                 if ov_h > 0:
@@ -2587,7 +2603,7 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
                 # Separable application (no 2D mask to save memory)
                 weight_h_5d = weight_h.view(1, 1, 1, eff_h_lat, 1)
                 weight_w_5d = weight_w.view(1, 1, 1, 1, eff_w_lat)
-                encoded_tile.mul_(weight_h_5d).mul_(weight_w_5d)
+                encoded_tile = encoded_tile.to(dtype=torch.float32).mul_(weight_h_5d).mul_(weight_w_5d)
 
                 # Accumulate (move to result device if different)
                 if result.device != encoded_tile.device:
@@ -2603,6 +2619,7 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
             result = result.to(x.device)
             count = count.to(x.device)
         result.div_(count.clamp(min=1e-6))
+        result = result.to(dtype=x.dtype)
 
         if x.shape[2] == 1:  # single frame
             result = result.squeeze(2)
@@ -2639,15 +2656,13 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
         latent_overlap_h = max(0, min((overlap_h // scale_factor), latent_tile_h - 1))
         latent_overlap_w = max(0, min((overlap_w // scale_factor), latent_tile_w - 1))
 
-        stride_h = max(1, latent_tile_h - latent_overlap_h)
-        stride_w = max(1, latent_tile_w - latent_overlap_w)
-
         # Allocate later using first decoded results
         result = None
         count = None
+        y_starts = _tile_starts(H, latent_tile_h, latent_overlap_h)
+        x_starts = _tile_starts(W, latent_tile_w, latent_overlap_w)
 
-        num_tiles = ((max(H - latent_overlap_h, 1) + stride_h - 1) // stride_h) \
-                  * ((max(W - latent_overlap_w, 1) + stride_w - 1) // stride_w)
+        num_tiles = len(y_starts) * len(x_starts)
 
         # Log once at start instead of per-tile
         if debug:
@@ -2666,9 +2681,9 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
             ramp_cache['w'] = 0.5 - 0.5 * torch.cos(t_w * torch.pi)
 
         tile_id = 0
-        for y_lat in range(0, H, stride_h):
+        for y_lat in y_starts:
             y_lat_end = min(y_lat + latent_tile_h, H)
-            for x_lat in range(0, W, stride_w):
+            for x_lat in x_starts:
                 x_lat_end = min(x_lat + latent_tile_w, W)
 
                 # Skip if fully within overlap of previous tiles
@@ -2718,8 +2733,8 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
                     if device is None or device == decoded_tile.device:
                         device = decoded_tile.device
 
-                    result = torch.zeros((b_out, c_out, out_f_tile, output_h, output_w), device=device, dtype=decoded_tile.dtype)
-                    count = torch.zeros((1, 1, 1, output_h, output_w), device=device, dtype=decoded_tile.dtype)
+                    result = torch.zeros((b_out, c_out, out_f_tile, output_h, output_w), device=device, dtype=torch.float32)
+                    count = torch.zeros((1, 1, 1, output_h, output_w), device=device, dtype=torch.float32)
 
                 # Corresponding output-space placement
                 y_out, y_out_end = y_lat * scale_factor, y_lat_end * scale_factor
@@ -2727,13 +2742,16 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
 
                 h_out = y_out_end - y_out
                 w_out = x_out_end - x_out
+                eff_h_out = min(h_out, decoded_tile.shape[3], result.shape[3] - y_out)
+                eff_w_out = min(w_out, decoded_tile.shape[4], result.shape[4] - x_out)
+                decoded_tile = decoded_tile[:, :, : result.shape[2], :eff_h_out, :eff_w_out]
 
                 # Build faded masks
-                ov_h_out = max(0, min(overlap_h, h_out - 1))
-                ov_w_out = max(0, min(overlap_w, w_out - 1))
+                ov_h_out = max(0, min(overlap_h, eff_h_out - 1))
+                ov_w_out = max(0, min(overlap_w, eff_w_out - 1))
 
-                weight_h = torch.ones((h_out,), device=decoded_tile.device, dtype=decoded_tile.dtype)
-                weight_w = torch.ones((w_out,), device=decoded_tile.device, dtype=decoded_tile.dtype)
+                weight_h = torch.ones((eff_h_out,), device=decoded_tile.device, dtype=torch.float32)
+                weight_w = torch.ones((eff_w_out,), device=decoded_tile.device, dtype=torch.float32)
 
                 # Apply fades only on interior edges using cached ramps (avoid fading on outer image borders)
                 if ov_h_out > 0:
@@ -2748,9 +2766,9 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
                         weight_w[-ov_w_out:] = 1 - ramp_cache['w'][:ov_w_out]
 
                 # Separable application (no 2D mask to save memory)
-                weight_h_5d = weight_h.view(1, 1, 1, h_out, 1)
-                weight_w_5d = weight_w.view(1, 1, 1, 1, w_out)
-                decoded_tile.mul_(weight_h_5d).mul_(weight_w_5d)
+                weight_h_5d = weight_h.view(1, 1, 1, eff_h_out, 1)
+                weight_w_5d = weight_w.view(1, 1, 1, 1, eff_w_out)
+                decoded_tile = decoded_tile.to(dtype=torch.float32).mul_(weight_h_5d).mul_(weight_w_5d)
 
                 # Accumulate (move to result device if different)
                 if result.device != decoded_tile.device:
@@ -2758,14 +2776,15 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
                     weight_h_5d = weight_h_5d.to(result.device)
                     weight_w_5d = weight_w_5d.to(result.device)
 
-                result[:, :, : decoded_tile.shape[2], y_out:y_out_end, x_out:x_out_end] += decoded_tile
-                count[:, :, :, y_out:y_out_end, x_out:x_out_end].addcmul_(weight_h_5d, weight_w_5d)
+                result[:, :, : decoded_tile.shape[2], y_out : y_out + eff_h_out, x_out : x_out + eff_w_out] += decoded_tile
+                count[:, :, :, y_out : y_out + eff_h_out, x_out : x_out + eff_w_out].addcmul_(weight_h_5d, weight_w_5d)
 
         # Move result back to inference device if needed and normalize
         if result.device != z.device:
             result = result.to(z.device)
             count = count.to(z.device)
         result.div_(count.clamp(min=1e-6)) # In-place normalize
+        result = result.to(dtype=z.dtype)
 
         if z.shape[2] == 1:  # single frame
             result = result.squeeze(2)
