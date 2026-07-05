@@ -1,4 +1,5 @@
 #include <ATen/ATen.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
 #include <torch/csrc/utils/pybind.h>
 
@@ -130,6 +131,7 @@ quantize_act_lora(at::Tensor input, at::Tensor lora_down, at::Tensor smooth, int
     check_half_like(input, "input");
     TORCH_CHECK(lora_down.scalar_type() == input.scalar_type(), "lora_down dtype must match input dtype");
     TORCH_CHECK(smooth.scalar_type() == input.scalar_type(), "smooth dtype must match input dtype");
+    const at::cuda::CUDAGuard device_guard(input.device());
 
     const int64_t actual_m = input.size(0);
     const int64_t actual_k = input.size(1);
@@ -193,6 +195,7 @@ at::Tensor gemm_svd(at::Tensor act,
     TORCH_CHECK(wscales.scalar_type() == ascales.scalar_type(), "wscales dtype must match ascales dtype");
     TORCH_CHECK(lora_up.scalar_type() == ascales.scalar_type(), "lora_up dtype must match ascales dtype");
     TORCH_CHECK(lora_act.scalar_type() == at::kFloat, "lora_act must be float32");
+    const at::cuda::CUDAGuard device_guard(act.device());
 
     const int64_t m_pad = act.size(0);
     const int64_t k_pad = act.size(1) * 2;

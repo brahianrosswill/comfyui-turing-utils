@@ -641,6 +641,9 @@ def _svdint4_forward(input_tensor: torch.Tensor, weight_qt, bias: torch.Tensor |
         input_tensor = input_tensor.dequantize()
     _validate_cuda_kernel_runtime(input_tensor)
     params = weight_qt._params
+    kernel_dtype = params.svd_down.dtype
+    if input_tensor.dtype != kernel_dtype:
+        input_tensor = input_tensor.to(kernel_dtype)
     out_features = params.orig_shape[1] if params.transposed else params.orig_shape[0]
     svd_int4_linear = _load_svdint4_linear()
     out = svd_int4_linear(
@@ -739,7 +742,7 @@ class SVDInt4PackedTensor:
         shape_fields = {field: (f"{name}.{field}", tuple(value.shape)) for field, value in tensors.items()}
         actual_in, actual_out = _validate_packed_layer_shapes(name, shape_fields)
         _validate_packed_layer_tensors(name, tensors, actual_in, actual_out)
-        if actual_in != self.in_features or actual_out != self.out_features:
+        if actual_in < self.in_features or actual_out < self.out_features:
             raise ValueError(
                 f"SVDInt4 layer {name} shape mismatch with ComfyUI model config: "
                 f"packed=({actual_out}, {actual_in}), module=({self.out_features}, {self.in_features})"
