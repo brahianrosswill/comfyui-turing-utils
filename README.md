@@ -219,6 +219,48 @@ The node category is:
 SVDInt4/loaders
 ```
 
+## SeedVR2 Auto Upscale
+
+This plugin also includes a self-contained SeedVR2 runtime adapted from
+`ComfyUI-SeedVR2_VideoUpscaler` under Apache-2.0. The runtime is vendored under
+`seedvr2_runtime/`; the original license is preserved at
+`seedvr2_runtime/SEEDVR2_LICENSE`.
+
+The `SeedVR2 Auto Upscale` node is a single high-level node. It takes only
+`IMAGE` input and exposes the DiT/VAE files as node parameters instead of
+requiring separate SeedVR2 loader nodes. Place SeedVR2 weights in:
+
+```text
+ComfyUI/models/SEEDVR2/
+  seedvr2_ema_3b_fp8_e4m3fn.safetensors
+  ema_vae_fp16.safetensors
+  ...
+```
+
+The node registers the `seedvr2` model folder type and scans
+`models/SEEDVR2` for `.safetensors` and `.gguf` files. It can optionally
+download missing official weights, but the default is to fail fast with a clear
+missing-file error so a workflow does not unexpectedly start a large download.
+
+`memory_mode` controls the automatic plan:
+
+- `balanced`: default. Uses ComfyUI's current torch device, estimates free VRAM,
+  chooses a 4n+1 frame batch, and enables large VAE tiles only when needed.
+- `fastest`: avoids VAE tiling when possible and favors larger frame batches.
+- `low_vram`: forces smaller batches, tensor CPU offload, and VAE tiling.
+
+The node retries on CUDA OOM by reducing the 4n+1 batch size first, then falling
+back to progressively smaller VAE tiles and CPU tensor/model offload. This is
+intended to behave closer to ComfyUI's native VAE fallback path: try the fastest
+non-tiled path first, then tile only when memory pressure requires it.
+
+The SeedVR2 runtime needs these optional Python packages in the ComfyUI
+environment: `omegaconf`, `diffusers`, `peft`, `opencv-python`, `gguf`,
+`matplotlib`, `psutil`, `einops`, `safetensors`, and `tqdm`. They are listed in
+`requirements.txt`; PyTorch is intentionally not listed to avoid replacing
+ComfyUI's installed Torch build. The small RoPE helper used by SeedVR2 is
+implemented locally, so no extra rotary embedding package is required.
+
 ## LoRA
 
 The packed SVD residual correction tensors inside the model are part of the
