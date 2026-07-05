@@ -48,6 +48,18 @@ class SeedVR2TilingTest(unittest.TestCase):
     def test_tile_starts_single_tile_when_tile_fits(self):
         self.assertEqual(seedvr2_vae._tile_starts(length=64, tile=128, overlap=16), [0])
 
+    def test_tile_variants_match_comfyui_multi_pass_strategy(self):
+        variants = seedvr2_vae._tile_variants((512, 512), (128, 128))
+
+        self.assertEqual(
+            variants,
+            [
+                ((512, 512), (128, 128)),
+                ((256, 1024), (128, 128)),
+                ((1024, 256), (128, 128)),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

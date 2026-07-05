@@ -22,6 +22,7 @@ SEEDVR2_MODEL_TYPE = "seedvr2"
 MODEL_EXTENSIONS = {".safetensors", ".sft"}
 KNOWN_VAE_MODEL_NAMES = {"ema_vae_fp16.safetensors"}
 ATTENTION_BACKENDS = ["sdpa", "sage_attn", "flash_attn"]
+SEEDVR2_VAE_TILE_SIZES = (1024, 768, 512, 384, 256)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -121,24 +122,8 @@ def _estimate_free_vram_gb(device: str) -> float:
         return 0.0
 
 
-def _choose_tile_size(height: int, width: int, free_gb: float) -> tuple[bool, int, int]:
-    longest = max(height, width)
-    if free_gb >= 18.0 and longest <= 1536:
-        return False, 0, 0
-    if free_gb >= 12.0 and longest <= 1280:
-        return False, 0, 0
-    if free_gb >= 10.0 and longest <= 1024:
-        return False, 0, 0
-
-    candidates = [1536, 1280, 1024, 768, 640, 512]
-    if free_gb < 8.0:
-        candidates = [768, 640, 512]
-    if free_gb < 6.0:
-        candidates = [512]
-
-    tile = next((item for item in candidates if item < longest), candidates[-1])
-    overlap = 128 if tile >= 1024 else 64
-    return True, tile, overlap
+def _tile_overlap(tile_size: int) -> int:
+    return max(64, int(tile_size) // 4)
 
 
 def _auto_batch_size(frame_count: int, height: int, width: int, free_gb: float) -> int:
@@ -173,17 +158,14 @@ def _build_plan(
     chosen_batch = _valid_4n1(batch_size) if batch_size > 0 else _auto_batch_size(frames, target_h, target_w, free_gb)
     chosen_batch = max(1, min(chosen_batch, _valid_4n1(frames)))
 
-    encode_tiled, encode_tile, encode_overlap = _choose_tile_size(target_h, target_w, free_gb)
-    decode_tiled, decode_tile, decode_overlap = _choose_tile_size(target_h, target_w, free_gb)
-
     return SeedVR2Plan(
         batch_size=chosen_batch,
-        encode_tiled=encode_tiled,
-        encode_tile_size=encode_tile or 1024,
-        encode_tile_overlap=encode_overlap or 128,
-        decode_tiled=decode_tiled,
-        decode_tile_size=decode_tile or 1024,
-        decode_tile_overlap=decode_overlap or 128,
+        encode_tiled=False,
+        encode_tile_size=SEEDVR2_VAE_TILE_SIZES[0],
+        encode_tile_overlap=_tile_overlap(SEEDVR2_VAE_TILE_SIZES[0]),
+        decode_tiled=False,
+        decode_tile_size=SEEDVR2_VAE_TILE_SIZES[0],
+        decode_tile_overlap=_tile_overlap(SEEDVR2_VAE_TILE_SIZES[0]),
     )
 
 
@@ -196,10 +178,10 @@ def _fallback_plans(plan: SeedVR2Plan) -> list[SeedVR2Plan]:
         if batch == 1:
             break
 
-    for tile in (1536, 1280, 1024, 768, 640, 512):
+    for tile in SEEDVR2_VAE_TILE_SIZES:
         if plans[-1].decode_tiled and tile >= plans[-1].decode_tile_size:
             continue
-        overlap = 128 if tile >= 1024 else 64
+        overlap = _tile_overlap(tile)
         plans.append(
             dataclasses.replace(
                 plans[-1],

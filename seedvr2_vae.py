@@ -88,6 +88,24 @@ def _tile_starts(length: int, tile: int, overlap: int) -> list[int]:
     return starts
 
 
+def _tile_variants(tile_size: tuple[int, int], tile_overlap: tuple[int, int]) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+    tile_h, tile_w = (max(1, int(tile_size[0])), max(1, int(tile_size[1])))
+    overlap_h, overlap_w = (max(0, int(tile_overlap[0])), max(0, int(tile_overlap[1])))
+    candidates = [
+        ((tile_h, tile_w), (overlap_h, overlap_w)),
+        ((max(1, tile_h // 2), tile_w * 2), (overlap_h, overlap_w)),
+        ((tile_h * 2, max(1, tile_w // 2)), (overlap_h, overlap_w)),
+    ]
+    variants: list[tuple[tuple[int, int], tuple[int, int]]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for tile, overlap in candidates:
+        key = (tile[0], tile[1], overlap[0], overlap[1])
+        if key not in seen:
+            seen.add(key)
+            variants.append((tile, overlap))
+    return variants
+
+
 class QuantizerOutput(NamedTuple):
     latent: torch.Tensor
     extra_loss: torch.Tensor
@@ -219,9 +237,16 @@ class SeedVR2AutoencoderKLBase(nn.Module):
 
     @property
     def device(self) -> torch.device:
+        runtime_device = getattr(self, "_runtime_device", None)
+        if runtime_device is not None:
+            return torch.device(runtime_device)
         for tensor in list(self.parameters(recurse=True)) + list(self.buffers(recurse=True)):
             return tensor.device
         return torch.device("cpu")
+
+    @device.setter
+    def device(self, device: torch.device | str) -> None:
+        self._runtime_device = torch.device(device)
 
     def enable_slicing(self):
         self.use_slicing = True
@@ -2460,6 +2485,27 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
 
     def tiled_encode(self, x: torch.Tensor, tile_size: Tuple[int, int] = (512, 512),
                      tile_overlap: Tuple[int, int] = (64, 64)) -> torch.Tensor:
+        if x.ndim != 5:
+            x = x.unsqueeze(2)
+        tile_h, tile_w = tile_size
+        if x.shape[3] <= tile_h and x.shape[4] <= tile_w:
+            return self.slicing_encode(x)
+
+        result = None
+        count = 0
+        for variant_size, variant_overlap in _tile_variants(tile_size, tile_overlap):
+            encoded = self._tiled_encode_once(x, tile_size=variant_size, tile_overlap=variant_overlap)
+            encoded = encoded.to(dtype=torch.float32)
+            if result is None:
+                result = encoded
+            else:
+                result.add_(encoded)
+            count += 1
+        result.div_(max(1, count))
+        return result.to(dtype=x.dtype)
+
+    def _tiled_encode_once(self, x: torch.Tensor, tile_size: Tuple[int, int] = (512, 512),
+                           tile_overlap: Tuple[int, int] = (64, 64)) -> torch.Tensor:
         r"""
         Encodes an input tensor `x` by splitting it into spatial tiles in latent space. Temporal is handled by `slicing_encode`.
         `tile_size` and `tile_overlap` are interpreted in output-space pixels and converted to latent-space.
@@ -2627,6 +2673,28 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
         return result
 
     def tiled_decode(self, z: torch.Tensor, tile_size: Tuple[int, int] = (512, 512), tile_overlap: Tuple[int, int] = (64, 64)) -> torch.Tensor:
+        if z.ndim != 5:
+            z = z.unsqueeze(2)
+        scale_factor = self.spatial_downsample_factor
+        latent_tile_h = max(1, int(tile_size[0]) // scale_factor)
+        latent_tile_w = max(1, int(tile_size[1]) // scale_factor)
+        if z.shape[3] <= latent_tile_h and z.shape[4] <= latent_tile_w:
+            return self.slicing_decode(z)
+
+        result = None
+        count = 0
+        for variant_size, variant_overlap in _tile_variants(tile_size, tile_overlap):
+            decoded = self._tiled_decode_once(z, tile_size=variant_size, tile_overlap=variant_overlap)
+            decoded = decoded.to(dtype=torch.float32)
+            if result is None:
+                result = decoded
+            else:
+                result.add_(decoded)
+            count += 1
+        result.div_(max(1, count))
+        return result.to(dtype=z.dtype)
+
+    def _tiled_decode_once(self, z: torch.Tensor, tile_size: Tuple[int, int] = (512, 512), tile_overlap: Tuple[int, int] = (64, 64)) -> torch.Tensor:
         r"""
         Decodes a latent tensor `z` by splitting it into spatial tiles only. Temporal is handled by `slicing_decode`.
         """

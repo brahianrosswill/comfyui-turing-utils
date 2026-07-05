@@ -24,6 +24,7 @@ LOG = logging.getLogger("comfyui-svdint4")
 
 SEEDVR2_SCALING_FACTOR = 0.9152
 SEEDVR2_T = 1000.0
+SEEDVR2_VAE_TILE_SIZES = (1024, 768, 512, 384, 256)
 _FLOAT8_DTYPES = tuple(
     getattr(torch, name)
     for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz")
@@ -187,6 +188,25 @@ def _module_device(module: torch.nn.Module, fallback: torch.device) -> torch.dev
     for tensor in module.buffers(recurse=True):
         return tensor.device
     return fallback
+
+
+def _vae_tile_overlap(tile_size: int) -> int:
+    return max(64, int(tile_size) // 4)
+
+
+def _vae_tile_candidates(preferred_tile_size: int) -> list[tuple[int, int]]:
+    preferred = max(1, int(preferred_tile_size))
+    sizes = [preferred]
+    sizes.extend(size for size in SEEDVR2_VAE_TILE_SIZES if size < preferred)
+    sizes.extend(size for size in SEEDVR2_VAE_TILE_SIZES if size >= preferred)
+    candidates: list[tuple[int, int]] = []
+    seen: set[int] = set()
+    for size in sizes:
+        if size in seen:
+            continue
+        seen.add(size)
+        candidates.append((size, _vae_tile_overlap(size)))
+    return candidates
 
 
 def _require_accelerator_device(device: torch.device, label: str) -> torch.device:
@@ -569,31 +589,113 @@ class SeedVR2VAE:
             [self.patcher],
             memory_required=memory_required,
         )
-        core_device = self.execution_device()
-        if self._last_logged_device != core_device:
+        self.model.device = self.load_device
+        if self._last_logged_device != self.execution_device():
             LOG.info(
-                "SeedVR2 VAE loaded through ComfyUI: core=%s, wrapper=%s",
-                _device_label(core_device),
-                _device_label(torch.device(getattr(self.model, "device", core_device))),
+                "SeedVR2 VAE loaded through ComfyUI: execute=%s, core=%s",
+                _device_label(self.execution_device()),
+                _device_label(_module_device(self.model.core, self.execution_device())),
             )
-            self._last_logged_device = core_device
+            self._last_logged_device = self.execution_device()
 
     def execution_device(self) -> torch.device:
-        return _module_device(self.model.core, self.patcher.load_device)
+        return torch.device(getattr(self.model, "device", self.patcher.load_device))
+
+    def _encode_memory(self, samples: torch.Tensor, tile_size: int | None = None) -> int:
+        if tile_size is None:
+            active = samples
+        else:
+            active_h = min(int(samples.shape[-2]), int(tile_size))
+            active_w = min(int(samples.shape[-1]), int(tile_size))
+            active_elements = int(samples.shape[0] * samples.shape[1] * samples.shape[2] * active_h * active_w)
+            return int(active_elements * samples.element_size() * 80)
+        return int(active.nelement() * active.element_size() * 60)
+
+    def _decode_memory(self, z: torch.Tensor, tile_size: int | None = None) -> int:
+        if tile_size is None:
+            active = z
+        else:
+            scale = getattr(self.model.core, "spatial_downsample_factor", 8)
+            latent_tile = max(1, int(tile_size) // int(scale))
+            active_h = min(int(z.shape[-2]), latent_tile)
+            active_w = min(int(z.shape[-1]), latent_tile)
+            active_elements = int(z.shape[0] * z.shape[1] * z.shape[2] * active_h * active_w)
+            return int(active_elements * z.element_size() * 1000)
+        return int(active.nelement() * active.element_size() * 900)
+
+    def _run_encode(self, samples: torch.Tensor, *, tiled: bool, tile_size: int, tile_overlap: int) -> torch.Tensor:
+        samples = samples.to(device=self.execution_device(), dtype=self.dtype)
+        with model_management.cuda_device_context(self.execution_device()):
+            return self.model.encode(
+                samples,
+                tiled=tiled,
+                tile_size=(tile_size, tile_size),
+                tile_overlap=(tile_overlap, tile_overlap),
+            ).latent
+
+    def _run_decode(self, z: torch.Tensor, *, tiled: bool, tile_size: int, tile_overlap: int) -> torch.Tensor:
+        z = z.to(device=self.execution_device(), dtype=self.dtype)
+        with model_management.cuda_device_context(self.execution_device()):
+            return self.model.decode(
+                z,
+                tiled=tiled,
+                tile_size=(tile_size, tile_size),
+                tile_overlap=(tile_overlap, tile_overlap),
+            ).sample
+
+    def _encode_tiled_with_retries(self, samples: torch.Tensor, preferred_tile_size: int) -> torch.Tensor:
+        last_exc: BaseException | None = None
+        for tile_size, tile_overlap in _vae_tile_candidates(preferred_tile_size):
+            try:
+                LOG.info("SeedVR2 VAE encode tiled retry: tile=%d, overlap=%d", tile_size, tile_overlap)
+                self._load(self._encode_memory(samples, tile_size))
+                return self._run_encode(samples, tiled=True, tile_size=tile_size, tile_overlap=tile_overlap)
+            except BaseException as exc:
+                model_management.raise_non_oom(exc)
+                last_exc = exc
+                LOG.warning("SeedVR2 VAE encode tiled retry hit OOM at tile=%d; trying smaller tile.", tile_size)
+                try:
+                    model_management.soft_empty_cache(force=True)
+                except Exception:
+                    model_management.soft_empty_cache()
+        raise RuntimeError(f"SeedVR2 VAE encode failed after tiled retries. Last error: {last_exc}") from last_exc
+
+    def _decode_tiled_with_retries(self, z: torch.Tensor, preferred_tile_size: int) -> torch.Tensor:
+        last_exc: BaseException | None = None
+        for tile_size, tile_overlap in _vae_tile_candidates(preferred_tile_size):
+            try:
+                LOG.info("SeedVR2 VAE decode tiled retry: tile=%d, overlap=%d", tile_size, tile_overlap)
+                self._load(self._decode_memory(z, tile_size))
+                return self._run_decode(z, tiled=True, tile_size=tile_size, tile_overlap=tile_overlap)
+            except BaseException as exc:
+                model_management.raise_non_oom(exc)
+                last_exc = exc
+                LOG.warning("SeedVR2 VAE decode tiled retry hit OOM at tile=%d; trying smaller tile.", tile_size)
+                try:
+                    model_management.soft_empty_cache(force=True)
+                except Exception:
+                    model_management.soft_empty_cache()
+        raise RuntimeError(f"SeedVR2 VAE decode failed after tiled retries. Last error: {last_exc}") from last_exc
 
     @torch.no_grad()
     def encode(self, video_tchw: torch.Tensor, seed: int, tiled: bool, tile_size: int, tile_overlap: int) -> torch.Tensor:
         _seed_everything(seed + 1_000_000)
         samples = _video_to_vae_input(video_tchw).to(dtype=self.dtype)
-        memory = int(samples.nelement() * samples.element_size() * 60)
-        self._load(memory)
-        samples = samples.to(device=self.execution_device(), dtype=self.dtype)
-        encoded = self.model.encode(
-            samples,
-            tiled=tiled,
-            tile_size=(tile_size, tile_size),
-            tile_overlap=(tile_overlap, tile_overlap),
-        ).latent
+        if tiled:
+            encoded = self._encode_tiled_with_retries(samples, tile_size)
+        else:
+            do_tile = False
+            encoded = None
+            try:
+                self._load(self._encode_memory(samples))
+                encoded = self._run_encode(samples, tiled=False, tile_size=tile_size, tile_overlap=tile_overlap)
+            except BaseException as exc:
+                model_management.raise_non_oom(exc)
+                LOG.warning("SeedVR2 VAE regular encoding hit OOM; retrying with tiled VAE encoding.")
+                do_tile = True
+            if do_tile:
+                model_management.soft_empty_cache()
+                encoded = self._encode_tiled_with_retries(samples, tile_size)
         latent = _vae_latent_to_seedvr2(encoded).to(dtype=self.dtype)
         _ensure_finite(latent, "VAE encode")
         return (latent - 0.0) * SEEDVR2_SCALING_FACTOR
@@ -602,15 +704,21 @@ class SeedVR2VAE:
     def decode(self, latent: torch.Tensor, tiled: bool, tile_size: int, tile_overlap: int) -> torch.Tensor:
         latent = (latent / SEEDVR2_SCALING_FACTOR).to(dtype=self.dtype)
         z = latent.permute(3, 0, 1, 2).unsqueeze(0).contiguous()
-        memory = int(z.nelement() * z.element_size() * 900)
-        self._load(memory)
-        z = z.to(device=self.execution_device(), dtype=self.dtype)
-        decoded = self.model.decode(
-            z,
-            tiled=tiled,
-            tile_size=(tile_size, tile_size),
-            tile_overlap=(tile_overlap, tile_overlap),
-        ).sample
+        if tiled:
+            decoded = self._decode_tiled_with_retries(z, tile_size)
+        else:
+            do_tile = False
+            decoded = None
+            try:
+                self._load(self._decode_memory(z))
+                decoded = self._run_decode(z, tiled=False, tile_size=tile_size, tile_overlap=tile_overlap)
+            except BaseException as exc:
+                model_management.raise_non_oom(exc)
+                LOG.warning("SeedVR2 VAE regular decoding hit OOM; retrying with tiled VAE decoding.")
+                do_tile = True
+            if do_tile:
+                model_management.soft_empty_cache()
+                decoded = self._decode_tiled_with_retries(z, tile_size)
         if decoded.ndim == 4:
             decoded = decoded.unsqueeze(2)
         decoded = decoded.squeeze(0).permute(1, 0, 2, 3).contiguous()
@@ -622,7 +730,23 @@ class _PatchableVAE(torch.nn.Module):
     def __init__(self, core: torch.nn.Module, device: torch.device):
         super().__init__()
         self.core = core
-        self.device = device
+        self._device = torch.device(device)
+        self._sync_core_device()
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
+
+    @device.setter
+    def device(self, device: torch.device | str) -> None:
+        self._device = torch.device(device)
+        self._sync_core_device()
+
+    def _sync_core_device(self) -> None:
+        try:
+            self.core.device = self._device
+        except Exception:
+            LOG.debug("SeedVR2 VAE core device sync failed", exc_info=True)
 
     def encode(self, *args, **kwargs):
         return self.core.encode(*args, **kwargs)

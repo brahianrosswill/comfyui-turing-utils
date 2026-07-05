@@ -97,6 +97,35 @@ class SeedVR2RuntimeContractTest(unittest.TestCase):
 
         self.assertEqual(seedvr2._infer_runtime_dtype(module, torch.bfloat16), torch.float16)
 
+    def test_patchable_vae_device_syncs_to_core(self):
+        class _Core(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self._device = torch.device("cpu")
+
+            @property
+            def device(self):
+                return self._device
+
+            @device.setter
+            def device(self, value):
+                self._device = torch.device(value)
+
+        core = _Core()
+        wrapper = seedvr2._PatchableVAE(core, torch.device("cpu"))
+
+        wrapper.device = torch.device("cuda:0")
+
+        self.assertEqual(wrapper.device, torch.device("cuda:0"))
+        self.assertEqual(core.device, torch.device("cuda:0"))
+
+    def test_vae_tile_candidates_are_conservative(self):
+        candidates = seedvr2._vae_tile_candidates(1024)
+
+        self.assertEqual(candidates[0], (1024, 256))
+        self.assertIn((256, 64), candidates)
+        self.assertNotIn((1536, 384), candidates)
+
     @unittest.skipUnless(hasattr(torch, "float8_e4m3fn"), "torch build has no float8 dtype")
     def test_fp8_storage_model_reports_runtime_dtype(self):
         class _FP8StorageModule(torch.nn.Module):
