@@ -253,19 +253,27 @@ ComfyUI/models/SEEDVR2/
 The node registers the `seedvr2` model folder type and scans
 `models/SEEDVR2` for official `.safetensors` files and single-file SVDInt4
 `.safetensors`/`.sft` files. It fails fast with a clear missing-file error
-instead of starting downloads from inside a workflow.
+instead of starting downloads from inside a workflow. DiT and VAE selectors
+are filtered separately: files whose names contain `vae` appear only in the
+VAE selector, while the remaining SeedVR2 weights appear in the DiT selector.
+
+The node does not expose device, offload-device, or attention-backend controls.
+DiT loading uses ComfyUI's current torch device and UNet offload device; VAE
+loading uses ComfyUI's VAE device and VAE offload device. Attention stays on
+the built-in PyTorch SDPA path so workflow behavior follows ComfyUI's default
+runtime expectations without extra per-node backend switches.
 
 `memory_mode` controls the automatic plan:
 
 - `balanced`: default. Uses ComfyUI's current torch device, estimates free VRAM,
   chooses a 4n+1 frame batch, and enables large VAE tiles only when needed.
 - `fastest`: avoids VAE tiling when possible and favors larger frame batches.
-- `low_vram`: forces smaller batches, tensor CPU offload, and VAE tiling.
+- `low_vram`: favors smaller frame batches and VAE tiling.
 
 The node retries on CUDA OOM by reducing the 4n+1 batch size first, then falling
-back to progressively smaller VAE tiles and CPU tensor/model offload. This is
-intended to behave closer to ComfyUI's VAE fallback path: try the fastest
-non-tiled path first, then tile only when memory pressure requires it.
+back to progressively smaller VAE tiles. This is intended to behave closer to
+ComfyUI's VAE fallback path: try the fastest non-tiled path first, then tile
+only when memory pressure requires it.
 
 The SeedVR2 runtime only needs the lightweight tensor/file helpers listed
 in `requirements.txt`: `einops`, `safetensors`, and `tqdm`. PyTorch is

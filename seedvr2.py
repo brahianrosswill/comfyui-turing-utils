@@ -137,35 +137,6 @@ def _seedvr2_condition(latent: torch.Tensor, latent_blur: torch.Tensor) -> torch
     return cond
 
 
-def _flow_add_noise(x: torch.Tensor, aug_noise: torch.Tensor, noise_scale: float) -> torch.Tensor:
-    if noise_scale <= 0.0:
-        return x
-    t = torch.tensor([SEEDVR2_T * noise_scale], device=x.device, dtype=x.dtype)
-    shape = torch.tensor(x.shape[:-1], device=x.device, dtype=torch.long)[None]
-    t = _timestep_transform(t, shape)
-    coeff = t.reshape((1,) * (x.ndim - 1) + (1,)) / SEEDVR2_T
-    return (1.0 - coeff) * x + coeff * aug_noise
-
-
-def _timestep_transform(timesteps: torch.Tensor, latent_shapes: torch.Tensor) -> torch.Tensor:
-    vt = 4
-    vs = 8
-    frames = (latent_shapes[:, 0] - 1) * vt + 1
-    heights = latent_shapes[:, 1] * vs
-    widths = latent_shapes[:, 2] * vs
-
-    def lin(x1: float, y1: float, x2: float, y2: float, x: torch.Tensor) -> torch.Tensor:
-        m = (y2 - y1) / (x2 - x1)
-        b = y1 - m * x1
-        return m * x + b
-
-    img_shift = lin(256 * 256, 1.0, 1024 * 1024, 3.2, heights * widths)
-    vid_shift = lin(256 * 256 * 37, 1.0, 1280 * 720 * 145, 5.0, heights * widths * frames)
-    shift = torch.where(frames > 1, vid_shift, img_shift).to(timesteps.dtype)
-    t = timesteps / SEEDVR2_T
-    return (shift * t / (1 + (shift - 1) * t)) * SEEDVR2_T
-
-
 def _model_size_bytes(model: torch.nn.Module) -> int:
     total = 0
     for tensor in list(model.parameters()) + list(model.buffers()):
@@ -572,13 +543,11 @@ class SeedVR2DiT:
             size=_model_size_bytes(model),
         )
 
-    def sample(self, latent: torch.Tensor, seed: int, latent_noise_scale: float) -> torch.Tensor:
+    def sample(self, latent: torch.Tensor, seed: int) -> torch.Tensor:
         _seed_everything(seed)
         latent = latent.to(device=self.patcher.load_device, dtype=self.model.dtype)
         base_noise = torch.randn_like(latent, dtype=self.model.dtype)
-        aug_noise = base_noise * 0.1 + torch.randn_like(base_noise) * 0.05
-        latent_blur = _flow_add_noise(latent, aug_noise, latent_noise_scale)
-        condition = _seedvr2_condition(base_noise, latent_blur)
+        condition = _seedvr2_condition(base_noise, latent)
         self.model.current_condition = condition
         noise = _seedvr2_latent_to_comfy(base_noise)
         latent_image = torch.zeros_like(noise)
@@ -620,27 +589,25 @@ class SeedVR2Pipeline:
         model_dir: str,
         dit_model: str,
         vae_model: str,
-        dit_device: str,
-        vae_device: str,
-        attention_mode: str,
         debug: bool = False,
     ):
         self.model_dir = Path(model_dir)
         self.dit_model = dit_model
         self.vae_model = vae_model
-        self.dit_device = torch.device(dit_device)
-        self.vae_device = torch.device(vae_device)
+        self.dit_device = model_management.get_torch_device()
+        self.vae_device = model_management.vae_device()
         self.offload_device = model_management.unet_offload_device()
+        self.vae_offload_device = model_management.vae_offload_device()
         self.dtype = _compute_dtype(self.dit_device)
         script_dir = Path(__file__).resolve().parent / "seedvr2_assets"
-        self.vae = SeedVR2VAE(str(self.model_dir / vae_model), self.vae_device, self.offload_device, self.dtype)
+        self.vae = SeedVR2VAE(str(self.model_dir / vae_model), self.vae_device, self.vae_offload_device, self.dtype)
         self.dit = SeedVR2DiT(
             str(self.model_dir / dit_model),
             dit_model,
             self.dit_device,
             self.offload_device,
             self.dtype,
-            attention_mode,
+            "sdpa",
             debug,
             script_dir,
         )
@@ -669,29 +636,21 @@ class SeedVR2Pipeline:
         max_resolution: int,
         seed: int,
         batch_size: int,
-        temporal_overlap: int,
         encode_tiled: bool,
         encode_tile_size: int,
         encode_tile_overlap: int,
         decode_tiled: bool,
         decode_tile_size: int,
         decode_tile_overlap: int,
-        input_noise_scale: float,
-        latent_noise_scale: float,
     ) -> torch.Tensor:
-        del temporal_overlap
         video, true_dims = _resize_normalize(image, resolution, max_resolution)
-        if input_noise_scale > 0:
-            noise = torch.randn_like(video) * 0.05
-            blend = float(input_noise_scale) * 0.5
-            video = video * (1.0 - blend) + (video + noise) * blend
         batches = _split_batches(video, batch_size)
         output_batches: list[torch.Tensor] = []
         original_lengths: list[int] = []
         for batch in batches:
             original_lengths.append(int(batch.shape[0]))
             latent = self.vae.encode(batch, seed, encode_tiled, encode_tile_size, encode_tile_overlap)
-            upscaled = self.dit.sample(latent, seed, latent_noise_scale)
+            upscaled = self.dit.sample(latent, seed)
             decoded = self.vae.decode(upscaled, decode_tiled, decode_tile_size, decode_tile_overlap)
             output_batches.append(decoded)
         out = _merge_batches(output_batches, original_lengths)
