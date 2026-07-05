@@ -177,11 +177,10 @@ def _model_size_bytes(model: torch.nn.Module) -> int:
 def _instantiate_dit(model_name: str, attention_mode: str) -> tuple[torch.nn.Module, Any]:
     lower = model_name.lower()
     if "7b" in lower:
-        from .seedvr2_runtime.src.models.dit_7b import na
-        from .seedvr2_runtime.src.models.dit_7b.nadit import NaDiT
+        from . import seedvr2_dit7b as na
 
         return (
-            NaDiT(
+            na.NaDiT(
                 vid_in_channels=33,
                 vid_out_channels=16,
                 vid_dim=3072,
@@ -210,11 +209,10 @@ def _instantiate_dit(model_name: str, attention_mode: str) -> tuple[torch.nn.Mod
             na,
         )
 
-    from .seedvr2_runtime.src.models.dit_3b import na
-    from .seedvr2_runtime.src.models.dit_3b.nadit import NaDiT
+    from . import seedvr2_dit3b as na
 
     return (
-        NaDiT(
+        na.NaDiT(
             vid_in_channels=33,
             vid_out_channels=16,
             vid_dim=2560,
@@ -248,7 +246,7 @@ def _instantiate_dit(model_name: str, attention_mode: str) -> tuple[torch.nn.Mod
 
 
 def _instantiate_vae() -> torch.nn.Module:
-    from .seedvr2_runtime.src.models.video_vae_v3.modules.attn_video_vae import VideoAutoencoderKLWrapper
+    from .seedvr2_vae import VideoAutoencoderKLWrapper
 
     model = VideoAutoencoderKLWrapper(
         in_channels=3,
@@ -554,7 +552,7 @@ class SeedVR2DiT:
     ):
         dit, na_module = _instantiate_dit(model_name, attention_mode)
         dit = _load_weights(dit, path, dtype=None)
-        from .seedvr2_runtime.src.optimization.compatibility import CompatibleDiT, validate_attention_mode
+        from .seedvr2_common import CompatibleDiT, validate_attention_mode
 
         attention_mode = validate_attention_mode(attention_mode, _LogShim(debug))
         for module in dit.modules():
@@ -605,8 +603,12 @@ class SeedVR2DiT:
 
     def close(self) -> None:
         self.model.current_condition = None
+        patcher = self.patcher
+        if patcher is None:
+            return
+        self.patcher = None
         try:
-            self.patcher.detach()
+            patcher.detach()
         except Exception:
             LOG.debug("SeedVR2 native DiT patcher detach failed", exc_info=True)
 
@@ -630,7 +632,7 @@ class SeedVR2NativePipeline:
         self.vae_device = torch.device(vae_device)
         self.offload_device = model_management.unet_offload_device()
         self.dtype = _compute_dtype(self.dit_device)
-        script_dir = Path(__file__).resolve().parent / "seedvr2_runtime"
+        script_dir = Path(__file__).resolve().parent / "seedvr2_assets"
         self.vae = SeedVR2VAE(str(self.model_dir / vae_model), self.vae_device, self.offload_device, self.dtype)
         self.dit = SeedVR2DiT(
             str(self.model_dir / dit_model),
@@ -644,11 +646,19 @@ class SeedVR2NativePipeline:
         )
 
     def close(self) -> None:
-        self.dit.close()
+        if self.dit is not None:
+            self.dit.close()
+            self.dit = None
+        patcher = self.vae.patcher if self.vae is not None else None
+        if patcher is None:
+            return
+        self.vae.patcher = None
         try:
-            self.vae.patcher.detach()
+            patcher.detach()
         except Exception:
             LOG.debug("SeedVR2 native VAE patcher detach failed", exc_info=True)
+        finally:
+            self.vae = None
 
     @torch.no_grad()
     def upscale(

@@ -234,10 +234,10 @@ SVDInt4/loaders
 
 ## SeedVR2 Auto Upscale
 
-This plugin also includes a self-contained SeedVR2 runtime adapted from
-`ComfyUI-SeedVR2_VideoUpscaler` under Apache-2.0. The runtime is vendored under
-`seedvr2_runtime/`; the original license is preserved at
-`seedvr2_runtime/SEEDVR2_LICENSE`.
+This plugin also includes a native SeedVR2 node implemented on ComfyUI's model
+patcher and sampler path. The compact architecture adapters live in the
+`seedvr2_*.py` modules; SeedVR2 text embeddings and the original Apache-2.0
+license are preserved under `seedvr2_assets/`.
 
 The `SeedVR2 Auto Upscale` node is a single high-level node. It takes only
 `IMAGE` input and exposes the DiT/VAE files as node parameters instead of
