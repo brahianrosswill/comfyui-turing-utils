@@ -560,6 +560,7 @@ class SeedVR2ComfyModel(torch.nn.Module):
         self.na = na_module
         self.dtype = dtype
         self.device = torch.device("cpu")
+        self.current_patcher: comfy.model_patcher.ModelPatcher | None = None
         self.current_condition: torch.Tensor | None = None
         self.register_buffer("text_pos", text_pos.to(dtype=dtype), persistent=False)
         self.register_buffer("text_neg", text_neg.to(dtype=dtype), persistent=False)
