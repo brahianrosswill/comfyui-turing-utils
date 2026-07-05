@@ -91,6 +91,10 @@ class CausalDecoderOutput(NamedTuple):
     sample: torch.Tensor
 
 
+def _get_debug(module):
+    return getattr(module, "debug", None)
+
+
 # ---- models/video_vae_v3/modules/global_config.py ----
 # // Copyright (c) 2025 Bytedance Ltd. and/or its affiliates
 # //
@@ -2442,6 +2446,7 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
         Encodes an input tensor `x` by splitting it into spatial tiles in latent space. Temporal is handled by `slicing_encode`.
         `tile_size` and `tile_overlap` are interpreted in output-space pixels and converted to latent-space.
         """
+        debug = _get_debug(self)
         # Ensure 5D [B, C, F, H, W]
         if x.ndim != 5:
             x = x.unsqueeze(2)
@@ -2453,8 +2458,8 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
         if H <= tile_h and W <= tile_w:
             return self.slicing_encode(x)
         else:
-            if self.debug:
-                self.debug.log(f"Using VAE tiled encoding (Tile: {tile_size}, Overlap: {tile_overlap})", category="vae", force=True, indent_level=1)
+            if debug:
+                debug.log(f"Using VAE tiled encoding (Tile: {tile_size}, Overlap: {tile_overlap})", category="vae", force=True, indent_level=1)
 
         # Spatial scale factor (output/latent)
         scale_factor = self.spatial_downsample_factor
@@ -2481,8 +2486,8 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
                   * ((max(W_lat_total - latent_overlap_w, 1) + stride_w - 1) // stride_w)
 
         # Log once at start instead of per-tile
-        if self.debug:
-            self.debug.log(
+        if debug:
+            debug.log(
                 f"Encoding {num_tiles} tiles (Tile: {tile_size}, Overlap: {tile_overlap})",
                 category="vae",
             )
@@ -2516,8 +2521,8 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
                 tile_id += 1
 
                 # Store tile boundary info for debug visualization
-                if self.debug and hasattr(self.debug, 'encode_tile_boundaries'):
-                    self.debug.encode_tile_boundaries.append({
+                if debug and hasattr(debug, 'encode_tile_boundaries'):
+                    debug.encode_tile_boundaries.append({
                         'id': tile_id,
                         'y': y_out,
                         'x': x_out,
@@ -2528,14 +2533,14 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
                 tile_sample = x[:, :, :, y_out:y_out_end, x_out:x_out_end]
 
                 # Log progress periodically instead of every tile (at 1, 6, 11, 16, ...)
-                if self.debug and (tile_id % 5 == 1 or tile_id == num_tiles):
+                if debug and (tile_id % 5 == 1 or tile_id == num_tiles):
                     if tile_id == num_tiles:
                         # Only log final tile if not covered by previous range
                         if (tile_id - 1) % 5 == 0:
-                            self.debug.log(f"Encoding tile {tile_id} / {num_tiles}", category="vae", indent_level=1)
+                            debug.log(f"Encoding tile {tile_id} / {num_tiles}", category="vae", indent_level=1)
                     else:
                         end_tile = min(tile_id + 4, num_tiles)
-                        self.debug.log(f"Encoding tiles {tile_id}-{end_tile} / {num_tiles}", category="vae", indent_level=1)
+                        debug.log(f"Encoding tiles {tile_id}-{end_tile} / {num_tiles}", category="vae", indent_level=1)
 
                 encoded_tile = self.slicing_encode(tile_sample)
 
@@ -2608,6 +2613,7 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
         r"""
         Decodes a latent tensor `z` by splitting it into spatial tiles only. Temporal is handled by `slicing_decode`.
         """
+        debug = _get_debug(self)
         if z.ndim != 5:
             z = z.unsqueeze(2)
 
@@ -2627,8 +2633,8 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
         if H <= latent_tile_h and W <= latent_tile_w:
             return self.slicing_decode(z)
         else:
-            if self.debug:
-                self.debug.log(f"Using VAE tiled decoding (Tile: {tile_size}, Overlap: {tile_overlap})", category="vae", force=True, indent_level=1)
+            if debug:
+                debug.log(f"Using VAE tiled decoding (Tile: {tile_size}, Overlap: {tile_overlap})", category="vae", force=True, indent_level=1)
 
         latent_overlap_h = max(0, min((overlap_h // scale_factor), latent_tile_h - 1))
         latent_overlap_w = max(0, min((overlap_w // scale_factor), latent_tile_w - 1))
@@ -2644,8 +2650,8 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
                   * ((max(W - latent_overlap_w, 1) + stride_w - 1) // stride_w)
 
         # Log once at start instead of per-tile
-        if self.debug:
-            self.debug.log(
+        if debug:
+            debug.log(
                 f"Decoding {num_tiles} tiles (Tile: {tile_size}, Overlap: {tile_overlap})",
                 category="vae",
             )
@@ -2673,13 +2679,13 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
                 tile_id += 1
 
                 # Store tile boundary info for debug visualization
-                if self.debug and hasattr(self.debug, 'decode_tile_boundaries'):
+                if debug and hasattr(debug, 'decode_tile_boundaries'):
                     # Map to output space
                     y_out = y_lat * scale_factor
                     x_out = x_lat * scale_factor
                     y_out_end = y_lat_end * scale_factor
                     x_out_end = x_lat_end * scale_factor
-                    self.debug.decode_tile_boundaries.append({
+                    debug.decode_tile_boundaries.append({
                         'id': tile_id,
                         'y': y_out,
                         'x': x_out,
@@ -2690,14 +2696,14 @@ class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
                 tile_latent = z[:, :, :, y_lat:y_lat_end, x_lat:x_lat_end]
 
                 # Log progress periodically instead of every tile (at 1, 6, 11, 16, ...)
-                if self.debug and (tile_id % 5 == 1 or tile_id == num_tiles):
+                if debug and (tile_id % 5 == 1 or tile_id == num_tiles):
                     if tile_id == num_tiles:
                         # Only log final tile if not covered by previous range
                         if (tile_id - 1) % 5 == 0:
-                            self.debug.log(f"Decoding tile {tile_id} / {num_tiles}", category="vae", indent_level=1)
+                            debug.log(f"Decoding tile {tile_id} / {num_tiles}", category="vae", indent_level=1)
                     else:
                         end_tile = min(tile_id + 4, num_tiles)
-                        self.debug.log(f"Decoding tiles {tile_id}-{end_tile} / {num_tiles}", category="vae", indent_level=1)
+                        debug.log(f"Decoding tiles {tile_id}-{end_tile} / {num_tiles}", category="vae", indent_level=1)
 
                 decoded_tile = self.slicing_decode(tile_latent)
 

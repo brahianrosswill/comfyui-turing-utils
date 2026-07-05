@@ -13,8 +13,10 @@ from safetensors.torch import load_file as load_safetensors_file
 
 import comfy.model_management as model_management
 import comfy.model_patcher
+import comfy.patcher_extension
 import comfy.sample
 import comfy.samplers
+import comfy.utils
 
 from .loader import build_loader_state_dict, is_svdint4_file
 
@@ -153,6 +155,34 @@ def _first_tensor_device(model: torch.nn.Module) -> torch.device | None:
     return None
 
 
+def _assert_module_device(module: torch.nn.Module, expected: torch.device, label: str) -> None:
+    actual = _first_tensor_device(module)
+    if actual is None or actual == expected:
+        return
+    raise RuntimeError(
+        f"SeedVR2 {label} is not on the expected ComfyUI device. "
+        f"Expected {expected}, got {actual}. "
+        "Free VRAM or use a smaller checkpoint; refusing to fall back to CPU inference."
+    )
+
+
+def _device_label(device: torch.device) -> str:
+    try:
+        return model_management.get_torch_device_name(device)
+    except Exception:
+        return str(device)
+
+
+def _require_accelerator_device(device: torch.device, label: str) -> torch.device:
+    if model_management.is_device_cpu(device):
+        raise RuntimeError(
+            f"SeedVR2 {label} load device resolved to CPU. "
+            "SeedVR2 DiT CPU inference is not supported by this node because it is too slow. "
+            "Start ComfyUI with GPU support enabled and without --cpu, or free/select a GPU device before running SeedVR2."
+        )
+    return device
+
+
 def _unload_patcher(patcher: comfy.model_patcher.ModelPatcher | None) -> None:
     if patcher is None:
         return
@@ -164,6 +194,26 @@ def _unload_patcher(patcher: comfy.model_patcher.ModelPatcher | None) -> None:
         patcher.detach()
     except Exception:
         LOG.debug("SeedVR2 patcher detach failed", exc_info=True)
+
+
+def _seedvr2_force_full_load_prepare_sampling(
+    executor,
+    model,
+    noise_shape,
+    conds,
+    model_options=None,
+    force_full_load=False,
+    force_offload=False,
+):
+    del force_full_load
+    return executor(
+        model,
+        noise_shape,
+        conds,
+        model_options=model_options,
+        force_full_load=True,
+        force_offload=force_offload,
+    )
 
 
 def _infer_dit_template(path: str, model_name: str) -> str:
@@ -381,7 +431,13 @@ class SeedVR2VAE:
         )
 
     def _load(self, memory_required: int) -> None:
-        model_management.load_models_gpu([self.patcher], memory_required=memory_required)
+        model_management.load_models_gpu(
+            [self.patcher],
+            memory_required=memory_required,
+            force_full_load=True,
+        )
+        self.model.device = self.patcher.load_device
+        _assert_module_device(self.model.core, self.patcher.load_device, "VAE")
 
     @torch.no_grad()
     def encode(self, video_tchw: torch.Tensor, seed: int, tiled: bool, tile_size: int, tile_overlap: int) -> torch.Tensor:
@@ -422,9 +478,11 @@ class _PatchableVAE(torch.nn.Module):
         self.device = device
 
     def encode(self, *args, **kwargs):
+        _assert_module_device(self.core, self.device, "VAE")
         return self.core.encode(*args, **kwargs)
 
     def decode(self, *args, **kwargs):
+        _assert_module_device(self.core, self.device, "VAE")
         return self.core.decode(*args, **kwargs)
 
 
@@ -495,6 +553,17 @@ class SeedVR2ComfyModel(torch.nn.Module):
         return x - pred * sigma
 
     def _predict_v(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        if model_management.is_device_cpu(x_t.device):
+            raise RuntimeError(
+                "SeedVR2 DiT received CPU latents. "
+                "This indicates the model was not prepared on an accelerator device."
+            )
+        if x_t.device != self.device:
+            raise RuntimeError(
+                f"SeedVR2 DiT input is on {x_t.device}, but the model is registered on {self.device}. "
+                "This indicates ComfyUI did not prepare the model on the expected load device."
+            )
+        _assert_module_device(self.diffusion_model, x_t.device, "DiT")
         try:
             model_dtype = next(self.diffusion_model.parameters()).dtype
         except StopIteration:
@@ -576,6 +645,7 @@ class SeedVR2DiT:
         debug: bool,
         script_dir: Path,
     ):
+        load_device = _require_accelerator_device(load_device, "DiT")
         template = _infer_dit_template(path, model_name)
         LOG.info("SeedVR2 DiT template selected: %s for %s", template.upper(), os.path.basename(path))
         dit, na_module = _instantiate_dit(template, attention_mode)
@@ -600,28 +670,43 @@ class SeedVR2DiT:
             offload_device=offload_device,
             size=_model_size_bytes(model),
         )
+        self.patcher.remove_wrappers_with_key(
+            comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING,
+            "SeedVR2_force_full_load",
+        )
+        self.patcher.add_wrapper_with_key(
+            comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING,
+            "SeedVR2_force_full_load",
+            _seedvr2_force_full_load_prepare_sampling,
+        )
+        LOG.info(
+            "SeedVR2 DiT patcher ready: load=%s, offload=%s, dtype=%s, size=%.2f MB",
+            _device_label(load_device),
+            _device_label(offload_device),
+            dtype,
+            _model_size_bytes(model) / (1024 * 1024),
+        )
 
     def _load(self, latent: torch.Tensor) -> None:
+        _require_accelerator_device(self.patcher.load_device, "DiT")
         noise_shape = _seedvr2_latent_to_comfy(latent).shape
         memory_required = self.patcher.memory_required(noise_shape)
+        LOG.info(
+            "SeedVR2 loading DiT: load=%s, offload=%s, memory_required=%.2f MB, latent_shape=%s",
+            _device_label(self.patcher.load_device),
+            _device_label(self.patcher.offload_device),
+            memory_required / (1024 * 1024),
+            tuple(noise_shape),
+        )
         model_management.load_models_gpu(
             [self.patcher],
             memory_required=memory_required,
             force_full_load=True,
         )
         self.model.device = self.patcher.load_device
-        actual_device = _first_tensor_device(self.model.diffusion_model)
-        if actual_device is None:
-            return
-        if actual_device != self.patcher.load_device:
-            raise RuntimeError(
-                "SeedVR2 DiT was not loaded onto the ComfyUI load device. "
-                f"Expected {self.patcher.load_device}, got {actual_device}. "
-                "This usually means the model does not fit as a full GPU load; "
-                "use a smaller SeedVR2 checkpoint or free more VRAM."
-            )
+        _assert_module_device(self.model.diffusion_model, self.patcher.load_device, "DiT")
 
-    def sample(self, latent: torch.Tensor, seed: int) -> torch.Tensor:
+    def sample(self, latent: torch.Tensor, seed: int, *, show_pbar: bool = True) -> torch.Tensor:
         _seed_everything(seed)
         self._load(latent)
         latent = latent.to(device=self.patcher.load_device, dtype=self.model.dtype)
@@ -642,7 +727,7 @@ class SeedVR2DiT:
                 positive=[(None, {})],
                 negative=[(None, {})],
                 latent_image=latent_image,
-                disable_pbar=True,
+                disable_pbar=not show_pbar,
                 seed=seed,
             )
         finally:
@@ -670,11 +755,19 @@ class SeedVR2Pipeline:
         self.model_dir = Path(model_dir)
         self.dit_model = dit_model
         self.vae_model = vae_model
-        self.dit_device = model_management.get_torch_device()
+        self.dit_device = _require_accelerator_device(model_management.get_torch_device(), "DiT")
         self.vae_device = model_management.vae_device()
         self.offload_device = model_management.unet_offload_device()
         self.vae_offload_device = model_management.vae_offload_device()
         self.dtype = _compute_dtype(self.dit_device)
+        LOG.info(
+            "SeedVR2 devices: dit=%s, dit_offload=%s, vae=%s, vae_offload=%s, dtype=%s",
+            _device_label(self.dit_device),
+            _device_label(self.offload_device),
+            _device_label(self.vae_device),
+            _device_label(self.vae_offload_device),
+            self.dtype,
+        )
         script_dir = Path(__file__).resolve().parent / "seedvr2_assets"
         self.vae = SeedVR2VAE(str(self.model_dir / vae_model), self.vae_device, self.vae_offload_device, self.dtype)
         self.dit = SeedVR2DiT(
@@ -717,14 +810,20 @@ class SeedVR2Pipeline:
     ) -> torch.Tensor:
         video, true_dims = _resize_normalize(image, resolution, max_resolution)
         batches = _split_batches(video, batch_size)
+        pbar = comfy.utils.ProgressBar(max(1, len(batches) * 3))
+        pbar.update_absolute(0)
         output_batches: list[torch.Tensor] = []
         original_lengths: list[int] = []
         for batch in batches:
             original_lengths.append(int(batch.shape[0]))
             latent = self.vae.encode(batch, seed, encode_tiled, encode_tile_size, encode_tile_overlap)
-            upscaled = self.dit.sample(latent, seed)
+            pbar.update(1)
+            upscaled = self.dit.sample(latent, seed, show_pbar=True)
+            pbar.update(1)
             decoded = self.vae.decode(upscaled, decode_tiled, decode_tile_size, decode_tile_overlap)
+            pbar.update(1)
             output_batches.append(decoded)
+        pbar.update_absolute(pbar.total)
         out = _merge_batches(output_batches, original_lengths)
         out = out[: image.shape[0], :, : true_dims[0], : true_dims[1]]
         return out.permute(0, 2, 3, 1).add(1.0).mul(0.5).clamp(0.0, 1.0).to(torch.float32).cpu()
