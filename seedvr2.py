@@ -8,6 +8,7 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from safetensors import safe_open
 from safetensors.torch import load_file as load_safetensors_file
 
 import comfy.model_management as model_management
@@ -145,9 +146,40 @@ def _model_size_bytes(model: torch.nn.Module) -> int:
     return total
 
 
-def _instantiate_dit(model_name: str, attention_mode: str) -> tuple[torch.nn.Module, Any]:
+def _infer_dit_template(path: str, model_name: str) -> str:
     lower = model_name.lower()
     if "7b" in lower:
+        return "7b"
+    if "3b" in lower:
+        return "3b"
+
+    max_block = -1
+    try:
+        with safe_open(path, framework="pt", device="cpu") as handle:
+            for key in handle.keys():
+                if not key.startswith("blocks."):
+                    continue
+                parts = key.split(".", 2)
+                if len(parts) >= 2 and parts[1].isdigit():
+                    max_block = max(max_block, int(parts[1]))
+    except Exception as exc:
+        raise ValueError(
+            f"Could not inspect SeedVR2 DiT checkpoint architecture for {model_name}. "
+            "Use a safetensors/.sft checkpoint whose filename or block keys identify a 3B or 7B SeedVR2 DiT."
+        ) from exc
+
+    if max_block >= 35:
+        return "7b"
+    if 0 <= max_block <= 31:
+        return "3b"
+    raise ValueError(
+        f"Unsupported SeedVR2 DiT checkpoint architecture for {model_name}: highest block index is {max_block}. "
+        "Only the SeedVR2 3B and 7B DiT templates are supported."
+    )
+
+
+def _instantiate_dit(template: str, attention_mode: str) -> tuple[torch.nn.Module, Any]:
+    if template == "7b":
         from . import seedvr2_dit7b as na
 
         return (
@@ -179,6 +211,9 @@ def _instantiate_dit(model_name: str, attention_mode: str) -> tuple[torch.nn.Mod
             ),
             na,
         )
+
+    if template != "3b":
+        raise ValueError(f"Unsupported SeedVR2 DiT template: {template}")
 
     from . import seedvr2_dit3b as na
 
@@ -521,7 +556,9 @@ class SeedVR2DiT:
         debug: bool,
         script_dir: Path,
     ):
-        dit, na_module = _instantiate_dit(model_name, attention_mode)
+        template = _infer_dit_template(path, model_name)
+        LOG.info("SeedVR2 DiT template selected: %s for %s", template.upper(), os.path.basename(path))
+        dit, na_module = _instantiate_dit(template, attention_mode)
         dit = _load_weights(dit, path, dtype=None)
         from .seedvr2_common import CompatibleDiT, validate_attention_mode
 

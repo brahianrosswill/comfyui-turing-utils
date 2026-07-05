@@ -250,12 +250,18 @@ ComfyUI/models/SEEDVR2/
   ...
 ```
 
-The node registers the `seedvr2` model folder type and scans
-`models/SEEDVR2` for official `.safetensors` files and single-file SVDInt4
-`.safetensors`/`.sft` files. It fails fast with a clear missing-file error
-instead of starting downloads from inside a workflow. DiT and VAE selectors
-are filtered separately: files whose names contain `vae` appear only in the
-VAE selector, while the remaining SeedVR2 weights appear in the DiT selector.
+The node registers the `seedvr2` model folder type and lists only files that
+actually exist under `models/SEEDVR2`. Official `.safetensors` files and
+single-file SVDInt4 `.safetensors`/`.sft` files are supported; files outside
+that folder are not shown. DiT and VAE selectors are filtered separately:
+files whose names contain `vae` appear only in the VAE selector, while the
+remaining SeedVR2 weights appear in the DiT selector.
+
+New DiT packages do not need to be hardcoded into the node. The loader supports
+the two SeedVR2 DiT templates, 3B and 7B, and selects the template from the
+filename when it contains `3b` or `7b`; otherwise it inspects checkpoint block
+keys to infer the template. Unsupported layouts fail with a clear error instead
+of being silently loaded as the wrong model.
 
 The node does not expose device, offload-device, or attention-backend controls.
 DiT loading uses ComfyUI's current torch device and UNet offload device; VAE

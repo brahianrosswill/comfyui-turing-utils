@@ -19,15 +19,7 @@ LOG = logging.getLogger("comfyui-svdint4")
 SEEDVR2_FOLDER_NAME = "SEEDVR2"
 SEEDVR2_MODEL_TYPE = "seedvr2"
 MODEL_EXTENSIONS = {".safetensors", ".sft"}
-DEFAULT_DIT_MODELS = [
-    "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
-    "seedvr2_ema_3b_fp16.safetensors",
-    "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
-    "seedvr2_ema_7b_fp16.safetensors",
-    "seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors",
-    "seedvr2_ema_7b_sharp_fp16.safetensors",
-]
-DEFAULT_VAE_MODELS = ["ema_vae_fp16.safetensors"]
+KNOWN_VAE_MODEL_NAMES = {"ema_vae_fp16.safetensors"}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -81,12 +73,11 @@ def _seedvr2_model_files() -> list[str]:
 
 def _is_vae_model_name(name: str) -> bool:
     lower = Path(name).name.lower()
-    return lower in {item.lower() for item in DEFAULT_VAE_MODELS} or "vae" in Path(lower).stem
+    return lower in KNOWN_VAE_MODEL_NAMES or "vae" in Path(lower).stem
 
 
-def _model_choices(defaults: list[str], *, vae: bool) -> list[str]:
-    discovered = [name for name in _seedvr2_model_files() if _is_vae_model_name(name) == vae]
-    return sorted(set(defaults + discovered))
+def _model_choices(*, vae: bool) -> list[str]:
+    return [name for name in _seedvr2_model_files() if _is_vae_model_name(name) == vae]
 
 
 def _round_even(value: float) -> int:
@@ -266,8 +257,8 @@ class SeedVR2Upscaler:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "dit_model": (_model_choices(DEFAULT_DIT_MODELS, vae=False),),
-                "vae_model": (_model_choices(DEFAULT_VAE_MODELS, vae=True),),
+                "dit_model": (_model_choices(vae=False),),
+                "vae_model": (_model_choices(vae=True),),
                 "resolution": ("INT", {"default": 1080, "min": 16, "max": 16384, "step": 2}),
                 "max_resolution": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 2}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 2**32 - 1, "step": 1}),
