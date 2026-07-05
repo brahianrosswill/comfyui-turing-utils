@@ -17,18 +17,14 @@ LOG = logging.getLogger("comfyui-svdint4")
 
 SEEDVR2_FOLDER_NAME = "SEEDVR2"
 SEEDVR2_MODEL_TYPE = "seedvr2"
-MODEL_EXTENSIONS = {".safetensors", ".gguf"}
+MODEL_EXTENSIONS = {".safetensors", ".sft"}
 DEFAULT_DIT_MODELS = [
     "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
     "seedvr2_ema_3b_fp16.safetensors",
-    "seedvr2_ema_3b-Q4_K_M.gguf",
-    "seedvr2_ema_3b-Q8_0.gguf",
     "seedvr2_ema_7b_fp8_e4m3fn_mixed_block35_fp16.safetensors",
     "seedvr2_ema_7b_fp16.safetensors",
-    "seedvr2_ema_7b-Q4_K_M.gguf",
     "seedvr2_ema_7b_sharp_fp8_e4m3fn_mixed_block35_fp16.safetensors",
     "seedvr2_ema_7b_sharp_fp16.safetensors",
-    "seedvr2_ema_7b_sharp-Q4_K_M.gguf",
 ]
 DEFAULT_VAE_MODELS = ["ema_vae_fp16.safetensors"]
 AUTO_BATCH = "auto"
@@ -341,17 +337,15 @@ def _import_seedvr2_runtime():
         )
         from .seedvr2_runtime.src.utils.constants import get_base_cache_dir
         from .seedvr2_runtime.src.utils.debug import Debug
-        from .seedvr2_runtime.src.utils.downloads import download_weight
     except ImportError as exc:
         raise ImportError(
             "SeedVR2 auto upscaler dependencies are missing. Install the optional SeedVR2 runtime "
-            "dependencies in the ComfyUI Python environment: omegaconf diffusers peft "
-            "opencv-python gguf matplotlib psutil einops safetensors tqdm. "
+            "dependencies in the ComfyUI Python environment: omegaconf diffusers "
+            "opencv-python psutil einops safetensors tqdm. "
             f"Original import error: {exc}"
         ) from exc
     return {
         "Debug": Debug,
-        "download_weight": download_weight,
         "get_base_cache_dir": get_base_cache_dir,
         "setup_generation_context": setup_generation_context,
         "prepare_runner": prepare_runner,
@@ -393,7 +387,6 @@ class SeedVR2AutoUpscaler:
                 "dit_offload_device": (_device_choices(include_none=True, include_cpu=True), {"default": "auto"}),
                 "vae_offload_device": (_device_choices(include_none=True, include_cpu=True), {"default": "auto"}),
                 "attention_mode": (["sdpa", "flash_attn_2", "flash_attn_3", "sageattn_2", "sageattn_3"], {"default": "sdpa"}),
-                "download_missing": ("BOOLEAN", {"default": False}),
                 "enable_debug": ("BOOLEAN", {"default": False}),
             },
         }
@@ -424,7 +417,6 @@ class SeedVR2AutoUpscaler:
         dit_offload_device: str = "auto",
         vae_offload_device: str = "auto",
         attention_mode: str = "sdpa",
-        download_missing: bool = False,
         enable_debug: bool = False,
     ):
         if image.ndim != 4 or int(image.shape[-1]) not in (3, 4):
@@ -465,7 +457,6 @@ class SeedVR2AutoUpscaler:
                         dit_device=dit_device,
                         vae_device=vae_device,
                         attention_mode=attention_mode,
-                        download_missing=download_missing,
                         enable_debug=enable_debug,
                         plan=candidate,
                     ),
@@ -494,12 +485,10 @@ class SeedVR2AutoUpscaler:
         dit_device: str,
         vae_device: str,
         attention_mode: str,
-        download_missing: bool,
         enable_debug: bool,
         plan: SeedVR2AutoPlan,
     ) -> torch.Tensor:
-        if not download_missing:
-            self._validate_model_files_exist(dit_model, vae_model)
+        self._validate_model_files_exist(dit_model, vae_model)
 
         runtime = _import_seedvr2_runtime()
         Debug = runtime["Debug"]
@@ -522,10 +511,6 @@ class SeedVR2AutoUpscaler:
                 runtime["cleanup_text_embeddings"](ctx, debug)
                 ctx = None
 
-        if download_missing:
-            if not runtime["download_weight"](dit_model=dit_model, vae_model=vae_model, debug=debug):
-                raise RuntimeError(f"Failed to download SeedVR2 weights: DiT={dit_model}, VAE={vae_model}")
-
         try:
             ctx = runtime["setup_generation_context"](
                 dit_device=torch.device(dit_device),
@@ -545,7 +530,6 @@ class SeedVR2AutoUpscaler:
                 vae_cache=False,
                 dit_id=_AUTO_NODE_ID,
                 vae_id=_AUTO_NODE_ID,
-                block_swap_config=None,
                 encode_tiled=plan.encode_tiled,
                 encode_tile_size=(plan.encode_tile_size, plan.encode_tile_size),
                 encode_tile_overlap=(plan.encode_tile_overlap, plan.encode_tile_overlap),
@@ -554,8 +538,6 @@ class SeedVR2AutoUpscaler:
                 decode_tile_overlap=(plan.decode_tile_overlap, plan.decode_tile_overlap),
                 tile_debug="false",
                 attention_mode=attention_mode,
-                torch_compile_args_dit=None,
-                torch_compile_args_vae=None,
             )
             ctx["cache_context"] = cache_context
             ctx["text_embeds"] = runtime["load_text_embeddings"](
@@ -645,5 +627,5 @@ class SeedVR2AutoUpscaler:
             raise FileNotFoundError(
                 "Missing SeedVR2 model file(s): "
                 + ", ".join(missing)
-                + f". Put them under {base} or enable download_missing."
+                + f". Put them under {base}."
             )

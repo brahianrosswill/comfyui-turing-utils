@@ -6,10 +6,7 @@
 # intentionally omitted so pip does not replace ComfyUI's installed PyTorch.
 omegaconf>=2.3.0
 diffusers>=0.33.1
-peft>=0.17.0
 opencv-python
-gguf
-matplotlib
 psutil
 einops
 safetensors

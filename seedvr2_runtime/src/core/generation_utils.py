@@ -428,7 +428,6 @@ def prepare_runner(
     vae_cache: bool = False,
     dit_id: Optional[int] = None,
     vae_id: Optional[int] = None,
-    block_swap_config: Optional[Dict[str, Any]] = None,
     encode_tiled: bool = False,
     encode_tile_size: Optional[Tuple[int, int]] = None,
     encode_tile_overlap: Optional[Tuple[int, int]] = None,
@@ -437,8 +436,6 @@ def prepare_runner(
     decode_tile_overlap: Optional[Tuple[int, int]] = None,
     tile_debug: str = "false",
     attention_mode: str = 'sdpa',
-    torch_compile_args_dit: Optional[Dict[str, Any]] = None,
-    torch_compile_args_vae: Optional[Dict[str, Any]] = None
 ) -> Tuple['VideoDiffusionInfer', Dict[str, Any]]:
     """
     Prepare runner with model state management and global cache integration.
@@ -454,7 +451,6 @@ def prepare_runner(
         vae_cache: Whether to cache VAE model between runs
         dit_id: Node instance ID for DiT model caching
         vae_id: Node instance ID for VAE model caching
-        block_swap_config: Optional BlockSwap configuration for DiT memory optimization
         encode_tiled: Enable tiled encoding to reduce VRAM during VAE encoding
         encode_tile_size: Tile size for encoding (height, width)
         encode_tile_overlap: Tile overlap for encoding (height, width)
@@ -463,8 +459,6 @@ def prepare_runner(
         decode_tile_overlap: Tile overlap for decoding (height, width)
         tile_debug: Tile visualization mode (false/encode/decode)
         attention_mode: Attention computation backend ('sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3')
-        torch_compile_args_dit: Optional torch.compile configuration for DiT model
-        torch_compile_args_vae: Optional torch.compile configuration for VAE model
 
     Returns:
         Tuple['VideoDiffusionInfer', Dict[str, Any]]: Tuple containing:
@@ -478,10 +472,7 @@ def prepare_runner(
 
     Features:
         - Independent DiT and VAE caching for flexible memory management
-        - Dynamic model reloading when models change
-        - Optional torch.compile optimization for inference speedup
         - Separate encode/decode tiling configuration for optimal performance
-        - Memory optimization and BlockSwap integration
     """
     dit_changed = False
     vae_changed = False
@@ -498,7 +489,6 @@ def prepare_runner(
         vae_cache=vae_cache,
         dit_id=dit_id,
         vae_id=vae_id,
-        block_swap_config=block_swap_config,
         encode_tiled=encode_tiled,
         encode_tile_size=encode_tile_size,
         encode_tile_overlap=encode_tile_overlap,
@@ -507,8 +497,6 @@ def prepare_runner(
         decode_tile_overlap=decode_tile_overlap,
         tile_debug=tile_debug,
         attention_mode=attention_mode,
-        torch_compile_args_dit=torch_compile_args_dit,
-        torch_compile_args_vae=torch_compile_args_vae
     )
 
     return runner, cache_context

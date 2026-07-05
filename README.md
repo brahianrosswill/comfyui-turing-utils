@@ -238,9 +238,9 @@ ComfyUI/models/SEEDVR2/
 ```
 
 The node registers the `seedvr2` model folder type and scans
-`models/SEEDVR2` for `.safetensors` and `.gguf` files. It can optionally
-download missing official weights, but the default is to fail fast with a clear
-missing-file error so a workflow does not unexpectedly start a large download.
+`models/SEEDVR2` for official `.safetensors` files and single-file SVDInt4
+`.safetensors`/`.sft` files. It fails fast with a clear missing-file error
+instead of starting downloads from inside a workflow.
 
 `memory_mode` controls the automatic plan:
 
@@ -255,8 +255,8 @@ intended to behave closer to ComfyUI's native VAE fallback path: try the fastest
 non-tiled path first, then tile only when memory pressure requires it.
 
 The SeedVR2 runtime needs these optional Python packages in the ComfyUI
-environment: `omegaconf`, `diffusers`, `peft`, `opencv-python`, `gguf`,
-`matplotlib`, `psutil`, `einops`, `safetensors`, and `tqdm`. They are listed in
+environment: `omegaconf`, `diffusers`, `opencv-python`, `psutil`, `einops`,
+`safetensors`, and `tqdm`. They are listed in
 `requirements.txt`; PyTorch is intentionally not listed to avoid replacing
 ComfyUI's installed Torch build. The small RoPE helper used by SeedVR2 is
 implemented locally, so no extra rotary embedding package is required.

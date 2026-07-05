@@ -2,7 +2,7 @@
 Unified debugging system for SeedVR2 generation pipeline
 
 Provides structured logging, memory tracking, and performance monitoring
-for all pipeline stages, including BlockSwap operations.
+for all pipeline stages.
 """
 
 import time
@@ -41,13 +41,13 @@ def _format_peak_with_overflow(peak_gb: float, total_vram_gb: float) -> str:
 
 class Debug:
     """
-    Unified debug logging for generation pipeline and BlockSwap monitoring
+    Unified debug logging for the generation pipeline
 
     Features:
     - Structured logging with categories
     - Memory tracking (VRAM/RAM)
     - Timing utilities
-    - BlockSwap operation tracking
+    - Memory movement tracking
     - Minimal overhead when disabled
     - Timestamped logs for better troubleshooting
     - Force parameters for critical logs
@@ -63,7 +63,7 @@ class Debug:
         "setup": "🔧",        # Configuration/setup
         "generation": "🎬",   # Generation process
         "dit": "🚀",          # Model loading/operations
-        "blockswap": "🔀",    # BlockSwap operations
+        "swap": "⇄",          # Tensor/model movement timing
         "download": "📥",     # Download operations
         "success": "✅",      # Successful completion
         "warning": "⚠️",      # Warnings
@@ -214,12 +214,11 @@ class Debug:
             gpu_str = "CPU"
             cudnn_ver = "N/A"
 
-        # Flash Attn, SageAttn & Triton - reuse existing module constants
+        # Flash Attention and SageAttention - reuse existing module constants.
         try:
             from ..optimization.compatibility import (
                 FLASH_ATTN_2_AVAILABLE, FLASH_ATTN_3_AVAILABLE,
                 SAGE_ATTN_2_AVAILABLE, SAGE_ATTN_3_AVAILABLE,
-                TRITON_AVAILABLE
             )
             fa_parts = []
             if FLASH_ATTN_3_AVAILABLE:
@@ -234,10 +233,8 @@ class Debug:
             if SAGE_ATTN_2_AVAILABLE:
                 sa_parts.append("2")
             sage_str = f"v{','.join(sa_parts)} ✓" if sa_parts else "✗"
-
-            triton_str = "✓" if TRITON_AVAILABLE else "✗"
         except ImportError:
-            flash_str = sage_str = triton_str = "?"
+            flash_str = sage_str = "?"
 
         # ComfyUI version
         comfy_str = None
@@ -250,7 +247,7 @@ class Debug:
 
         # Print
         self.log(f"OS: {os_str} | GPU: {gpu_str}", category="info")
-        self.log(f"Python: {py_ver} | PyTorch: {torch_ver} | FlashAttn: {flash_str} | SageAttn: {sage_str} | Triton: {triton_str}", category="info")
+        self.log(f"Python: {py_ver} | PyTorch: {torch_ver} | FlashAttn: {flash_str} | SageAttn: {sage_str}", category="info")
         cuda_line = f"CUDA: {cuda_ver} | cuDNN: {cudnn_ver}"
         self.log(f"{cuda_line} | ComfyUI: {comfy_str}" if comfy_str else cuda_line, category="info")
         self.log("", category="none")
@@ -429,7 +426,7 @@ class Debug:
 
         if overflow > 0 and platform.system() == 'Windows':
             self.log(f"VRAM overflow: {overflow:.2f}GB paged to system RAM - severe slowdown expected. "
-                     "Consider optimizing (e.g., reduce resolution, batch size, enable BlockSwap, VAE tiling...).",
+                     "Consider optimizing (e.g., reduce resolution, batch size, VAE tiling...).",
                      level="WARNING", category="memory", force=True)
 
         # Log detailed analysis if requested
@@ -712,7 +709,7 @@ class Debug:
     def log_swap_time(self, component_id: Union[int, str], duration: float,
                  component_type: str = "block", force: bool = False) -> None:
         """
-        Log swap timing information for BlockSwap operations
+        Log swap timing information
 
         Args:
             component_id: Identifier for the component being swapped
@@ -734,7 +731,7 @@ class Debug:
             else:
                 message = f"{component_type} {component_id} swap: {duration*1000:.2f}ms"
 
-            self.log(message, category="blockswap", force=force)
+            self.log(message, category="swap", force=force)
 
     def get_swap_summary(self) -> Dict[str, Any]:
         """Get summary of swap operations for analysis"""

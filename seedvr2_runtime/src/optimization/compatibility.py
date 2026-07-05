@@ -545,54 +545,7 @@ def call_sage_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, m
     return out.to(out_dtype) if out.dtype != out_dtype else out
 
 
-# 2. Triton - Required for torch.compile with inductor backend
-try:
-    import triton
-    TRITON_AVAILABLE = True
-except ImportError:
-    TRITON_AVAILABLE = False
-
-
-# 3. GGUF - Required for quantized model loading
-try:
-    import gguf
-    from gguf import GGMLQuantizationType
-    GGUF_AVAILABLE = True
-except ImportError:
-    GGUF_AVAILABLE = False
-    gguf = None
-    GGMLQuantizationType = None
-
-
-def validate_gguf_availability(operation: str = "load GGUF model", debug=None) -> None:
-    """
-    Validate GGUF availability and raise error if not installed.
-
-    Args:
-        operation: Description of the operation requiring GGUF
-        debug: Optional debug instance for logging
-
-    Raises:
-        RuntimeError: If GGUF is not available
-    """
-    if not GGUF_AVAILABLE:
-        error_msg = (
-            f"Cannot {operation}: GGUF library is not installed.\n"
-            f"\n"
-            f"GGUF provides quantized model support for memory-efficient loading.\n"
-            f"\n"
-            f"To fix this issue:\n"
-            f"  1. Install GGUF: pip install gguf\n"
-            f"  2. OR use a non-quantized model format (.safetensors)\n"
-            f"\n"
-            f"For more info: https://github.com/ggerganov/ggml"
-        )
-        if debug:
-            debug.log(error_msg, level="ERROR", category="setup", force=True)
-        raise RuntimeError(f"GGUF library required to {operation}")
-
-
-# 4. NVIDIA Conv3d Memory Bug - Workaround for PyTorch >= 2.9 + cuDNN >= 91002
+# 2. NVIDIA Conv3d Memory Bug - Workaround for PyTorch >= 2.9 + cuDNN >= 91002
 def _check_conv3d_memory_bug():
     """
     Check if Conv3d memory bug workaround needed.
@@ -647,20 +600,18 @@ if not os.environ.get("SEEDVR2_OPTIMIZATIONS_LOGGED"):
     # Build status strings
     sage_status = "✅" if SAGE_ATTN_AVAILABLE else "❌"
     flash_status = "✅" if FLASH_ATTN_AVAILABLE else "❌"
-    triton_status = "✅" if TRITON_AVAILABLE else "❌"
 
     # Count available optimizations
-    available = [SAGE_ATTN_AVAILABLE, FLASH_ATTN_AVAILABLE, TRITON_AVAILABLE]
+    available = [SAGE_ATTN_AVAILABLE, FLASH_ATTN_AVAILABLE]
     num_available = sum(available)
 
-    if num_available == 3:
-        print(f"⚡ SeedVR2 optimizations check: SageAttention {sage_status} | Flash Attention {flash_status} | Triton {triton_status}")
+    if num_available == 2:
+        print(f"⚡ SeedVR2 optimizations check: SageAttention {sage_status} | Flash Attention {flash_status}")
     elif num_available == 0:
-        print(f"⚠️  SeedVR2 optimizations check: SageAttention {sage_status} | Flash Attention {flash_status} | Triton {triton_status}")
-        print("💡 For best performance: pip install sageattention flash-attn triton")
+        print(f"⚠️  SeedVR2 optimizations check: SageAttention {sage_status} | Flash Attention {flash_status}")
+        print("💡 For best performance: pip install sageattention flash-attn")
     else:
-        icon = "⚡" if num_available >= 2 else "⚠️ "
-        print(f"{icon} SeedVR2 optimizations check: SageAttention {sage_status} | Flash Attention {flash_status} | Triton {triton_status}")
+        print(f"⚠️  SeedVR2 optimizations check: SageAttention {sage_status} | Flash Attention {flash_status}")
 
         # Build install suggestions for missing packages
         missing = []
@@ -668,8 +619,6 @@ if not os.environ.get("SEEDVR2_OPTIMIZATIONS_LOGGED"):
             missing.append("sageattention")
         if not FLASH_ATTN_AVAILABLE:
             missing.append("flash-attn")
-        if not TRITON_AVAILABLE:
-            missing.append("triton")
         if missing:
             print(f"💡 Optional: pip install {' '.join(missing)}")
 
@@ -724,7 +673,6 @@ class CompatibleDiT(torch.nn.Module):
     Precision Handling:
     - FP8: Keeps native FP8 parameters (memory efficient), converts inputs/outputs to compute_dtype for arithmetic
     - FP16/BFloat16/Float32: Uses native precision throughout
-    - GGUF: On-the-fly dequantization to compute_dtype
     - MPS: Forces all parameters to compute_dtype (unified memory requires dtype consistency)
     - RoPE: Converted from FP8 to compute_dtype for numerical consistency
 
@@ -753,7 +701,7 @@ class CompatibleDiT(torch.nn.Module):
             self.debug.end_timer("_convert_rope_freqs", "RoPE freqs conversion")
 
         # MPS requires unified dtype for all parameters/buffers (no autocast fallback)
-        # Apply to ALL model types (FP8, FP16, GGUF) when dtype differs from compute_dtype
+        # Apply to all standard model types when dtype differs from compute_dtype
         if not skip_conversion and hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
             if self.model_dtype != self.compute_dtype:
                 self.debug.log(f"Converting NaDiT parameters/buffers to {self.compute_dtype} for MPS backend", category="setup", force=True)
@@ -827,10 +775,9 @@ class CompatibleDiT(torch.nn.Module):
                     param.data = param.data.to(target_dtype)
                 converted_count += 1
 
-        # Also convert buffers (skip GGUF quantized buffers - they have tensor_type attribute)
+        # Also convert buffers (skip custom quantized buffers)
         for name, buffer in self.dit_model.named_buffers():
-            # Skip GGUF quantized buffers - these must stay in packed format for on-the-fly dequantization
-            if hasattr(buffer, 'tensor_type'):
+            if hasattr(buffer, "tensor_type") or hasattr(buffer, "_layout_cls"):
                 continue
             if buffer.dtype != target_dtype:
                 if buffer.device.type == "mps":

@@ -7,7 +7,6 @@ Only includes constants actually used in the codebase
 __version__ = "2.5.24"
 
 import os
-import warnings
 import inspect
 from typing import Optional
 
@@ -16,19 +15,7 @@ SEEDVR2_FOLDER_NAME = "SEEDVR2" # Physical folder name on disk
 SEEDVR2_MODEL_TYPE = "seedvr2" # Model type identifier for ComfyUI
 
 # Supported model file formats
-SUPPORTED_MODEL_EXTENSIONS = {'.safetensors', '.gguf'}
-
-# GGUF Quantization Constants
-QK_K = 256
-K_SCALE_SIZE = 12
-GGUF_BLOCK_SIZE = 32
-GGUF_TYPE_SIZE = 64
-
-# Download configuration
-HUGGINGFACE_BASE_URL = "https://huggingface.co/{repo}/resolve/main/{filename}"
-DOWNLOAD_CHUNK_SIZE = 8192 * 1024  # 8MB chunks for hash calculation
-DOWNLOAD_MAX_RETRIES = 3
-DOWNLOAD_RETRY_DELAY = 2  # seconds
+SUPPORTED_MODEL_EXTENSIONS = {'.safetensors', '.sft'}
 
 def get_script_directory() -> str:
     """Get the root script directory path (3 levels up from this file)"""
@@ -153,9 +140,5 @@ def is_supported_model_file(filename: str) -> bool:
 
 
 def suppress_tensor_warnings() -> None:
-    """
-    Suppress common tensor conversion and numpy array warnings that are expected behavior
-    when working with GGUF tensors and numpy arrays.
-    """
-    warnings.filterwarnings("ignore", message="To copy construct from a tensor", category=UserWarning)
-    warnings.filterwarnings("ignore", message="The given NumPy array is not writable", category=UserWarning)
+    """Compatibility shim kept for older call sites."""
+    return None
