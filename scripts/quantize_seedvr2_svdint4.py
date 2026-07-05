@@ -34,6 +34,10 @@ from seedvr2_runtime.src.core.generation_utils import (
 from seedvr2_runtime.src.optimization.memory_manager import cleanup_text_embeddings, complete_cleanup
 from seedvr2_runtime.src.utils.debug import Debug
 from svdint4.packing import build_svdint4_metadata, pack_bias, pack_linear_weight, pack_svd_down, pack_svd_up
+try:
+    from quantize_cli import add_lora_args, parse_lora_specs, reject_lora_specs
+except ImportError:
+    from scripts.quantize_cli import add_lora_args, parse_lora_specs, reject_lora_specs
 
 
 LOG = logging.getLogger("seedvr2-svdint4-quant")
@@ -466,7 +470,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--residual-niter", type=int, default=1)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--sidecar", type=Path, default=None)
-    return parser.parse_args()
+    add_lora_args(parser)
+    args = parser.parse_args()
+    args.lora_specs = parse_lora_specs(args.lora)
+    return args
 
 
 def main() -> None:
@@ -474,6 +481,7 @@ def main() -> None:
     args = parse_args()
     if args.rank <= 0 or args.rank % 16 != 0:
         raise ValueError("--rank must be a positive multiple of 16")
+    reject_lora_specs(args.lora_specs, tool_name="quantize_seedvr2_svdint4.py")
     model_dir = args.model_dir or args.checkpoint.parent
     cases = _load_calibration_cases(
         args.calib_path,

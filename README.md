@@ -126,6 +126,19 @@ Only the `format` metadata is required in the weight file. Keep provenance,
 calibration notes, source paths, and experiment notes in a sidecar JSON if you
 need them.
 
+Quantization scripts use one list-style LoRA argument when adapter fusion is
+needed:
+
+```bash
+python scripts/quantize_*.py ... \
+  --lora path/to/adapter_a.safetensors \
+  --lora path/to/adapter_b.safetensors:0.8
+```
+
+Do not add model-specific boolean switches for individual LoRAs. A quantizer
+that does not implement real LoRA fusion must reject `--lora` explicitly rather
+than ignoring it.
+
 The node scans ComfyUI's `diffusion_models` paths and only shows supported
 SVDInt4 files. For custom model locations, set `SVDINT4_DIT_PATHS` before
 starting ComfyUI. Separate multiple paths with `:` on Linux/macOS or `;` on
