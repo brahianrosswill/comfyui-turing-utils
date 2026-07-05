@@ -10,6 +10,7 @@ from .seedvr2_common import (
     apply_rotary_emb,
     call_flash_attn_2_varlen,
     call_flash_attn_3_varlen,
+    call_sage_attn_1_varlen,
     call_sage_attn_2_varlen,
     call_sage_attn_3_varlen,
     gather_heads_scatter_seq,
@@ -1232,6 +1233,7 @@ class FlashAttentionVarlen(nn.Module):
     - sdpa: PyTorch SDPA (fully compilable, always available)
     - flash_attn_2: Flash Attention 2 (Ampere+)
     - flash_attn_3: Flash Attention 3 (Hopper+)
+    - sageattn: SageAttention 1
     - sageattn_2: SageAttention 2
     - sageattn_3: SageAttention 3 (Blackwell/RTX 50xx)
 
@@ -1243,7 +1245,7 @@ class FlashAttentionVarlen(nn.Module):
         Initialize with specified attention backend.
 
         Args:
-            attention_mode: 'sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn_2', or 'sageattn_3'
+            attention_mode: 'sdpa', 'flash_attn_2', 'flash_attn_3', 'sageattn', 'sageattn_2', or 'sageattn_3'
             compute_dtype: Compute dtype for attention (set by pipeline, defaults to None for auto-detection)
         """
         super().__init__()
@@ -1279,6 +1281,11 @@ class FlashAttentionVarlen(nn.Module):
             )
         elif self.attention_mode == 'sageattn_3':
             return call_sage_attn_3_varlen(
+                q, k, v, cu_seqlens_q, cu_seqlens_k,
+                max_seqlen_q, max_seqlen_k, **kwargs
+            )
+        elif self.attention_mode == 'sageattn':
+            return call_sage_attn_1_varlen(
                 q, k, v, cu_seqlens_q, cu_seqlens_k,
                 max_seqlen_q, max_seqlen_k, **kwargs
             )

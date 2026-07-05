@@ -399,6 +399,15 @@ try:
 except (ImportError, AttributeError, OSError):
     pass
 
+sageattn_func = None
+SAGE_ATTN_1_AVAILABLE = False
+try:
+    from sageattention import sageattn as _sageattn
+    sageattn_func = _sageattn
+    SAGE_ATTN_1_AVAILABLE = True
+except (ImportError, AttributeError, OSError):
+    pass
+
 sageattn_varlen = None
 SAGE_ATTN_2_AVAILABLE = False
 try:
@@ -423,19 +432,75 @@ except (ImportError, AttributeError, OSError):
         pass
 
 FLASH_ATTN_AVAILABLE = FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE
-SAGE_ATTN_AVAILABLE = SAGE_ATTN_2_AVAILABLE or SAGE_ATTN_3_AVAILABLE
+SAGE_ATTN_AVAILABLE = SAGE_ATTN_1_AVAILABLE or SAGE_ATTN_2_AVAILABLE or SAGE_ATTN_3_AVAILABLE
 
 
 def validate_attention_mode(requested_mode: str, debug=None) -> str:
-    del debug
+    aliases = {
+        "sage_attention": "sage_attn",
+        "sage1": "sageattn",
+        "sage2": "sageattn_2",
+        "sage3": "sageattn_3",
+        "sageattn1": "sageattn",
+        "sageattn2": "sageattn_2",
+        "sageattn3": "sageattn_3",
+        "sageattn_varlen": "sageattn_2",
+        "flash_attention": "flash_attn",
+    }
+    requested_mode = aliases.get(requested_mode, requested_mode)
+
+    def fallback(mode: str, resolved: str) -> str:
+        if resolved != mode and debug is not None:
+            log = getattr(debug, "log", None)
+            if callable(log):
+                log(f"Attention backend {mode!r} resolved to {resolved!r}.", level="WARNING")
+        return resolved
+
+    def best_flash() -> str:
+        if FLASH_ATTN_3_AVAILABLE:
+            return "flash_attn_3"
+        if FLASH_ATTN_2_AVAILABLE:
+            return "flash_attn_2"
+        return "sdpa"
+
+    def best_sage() -> str:
+        if SAGE_ATTN_3_AVAILABLE:
+            return "sageattn_3"
+        if SAGE_ATTN_2_AVAILABLE:
+            return "sageattn_2"
+        if SAGE_ATTN_1_AVAILABLE:
+            return "sageattn"
+        return "sdpa"
+
+    def best_auto() -> str:
+        if FLASH_ATTN_3_AVAILABLE:
+            return "flash_attn_3"
+        if SAGE_ATTN_3_AVAILABLE:
+            return "sageattn_3"
+        if FLASH_ATTN_2_AVAILABLE:
+            return "flash_attn_2"
+        if SAGE_ATTN_2_AVAILABLE:
+            return "sageattn_2"
+        if SAGE_ATTN_1_AVAILABLE:
+            return "sageattn"
+        return "sdpa"
+
+    if requested_mode == "auto":
+        return fallback(requested_mode, best_auto())
+    if requested_mode == "flash_attn":
+        return fallback(requested_mode, best_flash())
+    if requested_mode == "sage_attn":
+        return fallback(requested_mode, best_sage())
     if requested_mode == "flash_attn_3":
-        return "flash_attn_3" if FLASH_ATTN_3_AVAILABLE else ("flash_attn_2" if FLASH_ATTN_2_AVAILABLE else "sdpa")
+        return fallback(requested_mode, "flash_attn_3" if FLASH_ATTN_3_AVAILABLE else ("flash_attn_2" if FLASH_ATTN_2_AVAILABLE else "sdpa"))
     if requested_mode == "flash_attn_2":
-        return "flash_attn_2" if FLASH_ATTN_2_AVAILABLE else "sdpa"
+        return fallback(requested_mode, "flash_attn_2" if FLASH_ATTN_2_AVAILABLE else "sdpa")
     if requested_mode == "sageattn_3":
-        return "sageattn_3" if SAGE_ATTN_3_AVAILABLE else ("sageattn_2" if SAGE_ATTN_2_AVAILABLE else "sdpa")
+        return fallback(requested_mode, "sageattn_3" if SAGE_ATTN_3_AVAILABLE else ("sageattn_2" if SAGE_ATTN_2_AVAILABLE else ("sageattn" if SAGE_ATTN_1_AVAILABLE else "sdpa")))
     if requested_mode == "sageattn_2":
-        return "sageattn_2" if SAGE_ATTN_2_AVAILABLE else "sdpa"
+        return fallback(requested_mode, "sageattn_2" if SAGE_ATTN_2_AVAILABLE else ("sageattn" if SAGE_ATTN_1_AVAILABLE else "sdpa"))
+    if requested_mode == "sageattn":
+        return fallback(requested_mode, "sageattn" if SAGE_ATTN_1_AVAILABLE else ("sageattn_2" if SAGE_ATTN_2_AVAILABLE else "sdpa"))
     return requested_mode
 
 
@@ -456,6 +521,31 @@ def call_flash_attn_3_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, 
         raise ImportError("Flash Attention 3 is not available")
     fa3_kwargs = {key: val for key, val in kwargs.items() if key not in ("dropout_p", "window_size")}
     return flash_attn_3_varlen_func(q=q, k=k, v=v, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k, max_seqlen_q=_as_int(max_seqlen_q), max_seqlen_k=_as_int(max_seqlen_k), seqused_q=None, seqused_k=None, **fa3_kwargs)[0]
+
+
+@torch._dynamo.disable
+def call_sage_attn_1_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, **kwargs):
+    del max_seqlen_q, max_seqlen_k
+    if not SAGE_ATTN_1_AVAILABLE:
+        raise ImportError("SageAttention 1 is not available")
+    out_dtype = q.dtype
+    if not (q.dtype == k.dtype == v.dtype):
+        k = k.to(q.dtype)
+        v = v.to(q.dtype)
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
+    is_causal = kwargs.get("causal", False)
+    q_splits = list(torch.tensor_split(q, cu_seqlens_q[1:-1].long().cpu(), dim=0))
+    k_splits = list(torch.tensor_split(k, cu_seqlens_k[1:-1].long().cpu(), dim=0))
+    v_splits = list(torch.tensor_split(v, cu_seqlens_k[1:-1].long().cpu(), dim=0))
+    out_splits = [
+        sageattn_func(q_i, k_i, v_i, is_causal=is_causal, tensor_layout="NHD")
+        for q_i, k_i, v_i in zip(q_splits, k_splits, v_splits)
+    ]
+    out = torch.cat(out_splits, dim=0)
+    return out.to(out_dtype) if out.dtype != out_dtype else out
 
 
 @torch._dynamo.disable

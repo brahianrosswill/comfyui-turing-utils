@@ -4,14 +4,15 @@ import logging
 import math
 import os
 from pathlib import Path
+from collections import Counter
 from typing import Any
 
 import torch
 import torch.nn.functional as F
 from safetensors import safe_open
-from safetensors.torch import load_file as load_safetensors_file
 
 import comfy.model_management as model_management
+import comfy.ops
 import comfy.model_patcher
 import comfy.patcher_extension
 import comfy.sample
@@ -25,6 +26,11 @@ LOG = logging.getLogger("comfyui-svdint4")
 
 SEEDVR2_SCALING_FACTOR = 0.9152
 SEEDVR2_T = 1000.0
+_FLOAT8_DTYPES = tuple(
+    getattr(torch, name)
+    for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz")
+    if hasattr(torch, name)
+)
 
 
 class _LogShim:
@@ -148,21 +154,55 @@ def _model_size_bytes(model: torch.nn.Module) -> int:
     return total
 
 
-def _first_tensor_device(model: torch.nn.Module) -> torch.device | None:
-    for tensor in list(model.parameters()) + list(model.buffers()):
-        if tensor is not None:
-            return tensor.device
-    return None
+def _format_tensor_counter(counter: Counter[str]) -> str:
+    return ", ".join(f"{key}={value / (1024 * 1024):.2f} MB" for key, value in counter.most_common())
 
 
 def _assert_module_device(module: torch.nn.Module, expected: torch.device, label: str) -> None:
-    actual = _first_tensor_device(module)
-    if actual is None or actual == expected:
+    mismatches: list[str] = []
+    device_bytes: Counter[str] = Counter()
+    dtype_bytes: Counter[str] = Counter()
+
+    for prefix, iterator in (("param", module.named_parameters()), ("buffer", module.named_buffers())):
+        for name, tensor in iterator:
+            if tensor is None:
+                continue
+            size = tensor.nelement() * tensor.element_size()
+            device_bytes[str(tensor.device)] += size
+            dtype_bytes[str(tensor.dtype)] += size
+            if tensor.device != expected and len(mismatches) < 8:
+                mismatches.append(f"{prefix}:{name}={tensor.device}/{tensor.dtype}")
+
+    if not device_bytes:
+        return
+    LOG.info(
+        "SeedVR2 %s tensor placement: devices=[%s], dtypes=[%s]",
+        label,
+        _format_tensor_counter(device_bytes),
+        _format_tensor_counter(dtype_bytes),
+    )
+    if not mismatches:
         return
     raise RuntimeError(
         f"SeedVR2 {label} is not on the expected ComfyUI device. "
-        f"Expected {expected}, got {actual}. "
+        f"Expected all tensors on {expected}. First mismatches: {mismatches}. "
         "Free VRAM or use a smaller checkpoint; refusing to fall back to CPU inference."
+    )
+
+
+def _ensure_finite(tensor: torch.Tensor, label: str) -> None:
+    if torch.isfinite(tensor).all():
+        return
+    finite = torch.isfinite(tensor)
+    bad = int((~finite).sum().item())
+    valid = tensor[finite]
+    if valid.numel() > 0:
+        summary = f"valid_min={valid.min().item():.5g}, valid_max={valid.max().item():.5g}"
+    else:
+        summary = "no finite values"
+    raise RuntimeError(
+        f"SeedVR2 {label} produced {bad} non-finite value(s) in shape={tuple(tensor.shape)}, "
+        f"dtype={tensor.dtype}, device={tensor.device}; {summary}."
     )
 
 
@@ -389,6 +429,41 @@ def _replace_svdint4_linears(
     return model
 
 
+def _is_float8_dtype(dtype: torch.dtype) -> bool:
+    return dtype in _FLOAT8_DTYPES
+
+
+def _replace_fp8_linears_with_comfy_ops(model: torch.nn.Module) -> int:
+    replacements = 0
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, torch.nn.Linear):
+            continue
+        if isinstance(module, comfy.ops.fp8_ops.Linear):
+            continue
+        if module.weight is None or not _is_float8_dtype(module.weight.dtype):
+            continue
+
+        parent, attr = _parent_module(model, name)
+        replacement = comfy.ops.fp8_ops.Linear(
+            module.in_features,
+            module.out_features,
+            bias=module.bias is not None,
+            device="meta",
+            dtype=module.weight.dtype,
+        )
+        replacement.weight = module.weight
+        replacement.bias = module.bias
+        replacement.weight_function = list(getattr(module, "weight_function", ()))
+        replacement.bias_function = list(getattr(module, "bias_function", ()))
+        replacement.weight_comfy_model_dtype = module.weight.dtype
+        if module.bias is not None:
+            replacement.bias_comfy_model_dtype = module.bias.dtype
+        replacement.train(module.training)
+        setattr(parent, attr, replacement)
+        replacements += 1
+    return replacements
+
+
 def _parent_module(model: torch.nn.Module, name: str) -> tuple[torch.nn.Module, str]:
     parts = name.split(".")
     parent = model
@@ -398,11 +473,12 @@ def _parent_module(model: torch.nn.Module, name: str) -> tuple[torch.nn.Module, 
 
 
 def _load_weights(model: torch.nn.Module, path: str, *, dtype: torch.dtype | None = None) -> torch.nn.Module:
-    if is_svdint4_file(path):
+    svdint4 = is_svdint4_file(path)
+    if svdint4:
         state, _metadata, packed, w4 = build_loader_state_dict(path)
         model = _replace_svdint4_linears(model, packed, w4)
     else:
-        state = load_safetensors_file(path, device="cpu")
+        state = comfy.utils.load_torch_file(path, safe_load=True, device=torch.device("cpu"))
     if dtype is not None:
         for key, value in list(state.items()):
             if torch.is_tensor(value) and value.is_floating_point():
@@ -412,6 +488,13 @@ def _load_weights(model: torch.nn.Module, path: str, *, dtype: torch.dtype | Non
         LOG.warning("SeedVR2 missing %d key(s) while loading %s", len(missing), os.path.basename(path))
     if unexpected:
         LOG.warning("SeedVR2 unexpected %d key(s) while loading %s", len(unexpected), os.path.basename(path))
+    if not svdint4:
+        fp8_linears = _replace_fp8_linears_with_comfy_ops(model)
+        if fp8_linears:
+            LOG.info(
+                "SeedVR2 routed %d FP8 Linear layer(s) through ComfyUI fp8_ops; FP8 weight storage is preserved.",
+                fp8_linears,
+            )
     return model
 
 
@@ -452,6 +535,7 @@ class SeedVR2VAE:
             tile_overlap=(tile_overlap, tile_overlap),
         ).latent
         latent = _vae_latent_to_seedvr2(encoded).to(dtype=self.dtype)
+        _ensure_finite(latent, "VAE encode")
         return (latent - 0.0) * SEEDVR2_SCALING_FACTOR
 
     @torch.no_grad()
@@ -468,7 +552,9 @@ class SeedVR2VAE:
         ).sample
         if decoded.ndim == 4:
             decoded = decoded.unsqueeze(2)
-        return decoded.squeeze(0).permute(1, 0, 2, 3).contiguous()
+        decoded = decoded.squeeze(0).permute(1, 0, 2, 3).contiguous()
+        _ensure_finite(decoded, "VAE decode")
+        return decoded
 
 
 class _PatchableVAE(torch.nn.Module):
@@ -550,7 +636,9 @@ class SeedVR2ComfyModel(torch.nn.Module):
         x_model = x.to(dtype=self.dtype)
         pred = self._predict_v(_comfy_latent_to_seedvr2(x_model), t)
         pred = _seedvr2_latent_to_comfy(pred).to(device=x.device, dtype=x.dtype)
-        return x - pred * sigma
+        denoised = x - pred * sigma
+        _ensure_finite(denoised, "DiT denoised")
+        return denoised
 
     def _predict_v(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         if model_management.is_device_cpu(x_t.device):
@@ -582,7 +670,9 @@ class SeedVR2ComfyModel(torch.nn.Module):
                 txt_shape=txt_shape,
                 timestep=timestep,
             ).vid_sample
-        return self.na.unflatten(out, vid_shape)[0]
+        out = self.na.unflatten(out, vid_shape)[0]
+        _ensure_finite(out, "DiT forward")
+        return out
 
 
 class _SeedVR2LatentFormat:
@@ -652,7 +742,16 @@ class SeedVR2DiT:
         dit = _load_weights(dit, path, dtype=None)
         from .seedvr2_common import CompatibleDiT, validate_attention_mode
 
+        requested_attention_mode = attention_mode
         attention_mode = validate_attention_mode(attention_mode, _LogShim(debug))
+        if attention_mode != requested_attention_mode:
+            LOG.info(
+                "SeedVR2 attention backend %s resolved to %s.",
+                requested_attention_mode,
+                attention_mode,
+            )
+        else:
+            LOG.info("SeedVR2 attention backend: %s", attention_mode)
         for module in dit.modules():
             if type(module).__name__ == "FlashAttentionVarlen":
                 module.attention_mode = attention_mode
@@ -732,7 +831,9 @@ class SeedVR2DiT:
             )
         finally:
             self.model.current_condition = None
-        return _comfy_latent_to_seedvr2(out.to(self.model.dtype))
+        out = _comfy_latent_to_seedvr2(out.to(self.model.dtype))
+        _ensure_finite(out, "DiT sample")
+        return out
 
     def close(self) -> None:
         self.model.current_condition = None
@@ -750,6 +851,7 @@ class SeedVR2Pipeline:
         model_dir: str,
         dit_model: str,
         vae_model: str,
+        attention_backend: str = "sdpa",
         debug: bool = False,
     ):
         self.model_dir = Path(model_dir)
@@ -776,7 +878,7 @@ class SeedVR2Pipeline:
             self.dit_device,
             self.offload_device,
             self.dtype,
-            "sdpa",
+            attention_backend,
             debug,
             script_dir,
         )
@@ -826,7 +928,9 @@ class SeedVR2Pipeline:
         pbar.update_absolute(pbar.total)
         out = _merge_batches(output_batches, original_lengths)
         out = out[: image.shape[0], :, : true_dims[0], : true_dims[1]]
-        return out.permute(0, 2, 3, 1).add(1.0).mul(0.5).clamp(0.0, 1.0).to(torch.float32).cpu()
+        out = out.permute(0, 2, 3, 1).add(1.0).mul(0.5).clamp(0.0, 1.0)
+        _ensure_finite(out, "final image")
+        return out.to(torch.float32).cpu()
 
 
 def _split_batches(video: torch.Tensor, batch_size: int) -> list[torch.Tensor]:

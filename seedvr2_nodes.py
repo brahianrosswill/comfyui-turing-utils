@@ -20,6 +20,7 @@ SEEDVR2_FOLDER_NAME = "SEEDVR2"
 SEEDVR2_MODEL_TYPE = "seedvr2"
 MODEL_EXTENSIONS = {".safetensors", ".sft"}
 KNOWN_VAE_MODEL_NAMES = {"ema_vae_fp16.safetensors"}
+ATTENTION_BACKENDS = ["auto", "sdpa", "sage_attn", "flash_attn"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -263,6 +264,7 @@ class SeedVR2Upscaler:
                 "max_resolution": ("INT", {"default": 0, "min": 0, "max": 16384, "step": 2}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 2**32 - 1, "step": 1}),
                 "memory_mode": (["balanced", "fastest", "low_vram"], {"default": "balanced"}),
+                "attention_backend": (ATTENTION_BACKENDS, {"default": "auto"}),
             },
         }
 
@@ -281,6 +283,7 @@ class SeedVR2Upscaler:
         max_resolution: int,
         seed: int,
         memory_mode: str,
+        attention_backend: str,
     ):
         if image.ndim != 4 or int(image.shape[-1]) not in (3, 4):
             raise ValueError(f"SeedVR2 Upscale expects IMAGE shaped [frames,h,w,3/4], got {tuple(image.shape)}")
@@ -305,6 +308,7 @@ class SeedVR2Upscaler:
                         resolution=resolution,
                         max_resolution=max_resolution,
                         seed=seed,
+                        attention_backend=attention_backend,
                         plan=candidate,
                     ),
                 )
@@ -326,6 +330,7 @@ class SeedVR2Upscaler:
         resolution: int,
         max_resolution: int,
         seed: int,
+        attention_backend: str,
         plan: SeedVR2Plan,
     ) -> torch.Tensor:
         self._validate_model_files_exist(dit_model, vae_model)
@@ -333,6 +338,7 @@ class SeedVR2Upscaler:
             model_dir=_seedvr2_model_dir(),
             dit_model=dit_model,
             vae_model=vae_model,
+            attention_backend=attention_backend,
         )
         try:
             return pipeline.upscale(
