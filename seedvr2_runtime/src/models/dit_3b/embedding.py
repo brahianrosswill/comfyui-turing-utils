@@ -14,8 +14,8 @@
 
 from typing import Optional, Union
 import torch
-from diffusers.models.embeddings import get_timestep_embedding
 from torch import nn
+from ..video_vae_v3.modules.native_layers import get_timestep_embedding
 
 
 def emb_add(emb1: torch.Tensor, emb2: Optional[torch.Tensor]):

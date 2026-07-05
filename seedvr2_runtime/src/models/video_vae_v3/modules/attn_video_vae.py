@@ -12,20 +12,9 @@
 
 from contextlib import nullcontext
 from typing import Literal, Optional, Tuple, Union
-import diffusers
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.models.attention_processor import Attention, SpatialNorm
-from diffusers.models.autoencoders.vae import DecoderOutput, DiagonalGaussianDistribution
-from diffusers.models.downsampling import Downsample2D
-from diffusers.models.lora import LoRACompatibleConv
-from diffusers.models.modeling_outputs import AutoencoderKLOutput
-from diffusers.models.resnet import ResnetBlock2D
-from diffusers.models.unets.unet_2d_blocks import DownEncoderBlock2D, UpDecoderBlock2D
-from diffusers.models.upsampling import Upsample2D
-from diffusers.utils import is_torch_version
-from diffusers.utils.accelerate_utils import apply_forward_hook
 from einops import rearrange
 from ....common.half_precision_fixes import safe_pad_operation, safe_interpolate_operation
 
@@ -42,6 +31,22 @@ from .context_parallel_lib import (
     causal_conv_slice_inputs,
 )
 from .global_config import set_norm_limit
+from .native_layers import (
+    Attention,
+    AutoencoderKLOutput,
+    DecoderOutput,
+    DiagonalGaussianDistribution,
+    DownEncoderBlock2D,
+    Downsample2D,
+    LoRACompatibleConv,
+    ResnetBlock2D,
+    SeedVR2AutoencoderKLBase,
+    SpatialNorm,
+    UpDecoderBlock2D,
+    Upsample2D,
+    apply_forward_hook,
+    is_torch_version,
+)
 from .types import (
     CausalAutoencoderOutput,
     CausalDecoderOutput,
@@ -322,8 +327,7 @@ class ResnetBlock3D(ResnetBlock2D):
         )
 
         if self.upsample is not None:
-            # upsample_nearest_nhwc fails with large batch sizes.
-            # see https://github.com/huggingface/diffusers/issues/984
+            # Some nearest-neighbor kernels fail with large batch sizes.
             if hidden_states.shape[0] >= 64:
                 input_tensor = input_tensor.contiguous()
                 hidden_states = hidden_states.contiguous()
@@ -682,8 +686,7 @@ class Encoder3D(nn.Module):
             The number of output channels.
         down_block_types (`Tuple[str, ...]`, *optional*, defaults to `("DownEncoderBlock2D",)`):
             The types of down blocks to use.
-            See `~diffusers.models.unet_2d_blocks.get_down_block`
-            for available options.
+            Supported names are resolved by this runtime.
         block_out_channels (`Tuple[int, ...]`, *optional*, defaults to `(64,)`):
             The number of output channels for each block.
         layers_per_block (`int`, *optional*, defaults to 2):
@@ -692,7 +695,7 @@ class Encoder3D(nn.Module):
             The number of groups for normalization.
         act_fn (`str`, *optional*, defaults to `"silu"`):
             The activation function to use.
-            See `~diffusers.models.activations.get_activation` for available options.
+            Supported names are resolved by this runtime.
         double_z (`bool`, *optional*, defaults to `True`):
             Whether to double the number of output channels for the last block.
     """
@@ -868,7 +871,7 @@ class Decoder3D(nn.Module):
             The number of output channels.
         up_block_types (`Tuple[str, ...]`, *optional*, defaults to `("UpDecoderBlock2D",)`):
             The types of up blocks to use.
-            See `~diffusers.models.unet_2d_blocks.get_up_block` for available options.
+            Supported names are resolved by this runtime.
         block_out_channels (`Tuple[int, ...]`, *optional*, defaults to `(64,)`):
             The number of output channels for each block.
         layers_per_block (`int`, *optional*, defaults to 2):
@@ -877,7 +880,7 @@ class Decoder3D(nn.Module):
             The number of groups for normalization.
         act_fn (`str`, *optional*, defaults to `"silu"`):
             The activation function to use.
-            See `~diffusers.models.activations.get_activation` for available options.
+            Supported names are resolved by this runtime.
         norm_type (`str`, *optional*, defaults to `"group"`):
             The normalization type to use. Can be either `"group"` or `"spatial"`.
     """
@@ -1035,23 +1038,21 @@ class Decoder3D(nn.Module):
         return sample
 
 
-class AutoencoderKL(diffusers.AutoencoderKL):
+class AutoencoderKL(SeedVR2AutoencoderKLBase):
     """
-    We simply inherit the model code from diffusers
+    Lightweight local AutoencoderKL compatibility shell.
     """
 
     def __init__(self, attention: bool = True, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         # A hacky way to remove attention.
-        if not attention:
+        if not attention and hasattr(self, "encoder") and hasattr(self, "decoder"):
             self.encoder.mid_block.attentions = torch.nn.ModuleList([None])
             self.decoder.mid_block.attentions = torch.nn.ModuleList([None])
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
-        # Newer version of diffusers changed the model keys,
-        # causing incompatibility with old checkpoints.
-        # They provided a method for conversion. We call conversion before loading state_dict.
+        # Keep compatibility with older attention block checkpoint key layouts.
         convert_deprecated_attention_blocks = getattr(
             self, "_convert_deprecated_attention_blocks", None
         )
@@ -1060,9 +1061,9 @@ class AutoencoderKL(diffusers.AutoencoderKL):
         return super().load_state_dict(state_dict, strict, assign)
 
 
-class VideoAutoencoderKL(diffusers.AutoencoderKL):
+class VideoAutoencoderKL(SeedVR2AutoencoderKLBase):
     """
-    We simply inherit the model code from diffusers
+    SeedVR2 3D VAE with a local AutoencoderKL compatibility shell.
     """
 
     def __init__(
@@ -1645,10 +1646,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
             return h.sample
 
     def load_state_dict(self, state_dict, strict=False, assign=False):
-        # Newer version of diffusers changed the model keys,
-        # causing incompatibility with old checkpoints.
-        # They provided a method for conversion.
-        # We call conversion before loading state_dict.
+        # Keep compatibility with older attention block checkpoint key layouts.
         convert_deprecated_attention_blocks = getattr(
             self, "_convert_deprecated_attention_blocks", None
         )

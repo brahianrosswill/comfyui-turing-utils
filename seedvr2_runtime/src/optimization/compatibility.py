@@ -5,10 +5,11 @@ Contains FP8/FP16 compatibility layers and wrappers for different model architec
 Extracted from: seedvr2.py (lines 1045-1630)
 """
 
-# Compatibility shims - Must run before any torch/diffusers import
+# Compatibility shims - Must run before torch and optional attention imports
 import sys
 import types
 import importlib.machinery
+import logging
 
 
 def ensure_triton_compat():
@@ -36,7 +37,7 @@ def ensure_triton_compat():
 def ensure_flash_attn_safe():
     """
     Pre-test flash_attn package; stub if DLL is broken.
-    Prevents diffusers from crashing when flash_attn has broken DLLs.
+    Prevents optional attention integrations from crashing when flash_attn has broken DLLs.
     """
     if 'flash_attn' in sys.modules:
         return  # Already loaded
@@ -50,7 +51,7 @@ def ensure_flash_attn_safe():
         stub.__file__ = None
         stub.__path__ = []
         stub.__loader__ = None
-        # Provide attributes that diffusers/transformers import
+        # Provide attributes that transformers and attention wrappers import
         stub.flash_attn_func = None
         stub.flash_attn_varlen_func = None
         sys.modules['flash_attn'] = stub
@@ -89,8 +90,8 @@ def ensure_bitsandbytes_safe():
     PyTorch kernels during import then fails. If another node already triggered
     this partial load, re-importing causes kernel registration conflicts.
 
-    This shim catches such failures and stubs the module so diffusers can load
-    gracefully without bitsandbytes quantization support.
+    This shim catches such failures and stubs the module so optional integrations
+    can load gracefully without bitsandbytes quantization support.
     """
     if 'bitsandbytes' in sys.modules:
         return  # Already loaded or stubbed
@@ -108,7 +109,7 @@ def ensure_bitsandbytes_safe():
         sys.modules['bitsandbytes'] = stub
 
 
-# Run all shims immediately on import, before torch/diffusers
+# Run all shims immediately on import, before torch and optional attention modules
 ensure_triton_compat()
 ensure_flash_attn_safe()
 ensure_xformers_flash_compat()
@@ -606,12 +607,12 @@ if not os.environ.get("SEEDVR2_OPTIMIZATIONS_LOGGED"):
     num_available = sum(available)
 
     if num_available == 2:
-        print(f"⚡ SeedVR2 optimizations check: SageAttention {sage_status} | Flash Attention {flash_status}")
+        logging.debug("SeedVR2 optimizations check: SageAttention %s | Flash Attention %s", sage_status, flash_status)
     elif num_available == 0:
-        print(f"⚠️  SeedVR2 optimizations check: SageAttention {sage_status} | Flash Attention {flash_status}")
-        print("💡 For best performance: pip install sageattention flash-attn")
+        logging.info("SeedVR2 optimizations check: SageAttention %s | Flash Attention %s", sage_status, flash_status)
+        logging.info("For best SeedVR2 performance, install optional packages: sageattention flash-attn")
     else:
-        print(f"⚠️  SeedVR2 optimizations check: SageAttention {sage_status} | Flash Attention {flash_status}")
+        logging.debug("SeedVR2 optimizations check: SageAttention %s | Flash Attention %s", sage_status, flash_status)
 
         # Build install suggestions for missing packages
         missing = []
@@ -620,13 +621,13 @@ if not os.environ.get("SEEDVR2_OPTIMIZATIONS_LOGGED"):
         if not FLASH_ATTN_AVAILABLE:
             missing.append("flash-attn")
         if missing:
-            print(f"💡 Optional: pip install {' '.join(missing)}")
+            logging.debug("Optional SeedVR2 acceleration packages missing: %s", " ".join(missing))
 
     # Conv3d workaround status (if applicable)
     if NVIDIA_CONV3D_MEMORY_BUG_WORKAROUND:
         torch_ver = torch.__version__.split('+')[0]
         cudnn_ver = torch.backends.cudnn.version()
-        print(f"🔧 Conv3d workaround active: PyTorch {torch_ver}, cuDNN {cudnn_ver} (fixing VAE 3x memory bug)")
+        logging.info("SeedVR2 Conv3d workaround active: PyTorch %s, cuDNN %s", torch_ver, cudnn_ver)
 
 
 # Bfloat16 CUBLAS support

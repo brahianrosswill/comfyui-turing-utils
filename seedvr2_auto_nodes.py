@@ -12,6 +12,8 @@ import torch
 import comfy.model_management as model_management
 import folder_paths
 
+from .seedvr2_native import SeedVR2NativePipeline
+
 
 LOG = logging.getLogger("comfyui-svdint4")
 
@@ -63,6 +65,17 @@ def _register_seedvr2_folder() -> None:
         os.makedirs(model_dir, exist_ok=True)
     except OSError:
         LOG.warning("Could not create SeedVR2 model directory: %s", model_dir)
+
+
+def _seedvr2_model_dir() -> str:
+    _register_seedvr2_folder()
+    try:
+        paths = folder_paths.get_folder_paths(SEEDVR2_MODEL_TYPE)
+        if paths:
+            return paths[0]
+    except Exception:
+        pass
+    return os.path.join(folder_paths.models_dir, SEEDVR2_FOLDER_NAME)
 
 
 def _seedvr2_model_files() -> list[str]:
@@ -315,53 +328,6 @@ def _clear_after_oom() -> None:
         model_management.soft_empty_cache()
 
 
-def _import_seedvr2_runtime():
-    try:
-        from .seedvr2_runtime.src.core.generation_phases import (
-            decode_all_batches,
-            encode_all_batches,
-            postprocess_all_batches,
-            upscale_all_batches,
-        )
-        from .seedvr2_runtime.src.core.generation_utils import (
-            compute_generation_info,
-            load_text_embeddings,
-            log_generation_start,
-            prepare_runner,
-            script_directory,
-            setup_generation_context,
-        )
-        from .seedvr2_runtime.src.optimization.memory_manager import (
-            cleanup_text_embeddings,
-            complete_cleanup,
-        )
-        from .seedvr2_runtime.src.utils.constants import get_base_cache_dir
-        from .seedvr2_runtime.src.utils.debug import Debug
-    except ImportError as exc:
-        raise ImportError(
-            "SeedVR2 auto upscaler dependencies are missing. Install the optional SeedVR2 runtime "
-            "dependencies in the ComfyUI Python environment: omegaconf diffusers "
-            "opencv-python psutil einops safetensors tqdm. "
-            f"Original import error: {exc}"
-        ) from exc
-    return {
-        "Debug": Debug,
-        "get_base_cache_dir": get_base_cache_dir,
-        "setup_generation_context": setup_generation_context,
-        "prepare_runner": prepare_runner,
-        "load_text_embeddings": load_text_embeddings,
-        "script_directory": script_directory,
-        "compute_generation_info": compute_generation_info,
-        "log_generation_start": log_generation_start,
-        "encode_all_batches": encode_all_batches,
-        "upscale_all_batches": upscale_all_batches,
-        "decode_all_batches": decode_all_batches,
-        "postprocess_all_batches": postprocess_all_batches,
-        "cleanup_text_embeddings": cleanup_text_embeddings,
-        "complete_cleanup": complete_cleanup,
-    }
-
-
 class SeedVR2AutoUpscaler:
     @classmethod
     def INPUT_TYPES(cls):
@@ -489,123 +455,35 @@ class SeedVR2AutoUpscaler:
         plan: SeedVR2AutoPlan,
     ) -> torch.Tensor:
         self._validate_model_files_exist(dit_model, vae_model)
-
-        runtime = _import_seedvr2_runtime()
-        Debug = runtime["Debug"]
-        debug = Debug(enabled=enable_debug)
-        runner = None
-        ctx = None
-
-        def progress_callback(current_step: int, total_steps: int, current_frames: int, phase_name: str) -> None:
-            del current_frames
-            if total_steps <= 0:
-                return
-            LOG.info("SeedVR2 %s: %d/%d", phase_name, current_step, total_steps)
-
-        def cleanup() -> None:
-            nonlocal runner, ctx
-            if runner is not None:
-                runtime["complete_cleanup"](runner=runner, debug=debug, dit_cache=False, vae_cache=False)
-                runner = None
-            if ctx is not None:
-                runtime["cleanup_text_embeddings"](ctx, debug)
-                ctx = None
-
+        del color_correction
+        pipeline = SeedVR2NativePipeline(
+            model_dir=_seedvr2_model_dir(),
+            dit_model=dit_model,
+            vae_model=vae_model,
+            dit_device=dit_device,
+            vae_device=vae_device,
+            attention_mode=attention_mode,
+            debug=enable_debug,
+        )
         try:
-            ctx = runtime["setup_generation_context"](
-                dit_device=torch.device(dit_device),
-                vae_device=torch.device(vae_device),
-                dit_offload_device=torch.device(plan.dit_offload_device) if plan.dit_offload_device != "none" else None,
-                vae_offload_device=torch.device(plan.vae_offload_device) if plan.vae_offload_device != "none" else None,
-                tensor_offload_device=torch.device(plan.tensor_offload_device) if plan.tensor_offload_device != "none" else None,
-                debug=debug,
-            )
-            runner, cache_context = runtime["prepare_runner"](
-                dit_model=dit_model,
-                vae_model=vae_model,
-                model_dir=runtime["get_base_cache_dir"](),
-                debug=debug,
-                ctx=ctx,
-                dit_cache=False,
-                vae_cache=False,
-                dit_id=_AUTO_NODE_ID,
-                vae_id=_AUTO_NODE_ID,
+            return pipeline.upscale(
+                image,
+                resolution=resolution,
+                max_resolution=max_resolution,
+                seed=seed,
+                batch_size=plan.batch_size,
+                temporal_overlap=plan.temporal_overlap,
                 encode_tiled=plan.encode_tiled,
-                encode_tile_size=(plan.encode_tile_size, plan.encode_tile_size),
-                encode_tile_overlap=(plan.encode_tile_overlap, plan.encode_tile_overlap),
+                encode_tile_size=plan.encode_tile_size,
+                encode_tile_overlap=plan.encode_tile_overlap,
                 decode_tiled=plan.decode_tiled,
-                decode_tile_size=(plan.decode_tile_size, plan.decode_tile_size),
-                decode_tile_overlap=(plan.decode_tile_overlap, plan.decode_tile_overlap),
-                tile_debug="false",
-                attention_mode=attention_mode,
-            )
-            ctx["cache_context"] = cache_context
-            ctx["text_embeds"] = runtime["load_text_embeddings"](
-                runtime["script_directory"],
-                ctx["dit_device"],
-                ctx["compute_dtype"],
-                debug,
-            )
-
-            image, gen_info = runtime["compute_generation_info"](
-                ctx=ctx,
-                images=image,
-                resolution=resolution,
-                max_resolution=max_resolution,
-                batch_size=plan.batch_size,
-                uniform_batch_size=plan.uniform_batch_size,
-                seed=seed,
-                prepend_frames=0,
-                temporal_overlap=plan.temporal_overlap,
-                debug=debug,
-            )
-            runtime["log_generation_start"](gen_info, debug)
-            ctx = runtime["encode_all_batches"](
-                runner,
-                ctx=ctx,
-                images=image,
-                debug=debug,
-                batch_size=plan.batch_size,
-                uniform_batch_size=plan.uniform_batch_size,
-                seed=seed,
-                progress_callback=progress_callback,
-                temporal_overlap=plan.temporal_overlap,
-                resolution=resolution,
-                max_resolution=max_resolution,
+                decode_tile_size=plan.decode_tile_size,
+                decode_tile_overlap=plan.decode_tile_overlap,
                 input_noise_scale=input_noise_scale,
-                color_correction=color_correction,
-            )
-            ctx = runtime["upscale_all_batches"](
-                runner,
-                ctx=ctx,
-                debug=debug,
-                progress_callback=progress_callback,
-                seed=seed,
                 latent_noise_scale=latent_noise_scale,
-                cache_model=False,
             )
-            ctx = runtime["decode_all_batches"](
-                runner,
-                ctx=ctx,
-                debug=debug,
-                progress_callback=progress_callback,
-                cache_model=False,
-            )
-            ctx = runtime["postprocess_all_batches"](
-                ctx=ctx,
-                debug=debug,
-                progress_callback=progress_callback,
-                color_correction=color_correction,
-                prepend_frames=0,
-                temporal_overlap=plan.temporal_overlap,
-                batch_size=plan.batch_size,
-            )
-            output = ctx["final_video"]
-            if output.device.type != "cpu":
-                output = output.cpu()
-            return output.to(torch.float32).clamp_(0.0, 1.0)
         finally:
-            cleanup()
+            pipeline.close()
 
     @staticmethod
     def _validate_model_files_exist(dit_model: str, vae_model: str) -> None:

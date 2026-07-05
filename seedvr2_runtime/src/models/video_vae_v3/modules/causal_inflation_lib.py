@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from typing import List, Optional, Union
 import torch
 import torch.nn.functional as F
-from diffusers.models.normalization import RMSNorm
+from .native_layers import RMSNorm
 from einops import rearrange
 from torch import Tensor, nn
 from torch.nn import Conv3d

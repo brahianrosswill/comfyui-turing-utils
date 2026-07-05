@@ -267,12 +267,13 @@ back to progressively smaller VAE tiles and CPU tensor/model offload. This is
 intended to behave closer to ComfyUI's native VAE fallback path: try the fastest
 non-tiled path first, then tile only when memory pressure requires it.
 
-The SeedVR2 runtime needs these optional Python packages in the ComfyUI
-environment: `omegaconf`, `diffusers`, `opencv-python`, `psutil`, `einops`,
-`safetensors`, and `tqdm`. They are listed in
-`requirements.txt`; PyTorch is intentionally not listed to avoid replacing
-ComfyUI's installed Torch build. The small RoPE helper used by SeedVR2 is
-implemented locally, so no extra rotary embedding package is required.
+The SeedVR2 native runtime only needs the lightweight tensor/file helpers listed
+in `requirements.txt`: `einops`, `safetensors`, and `tqdm`. PyTorch is
+intentionally not listed to avoid replacing ComfyUI's installed Torch build.
+The small RoPE helper used by SeedVR2 is implemented locally, and the SeedVR2
+VAE/DiT compatibility pieces are vendored locally, so no extra rotary embedding,
+Diffusers, OmegaConf, OpenCV, or external diffusion framework package is
+required for inference.
 
 ## LoRA
 

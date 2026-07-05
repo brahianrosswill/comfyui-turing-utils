@@ -13,7 +13,7 @@
 # // limitations under the License.
 
 from typing import Callable, Optional
-from diffusers.models.normalization import RMSNorm
+from ..video_vae_v3.modules.native_layers import RMSNorm
 from torch import nn
 import torch
 import torch.nn.functional as F
