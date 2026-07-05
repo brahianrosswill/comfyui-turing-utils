@@ -146,6 +146,26 @@ def _model_size_bytes(model: torch.nn.Module) -> int:
     return total
 
 
+def _first_tensor_device(model: torch.nn.Module) -> torch.device | None:
+    for tensor in list(model.parameters()) + list(model.buffers()):
+        if tensor is not None:
+            return tensor.device
+    return None
+
+
+def _unload_patcher(patcher: comfy.model_patcher.ModelPatcher | None) -> None:
+    if patcher is None:
+        return
+    try:
+        model_management.unload_model_and_clones(patcher, unload_additional_models=False)
+    except Exception:
+        LOG.debug("SeedVR2 patcher managed unload failed", exc_info=True)
+    try:
+        patcher.detach()
+    except Exception:
+        LOG.debug("SeedVR2 patcher detach failed", exc_info=True)
+
+
 def _infer_dit_template(path: str, model_name: str) -> str:
     lower = model_name.lower()
     if "7b" in lower:
@@ -572,6 +592,7 @@ class SeedVR2DiT:
         text_neg = torch.load(script_dir / "neg_emb.pt", map_location="cpu", weights_only=True)
         model = SeedVR2ComfyModel(dit, na_module, text_pos, text_neg, dtype)
         model.to(offload_device)
+        model.device = offload_device
         self.model = model
         self.patcher = comfy.model_patcher.ModelPatcher(
             model,
@@ -580,8 +601,29 @@ class SeedVR2DiT:
             size=_model_size_bytes(model),
         )
 
+    def _load(self, latent: torch.Tensor) -> None:
+        noise_shape = _seedvr2_latent_to_comfy(latent).shape
+        memory_required = self.patcher.memory_required(noise_shape)
+        model_management.load_models_gpu(
+            [self.patcher],
+            memory_required=memory_required,
+            force_full_load=True,
+        )
+        self.model.device = self.patcher.load_device
+        actual_device = _first_tensor_device(self.model.diffusion_model)
+        if actual_device is None:
+            return
+        if actual_device != self.patcher.load_device:
+            raise RuntimeError(
+                "SeedVR2 DiT was not loaded onto the ComfyUI load device. "
+                f"Expected {self.patcher.load_device}, got {actual_device}. "
+                "This usually means the model does not fit as a full GPU load; "
+                "use a smaller SeedVR2 checkpoint or free more VRAM."
+            )
+
     def sample(self, latent: torch.Tensor, seed: int) -> torch.Tensor:
         _seed_everything(seed)
+        self._load(latent)
         latent = latent.to(device=self.patcher.load_device, dtype=self.model.dtype)
         base_noise = torch.randn_like(latent, dtype=self.model.dtype)
         condition = _seedvr2_condition(base_noise, latent)
@@ -613,10 +655,7 @@ class SeedVR2DiT:
         if patcher is None:
             return
         self.patcher = None
-        try:
-            patcher.detach()
-        except Exception:
-            LOG.debug("SeedVR2 DiT patcher detach failed", exc_info=True)
+        _unload_patcher(patcher)
 
 
 class SeedVR2Pipeline:
@@ -657,12 +696,8 @@ class SeedVR2Pipeline:
         if patcher is None:
             return
         self.vae.patcher = None
-        try:
-            patcher.detach()
-        except Exception:
-            LOG.debug("SeedVR2 VAE patcher detach failed", exc_info=True)
-        finally:
-            self.vae = None
+        _unload_patcher(patcher)
+        self.vae = None
 
     @torch.no_grad()
     def upscale(
