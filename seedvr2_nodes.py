@@ -338,8 +338,12 @@ class SeedVR2Upscaler:
     RETURN_TYPES = ("IMAGE",)
     RETURN_NAMES = ("image",)
     FUNCTION = "upscale"
-    CATEGORY = "SVDInt4/SeedVR2"
-    TITLE = "SeedVR2 Upscale"
+    CATEGORY = "SVDInt4/experimental"
+    DESCRIPTION = (
+        "Experimental and currently not production-ready. The SeedVR2 pipeline can still produce seams, "
+        "black-line artifacts, and unreliable memory behavior."
+    )
+    TITLE = "SeedVR2 Upscale (EXPERIMENTAL / UNUSABLE)"
 
     def upscale(
         self,
@@ -361,6 +365,10 @@ class SeedVR2Upscaler:
         if image.ndim != 4 or int(image.shape[-1]) not in (3, 4):
             raise ValueError(f"SeedVR2 Upscale expects IMAGE shaped [frames,h,w,3/4], got {tuple(image.shape)}")
 
+        LOG.warning(
+            "SeedVR2 Upscale is experimental and currently marked unusable; outputs may contain seams, "
+            "black lines, or unstable memory behavior."
+        )
         plan = _build_plan(
             image,
             resolution=resolution,

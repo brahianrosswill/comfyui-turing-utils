@@ -22,5 +22,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SVDInt4DreamIDVConditioning": "DreamID-V Conditioning",
     "SVDInt4WanVideoFramesPadding": "Wan Video Frames Padding",
     "SVDInt4BerniniContextWindowsCore": "Bernini Context Windows",
-    "SVDInt4SeedVR2Upscaler": "SeedVR2 Upscale",
+    "SVDInt4SeedVR2Upscaler": "SeedVR2 Upscale (EXPERIMENTAL / UNUSABLE)",
 }

@@ -234,6 +234,11 @@ SVDInt4/loaders
 
 ## SeedVR2 Upscale
 
+> **Experimental / currently unusable:** this SeedVR2 node is not production
+> ready. It can still produce visible seams, black-line artifacts, and unstable
+> memory behavior on real workflows. It remains in the repository only as an
+> experimental integration target and should not be treated as a reliable node.
+
 This plugin also includes a SeedVR2 node implemented on ComfyUI's model
 patcher and sampler path. The compact architecture adapters live in the
 `seedvr2_*.py` modules; SeedVR2 text embeddings and the original Apache-2.0
