@@ -375,12 +375,21 @@ public:
             const int bn = binfo.bn;
 
             if constexpr (FP4_AVAILABLE) {
+                const int64_t act_offset =
+                    static_cast<int64_t>(bm) * (K / WARP_K) * NUM_WARPS * WARP_M_TILES * WARP_SIZE;
+                const int64_t wgt_offset =
+                    static_cast<int64_t>(bn) * (K / WARP_K) * WARP_N_TILES * WARP_SIZE;
+                const int64_t ascale_offset =
+                    static_cast<int64_t>(bm) * (K / WARP_K) * NUM_WARPS * AMSCALES_NUM_PACKS *
+                    AMSCALES_VALID_LANES;
+                const int64_t wscale_offset =
+                    static_cast<int64_t>(bn) * (K / WARP_K) * WMSCALES_NUM_PACKS * WMSCALES_VALID_LANES;
                 gemm_w4a4_fp4_block<Epilogue, USE_ALPHA>(
                     binfo,
-                    act + bm * (K / WARP_K) * NUM_WARPS * WARP_M_TILES * WARP_SIZE,
-                    wgt + bn * (K / WARP_K) * WARP_N_TILES * WARP_SIZE,
-                    ascales + bm * (K / WARP_K) * NUM_WARPS * AMSCALES_NUM_PACKS * AMSCALES_VALID_LANES,
-                    wscales + bn * (K / WARP_K) * WMSCALES_NUM_PACKS * WMSCALES_VALID_LANES,
+                    act + act_offset,
+                    wgt + wgt_offset,
+                    ascales + ascale_offset,
+                    wscales + wscale_offset,
                     alpha,
                     M,
                     N,
@@ -905,14 +914,19 @@ public:
             const int bn = binfo.bn;
 
             if constexpr (!USE_FP4 || FP4_AVAILABLE) {
+                const int64_t tile_group = static_cast<int64_t>(bm) * (N / WARP_K) +
+                                           static_cast<int64_t>(bn) * NUM_GROUPS;
+                const int64_t qout_offset = tile_group * NUM_WARPS * WARP_M_TILES * WARP_SIZE;
+                const int64_t oscale_offset =
+                    tile_group * NUM_WARPS *
+                    (USE_FP4 ? AMSCALES_NUM_PACKS * AMSCALES_VALID_LANES
+                             : ASCALES_NUM_PACKS * ASCALES_VALID_LANES);
                 apply_quantize(fpsum,
                                M,
                                N,
                                K,
-                               args.qout + (bm * N / WARP_K + bn * NUM_GROUPS) * NUM_WARPS * WARP_M_TILES * WARP_SIZE,
-                               args.oscales + (bm * N / WARP_K + bn * NUM_GROUPS) * NUM_WARPS *
-                                                  (USE_FP4 ? AMSCALES_NUM_PACKS * AMSCALES_VALID_LANES
-                                                           : ASCALES_NUM_PACKS * ASCALES_VALID_LANES),
+                               args.qout + qout_offset,
+                               args.oscales + oscale_offset,
                                args.shift_value,
                                args.smooth_factor + bn * WSCALES_NUM_PACKS * WSCALES_VALID_LANES);
             } else {
@@ -953,13 +967,22 @@ public:
             const int bn = binfo.bn;
 
             // bool fusequant = !out;
+            const int64_t act_offset =
+                static_cast<int64_t>(bm) * (K / WARP_K) * NUM_WARPS * WARP_M_TILES * WARP_SIZE;
+            const int64_t wgt_offset =
+                static_cast<int64_t>(bn) * (K / WARP_K) * WARP_N_TILES * WARP_SIZE;
+            const int64_t ascale_offset =
+                static_cast<int64_t>(bm) * (K / WARP_K) * NUM_WARPS * ASCALES_NUM_PACKS *
+                ASCALES_VALID_LANES;
+            const int64_t wscale_offset =
+                static_cast<int64_t>(bn) * (K / WARP_K) * WSCALES_NUM_PACKS * WSCALES_VALID_LANES;
 
             gemm_w4a4_block<Epilogue, ACT_UNSIGNED, false>(
                 binfo,
-                act + bm * (K / WARP_K) * NUM_WARPS * WARP_M_TILES * WARP_SIZE,
-                wgt + bn * (K / WARP_K) * WARP_N_TILES * WARP_SIZE,
-                ascales + bm * (K / WARP_K) * NUM_WARPS * ASCALES_NUM_PACKS * ASCALES_VALID_LANES,
-                wscales + bn * (K / WARP_K) * WSCALES_NUM_PACKS * WSCALES_VALID_LANES,
+                act + act_offset,
+                wgt + wgt_offset,
+                ascales + ascale_offset,
+                wscales + wscale_offset,
                 // bias ? bias + bn * WSCALES_NUM_PACKS * WSCALES_VALID_LANES : nullptr,
                 // out + (bm * BLOCK_M * N) + bn * BLOCK_N,
                 // out + (bm * N / BLOCK_N + bn) * NUM_WARPS * WARP_M_TILES * WARP_N_TILES * WARP_SIZE,
@@ -1012,12 +1035,13 @@ public:
 
             const int m_offset = bm * BLOCK_M + warpId * WARP_M;
             const int n_offset = bn * BLOCK_N * (fuse_glu ? 2 : 1);
+            const int64_t input_offset = static_cast<int64_t>(m_offset) * args.actualN + n_offset;
 
             extern __shared__ uint8_t shmem[];
 
             fpsum_warp fpsum;
 
-            Base::template load_act_to_fpsum<fuse_glu>()(args.input + m_offset * args.actualN + n_offset,
+            Base::template load_act_to_fpsum<fuse_glu>()(args.input + input_offset,
                                                          args.actualN,
                                                          args.actualM - m_offset,
                                                          args.actualN - n_offset,

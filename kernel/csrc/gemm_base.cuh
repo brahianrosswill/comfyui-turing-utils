@@ -626,9 +626,10 @@ public:
 
             const int m_offset = binfo.bm * BLOCK_M + warpId * WARP_M;
             const int n_offset = binfo.bn * BLOCK_N;
+            const int64_t out_offset = static_cast<int64_t>(m_offset) * args.actualN + n_offset;
 
             unpack_fpsum()(fpsum,
-                           args.out + m_offset * args.actualN + n_offset,
+                           args.out + out_offset,
                            args.actualN,
                            args.actualM - m_offset,
                            args.actualN - n_offset,

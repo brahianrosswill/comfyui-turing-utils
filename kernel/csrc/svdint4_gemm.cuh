@@ -4,6 +4,39 @@
 
 namespace svdint4::kernels {
 
+inline void checkHost(bool condition, const char *message) {
+    if (!condition) {
+        throw std::runtime_error(message);
+    }
+}
+
+inline int checkedIntDim(size_t value, const char *name) {
+    if (value > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        std::ostringstream msg;
+        msg << name << " is too large for SVDInt4 kernel int dimensions: " << value;
+        throw std::runtime_error(msg.str());
+    }
+    return static_cast<int>(value);
+}
+
+inline int checkedPaddedDim(int value, int alignment, const char *name) {
+    const int64_t padded = ceilDiv<int64_t>(value, alignment) * alignment;
+    if (padded > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+        std::ostringstream msg;
+        msg << name << " padded dimension is too large for SVDInt4 kernel int dimensions: " << padded;
+        throw std::runtime_error(msg.str());
+    }
+    return static_cast<int>(padded);
+}
+
+inline void checkSizeEquals(size_t actual, size_t expected, const char *name) {
+    if (actual != expected) {
+        std::ostringstream msg;
+        msg << name << " has invalid numel: expected " << expected << ", got " << actual;
+        throw std::runtime_error(msg.str());
+    }
+}
+
 template <typename Config>
 class SVDInt4Gemm {
     using GEMM = GEMM_W4A4<Config>;
@@ -27,19 +60,19 @@ public:
                      Tensor bias,
                      bool act_unsigned,
                      const std::vector<float> &lora_scales) {
-        const int M = static_cast<int>(act.numel() / act.shape[-1]);
+        const int M = checkedIntDim(act.numel() / static_cast<size_t>(act.shape[-1]), "act M");
         const int N = wgt.shape[0];
         const int K = act.shape[-1] * 2;
-        assert(K == wgt.shape[1] * 2);
+        checkHost(K == wgt.shape[1] * 2, "qweight K must match act K");
 
-        const int actualM = static_cast<int>(out.numel() / out.shape[-1]);
+        const int actualM = checkedIntDim(out.numel() / static_cast<size_t>(out.shape[-1]), "out M");
         const int actualN = out.shape[-1];
-        assert(actualM <= M && M - actualM < GEMM::BLOCK_M);
-        assert(actualN <= N && N - actualN < GEMM::BLOCK_N);
+        checkHost(actualM <= M && M - actualM < GEMM::BLOCK_M, "actual M is outside the padded SVDInt4 block");
+        checkHost(actualN <= N && N - actualN < GEMM::BLOCK_N, "actual N is outside the padded SVDInt4 block");
 
         auto launch = [&]<typename Epilogue>(typename Epilogue::Arguments args) {
-            assert(M % GEMM::BLOCK_M == 0);
-            assert(N % GEMM::BLOCK_N == 0);
+            checkHost(M % GEMM::BLOCK_M == 0, "SVDInt4 act M must be block-aligned");
+            checkHost(N % GEMM::BLOCK_N == 0, "SVDInt4 qweight N must be block-aligned");
 
             dim3 grid(M / GEMM::BLOCK_M, N / GEMM::BLOCK_N);
             bool swap_block_mn = M > N * 2;
@@ -76,7 +109,8 @@ public:
         };
 
         auto launch_bias = [&]<typename NextEpilogue>(typename NextEpilogue::Arguments next_args) {
-            assert(!bias.valid() || bias.numel() == static_cast<size_t>(N));
+            checkHost(!bias.valid() || bias.numel() == static_cast<size_t>(N),
+                      "bias must be packed/padded to qweight N");
 
             dispatchBool(bias.valid(), [&]<bool USE_BIAS>() {
                 using Bias = typename GEMM::template EpilogueBias<USE_BIAS, false>;
@@ -106,10 +140,10 @@ public:
         }
 
         const int rank = lora_up.shape[1];
-        assert(rank % 16 == 0);
-        assert(lora_up.shape[0] == N);
-        assert(lora_act.shape[0] == M);
-        assert(lora_act.shape[1] == rank);
+        checkHost(rank % 16 == 0, "SVD residual rank must be a multiple of 16");
+        checkHost(lora_up.shape[0] == N, "svd_up N must match qweight N");
+        checkHost(lora_act.shape[0] == M, "svd activation M must match padded act M");
+        checkHost(lora_act.shape[1] == rank, "svd activation rank must match svd_up rank");
 
         typename LoraUp::scale_t scales{};
         for (size_t i = 0; i < scales.size(); ++i) {
@@ -137,22 +171,24 @@ public:
                                   Tensor lora_down,
                                   Tensor lora_act_out,
                                   Tensor smooth) {
-        const int actualM = static_cast<int>(input.numel() / input.shape[-1]);
+        const int actualM = checkedIntDim(input.numel() / static_cast<size_t>(input.shape[-1]), "input M");
         const int actualN = input.shape[-1];
-        const int M = ceilDiv(actualM, GEMM::BLOCK_M) * GEMM::BLOCK_M;
-        const int N = ceilDiv(actualN, GEMM::BLOCK_N) * GEMM::BLOCK_N;
+        const int M = checkedPaddedDim(actualM, GEMM::BLOCK_M, "input M");
+        const int N = checkedPaddedDim(actualN, GEMM::BLOCK_N, "input N");
 
-        assert(output.dtype() == Tensor::INT8);
-        assert(output.numel() / output.shape[-1] == static_cast<size_t>(M));
-        assert(output.shape[-1] == N / 2);
-        assert(isTypeMatch<half_t>(oscales.dtype()));
-        assert(oscales.numel() == static_cast<size_t>(M * N / GEMM::WARP_K));
+        checkHost(output.dtype() == Tensor::INT8, "packed activation output must be int8");
+        checkSizeEquals(output.numel() / static_cast<size_t>(output.shape[-1]), static_cast<size_t>(M), "qact rows");
+        checkHost(output.shape[-1] == N / 2, "qact K dimension is invalid");
+        checkHost(isTypeMatch<half_t>(oscales.dtype()), "activation scales dtype must match kernel dtype");
+        const size_t expected_oscales =
+            (static_cast<size_t>(M) * static_cast<size_t>(N)) / static_cast<size_t>(GEMM::WARP_K);
+        checkSizeEquals(oscales.numel(), expected_oscales, "activation scales");
 
         const int rank = lora_down.shape[1];
-        assert(rank % 16 == 0);
-        assert(lora_down.shape[0] == N);
-        assert(lora_act_out.shape[0] == M);
-        assert(lora_act_out.shape[1] == rank);
+        checkHost(rank % 16 == 0, "SVD residual rank must be a multiple of 16");
+        checkHost(lora_down.shape[0] == N, "svd_down K must match padded input N");
+        checkHost(lora_act_out.shape[0] == M, "svd activation output M must match padded input M");
+        checkHost(lora_act_out.shape[1] == rank, "svd activation output rank must match svd_down rank");
 
         lora_act_out.zero_();
 
