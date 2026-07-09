@@ -43,17 +43,26 @@ def _model_names() -> list[str]:
         if Path(name).suffix.lower() not in MODEL_EXTENSIONS:
             continue
         path = folder_paths.get_full_path(FOLDER_NAME, name)
-        if path is not None and _is_svdint4_file(path):
+        if path is None:
+            LOG.debug("Skipping SVDInt4 candidate %s: folder_paths could not resolve it", name)
+            continue
+        skip_reason = _svdint4_skip_reason(path)
+        if skip_reason is None:
             names.append(name)
+        else:
+            LOG.debug("Skipping SVDInt4 candidate %s: %s", name, skip_reason)
     return names
 
 
-def _is_svdint4_file(model_path: str | Path) -> bool:
+def _svdint4_skip_reason(model_path: str | Path) -> str | None:
     try:
         with safe_open(model_path, framework="pt", device="cpu") as handle:
-            return (handle.metadata() or {}).get("format") in SUPPORTED_FORMATS
-    except Exception:
-        return False
+            fmt = (handle.metadata() or {}).get("format")
+    except Exception as exc:
+        return f"could not read safetensors metadata ({exc})"
+    if fmt not in SUPPORTED_FORMATS:
+        return f"format={fmt!r}, expected one of {sorted(SUPPORTED_FORMATS)}"
+    return None
 
 
 def _resolve_model_path(model_name: str) -> str:

@@ -1,167 +1,15 @@
 from __future__ import annotations
 
-import json
-import logging
 from pathlib import Path
 
 import comfy.model_management
-import comfy.sd
 import comfy.utils
-import folder_paths
 import torch
-from safetensors import safe_open
 
 
-LOG = logging.getLogger("comfyui-svdint4")
-FOLDER_NAME = "diffusion_models"
-DREAMIDV_MODEL_EXTENSIONS = {".safetensors", ".sft", ".pth", ".pt", ".ckpt"}
-DREAMIDV_MODEL_DIR_NAME = "DreamID-V"
 DREAMIDV_CONTEXT_PATH = Path(__file__).resolve().parent / "assets" / "dreamidv" / "context.pth"
 DREAMIDV_TEXT_LEN = 512
-DREAMIDV_TRANSFORMER_CONFIG = {
-    # DreamID-V uses Wan's reference_latent/ref_conv path, not CLIP image features.
-    # Keep the base Wan block type t2v so ComfyUI does not instantiate unused img_emb weights.
-    "model_type": "t2v",
-    "patch_size": [1, 2, 2],
-    "dim": 1536,
-    "ffn_dim": 8960,
-    "freq_dim": 256,
-    "in_dim": 48,
-    "num_heads": 12,
-    "num_layers": 30,
-    "window_size": [-1, -1],
-    "qk_norm": True,
-    "cross_attn_norm": True,
-    "eps": 1e-6,
-    "in_dim_ref_conv": 16,
-}
-SUPPORTED_FORMATS = {"svdint4-dit-single-v2"}
 _DREAMIDV_CONTEXT_CACHE: torch.Tensor | None = None
-
-
-def _dreamidv_model_root() -> Path:
-    return Path(folder_paths.models_dir) / DREAMIDV_MODEL_DIR_NAME
-
-
-def _dreamidv_model_names() -> list[str]:
-    names: set[str] = set()
-    root = _dreamidv_model_root()
-    if root.is_dir():
-        for path in root.rglob("*"):
-            if path.is_file() and path.suffix.lower() in DREAMIDV_MODEL_EXTENSIONS:
-                names.add(f"{DREAMIDV_MODEL_DIR_NAME}/{path.relative_to(root).as_posix()}")
-    for name in folder_paths.get_filename_list(FOLDER_NAME):
-        if Path(name).suffix.lower() not in DREAMIDV_MODEL_EXTENSIONS:
-            continue
-        path = folder_paths.get_full_path(FOLDER_NAME, name)
-        if path is not None and _is_dreamidv_svdint4_file(path):
-            names.add(f"{FOLDER_NAME}/{name}")
-    return sorted(names)
-
-
-def _is_svdint4_file(model_path: str | Path) -> bool:
-    try:
-        with safe_open(model_path, framework="pt", device="cpu") as handle:
-            return (handle.metadata() or {}).get("format") in SUPPORTED_FORMATS
-    except Exception:
-        return False
-
-
-def _is_dreamidv_svdint4_file(model_path: str | Path) -> bool:
-    try:
-        with safe_open(model_path, framework="pt", device="cpu") as handle:
-            metadata = handle.metadata() or {}
-    except Exception:
-        return False
-    if metadata.get("format") not in SUPPORTED_FORMATS:
-        return False
-    haystack = " ".join(
-        str(metadata.get(key, ""))
-        for key in ("model_family", "model_name", "model_variant", "source")
-    ).lower()
-    return "dreamid" in haystack or "dream_id" in haystack or "swapface" in haystack
-
-
-def _resolve_dreamidv_model_path(model_name: str) -> str:
-    if model_name.startswith(f"{DREAMIDV_MODEL_DIR_NAME}/"):
-        path = _dreamidv_model_root() / model_name[len(DREAMIDV_MODEL_DIR_NAME) + 1:]
-        if path.is_file():
-            return str(path)
-        raise FileNotFoundError(f"DreamID-V model not found: {path}")
-    if model_name.startswith(f"{FOLDER_NAME}/"):
-        return folder_paths.get_full_path_or_raise(FOLDER_NAME, model_name[len(FOLDER_NAME) + 1:])
-
-    dreamidv_path = _dreamidv_model_root() / model_name
-    if dreamidv_path.is_file():
-        return str(dreamidv_path)
-    return folder_paths.get_full_path_or_raise(FOLDER_NAME, model_name)
-
-
-def _unwrap_state_dict(state_dict):
-    if not isinstance(state_dict, dict):
-        raise TypeError(f"Expected a DreamID-V state dict, got {type(state_dict).__name__}.")
-    for key in ("state_dict", "model", "module"):
-        value = state_dict.get(key)
-        if isinstance(value, dict):
-            return value
-    return state_dict
-
-
-def _find_state_key(state_dict: dict, suffix: str) -> str | None:
-    if suffix in state_dict:
-        return suffix
-    for key in state_dict:
-        if key.endswith(suffix):
-            return key
-    return None
-
-
-def _validate_dreamidv_state_dict(state_dict: dict, model_path: str | Path) -> None:
-    patch_key = _find_state_key(state_dict, "patch_embedding.weight")
-    ref_key = _find_state_key(state_dict, "ref_conv.weight")
-    layer_key = _find_state_key(state_dict, "blocks.29.ffn.2.weight")
-    if patch_key is None or ref_key is None or layer_key is None:
-        raise ValueError(
-            f"{model_path} does not look like a DreamID-V Faster DiT checkpoint. "
-            "Expected patch_embedding, ref_conv, and 30 Wan transformer blocks."
-        )
-    patch_shape = tuple(state_dict[patch_key].shape)
-    ref_shape = tuple(state_dict[ref_key].shape)
-    if len(patch_shape) < 2 or patch_shape[1] != DREAMIDV_TRANSFORMER_CONFIG["in_dim"]:
-        raise ValueError(f"DreamID-V patch_embedding input channels must be 48, got {patch_shape}.")
-    if len(ref_shape) < 2 or ref_shape[1] != DREAMIDV_TRANSFORMER_CONFIG["in_dim_ref_conv"]:
-        raise ValueError(f"DreamID-V ref_conv input channels must be 16, got {ref_shape}.")
-
-
-def _dreamidv_metadata(metadata: dict | None) -> dict:
-    metadata = dict(metadata or {})
-    config = {}
-    if metadata.get("config"):
-        try:
-            config = json.loads(metadata["config"])
-        except Exception:
-            LOG.warning("Ignoring invalid DreamID-V checkpoint config metadata.")
-            config = {}
-    transformer = dict(config.get("transformer", {}))
-    transformer.update(DREAMIDV_TRANSFORMER_CONFIG)
-    config["transformer"] = transformer
-    metadata["config"] = json.dumps(config)
-    return metadata
-
-
-def _load_dreamidv_dense_model(model_path: str):
-    state_dict, metadata = comfy.utils.load_torch_file(model_path, return_metadata=True)
-    state_dict = _unwrap_state_dict(state_dict)
-    _validate_dreamidv_state_dict(state_dict, model_path)
-    model = comfy.sd.load_diffusion_model_state_dict(
-        state_dict,
-        metadata=_dreamidv_metadata(metadata),
-        disable_dynamic=False,
-    )
-    if model is None:
-        raise RuntimeError(f"Could not load DreamID-V DiT checkpoint: {model_path}")
-    model.cached_patcher_init = (_load_dreamidv_dense_model, (model_path,))
-    return model
 
 
 def _load_dreamidv_context() -> torch.Tensor:
@@ -301,50 +149,6 @@ def _encode_vae_raw_tiled(vae, pixel_samples: torch.Tensor) -> torch.Tensor:
         index_formulas=vae.downscale_index_formula,
         output_device=vae.output_device,
     )
-
-
-class DreamIDVDiTLoader:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "dit_name": (
-                    _dreamidv_model_names(),
-                    {
-                        "tooltip": (
-                            "DreamID-V Faster DiT checkpoint. Dense .pth/.safetensors files can live in "
-                            "ComfyUI/models/DreamID-V; SVDInt4 single-file safetensors can live there or "
-                            "in ComfyUI/models/diffusion_models."
-                        )
-                    },
-                ),
-                "backend": (
-                    ["auto", "dense", "svdint4"],
-                    {"default": "auto", "tooltip": "auto detects SVDInt4 safetensors metadata; .pth loads as dense."},
-                ),
-            }
-        }
-
-    RETURN_TYPES = ("MODEL",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "load_dit"
-    CATEGORY = "SVDInt4/loaders"
-    TITLE = "Load DreamID-V DiT"
-
-    def load_dit(self, dit_name: str, backend: str):
-        model_path = _resolve_dreamidv_model_path(dit_name)
-        is_svdint4 = _is_svdint4_file(model_path)
-        if backend == "auto":
-            backend = "svdint4" if is_svdint4 else "dense"
-        if backend == "svdint4":
-            if not is_svdint4:
-                raise ValueError(f"{model_path} is not an SVDInt4 single-file safetensors checkpoint.")
-            from .loader import load_svdint4_model
-
-            return (load_svdint4_model(model_path),)
-        if is_svdint4:
-            raise ValueError(f"{model_path} is an SVDInt4 checkpoint; use backend=auto or backend=svdint4.")
-        return (_load_dreamidv_dense_model(model_path),)
 
 
 class DreamIDVConditioning:
