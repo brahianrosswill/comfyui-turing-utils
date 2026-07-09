@@ -110,17 +110,8 @@ tensors:
   blocks.N.self_attn.q.smooth
   blocks.N.self_attn.q.bias_packed
   ...
-  transformer_blocks.N.img_mod.1.w4_qweight
-  transformer_blocks.N.img_mod.1.w4_scales
-  transformer_blocks.N.img_mod.1.bias
-  ...
   non-quantized model tensors use their normal ComfyUI/Diffusers keys
 ```
-
-The optional `*.w4_qweight`/`*.w4_scales` layout is a storage-only W4 format
-for sensitive dense Linear weights. ComfyUI moves the packed weight and scales
-as QuantizedTensor state and dequantizes to FP16 only when the Linear is
-evaluated or when a dense weight patch needs a materialized weight.
 
 Only the `format` metadata is required in the weight file. Keep provenance,
 calibration notes, source paths, and experiment notes in a sidecar JSON if you
@@ -215,11 +206,6 @@ correction tensors together. The public `state_dict()` does not expose packed
 weights as normal `.weight` tensors, so standard ComfyUI LoRA patching does not
 accidentally treat them as dense fp16 weights.
 
-Storage-only W4 weights are also represented as QuantizedTensor weights, but
-they intentionally dequantize to ordinary FP16 Linear weights at use time. They
-are meant for layers where a compact checkpoint is useful but a dedicated W4
-kernel is not required.
-
 SVDInt4 DiT weights are loaded through ComfyUI's normal model patcher path.
 ComfyUI may keep the packed branch fully loaded or use its DynamicVRAM/offload
 logic depending on the current workflow and available VRAM. The loader only
@@ -231,68 +217,6 @@ The node category is:
 ```text
 SVDInt4/loaders
 ```
-
-## SeedVR2 Upscale
-
-> **Experimental / currently unusable:** this SeedVR2 node is not production
-> ready. It can still produce visible seams, black-line artifacts, and unstable
-> memory behavior on real workflows. It remains in the repository only as an
-> experimental integration target and should not be treated as a reliable node.
-
-This plugin also includes a SeedVR2 node implemented on ComfyUI's model
-patcher and sampler path. The compact architecture adapters live in the
-`seedvr2_*.py` modules; SeedVR2 text embeddings and the original Apache-2.0
-license are preserved under `seedvr2_assets/`.
-
-The `SeedVR2 Upscale` node is a single high-level node. It takes only
-`IMAGE` input and exposes the DiT/VAE files as node parameters instead of
-requiring separate SeedVR2 loader nodes. Place SeedVR2 weights in:
-
-```text
-ComfyUI/models/SEEDVR2/
-  seedvr2_ema_3b_fp8_e4m3fn.safetensors
-  ema_vae_fp16.safetensors
-  ...
-```
-
-The node registers the `seedvr2` model folder type and lists only files that
-actually exist under `models/SEEDVR2`. Official `.safetensors` files and
-single-file SVDInt4 `.safetensors`/`.sft` files are supported; files outside
-that folder are not shown. DiT and VAE selectors are filtered separately:
-files whose names contain `vae` appear only in the VAE selector, while the
-remaining SeedVR2 weights appear in the DiT selector.
-
-New DiT packages do not need to be hardcoded into the node. The loader supports
-the two SeedVR2 DiT templates, 3B and 7B, and selects the template from the
-filename when it contains `3b` or `7b`; otherwise it inspects checkpoint block
-keys to infer the template. Unsupported layouts fail with a clear error instead
-of being silently loaded as the wrong model.
-
-The node does not expose device or offload-device controls. DiT loading uses
-ComfyUI's current torch device and UNet offload device; VAE loading uses
-ComfyUI's VAE device and VAE offload device. FP8 DiT weights are routed through
-ComfyUI's manual-cast path so FP8 storage is preserved when the local GPU cannot
-run native FP8 matmuls.
-
-Sampling controls are exposed on the node: `steps`, `cfg`, `sampler_name`,
-`scheduler`, `denoise`, and `seed`. The attention backend can be selected from
-`sdpa`, `sage_attn`, and `flash_attn`; unsupported requested backends resolve
-through the vendored SeedVR2 compatibility layer with a warning.
-
-Batching and VAE tiling are planned automatically from the current input shape
-and estimated free VRAM. `batch_size=0` keeps the automatic 4n+1 frame batch
-selection; a positive `batch_size` manually caps the working window. The node
-retries on CUDA OOM by reducing the 4n+1 batch size first, then falling back to
-progressively smaller VAE tiles. Disable `retry_on_oom` only when profiling a
-specific plan.
-
-The SeedVR2 runtime only needs the lightweight tensor/file helpers listed
-in `requirements.txt`: `einops`, `safetensors`, and `tqdm`. PyTorch is
-intentionally not listed to avoid replacing ComfyUI's installed Torch build.
-The small RoPE helper used by SeedVR2 is implemented locally, and the SeedVR2
-VAE/DiT compatibility pieces are vendored locally, so no extra rotary embedding,
-Diffusers, OmegaConf, OpenCV, or external diffusion framework package is
-required for inference.
 
 ## LoRA
 

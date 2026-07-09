@@ -1,9 +1,4 @@
 # ComfyUI Manager may install this file when the custom node is cloned.
 # Keep it free of svdint4-kernel so CUDA compilation is an explicit user step:
 #   python -m pip install -v --no-build-isolation -e ./kernel
-#
-# Optional SeedVR2 Upscale runtime dependencies. Torch/torchvision are
-# intentionally omitted so pip does not replace ComfyUI's installed PyTorch.
-einops
 safetensors
-tqdm
