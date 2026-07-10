@@ -7,6 +7,11 @@ from pathlib import Path
 import folder_paths
 from safetensors import safe_open
 
+try:
+    from .attention_backends import attention_backend_choices
+except ImportError:
+    from attention_backends import attention_backend_choices
+
 
 LOG = logging.getLogger("comfyui-svdint4")
 FOLDER_NAME = "diffusion_models"
@@ -84,7 +89,20 @@ class SVDInt4DiffusionModelLoader:
                         )
                     },
                 ),
-            }
+            },
+            "optional": {
+                "patch_attention": (
+                    attention_backend_choices(),
+                    {
+                        "default": "default",
+                        "tooltip": (
+                            "Override this SVDInt4 model's attention backend. "
+                            "default keeps ComfyUI's global choice; sdpa uses PyTorch SDPA; "
+                            "sage_attn and flash_attn require their matching packages."
+                        ),
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("MODEL",)
@@ -96,7 +114,8 @@ class SVDInt4DiffusionModelLoader:
     def load_diffusion_model(
         self,
         unet_name: str,
+        patch_attention: str = "default",
     ):
         from .loader import load_svdint4_model
 
-        return (load_svdint4_model(_resolve_model_path(unet_name)),)
+        return (load_svdint4_model(_resolve_model_path(unet_name), attention_backend=patch_attention),)

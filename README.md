@@ -187,7 +187,9 @@ The script writes original metadata and basic provenance to
 
 - `Load SVDInt4 DiT`
   Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
-  returns a ComfyUI `MODEL`.
+  returns a ComfyUI `MODEL`. `patch_attention` can keep ComfyUI's default
+  attention path or override this model to use SDPA, SageAttention, or Flash
+  Attention when the matching backend is installed.
 
 - `Bernini Context Windows`
   Uses the same controls and defaults as ComfyUI's Wan Context Windows node,

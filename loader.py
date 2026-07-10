@@ -16,6 +16,11 @@ import comfy.weight_adapter
 from comfy.patcher_extension import CallbacksMP
 
 try:
+    from .attention_backends import apply_attention_backend, normalize_attention_backend
+except ImportError:
+    from attention_backends import apply_attention_backend, normalize_attention_backend
+
+try:
     from comfy.quant_ops import QuantizedLayout, QuantizedTensor, register_layout_class, register_layout_op
     _HAS_COMFY_QUANTIZED_TENSOR = issubclass(QuantizedTensor, torch.Tensor)
 except Exception:
@@ -1078,8 +1083,15 @@ def _after_model_load(model_patcher, *_) -> None:
 
 def load_svdint4_model(
     model_path: str | Path,
+    attention_backend: str | bool | None = "default",
+    *,
     disable_dynamic: bool = False,
 ):
+    if isinstance(attention_backend, bool):
+        disable_dynamic = attention_backend
+        attention_backend = "default"
+    attention_backend = normalize_attention_backend(attention_backend)
+
     if not _HAS_COMFY_QUANTIZED_TENSOR:
         raise RuntimeError(
             "SVDInt4 requires a ComfyUI build with comfy.quant_ops.QuantizedTensor support. "
@@ -1153,5 +1165,6 @@ def load_svdint4_model(
     model.add_callback(CallbacksMP.ON_CLONE, _clone_svdint4_lora_overlay_state)
     model.add_callback(CallbacksMP.ON_DETACH, _clear_adapter_staging_runtime)
     model.add_callback(CallbacksMP.ON_CLEANUP, _clear_adapter_staging_runtime)
-    model.cached_patcher_init = (load_svdint4_model, (str(model_path),))
+    apply_attention_backend(model, attention_backend)
+    model.cached_patcher_init = (load_svdint4_model, (str(model_path), attention_backend))
     return model
