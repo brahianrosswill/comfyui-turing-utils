@@ -9,15 +9,16 @@ from safetensors import safe_open
 
 try:
     from .attention_backends import attention_backend_choices
+    from .model_format import validate_svdint4_metadata
 except ImportError:
     from attention_backends import attention_backend_choices
+    from model_format import validate_svdint4_metadata
 
 
 LOG = logging.getLogger("comfyui-svdint4")
 FOLDER_NAME = "diffusion_models"
 MODEL_EXTENSIONS = {".safetensors", ".sft"}
 ENV_PATHS = ("SVDINT4_DIT_PATHS",)
-SUPPORTED_FORMATS = {"svdint4-dit-single-v2"}
 
 
 def _model_dirs() -> list[str]:
@@ -62,11 +63,13 @@ def _model_names() -> list[str]:
 def _svdint4_skip_reason(model_path: str | Path) -> str | None:
     try:
         with safe_open(model_path, framework="pt", device="cpu") as handle:
-            fmt = (handle.metadata() or {}).get("format")
+            metadata = handle.metadata() or {}
     except Exception as exc:
         return f"could not read safetensors metadata ({exc})"
-    if fmt not in SUPPORTED_FORMATS:
-        return f"format={fmt!r}, expected one of {sorted(SUPPORTED_FORMATS)}"
+    try:
+        validate_svdint4_metadata(metadata, model_path)
+    except ValueError as exc:
+        return str(exc)
     return None
 
 

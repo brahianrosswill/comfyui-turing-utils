@@ -3,13 +3,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 from safetensors import safe_open
 from safetensors.torch import save_file
 
 
-MINIMAL_FORMAT = "svdint4-dit-single-v2"
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+if str(PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+
+from model_format import SUPPORTED_ARCHITECTURES, SVDINT4_FORMAT  # noqa: E402
 
 
 def _sidecar_path(output: Path) -> Path:
@@ -20,7 +25,7 @@ def _count_packed_linears(keys: list[str]) -> int:
     return sum(1 for key in keys if key.endswith(".qweight"))
 
 
-def repack_single_file(src: Path, dst: Path, sidecar: Path | None) -> None:
+def repack_single_file(src: Path, dst: Path, architecture: str, sidecar: Path | None) -> None:
     tensors = {}
     with safe_open(src, framework="pt", device="cpu") as handle:
         keys = list(handle.keys())
@@ -32,7 +37,7 @@ def repack_single_file(src: Path, dst: Path, sidecar: Path | None) -> None:
     tmp = dst.with_name(dst.name + ".tmp")
     if tmp.exists():
         tmp.unlink()
-    save_file(tensors, tmp, metadata={"format": MINIMAL_FORMAT})
+    save_file(tensors, tmp, metadata={"format": SVDINT4_FORMAT, "architecture": architecture})
     os.replace(tmp, dst)
 
     if sidecar is not None:
@@ -40,7 +45,8 @@ def repack_single_file(src: Path, dst: Path, sidecar: Path | None) -> None:
         info = {
             "source": str(src),
             "output": str(dst),
-            "format": MINIMAL_FORMAT,
+            "format": SVDINT4_FORMAT,
+            "architecture": architecture,
             "tensor_count": len(keys),
             "packed_linear_count": _count_packed_linears(keys),
             "source_metadata": source_metadata,
@@ -52,6 +58,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Repack an SVDInt4 single-file safetensors asset with minimal metadata.")
     parser.add_argument("--input", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--architecture", required=True, choices=sorted(SUPPORTED_ARCHITECTURES))
     parser.add_argument(
         "--sidecar",
         type=Path,
@@ -62,7 +69,7 @@ def main() -> None:
     args = parser.parse_args()
 
     sidecar = None if args.no_sidecar else (args.sidecar or _sidecar_path(args.output))
-    repack_single_file(args.input, args.output, sidecar)
+    repack_single_file(args.input, args.output, args.architecture, sidecar)
     print(f"wrote {args.output}")
     if sidecar is not None:
         print(f"wrote {sidecar}")

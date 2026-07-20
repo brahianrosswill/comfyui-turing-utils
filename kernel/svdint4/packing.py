@@ -5,16 +5,15 @@ from dataclasses import dataclass
 import torch
 
 
-SVDINT4_METADATA_CONTRACT_VERSION = "1"
 SVDINT4_DEFAULT_METADATA = {
-    "format": "svdint4-dit-single-v2",
-    "svdint4_contract_version": SVDINT4_METADATA_CONTRACT_VERSION,
+    "format": "svdint4",
     "has_svd_correction": "true",
 }
 
 
-def build_svdint4_metadata(**overrides: str) -> dict[str, str]:
+def build_svdint4_metadata(*, architecture: str, **overrides: str) -> dict[str, str]:
     metadata = dict(SVDINT4_DEFAULT_METADATA)
+    metadata["architecture"] = architecture
     metadata.update({key: str(value) for key, value in overrides.items() if value is not None})
     return metadata
 

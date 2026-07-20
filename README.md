@@ -100,7 +100,8 @@ The file must use the SVDInt4 single-file layout:
 
 ```text
 metadata:
-  format = svdint4-dit-single-v2
+  format = svdint4
+  architecture = wan
 
 tensors:
   blocks.N.self_attn.q.qweight
@@ -113,22 +114,28 @@ tensors:
   non-quantized model tensors use their normal ComfyUI/Diffusers keys
 ```
 
-Only the `format` metadata is required in the weight file. Keep provenance,
-calibration notes, source paths, and experiment notes in a sidecar JSON if you
-need them.
+`format` and `architecture` are required. `format` has exactly one accepted
+value, `svdint4`; architecture identity is never encoded into that string. See
+[`docs/format.md`](docs/format.md) for the complete tensor contract. Keep
+provenance, calibration notes, source paths, and experiment notes in a sidecar
+JSON if you need them.
 
-Quantization scripts use one list-style LoRA argument when adapter fusion is
-needed:
+The data-free converter consumes a dense checkpoint whose desired LoRAs are
+already fused:
 
 ```bash
-python scripts/quantize_*.py ... \
-  --lora path/to/adapter_a.safetensors \
-  --lora path/to/adapter_b.safetensors:0.8
+python scripts/convert_diffusion_model.py \
+  --input path/to/fused-high.safetensors \
+  --output path/to/svdint4-high.safetensors \
+  --architecture wan \
+  --branch high
 ```
 
-Do not add model-specific boolean switches for individual LoRAs. A quantizer
-that does not implement real LoRA fusion must reject `--lora` explicitly rather
-than ignoring it.
+This path uses unit smooth factors and performs no activation calibration. It
+is useful for conversion experiments, but it is not a substitute for the
+Bernini calibration and held-out validation gate. The calibrated flow and its
+1024/256 manifest contract are documented in
+[`docs/calibration.md`](docs/calibration.md).
 
 The node scans ComfyUI's `diffusion_models` paths and only shows supported
 SVDInt4 files. For custom model locations, set `SVDINT4_DIT_PATHS` before
@@ -163,7 +170,7 @@ Convert each branch into one `.safetensors` file before using it in ComfyUI:
 4. Rename old SVD correction tensor keys:
    - `.lora_down` -> `.svd_down`
    - `.lora_up` -> `.svd_up`
-5. Save with minimal metadata: `format=svdint4-dit-single-v2`.
+5. Save with minimal metadata: `format=svdint4` and `architecture=wan`.
 
 High-noise and low-noise branches should become two separate files, for example:
 
@@ -172,12 +179,13 @@ bernini-high.safetensors
 bernini-low.safetensors
 ```
 
-To repack an existing single-file asset into the minimal v2 metadata layout:
+To repack an existing single-file asset into the canonical metadata layout:
 
 ```bash
 python custom_nodes/comfyui-svdint4/scripts/repack_single_file.py \
   --input old-high.safetensors \
-  --output bernini-high.safetensors
+  --output bernini-high.safetensors \
+  --architecture wan
 ```
 
 The script writes original metadata and basic provenance to
@@ -301,7 +309,7 @@ The model dropdown is empty
 
 No valid SVDInt4 DiT files were found. Put the single-file assets in
 `ComfyUI/models/diffusion_models` and make sure their metadata contains
-`format=svdint4-dit-single-v2`.
+`format=svdint4` and `architecture=wan`.
 
 ComfyUI starts, but generation fails when sampling
 

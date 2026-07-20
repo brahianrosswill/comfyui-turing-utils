@@ -17,8 +17,10 @@ from comfy.patcher_extension import CallbacksMP
 
 try:
     from .attention_backends import apply_attention_backend, normalize_attention_backend
+    from .model_format import validate_svdint4_metadata
 except ImportError:
     from attention_backends import apply_attention_backend, normalize_attention_backend
+    from model_format import validate_svdint4_metadata
 
 try:
     from comfy.quant_ops import QuantizedLayout, QuantizedTensor, register_layout_class, register_layout_op
@@ -41,7 +43,6 @@ LOG = logging.getLogger("comfyui-svdint4")
 
 PACKED_FIELDS = {"qweight", "wscales", "smooth", "svd_down", "svd_up", "bias_packed"}
 REQUIRED_FIELDS = {"qweight", "wscales", "svd_down", "svd_up"}
-SUPPORTED_FORMATS = {"svdint4-dit-single-v2"}
 COMPUTE_DTYPE = torch.float16
 SVDINT4_LAYOUT_NAME = "SVDInt4PackedLayout"
 SVDINT4_STATE_PREFIX = "svdint4_"
@@ -91,18 +92,14 @@ def _model_metadata(model_path: Path) -> dict[str, str]:
 
 def is_svdint4_file(model_path: str | Path) -> bool:
     try:
-        return _model_metadata(Path(model_path)).get("format") in SUPPORTED_FORMATS
+        validate_svdint4_metadata(_model_metadata(Path(model_path)), model_path)
+        return True
     except Exception:
         return False
 
 
 def _validate_metadata(metadata: dict[str, str], model_path: Path) -> None:
-    fmt = metadata.get("format")
-    if fmt not in SUPPORTED_FORMATS:
-        raise ValueError(
-            f"{model_path} is not an SVDInt4 DiT file: format={fmt!r}; "
-            f"expected one of {sorted(SUPPORTED_FORMATS)}"
-        )
+    validate_svdint4_metadata(metadata, model_path)
 
 
 def _collect_packed_layers_from_handle(handle) -> dict[str, dict[str, tuple[str, tuple[int, ...]]]]:
