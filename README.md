@@ -193,6 +193,15 @@ The script writes original metadata and basic provenance to
 
 ## Nodes
 
+- `Load ConvRot DiT`
+  Loads an official ComfyUI ConvRot diffusion model with an activation mode of
+  `auto`, `int4`, or `int8`. `auto` follows the file metadata. W4 ConvRot
+  weights can run as W4A4 or W4A8 without repacking their tensor payload.
+  W8 ConvRot weights support A8 only; selecting `int4` for a model containing
+  W8 ConvRot layers fails before model construction instead of silently falling
+  back. W4A8 also requires an enabled comfy-kitchen CUDA backend because its
+  eager fallback always computes W4A4.
+
 - `Load SVDInt4 DiT`
   Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
   returns a ComfyUI `MODEL`. `patch_attention` can keep ComfyUI's default
