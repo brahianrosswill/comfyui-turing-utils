@@ -4,6 +4,7 @@ import json
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -14,7 +15,16 @@ COMFY_ROOT = PLUGIN_ROOT.parents[1]
 sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
-from convrot_nodes import ConvRotSummary, _validate_runtime_support, configure_convrot_activation  # noqa: E402
+import comfy.sd  # noqa: E402
+
+from convrot_nodes import (  # noqa: E402
+    ConvRotCLIPLoader,
+    ConvRotDiffusionModelLoader,
+    ConvRotSummary,
+    _validate_runtime_support,
+    configure_convrot_activation,
+    load_convrot_clip,
+)
 
 
 def quant_tensor(config: dict) -> torch.Tensor:
@@ -26,14 +36,14 @@ def quant_config(value: torch.Tensor) -> dict:
 
 
 class ConvRotActivationTest(unittest.TestCase):
-    def test_auto_uses_w4_format_default(self):
+    def test_false_uses_w4_format_default(self):
         metadata = {
             "_quantization_metadata": json.dumps(
                 {"layers": {"blocks.0.ffn.0": {"format": "convrot_w4a4"}}}
             )
         }
 
-        updated, summary = configure_convrot_activation({}, metadata, "auto")
+        updated, summary = configure_convrot_activation({}, metadata, False)
 
         config = json.loads(updated["_quantization_metadata"])["layers"]["blocks.0.ffn.0"]
         self.assertNotIn("linear_dtype", config)
@@ -51,24 +61,24 @@ class ConvRotActivationTest(unittest.TestCase):
             )
         }
 
-        updated, summary = configure_convrot_activation(state_dict, metadata, "int8")
+        updated, summary = configure_convrot_activation(state_dict, metadata, True)
 
         header_config = json.loads(updated["_quantization_metadata"])["layers"]["blocks.0.ffn.0"]
         self.assertEqual(header_config["linear_dtype"], "int8")
         self.assertEqual(quant_config(state_dict["blocks.1.ffn.0.comfy_quant"])["linear_dtype"], "int8")
         self.assertEqual(summary, ConvRotSummary(w4a8=2))
 
-    def test_int4_rejects_w8_convrot(self):
+    def test_false_rejects_w8a4_metadata(self):
         state_dict = {
             "blocks.0.ffn.0.comfy_quant": quant_tensor(
-                {"format": "int8_tensorwise", "convrot": True}
+                {"format": "int8_tensorwise", "convrot": True, "linear_dtype": "int4"}
             )
         }
 
-        with self.assertRaisesRegex(ValueError, "Cannot run ConvRot W8 weights with INT4 activations"):
-            configure_convrot_activation(state_dict, None, "int4")
+        with self.assertRaisesRegex(ValueError, "W8 ConvRot supports INT8 activations only"):
+            configure_convrot_activation(state_dict, None, False)
 
-    def test_int8_accepts_mixed_w4_and_w8_convrot(self):
+    def test_force_int8_accepts_mixed_w4_and_w8_convrot(self):
         state_dict = {
             "blocks.0.ffn.0.comfy_quant": quant_tensor({"format": "convrot_w4a4"}),
             "blocks.1.ffn.0.comfy_quant": quant_tensor(
@@ -76,32 +86,32 @@ class ConvRotActivationTest(unittest.TestCase):
             ),
         }
 
-        _, summary = configure_convrot_activation(state_dict, None, "int8")
+        _, summary = configure_convrot_activation(state_dict, None, True)
 
         self.assertEqual(summary, ConvRotSummary(w4a8=1, w8a8=1))
 
-    def test_auto_preserves_explicit_w4a8(self):
+    def test_false_preserves_explicit_w4a8(self):
         state_dict = {
             "blocks.0.ffn.0.comfy_quant": quant_tensor(
                 {"format": "convrot_w4a4", "params": {"linear_dtype": "int8"}}
             )
         }
 
-        _, summary = configure_convrot_activation(state_dict, None, "auto")
+        _, summary = configure_convrot_activation(state_dict, None, False)
 
         self.assertEqual(summary, ConvRotSummary(w4a8=1))
 
-    def test_int4_overrides_explicit_w4a8(self):
+    def test_force_int8_overrides_invalid_w8a4_metadata(self):
         state_dict = {
             "blocks.0.ffn.0.comfy_quant": quant_tensor(
-                {"format": "convrot_w4a4", "linear_dtype": "int8"}
+                {"format": "int8_tensorwise", "convrot": True, "linear_dtype": "int4"}
             )
         }
 
-        _, summary = configure_convrot_activation(state_dict, None, "int4")
+        _, summary = configure_convrot_activation(state_dict, None, True)
 
-        self.assertEqual(quant_config(state_dict["blocks.0.ffn.0.comfy_quant"])["linear_dtype"], "int4")
-        self.assertEqual(summary, ConvRotSummary(w4a4=1))
+        self.assertEqual(quant_config(state_dict["blocks.0.ffn.0.comfy_quant"])["linear_dtype"], "int8")
+        self.assertEqual(summary, ConvRotSummary(w8a8=1))
 
     def test_non_convrot_model_is_rejected(self):
         state_dict = {
@@ -109,7 +119,7 @@ class ConvRotActivationTest(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "does not contain supported ConvRot"):
-            configure_convrot_activation(state_dict, None, "auto")
+            configure_convrot_activation(state_dict, None, False)
 
     def test_unsupported_convrot_format_is_rejected(self):
         state_dict = {
@@ -119,7 +129,7 @@ class ConvRotActivationTest(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "unsupported weight format"):
-            configure_convrot_activation(state_dict, None, "auto")
+            configure_convrot_activation(state_dict, None, False)
 
     def test_w8_metadata_cannot_declare_int4_activations(self):
         state_dict = {
@@ -129,9 +139,9 @@ class ConvRotActivationTest(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "W8 ConvRot supports INT8 activations only"):
-            configure_convrot_activation(state_dict, None, "auto")
+            configure_convrot_activation(state_dict, None, False)
 
-    def test_auto_rejects_conflicting_duplicate_metadata(self):
+    def test_false_rejects_conflicting_duplicate_metadata(self):
         metadata = {
             "_quantization_metadata": json.dumps(
                 {
@@ -149,11 +159,11 @@ class ConvRotActivationTest(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "Conflicting ConvRot metadata"):
-            configure_convrot_activation(state_dict, metadata, "auto")
+            configure_convrot_activation(state_dict, metadata, False)
 
     def test_invalid_header_json_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "contains invalid JSON"):
-            configure_convrot_activation({}, {"_quantization_metadata": "{"}, "auto")
+            configure_convrot_activation({}, {"_quantization_metadata": "{"}, False)
 
     def test_invalid_tensor_json_is_rejected(self):
         state_dict = {
@@ -161,11 +171,11 @@ class ConvRotActivationTest(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "contains invalid quantization JSON"):
-            configure_convrot_activation(state_dict, None, "auto")
+            configure_convrot_activation(state_dict, None, False)
 
-    def test_invalid_activation_selection_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "Unsupported ConvRot activation_dtype"):
-            configure_convrot_activation({}, None, "fp16")
+    def test_non_boolean_force_int8_gemm_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "force_int8_gemm must be boolean"):
+            configure_convrot_activation({}, None, "int8")
 
     def test_w4a8_rejects_disabled_cuda_backend(self):
         backends = {
@@ -194,6 +204,162 @@ class ConvRotActivationTest(unittest.TestCase):
             mock.patch("torch.cuda.get_device_capability", return_value=(7, 5)),
         ):
             _validate_runtime_support(ConvRotSummary(w4a8=1))
+
+    def test_w4a8_rejects_explicit_cpu_load_device(self):
+        backends = {
+            "cuda": {
+                "available": True,
+                "disabled": False,
+                "unavailable_reason": None,
+            }
+        }
+        with (
+            mock.patch("comfy_kitchen.list_backends", return_value=backends),
+            mock.patch("torch.cuda.is_available", return_value=True),
+            self.assertRaisesRegex(RuntimeError, "requires an NVIDIA CUDA load device"),
+        ):
+            _validate_runtime_support(ConvRotSummary(w4a8=1), torch.device("cpu"))
+
+
+class FakeQuantLinear(torch.nn.Module):
+    def __init__(self, weight_format: str, activation_dtype: str):
+        super().__init__()
+        self.quant_format = weight_format
+        self.weight = SimpleNamespace(
+            _params=SimpleNamespace(
+                linear_dtype=activation_dtype,
+                convrot=weight_format == "int8_tensorwise",
+            )
+        )
+
+
+class FakeCLIP:
+    def __init__(self, weight_format: str, activation_dtype: str):
+        self.cond_stage_model = torch.nn.Module()
+        self.cond_stage_model.layer = FakeQuantLinear(weight_format, activation_dtype)
+        self.patcher = SimpleNamespace(cached_patcher_init=None)
+
+
+class ConvRotCLIPLoaderTest(unittest.TestCase):
+    def test_load_clip_forces_mixed_ops_and_preserves_activation_override(self):
+        state_dict = {
+            "text_model.encoder.layers.0.mlp.fc1.comfy_quant": quant_tensor(
+                {"format": "convrot_w4a4"}
+            )
+        }
+        fake_clip = FakeCLIP("convrot_w4a4", "int8")
+        captured = {}
+
+        def fake_load_text_encoder(state_dicts, **kwargs):
+            captured["state_dicts"] = state_dicts
+            captured["kwargs"] = kwargs
+            return fake_clip
+
+        with (
+            mock.patch("comfy.utils.load_torch_file", return_value=(state_dict, {})),
+            mock.patch("comfy.model_management.text_encoder_device", return_value=torch.device("cuda", 0)),
+            mock.patch("convrot_nodes._validate_runtime_support") as validate,
+            mock.patch("comfy.sd.load_text_encoder_state_dicts", side_effect=fake_load_text_encoder),
+        ):
+            loaded = load_convrot_clip(
+                "clip.safetensors",
+                clip_type=comfy.sd.CLIPType.STABLE_DIFFUSION,
+                force_int8_gemm=True,
+            )
+
+        self.assertIs(loaded, fake_clip)
+        validate.assert_called_once_with(ConvRotSummary(w4a8=1), torch.device("cuda", 0))
+        config = quant_config(
+            captured["state_dicts"][0][
+                "text_model.encoder.layers.0.mlp.fc1.comfy_quant"
+            ]
+        )
+        self.assertEqual(config["linear_dtype"], "int8")
+        self.assertEqual(
+            captured["kwargs"]["model_options"]["quantization_metadata"],
+            {"mixed_ops": True},
+        )
+        self.assertIsNotNone(fake_clip.patcher.cached_patcher_init[0])
+
+    def test_load_clip_converts_header_metadata_to_tensor_metadata(self):
+        metadata = {
+            "_quantization_metadata": json.dumps(
+                {
+                    "layers": {
+                        "text_model.encoder.layers.0.mlp.fc1": {
+                            "format": "convrot_w4a4"
+                        }
+                    }
+                }
+            )
+        }
+        fake_clip = FakeCLIP("convrot_w4a4", "int4")
+        captured = {}
+
+        def fake_load_text_encoder(state_dicts, **kwargs):
+            captured["state_dict"] = state_dicts[0]
+            return fake_clip
+
+        with (
+            mock.patch("comfy.utils.load_torch_file", return_value=({}, metadata)),
+            mock.patch("comfy.model_management.text_encoder_device", return_value=torch.device("cpu")),
+            mock.patch("comfy.sd.load_text_encoder_state_dicts", side_effect=fake_load_text_encoder),
+        ):
+            load_convrot_clip("clip.safetensors")
+
+        key = "text_model.encoder.layers.0.mlp.fc1.comfy_quant"
+        self.assertIn(key, captured["state_dict"])
+        self.assertEqual(quant_config(captured["state_dict"][key])["format"], "convrot_w4a4")
+
+    def test_load_clip_rejects_layers_not_loaded_as_quantized(self):
+        state_dict = {
+            "text_model.encoder.layers.0.mlp.fc1.comfy_quant": quant_tensor(
+                {"format": "convrot_w4a4"}
+            )
+        }
+        fake_clip = SimpleNamespace(
+            cond_stage_model=torch.nn.Module(),
+            patcher=SimpleNamespace(cached_patcher_init=None),
+        )
+
+        with (
+            mock.patch("comfy.utils.load_torch_file", return_value=(state_dict, {})),
+            mock.patch("comfy.model_management.text_encoder_device", return_value=torch.device("cpu")),
+            mock.patch("comfy.sd.load_text_encoder_state_dicts", return_value=fake_clip),
+            self.assertRaisesRegex(RuntimeError, "was not applied to every CLIP layer"),
+        ):
+            load_convrot_clip("clip.safetensors")
+
+    def test_node_matches_single_clip_loader_contract(self):
+        inputs = ConvRotCLIPLoader.INPUT_TYPES()
+        self.assertIn("clip_name", inputs["required"])
+        self.assertIn("type", inputs["required"])
+        self.assertEqual(
+            inputs["required"]["force_int8_gemm"],
+            (
+                "BOOLEAN",
+                {
+                    "default": False,
+                    "tooltip": (
+                        "False follows each layer's activation format. "
+                        "True forces INT8 GEMM activations."
+                    ),
+                },
+            ),
+        )
+        self.assertNotIn("activation_dtype", inputs["required"])
+        self.assertIn("device", inputs["optional"])
+        self.assertEqual(ConvRotCLIPLoader.RETURN_TYPES, ("CLIP",))
+
+    def test_diffusion_node_uses_force_int8_gemm_boolean(self):
+        inputs = ConvRotDiffusionModelLoader.INPUT_TYPES()
+        self.assertEqual(inputs["required"]["force_int8_gemm"][0], "BOOLEAN")
+        self.assertFalse(inputs["required"]["force_int8_gemm"][1]["default"])
+        self.assertNotIn("activation_dtype", inputs["required"])
+
+    def test_node_rejects_invalid_clip_type(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported ConvRot CLIP type"):
+            ConvRotCLIPLoader().load_clip("clip.safetensors", type="unknown")
 
 
 if __name__ == "__main__":

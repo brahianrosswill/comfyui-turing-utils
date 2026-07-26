@@ -14,8 +14,36 @@ import comfy.utils
 
 
 LOG = logging.getLogger("comfyui-svdint4")
-FOLDER_NAME = "diffusion_models"
-ACTIVATION_DTYPES = ("auto", "int4", "int8")
+DIFFUSION_FOLDER_NAME = "diffusion_models"
+CLIP_FOLDER_NAME = "text_encoders"
+CLIP_TYPES = (
+    "stable_diffusion",
+    "stable_cascade",
+    "sd3",
+    "stable_audio",
+    "mochi",
+    "ltxv",
+    "pixart",
+    "cosmos",
+    "lumina2",
+    "wan",
+    "hidream",
+    "chroma",
+    "ace",
+    "omnigen2",
+    "qwen_image",
+    "hunyuan_image",
+    "flux2",
+    "ovis",
+    "longcat_image",
+    "cogvideox",
+    "lens",
+    "pixeldit",
+    "ideogram4",
+    "boogu",
+    "krea2",
+    "joyimage",
+)
 W4_FORMAT = "convrot_w4a4"
 W8_FORMAT = "int8_tensorwise"
 
@@ -38,7 +66,7 @@ def _config_value(config: dict, params: dict, name: str, default):
     return config[name] if name in config else params.get(name, default)
 
 
-def _classify_config(config: dict, layer_name: str) -> tuple[str, str] | None:
+def _classify_config(config: dict, layer_name: str, force_int8_gemm: bool) -> tuple[str, str] | None:
     if not isinstance(config, dict):
         raise ValueError(f"Quantization metadata for layer {layer_name} must be an object")
 
@@ -51,7 +79,7 @@ def _classify_config(config: dict, layer_name: str) -> tuple[str, str] | None:
                 f"ConvRot W4 layer {layer_name} declares unsupported linear_dtype={activation_dtype!r}; "
                 "expected 'int4' or 'int8'"
             )
-        return "w4", activation_dtype
+        return "w4", "int8" if force_int8_gemm else activation_dtype
 
     convrot = _config_value(config, params, "convrot", False)
     if not isinstance(convrot, bool):
@@ -62,7 +90,12 @@ def _classify_config(config: dict, layer_name: str) -> tuple[str, str] | None:
         raise ValueError(f"ConvRot layer {layer_name} uses unsupported weight format {quant_format!r}")
 
     activation_dtype = _config_value(config, params, "linear_dtype", "int8")
-    if activation_dtype != "int8":
+    if activation_dtype not in {"int4", "int8"}:
+        raise ValueError(
+            f"ConvRot W8 layer {layer_name} declares unsupported linear_dtype={activation_dtype!r}; "
+            "expected 'int8'"
+        )
+    if activation_dtype != "int8" and not force_int8_gemm:
         raise ValueError(
             f"ConvRot W8 layer {layer_name} cannot use linear_dtype={activation_dtype!r}; "
             "W8 ConvRot supports INT8 activations only"
@@ -89,12 +122,10 @@ def _encode_quant_tensor(config: dict) -> torch.Tensor:
 def configure_convrot_activation(
     state_dict: dict[str, torch.Tensor],
     metadata: dict[str, str] | None,
-    activation_dtype: str,
+    force_int8_gemm: bool,
 ) -> tuple[dict[str, str], ConvRotSummary]:
-    if activation_dtype not in ACTIVATION_DTYPES:
-        raise ValueError(
-            f"Unsupported ConvRot activation_dtype={activation_dtype!r}; expected one of {ACTIVATION_DTYPES}"
-        )
+    if not isinstance(force_int8_gemm, bool):
+        raise ValueError(f"force_int8_gemm must be boolean, got {force_int8_gemm!r}")
 
     metadata = dict(metadata or {})
     records: list[tuple[str, dict]] = []
@@ -121,14 +152,12 @@ def configure_convrot_activation(
     classified_records: list[tuple[str, dict, str, str]] = []
     layer_types: dict[str, tuple[str, str]] = {}
     for layer_name, config in records:
-        classification = _classify_config(config, layer_name)
+        classification = _classify_config(config, layer_name, force_int8_gemm)
         if classification is None:
             continue
         previous = layer_types.get(layer_name)
         if previous is not None:
-            same_weight_format = previous[0] == classification[0]
-            same_auto_activation = previous[1] == classification[1]
-            if not same_weight_format or (activation_dtype == "auto" and not same_auto_activation):
+            if previous != classification:
                 raise ValueError(
                     f"Conflicting ConvRot metadata for layer {layer_name}: "
                     f"{previous[0]}/{previous[1]} versus {classification[0]}/{classification[1]}"
@@ -140,23 +169,9 @@ def configure_convrot_activation(
     if not classified_records:
         raise ValueError("The selected model does not contain supported ConvRot quantization metadata")
 
-    w8_layers = sorted(name for name, (weight_dtype, _) in layer_types.items() if weight_dtype == "w8")
-    if activation_dtype == "int4" and w8_layers:
-        sample = ", ".join(w8_layers[:5])
-        suffix = "" if len(w8_layers) <= 5 else ", ..."
-        raise ValueError(
-            f"Cannot run ConvRot W8 weights with INT4 activations. "
-            f"The model contains {len(w8_layers)} W8 ConvRot layer(s): {sample}{suffix}"
-        )
-
-    if activation_dtype != "auto":
-        for _, config, weight_dtype, _ in classified_records:
-            if weight_dtype == "w4":
-                config["linear_dtype"] = activation_dtype
-        layer_types = {
-            name: (weight_dtype, activation_dtype if weight_dtype == "w4" else current_activation)
-            for name, (weight_dtype, current_activation) in layer_types.items()
-        }
+    if force_int8_gemm:
+        for _, config, _, _ in classified_records:
+            config["linear_dtype"] = "int8"
 
     if header_quantization is not None:
         metadata["_quantization_metadata"] = json.dumps(header_quantization)
@@ -171,11 +186,11 @@ def configure_convrot_activation(
     return metadata, summary
 
 
-def _loaded_convrot_summary(model) -> ConvRotSummary:
+def _summarize_convrot_modules(root: torch.nn.Module) -> ConvRotSummary:
     w4a4 = 0
     w4a8 = 0
     w8a8 = 0
-    for _, module in model.model.named_modules():
+    for _, module in root.named_modules():
         quant_format = getattr(module, "quant_format", None)
         weight = getattr(module, "weight", None)
         params = getattr(weight, "_params", None)
@@ -195,7 +210,15 @@ def _loaded_convrot_summary(model) -> ConvRotSummary:
     return ConvRotSummary(w4a4=w4a4, w4a8=w4a8, w8a8=w8a8)
 
 
-def _validate_runtime_support(expected: ConvRotSummary) -> None:
+def _loaded_convrot_summary(model) -> ConvRotSummary:
+    return _summarize_convrot_modules(model.model)
+
+
+def _loaded_convrot_clip_summary(clip) -> ConvRotSummary:
+    return _summarize_convrot_modules(clip.cond_stage_model)
+
+
+def _validate_runtime_support(expected: ConvRotSummary, device: torch.device | None = None) -> None:
     if expected.w4a8 == 0:
         return
 
@@ -213,7 +236,8 @@ def _validate_runtime_support(expected: ConvRotSummary) -> None:
             f"{detail}. The eager ConvRot W4 path always computes A4, so this loader will not silently accept A8."
         )
 
-    device = comfy.model_management.get_torch_device()
+    if device is None:
+        device = comfy.model_management.get_torch_device()
     if not torch.cuda.is_available() or device.type != "cuda":
         raise RuntimeError(f"ConvRot W4A8 requires an NVIDIA CUDA load device, got {device}")
     capability = torch.cuda.get_device_capability(device)
@@ -225,13 +249,13 @@ def _validate_runtime_support(expected: ConvRotSummary) -> None:
 
 def load_convrot_model(
     model_path: str | Path,
-    activation_dtype: str = "auto",
+    force_int8_gemm: bool = False,
     *,
     disable_dynamic: bool = False,
 ):
     model_path = Path(model_path)
     state_dict, metadata = comfy.utils.load_torch_file(str(model_path), return_metadata=True)
-    metadata, expected = configure_convrot_activation(state_dict, metadata, activation_dtype)
+    metadata, expected = configure_convrot_activation(state_dict, metadata, force_int8_gemm)
     _validate_runtime_support(expected)
     model = comfy.sd.load_diffusion_model_state_dict(
         state_dict,
@@ -249,14 +273,90 @@ def load_convrot_model(
         )
 
     LOG.info(
-        "Loaded ConvRot model with activation_dtype=%s: W4A4=%d, W4A8=%d, W8A8=%d",
-        activation_dtype,
+        "Loaded ConvRot model with force_int8_gemm=%s: W4A4=%d, W4A8=%d, W8A8=%d",
+        force_int8_gemm,
         loaded.w4a4,
         loaded.w4a8,
         loaded.w8a8,
     )
-    model.cached_patcher_init = (load_convrot_model, (str(model_path), activation_dtype))
+    model.cached_patcher_init = (load_convrot_model, (str(model_path), force_int8_gemm))
     return model
+
+
+def load_convrot_clip_patcher(
+    model_path: str | Path,
+    embedding_directory,
+    clip_type,
+    force_int8_gemm: bool,
+    model_options: dict,
+    disable_dynamic: bool = False,
+):
+    return load_convrot_clip(
+        model_path,
+        embedding_directory=embedding_directory,
+        clip_type=clip_type,
+        force_int8_gemm=force_int8_gemm,
+        model_options=model_options,
+        disable_dynamic=disable_dynamic,
+    ).patcher
+
+
+def load_convrot_clip(
+    model_path: str | Path,
+    *,
+    embedding_directory=None,
+    clip_type=comfy.sd.CLIPType.STABLE_DIFFUSION,
+    force_int8_gemm: bool = False,
+    model_options: dict | None = None,
+    disable_dynamic: bool = False,
+):
+    model_path = Path(model_path)
+    state_dict, metadata = comfy.utils.load_torch_file(
+        str(model_path),
+        safe_load=True,
+        return_metadata=True,
+    )
+    metadata, expected = configure_convrot_activation(state_dict, metadata, force_int8_gemm)
+
+    model_options = dict(model_options or {})
+    load_device = model_options.get("load_device", comfy.model_management.text_encoder_device())
+    _validate_runtime_support(expected, load_device)
+
+    state_dict, metadata = comfy.utils.convert_old_quants(state_dict, model_prefix="", metadata=metadata)
+    model_options["quantization_metadata"] = {"mixed_ops": True}
+    clip = comfy.sd.load_text_encoder_state_dicts(
+        [state_dict],
+        embedding_directory=embedding_directory,
+        clip_type=clip_type,
+        model_options=model_options,
+        disable_dynamic=disable_dynamic,
+    )
+
+    loaded = _loaded_convrot_clip_summary(clip)
+    if loaded != expected:
+        raise RuntimeError(
+            "ConvRot activation selection was not applied to every CLIP layer: "
+            f"expected {expected}, loaded {loaded}. Check the CLIP type and update ComfyUI and comfy-kitchen."
+        )
+
+    LOG.info(
+        "Loaded ConvRot CLIP with force_int8_gemm=%s: W4A4=%d, W4A8=%d, W8A8=%d",
+        force_int8_gemm,
+        loaded.w4a4,
+        loaded.w4a8,
+        loaded.w8a8,
+    )
+    clip.patcher.cached_patcher_init = (
+        load_convrot_clip_patcher,
+        (
+            str(model_path),
+            embedding_directory,
+            clip_type,
+            force_int8_gemm,
+            model_options,
+        ),
+    )
+    return clip
 
 
 class ConvRotDiffusionModelLoader:
@@ -264,14 +364,14 @@ class ConvRotDiffusionModelLoader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "unet_name": (folder_paths.get_filename_list(FOLDER_NAME),),
-                "activation_dtype": (
-                    ACTIVATION_DTYPES,
+                "unet_name": (folder_paths.get_filename_list(DIFFUSION_FOLDER_NAME),),
+                "force_int8_gemm": (
+                    "BOOLEAN",
                     {
-                        "default": "auto",
+                        "default": False,
                         "tooltip": (
-                            "auto follows each layer's file metadata. int4 selects W4A4 and requires W4 ConvRot weights. "
-                            "int8 selects W4A8 for W4 weights and keeps W8 ConvRot layers at W8A8."
+                            "False follows each layer's activation format. "
+                            "True forces INT8 GEMM activations."
                         ),
                     },
                 ),
@@ -284,6 +384,62 @@ class ConvRotDiffusionModelLoader:
     CATEGORY = "SVDInt4/loaders"
     TITLE = "Load ConvRot DiT"
 
-    def load_diffusion_model(self, unet_name: str, activation_dtype: str = "auto"):
-        model_path = folder_paths.get_full_path_or_raise(FOLDER_NAME, unet_name)
-        return (load_convrot_model(model_path, activation_dtype),)
+    def load_diffusion_model(self, unet_name: str, force_int8_gemm: bool = False):
+        model_path = folder_paths.get_full_path_or_raise(DIFFUSION_FOLDER_NAME, unet_name)
+        return (load_convrot_model(model_path, force_int8_gemm),)
+
+
+class ConvRotCLIPLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "clip_name": (folder_paths.get_filename_list(CLIP_FOLDER_NAME),),
+                "type": (CLIP_TYPES,),
+                "force_int8_gemm": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "False follows each layer's activation format. "
+                            "True forces INT8 GEMM activations."
+                        ),
+                    },
+                ),
+            },
+            "optional": {
+                "device": (("default", "cpu"), {"advanced": True}),
+            },
+        }
+
+    RETURN_TYPES = ("CLIP",)
+    RETURN_NAMES = ("clip",)
+    FUNCTION = "load_clip"
+    CATEGORY = "SVDInt4/loaders"
+    TITLE = "Load ConvRot CLIP"
+
+    def load_clip(
+        self,
+        clip_name: str,
+        type: str = "stable_diffusion",
+        force_int8_gemm: bool = False,
+        device: str = "default",
+    ):
+        if type not in CLIP_TYPES:
+            raise ValueError(f"Unsupported ConvRot CLIP type {type!r}; expected one of {CLIP_TYPES}")
+        if device not in {"default", "cpu"}:
+            raise ValueError(f"Unsupported ConvRot CLIP device {device!r}; expected 'default' or 'cpu'")
+        clip_type = getattr(comfy.sd.CLIPType, type.upper())
+        model_options = {}
+        if device == "cpu":
+            model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
+
+        model_path = folder_paths.get_full_path_or_raise(CLIP_FOLDER_NAME, clip_name)
+        clip = load_convrot_clip(
+            model_path,
+            embedding_directory=folder_paths.get_folder_paths("embeddings"),
+            clip_type=clip_type,
+            force_int8_gemm=force_int8_gemm,
+            model_options=model_options,
+        )
+        return (clip,)

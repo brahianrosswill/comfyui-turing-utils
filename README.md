@@ -194,13 +194,16 @@ The script writes original metadata and basic provenance to
 ## Nodes
 
 - `Load ConvRot DiT`
-  Loads an official ComfyUI ConvRot diffusion model with an activation mode of
-  `auto`, `int4`, or `int8`. `auto` follows the file metadata. W4 ConvRot
-  weights can run as W4A4 or W4A8 without repacking their tensor payload.
-  W8 ConvRot weights support A8 only; selecting `int4` for a model containing
-  W8 ConvRot layers fails before model construction instead of silently falling
-  back. W4A8 also requires an enabled comfy-kitchen CUDA backend because its
+  Loads an official ComfyUI ConvRot diffusion model. `force_int8_gemm=false`
+  follows each layer's activation format, while `true` forces INT8 GEMM
+  activations. W4A8 requires an enabled comfy-kitchen CUDA backend because its
   eager fallback always computes W4A4.
+
+- `Load ConvRot CLIP`
+  Loads one ConvRot text encoder from `models/text_encoders` with the same
+  `force_int8_gemm` behavior. It supports the text encoder types exposed by
+  ComfyUI's single CLIP loader, verifies that every declared ConvRot layer was
+  loaded through mixed-precision ops, and rejects W4A8 on a CPU load device.
 
 - `Load SVDInt4 DiT`
   Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
