@@ -12,17 +12,20 @@ from model_format import SVDINT4_FORMAT, validate_svdint4_metadata  # noqa: E402
 
 
 class ModelFormatTest(unittest.TestCase):
-    def test_unique_format_and_wan_architecture(self):
+    def test_unique_format_is_accepted(self):
         self.assertEqual(SVDINT4_FORMAT, "svdint4")
-        self.assertEqual(validate_svdint4_metadata({"format": "svdint4", "architecture": "wan"}), "wan")
+        self.assertIsNone(validate_svdint4_metadata({"format": "svdint4"}))
 
     def test_old_format_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "expected 'svdint4'"):
             validate_svdint4_metadata({"format": "svdint4-dit-single-v2", "architecture": "wan"})
 
-    def test_architecture_is_required(self):
-        with self.assertRaisesRegex(ValueError, "architecture=None"):
-            validate_svdint4_metadata({"format": "svdint4"})
+    def test_architecture_does_not_restrict_loading(self):
+        self.assertIsNone(
+            validate_svdint4_metadata(
+                {"format": "svdint4", "architecture": "qwen_image"}
+            )
+        )
 
 
 if __name__ == "__main__":

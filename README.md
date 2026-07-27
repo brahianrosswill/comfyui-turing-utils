@@ -101,7 +101,6 @@ The file must use the SVDInt4 single-file layout:
 ```text
 metadata:
   format = svdint4
-  architecture = wan
 
 tensors:
   blocks.N.self_attn.q.qweight
@@ -114,11 +113,11 @@ tensors:
   non-quantized model tensors use their normal ComfyUI/Diffusers keys
 ```
 
-`format` and `architecture` are required. `format` has exactly one accepted
-value, `svdint4`; architecture identity is never encoded into that string. See
-[`docs/format.md`](docs/format.md) for the complete tensor contract. Keep
-provenance, calibration notes, source paths, and experiment notes in a sidecar
-JSON if you need them.
+`format` is required and has exactly one accepted value, `svdint4`.
+`architecture` is optional informational metadata and is not a loader
+whitelist. See [`docs/format.md`](docs/format.md) for the complete tensor
+contract. Keep provenance, calibration notes, source paths, and experiment
+notes in a sidecar JSON if you need them.
 
 The data-free converter consumes a dense checkpoint whose desired LoRAs are
 already fused:
@@ -321,7 +320,7 @@ The model dropdown is empty
 
 No valid SVDInt4 DiT files were found. Put the single-file assets in
 `ComfyUI/models/diffusion_models` and make sure their metadata contains
-`format=svdint4` and `architecture=wan`.
+`format=svdint4`.
 
 ComfyUI starts, but generation fails when sampling
 

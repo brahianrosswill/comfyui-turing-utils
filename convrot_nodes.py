@@ -7,6 +7,7 @@ from pathlib import Path
 
 import folder_paths
 import torch
+from safetensors import safe_open
 
 import comfy.model_management
 import comfy.sd
@@ -16,6 +17,7 @@ import comfy.utils
 LOG = logging.getLogger("comfyui-svdint4")
 DIFFUSION_FOLDER_NAME = "diffusion_models"
 CLIP_FOLDER_NAME = "text_encoders"
+MODEL_EXTENSIONS = {".safetensors", ".sft"}
 CLIP_TYPES = (
     "stable_diffusion",
     "stable_cascade",
@@ -117,6 +119,60 @@ def _decode_quant_tensor(value: torch.Tensor, key: str) -> dict:
 
 def _encode_quant_tensor(config: dict) -> torch.Tensor:
     return torch.tensor(list(json.dumps(config).encode("utf-8")), dtype=torch.uint8)
+
+
+def _convrot_skip_reason(model_path: str | Path) -> str | None:
+    model_path = Path(model_path)
+    if model_path.suffix.lower() not in MODEL_EXTENSIONS:
+        return f"unsupported file extension {model_path.suffix!r}"
+
+    try:
+        with safe_open(model_path, framework="pt", device="cpu") as handle:
+            metadata = handle.metadata() or {}
+            raw_header = metadata.get("_quantization_metadata")
+            if raw_header is not None:
+                header = json.loads(raw_header)
+                if not isinstance(header, dict) or not isinstance(header.get("layers"), dict):
+                    return "safetensors _quantization_metadata must contain a layers object"
+                for layer_name, config in header["layers"].items():
+                    if _classify_config(config, layer_name, True) is not None:
+                        return None
+
+            for key in handle.keys():
+                if not key.endswith(".comfy_quant"):
+                    continue
+                config = _decode_quant_tensor(handle.get_tensor(key), key)
+                if _classify_config(config, key[: -len(".comfy_quant")], True) is not None:
+                    return None
+    except Exception as exc:
+        return f"could not read ConvRot metadata ({exc})"
+
+    return "does not contain supported ConvRot quantization metadata"
+
+
+def _convrot_model_names(folder_name: str) -> list[str]:
+    names = []
+    for name in folder_paths.get_filename_list(folder_name):
+        if Path(name).suffix.lower() not in MODEL_EXTENSIONS:
+            continue
+        model_path = folder_paths.get_full_path(folder_name, name)
+        if model_path is None:
+            LOG.debug("Skipping ConvRot candidate %s: folder_paths could not resolve it", name)
+            continue
+        skip_reason = _convrot_skip_reason(model_path)
+        if skip_reason is None:
+            names.append(name)
+        else:
+            LOG.debug("Skipping ConvRot candidate %s: %s", name, skip_reason)
+    return names
+
+
+def _resolve_convrot_model_path(folder_name: str, model_name: str) -> str:
+    model_path = folder_paths.get_full_path_or_raise(folder_name, model_name)
+    skip_reason = _convrot_skip_reason(model_path)
+    if skip_reason is not None:
+        raise ValueError(f"{model_path} is not a supported ConvRot model: {skip_reason}")
+    return model_path
 
 
 def configure_convrot_activation(
@@ -364,7 +420,15 @@ class ConvRotDiffusionModelLoader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "unet_name": (folder_paths.get_filename_list(DIFFUSION_FOLDER_NAME),),
+                "unet_name": (
+                    _convrot_model_names(DIFFUSION_FOLDER_NAME),
+                    {
+                        "tooltip": (
+                            "ConvRot DiT file from ComfyUI/models/diffusion_models. "
+                            "Files without supported ConvRot quantization metadata are hidden."
+                        )
+                    },
+                ),
                 "force_int8_gemm": (
                     "BOOLEAN",
                     {
@@ -385,7 +449,7 @@ class ConvRotDiffusionModelLoader:
     TITLE = "Load ConvRot DiT"
 
     def load_diffusion_model(self, unet_name: str, force_int8_gemm: bool = False):
-        model_path = folder_paths.get_full_path_or_raise(DIFFUSION_FOLDER_NAME, unet_name)
+        model_path = _resolve_convrot_model_path(DIFFUSION_FOLDER_NAME, unet_name)
         return (load_convrot_model(model_path, force_int8_gemm),)
 
 
@@ -394,7 +458,15 @@ class ConvRotCLIPLoader:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "clip_name": (folder_paths.get_filename_list(CLIP_FOLDER_NAME),),
+                "clip_name": (
+                    _convrot_model_names(CLIP_FOLDER_NAME),
+                    {
+                        "tooltip": (
+                            "ConvRot CLIP file from ComfyUI/models/text_encoders. "
+                            "Files without supported ConvRot quantization metadata are hidden."
+                        )
+                    },
+                ),
                 "type": (CLIP_TYPES,),
                 "force_int8_gemm": (
                     "BOOLEAN",
@@ -434,7 +506,7 @@ class ConvRotCLIPLoader:
         if device == "cpu":
             model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
 
-        model_path = folder_paths.get_full_path_or_raise(CLIP_FOLDER_NAME, clip_name)
+        model_path = _resolve_convrot_model_path(CLIP_FOLDER_NAME, clip_name)
         clip = load_convrot_clip(
             model_path,
             embedding_directory=folder_paths.get_folder_paths("embeddings"),

@@ -15,13 +15,12 @@ older identifiers.
 
 ```text
 format = svdint4
-architecture = wan
 ```
 
-`architecture` selects the model key mapping independently from the storage
-format. The current loader implements `wan`, which covers supported Wan,
-Wan2.2, Bernini, and SCAIL-derived DiT checkpoints. New architecture mappings
-must add a new `architecture` value without creating a new `format` value.
+`architecture` may be included as informational metadata, but the loader does
+not use it as a compatibility whitelist. ComfyUI detects the model architecture
+from the normal model tensors, while this plugin validates the packed tensor
+layout and requires every packed layer to be consumed by that model.
 
 Release name, branch, recipe, calibration method, rank, provenance, and model
 version are not format identity. They may be stored as additional metadata or
@@ -51,9 +50,9 @@ Non-quantized tensors retain the normal architecture keys and dtypes expected
 by ComfyUI. One file contains one DiT branch; high-noise and low-noise branches
 remain separate files.
 
-## Architecture: `wan`
+## Bundled Wan converter key layout
 
-The public quantized Linear bases use storage-style Wan names:
+The bundled converter currently produces storage-style Wan names:
 
 ```text
 blocks.N.self_attn.{q,k,v,o}
@@ -68,7 +67,7 @@ does not consume.
 ## Data-free and calibrated weights
 
 Both paths produce exactly the same format. Calibration status does not alter
-`format` or `architecture`:
+`format`:
 
 - Data-free conversion derives a weight-only low-rank correction and writes
   unit smooth factors.

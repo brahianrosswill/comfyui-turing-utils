@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
+from safetensors.torch import save_file
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +23,8 @@ from convrot_nodes import (  # noqa: E402
     ConvRotCLIPLoader,
     ConvRotDiffusionModelLoader,
     ConvRotSummary,
+    _convrot_model_names,
+    _convrot_skip_reason,
     _validate_runtime_support,
     configure_convrot_activation,
     load_convrot_clip,
@@ -219,6 +223,106 @@ class ConvRotActivationTest(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "requires an NVIDIA CUDA load device"),
         ):
             _validate_runtime_support(ConvRotSummary(w4a8=1), torch.device("cpu"))
+
+
+class ConvRotModelFilterTest(unittest.TestCase):
+    def _save(self, directory: str, name: str, tensors: dict, metadata=None) -> Path:
+        path = Path(directory) / name
+        save_file(tensors, path, metadata=metadata)
+        return path
+
+    def test_supported_tensor_metadata_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._save(
+                directory,
+                "convrot.safetensors",
+                {"blocks.0.ffn.0.comfy_quant": quant_tensor({"format": "convrot_w4a4"})},
+            )
+
+            self.assertIsNone(_convrot_skip_reason(path))
+
+    def test_supported_header_metadata_is_accepted(self):
+        metadata = {
+            "_quantization_metadata": json.dumps(
+                {"layers": {"blocks.0.ffn.0": {"format": "convrot_w4a4"}}}
+            )
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._save(
+                directory,
+                "convrot.safetensors",
+                {"blocks.0.ffn.0.weight": torch.zeros((1, 1))},
+                metadata,
+            )
+
+            self.assertIsNone(_convrot_skip_reason(path))
+
+    def test_dense_and_non_convrot_quantized_models_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            dense = self._save(
+                directory,
+                "dense.safetensors",
+                {"blocks.0.ffn.0.weight": torch.zeros((1, 1))},
+            )
+            int8 = self._save(
+                directory,
+                "int8.safetensors",
+                {
+                    "blocks.0.ffn.0.comfy_quant": quant_tensor(
+                        {"format": "int8_tensorwise"}
+                    )
+                },
+            )
+
+            self.assertIn("does not contain supported ConvRot", _convrot_skip_reason(dense))
+            self.assertIn("does not contain supported ConvRot", _convrot_skip_reason(int8))
+
+    def test_model_list_only_contains_supported_convrot_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            convrot = self._save(
+                directory,
+                "convrot.safetensors",
+                {"blocks.0.ffn.0.comfy_quant": quant_tensor({"format": "convrot_w4a4"})},
+            )
+            dense = self._save(
+                directory,
+                "dense.safetensors",
+                {"blocks.0.ffn.0.weight": torch.zeros((1, 1))},
+            )
+            paths = {
+                convrot.name: str(convrot),
+                dense.name: str(dense),
+            }
+            with (
+                mock.patch(
+                    "folder_paths.get_filename_list",
+                    return_value=[convrot.name, dense.name, "model.gguf"],
+                ),
+                mock.patch(
+                    "folder_paths.get_full_path",
+                    side_effect=lambda _folder, name: paths.get(name),
+                ),
+            ):
+                names = _convrot_model_names("diffusion_models")
+
+            self.assertEqual(names, [convrot.name])
+
+    def test_stale_workflow_selection_is_rejected_before_loading(self):
+        with (
+            mock.patch(
+                "folder_paths.get_full_path_or_raise",
+                return_value="/models/dense.safetensors",
+            ),
+            mock.patch(
+                "convrot_nodes._convrot_skip_reason",
+                return_value="does not contain supported ConvRot quantization metadata",
+            ),
+            mock.patch("convrot_nodes.load_convrot_model") as load_model,
+            self.assertRaisesRegex(ValueError, "is not a supported ConvRot model"),
+        ):
+            ConvRotDiffusionModelLoader().load_diffusion_model("dense.safetensors")
+
+        load_model.assert_not_called()
 
 
 class FakeQuantLinear(torch.nn.Module):
