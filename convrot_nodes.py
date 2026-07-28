@@ -9,6 +9,7 @@ import folder_paths
 import torch
 from safetensors import safe_open
 
+import comfy.model_detection
 import comfy.model_management
 import comfy.sd
 import comfy.utils
@@ -192,6 +193,7 @@ def configure_convrot_activation(
     state_dict: dict[str, torch.Tensor],
     metadata: dict[str, str] | None,
     force_int8_gemm: bool,
+    model_prefix: str | None = None,
 ) -> tuple[dict[str, str], ConvRotSummary]:
     if not isinstance(force_int8_gemm, bool):
         raise ValueError(f"force_int8_gemm must be boolean, got {force_int8_gemm!r}")
@@ -207,13 +209,19 @@ def configure_convrot_activation(
             raise ValueError("Safetensors _quantization_metadata contains invalid JSON") from exc
         if not isinstance(header_quantization, dict) or not isinstance(header_quantization.get("layers"), dict):
             raise ValueError("Safetensors _quantization_metadata must contain a layers object")
-        records.extend((name, config) for name, config in header_quantization["layers"].items())
+        records.extend(
+            (name, config)
+            for name, config in header_quantization["layers"].items()
+            if model_prefix is None or name.startswith(model_prefix)
+        )
 
     tensor_configs: dict[str, dict] = {}
     for key, value in state_dict.items():
         if not key.endswith(".comfy_quant"):
             continue
         layer_name = key[: -len(".comfy_quant")]
+        if model_prefix is not None and not layer_name.startswith(model_prefix):
+            continue
         config = _decode_quant_tensor(value, key)
         tensor_configs[key] = config
         records.append((layer_name, config))
@@ -326,7 +334,15 @@ def load_convrot_model(
     attention_backend = normalize_attention_backend(attention_backend)
     model_path = Path(model_path)
     state_dict, metadata = comfy.utils.load_torch_file(str(model_path), return_metadata=True)
-    metadata, expected = configure_convrot_activation(state_dict, metadata, force_int8_gemm)
+    diffusion_model_prefix = comfy.model_detection.unet_prefix_from_state_dict(state_dict)
+    if not any(key.startswith(diffusion_model_prefix) for key in state_dict):
+        diffusion_model_prefix = ""
+    metadata, expected = configure_convrot_activation(
+        state_dict,
+        metadata,
+        force_int8_gemm,
+        model_prefix=diffusion_model_prefix,
+    )
     _validate_runtime_support(expected)
     model = comfy.sd.load_diffusion_model_state_dict(
         state_dict,

@@ -73,6 +73,41 @@ class ConvRotActivationTest(unittest.TestCase):
         self.assertEqual(quant_config(state_dict["blocks.1.ffn.0.comfy_quant"])["linear_dtype"], "int8")
         self.assertEqual(summary, ConvRotSummary(w4a8=2))
 
+    def test_model_prefix_excludes_aio_text_encoder_layers(self):
+        state_dict = {
+            "model.diffusion_model.blocks.0.ffn.0.comfy_quant": quant_tensor(
+                {"format": "convrot_w4a4", "linear_dtype": "int4"}
+            ),
+            "text_encoders.qwen.layers.0.mlp.comfy_quant": quant_tensor(
+                {"format": "convrot_w4a4", "linear_dtype": "int4"}
+            ),
+        }
+
+        _, summary = configure_convrot_activation(
+            state_dict,
+            None,
+            True,
+            model_prefix="model.diffusion_model.",
+        )
+
+        self.assertEqual(summary, ConvRotSummary(w4a8=1))
+        self.assertEqual(
+            quant_config(
+                state_dict[
+                    "model.diffusion_model.blocks.0.ffn.0.comfy_quant"
+                ]
+            )["linear_dtype"],
+            "int8",
+        )
+        self.assertEqual(
+            quant_config(
+                state_dict[
+                    "text_encoders.qwen.layers.0.mlp.comfy_quant"
+                ]
+            )["linear_dtype"],
+            "int4",
+        )
+
     def test_false_rejects_w8a4_metadata(self):
         state_dict = {
             "blocks.0.ffn.0.comfy_quant": quant_tensor(
@@ -356,12 +391,21 @@ class FakeModel:
 class ConvRotCLIPLoaderTest(unittest.TestCase):
     def test_load_model_defaults_to_auto_and_preserves_it_for_reload(self):
         state_dict = {
-            "blocks.0.ffn.0.comfy_quant": quant_tensor({"format": "convrot_w4a4"})
+            "model.diffusion_model.blocks.0.ffn.0.comfy_quant": quant_tensor(
+                {"format": "convrot_w4a4"}
+            ),
+            "text_encoders.qwen.layers.0.mlp.comfy_quant": quant_tensor(
+                {"format": "convrot_w4a4"}
+            ),
         }
         fake_model = FakeModel("convrot_w4a4", "int4")
 
         with (
             mock.patch("comfy.utils.load_torch_file", return_value=(state_dict, {})),
+            mock.patch(
+                "comfy.model_detection.unet_prefix_from_state_dict",
+                return_value="model.diffusion_model.",
+            ),
             mock.patch("convrot_nodes._validate_runtime_support"),
             mock.patch("comfy.sd.load_diffusion_model_state_dict", return_value=fake_model),
             mock.patch("convrot_nodes.apply_attention_backend") as apply_backend,
