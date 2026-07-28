@@ -35,18 +35,10 @@ def _normalize_key(value: str) -> str:
 
 register_attention_backend(
     AttentionBackend(
-        option="default",
+        option="auto",
         attention_function=None,
-        label="default",
-        aliases=("auto", "none", "comfyui_default"),
-    )
-)
-register_attention_backend(
-    AttentionBackend(
-        option="sdpa",
-        attention_function="pytorch",
-        label="sdpa",
-        aliases=("pytorch", "torch", "torch_sdpa"),
+        label="auto",
+        aliases=("default", "none", "comfyui_default"),
     )
 )
 register_attention_backend(
@@ -67,6 +59,16 @@ register_attention_backend(
         aliases=("flash", "flash_attention", "flashattention"),
     )
 )
+register_attention_backend(
+    AttentionBackend(
+        option="sdpa",
+        attention_function="pytorch",
+        label="sdpa",
+        aliases=("pytorch", "torch", "torch_sdpa"),
+    )
+)
+
+AUTO_BACKEND_PRIORITY = ("sage_attn", "flash_attn", "sdpa")
 
 
 def attention_backend_choices() -> tuple[str, ...]:
@@ -75,7 +77,7 @@ def attention_backend_choices() -> tuple[str, ...]:
 
 def normalize_attention_backend(value: str | None) -> str:
     if value is None:
-        return "default"
+        return "auto"
     option = _ALIASES.get(_normalize_key(value))
     if option is None:
         raise ValueError(
@@ -103,11 +105,24 @@ def _resolve_attention_function(backend: AttentionBackend) -> Callable | None:
     return func
 
 
+def _select_attention_backend(option: str) -> tuple[AttentionBackend, Callable]:
+    option = normalize_attention_backend(option)
+    if option != "auto":
+        backend = _BACKENDS[option]
+        return backend, _resolve_attention_function(backend)
+
+    from comfy.ldm.modules import attention
+
+    for candidate in AUTO_BACKEND_PRIORITY:
+        backend = _BACKENDS[candidate]
+        func = attention.get_attention_function(backend.attention_function, None)
+        if func is not None:
+            return backend, func
+    raise RuntimeError("No supported attention backend is available")
+
+
 def make_attention_override(option: str) -> Callable | None:
-    backend = _BACKENDS[normalize_attention_backend(option)]
-    target = _resolve_attention_function(backend)
-    if target is None:
-        return None
+    backend, target = _select_attention_backend(option)
 
     def attention_override(original: Callable, *args, **kwargs):
         return target(*args, **kwargs)
@@ -119,13 +134,9 @@ def make_attention_override(option: str) -> Callable | None:
 def apply_attention_backend(model, option: str):
     option = normalize_attention_backend(option)
     transformer_options = model.model_options.setdefault("transformer_options", {})
-
-    if option == "default":
-        transformer_options.pop("optimized_attention_override", None)
-        transformer_options.pop("svdint4_attention_backend", None)
-        return model
-
-    transformer_options["optimized_attention_override"] = make_attention_override(option)
-    transformer_options["svdint4_attention_backend"] = option
-    LOG.info("SVDInt4 attention backend override: %s", option)
+    override = make_attention_override(option)
+    selected = override.svdint4_attention_backend
+    transformer_options["optimized_attention_override"] = override
+    transformer_options["svdint4_attention_backend"] = selected
+    LOG.info("SVDInt4 attention backend override: %s (requested %s)", selected, option)
     return model

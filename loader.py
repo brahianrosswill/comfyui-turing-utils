@@ -1080,13 +1080,13 @@ def _after_model_load(model_patcher, *_) -> None:
 
 def load_svdint4_model(
     model_path: str | Path,
-    attention_backend: str | bool | None = "default",
+    attention_backend: str | bool | None = "auto",
     *,
     disable_dynamic: bool = False,
 ):
     if isinstance(attention_backend, bool):
         disable_dynamic = attention_backend
-        attention_backend = "default"
+        attention_backend = "auto"
     attention_backend = normalize_attention_backend(attention_backend)
 
     if not _HAS_COMFY_QUANTIZED_TENSOR:

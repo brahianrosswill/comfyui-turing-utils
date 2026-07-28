@@ -13,6 +13,19 @@ import comfy.model_management
 import comfy.sd
 import comfy.utils
 
+try:
+    from .attention_backends import (
+        apply_attention_backend,
+        attention_backend_choices,
+        normalize_attention_backend,
+    )
+except ImportError:
+    from attention_backends import (
+        apply_attention_backend,
+        attention_backend_choices,
+        normalize_attention_backend,
+    )
+
 
 LOG = logging.getLogger("comfyui-svdint4")
 DIFFUSION_FOLDER_NAME = "diffusion_models"
@@ -306,9 +319,11 @@ def _validate_runtime_support(expected: ConvRotSummary, device: torch.device | N
 def load_convrot_model(
     model_path: str | Path,
     force_int8_gemm: bool = False,
+    attention_backend: str | None = "auto",
     *,
     disable_dynamic: bool = False,
 ):
+    attention_backend = normalize_attention_backend(attention_backend)
     model_path = Path(model_path)
     state_dict, metadata = comfy.utils.load_torch_file(str(model_path), return_metadata=True)
     metadata, expected = configure_convrot_activation(state_dict, metadata, force_int8_gemm)
@@ -335,7 +350,11 @@ def load_convrot_model(
         loaded.w4a8,
         loaded.w8a8,
     )
-    model.cached_patcher_init = (load_convrot_model, (str(model_path), force_int8_gemm))
+    apply_attention_backend(model, attention_backend)
+    model.cached_patcher_init = (
+        load_convrot_model,
+        (str(model_path), force_int8_gemm, attention_backend),
+    )
     return model
 
 
@@ -439,7 +458,19 @@ class ConvRotDiffusionModelLoader:
                         ),
                     },
                 ),
-            }
+            },
+            "optional": {
+                "patch_attention": (
+                    attention_backend_choices(),
+                    {
+                        "default": "auto",
+                        "tooltip": (
+                            "Select this ConvRot model's attention backend. "
+                            "auto tries sage_attn, then flash_attn, then PyTorch SDPA."
+                        ),
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("MODEL",)
@@ -448,9 +479,14 @@ class ConvRotDiffusionModelLoader:
     CATEGORY = "SVDInt4/loaders"
     TITLE = "Load ConvRot DiT"
 
-    def load_diffusion_model(self, unet_name: str, force_int8_gemm: bool = False):
+    def load_diffusion_model(
+        self,
+        unet_name: str,
+        force_int8_gemm: bool = False,
+        patch_attention: str = "auto",
+    ):
         model_path = _resolve_convrot_model_path(DIFFUSION_FOLDER_NAME, unet_name)
-        return (load_convrot_model(model_path, force_int8_gemm),)
+        return (load_convrot_model(model_path, force_int8_gemm, attention_backend=patch_attention),)
 
 
 class ConvRotCLIPLoader:

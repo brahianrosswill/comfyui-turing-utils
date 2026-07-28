@@ -196,7 +196,8 @@ The script writes original metadata and basic provenance to
   Loads an official ComfyUI ConvRot diffusion model. `force_int8_gemm=false`
   follows each layer's activation format, while `true` forces INT8 GEMM
   activations. W4A8 requires an enabled comfy-kitchen CUDA backend because its
-  eager fallback always computes W4A4.
+  eager fallback always computes W4A4. `patch_attention=auto` selects
+  SageAttention first, Flash Attention second, and PyTorch SDPA as the fallback.
 
 - `Load ConvRot CLIP`
   Loads one ConvRot text encoder from `models/text_encoders` with the same
@@ -206,9 +207,8 @@ The script writes original metadata and basic provenance to
 
 - `Load SVDInt4 DiT`
   Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
-  returns a ComfyUI `MODEL`. `patch_attention` can keep ComfyUI's default
-  attention path or override this model to use SDPA, SageAttention, or Flash
-  Attention when the matching backend is installed.
+  returns a ComfyUI `MODEL`. `patch_attention=auto` uses the same SageAttention,
+  Flash Attention, then PyTorch SDPA priority.
 
 - `Bernini Context Windows`
   Uses the same controls and defaults as ComfyUI's Wan Context Windows node,

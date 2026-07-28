@@ -28,6 +28,7 @@ from convrot_nodes import (  # noqa: E402
     _validate_runtime_support,
     configure_convrot_activation,
     load_convrot_clip,
+    load_convrot_model,
 )
 
 
@@ -344,7 +345,39 @@ class FakeCLIP:
         self.patcher = SimpleNamespace(cached_patcher_init=None)
 
 
+class FakeModel:
+    def __init__(self, weight_format: str, activation_dtype: str):
+        self.model = torch.nn.Module()
+        self.model.layer = FakeQuantLinear(weight_format, activation_dtype)
+        self.model_options = {}
+        self.cached_patcher_init = None
+
+
 class ConvRotCLIPLoaderTest(unittest.TestCase):
+    def test_load_model_defaults_to_auto_and_preserves_it_for_reload(self):
+        state_dict = {
+            "blocks.0.ffn.0.comfy_quant": quant_tensor({"format": "convrot_w4a4"})
+        }
+        fake_model = FakeModel("convrot_w4a4", "int4")
+
+        with (
+            mock.patch("comfy.utils.load_torch_file", return_value=(state_dict, {})),
+            mock.patch("convrot_nodes._validate_runtime_support"),
+            mock.patch("comfy.sd.load_diffusion_model_state_dict", return_value=fake_model),
+            mock.patch("convrot_nodes.apply_attention_backend") as apply_backend,
+        ):
+            loaded = load_convrot_model("model.safetensors")
+
+        self.assertIs(loaded, fake_model)
+        apply_backend.assert_called_once_with(fake_model, "auto")
+        self.assertEqual(
+            fake_model.cached_patcher_init,
+            (
+                load_convrot_model,
+                ("model.safetensors", False, "auto"),
+            ),
+        )
+
     def test_load_clip_forces_mixed_ops_and_preserves_activation_override(self):
         state_dict = {
             "text_model.encoder.layers.0.mlp.fc1.comfy_quant": quant_tensor(
@@ -460,6 +493,33 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
         self.assertEqual(inputs["required"]["force_int8_gemm"][0], "BOOLEAN")
         self.assertFalse(inputs["required"]["force_int8_gemm"][1]["default"])
         self.assertNotIn("activation_dtype", inputs["required"])
+        self.assertEqual(
+            inputs["optional"]["patch_attention"][0],
+            ("auto", "sage_attn", "flash_attn", "sdpa"),
+        )
+        self.assertEqual(inputs["optional"]["patch_attention"][1]["default"], "auto")
+
+    def test_diffusion_node_forwards_attention_backend(self):
+        fake_model = object()
+        with (
+            mock.patch(
+                "convrot_nodes._resolve_convrot_model_path",
+                return_value="/models/convrot.safetensors",
+            ),
+            mock.patch("convrot_nodes.load_convrot_model", return_value=fake_model) as load_model,
+        ):
+            result = ConvRotDiffusionModelLoader().load_diffusion_model(
+                "convrot.safetensors",
+                force_int8_gemm=True,
+                patch_attention="flash_attn",
+            )
+
+        self.assertEqual(result, (fake_model,))
+        load_model.assert_called_once_with(
+            "/models/convrot.safetensors",
+            True,
+            attention_backend="flash_attn",
+        )
 
     def test_node_rejects_invalid_clip_type(self):
         with self.assertRaisesRegex(ValueError, "Unsupported ConvRot CLIP type"):

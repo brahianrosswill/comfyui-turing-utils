@@ -97,11 +97,10 @@ class SVDInt4DiffusionModelLoader:
                 "patch_attention": (
                     attention_backend_choices(),
                     {
-                        "default": "default",
+                        "default": "auto",
                         "tooltip": (
-                            "Override this SVDInt4 model's attention backend. "
-                            "default keeps ComfyUI's global choice; sdpa uses PyTorch SDPA; "
-                            "sage_attn and flash_attn require their matching packages."
+                            "Select this SVDInt4 model's attention backend. "
+                            "auto tries sage_attn, then flash_attn, then PyTorch SDPA."
                         ),
                     },
                 ),
@@ -117,7 +116,7 @@ class SVDInt4DiffusionModelLoader:
     def load_diffusion_model(
         self,
         unet_name: str,
-        patch_attention: str = "default",
+        patch_attention: str = "auto",
     ):
         from .loader import load_svdint4_model
 
