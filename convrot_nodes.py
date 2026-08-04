@@ -15,7 +15,6 @@ import torch
 
 import comfy.model_detection
 import comfy.model_management
-import comfy.patcher_extension
 import comfy.sd
 import comfy.utils
 
@@ -43,8 +42,6 @@ LEGACY_W8_FORMAT = "int8_rowwise"
 MAX_SAFETENSORS_HEADER_SIZE = 128 * 1024 * 1024
 MAX_QUANT_CONFIG_SIZE = 1024 * 1024
 _MODEL_DTYPE_OVERRIDE_LOCK = threading.RLock()
-_H3_FP32_LATENT_KEY = "svdint4_h3_fp32_latent_io"
-_H3_PACKED_LATENT_KEY = "svdint4_h3_fp32_packed_latent"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -439,110 +436,6 @@ def _detect_convrot_model_config(state_dict, metadata, diffusion_model_prefix: s
     )
 
 
-def _is_minimax_h3(model) -> bool:
-    base_model = getattr(model, "model", None)
-    model_config = getattr(base_model, "model_config", None)
-    unet_config = getattr(model_config, "unet_config", None)
-    if isinstance(unet_config, dict) and unet_config.get("image_model") == "minimax_h3":
-        return True
-
-    diffusion_model = getattr(base_model, "diffusion_model", None)
-    return (
-        type(diffusion_model).__name__ == "MiniMaxH3Model"
-        and type(diffusion_model).__module__ == "comfy.ldm.minimax.model"
-    )
-
-
-def _h3_capture_fp32_latent_wrapper(
-    executor,
-    x,
-    t,
-    c_concat=None,
-    c_crossattn=None,
-    control=None,
-    transformer_options=None,
-    **kwargs,
-):
-    if transformer_options is None:
-        transformer_options = {}
-    if c_concat is None and isinstance(x, torch.Tensor) and x.is_floating_point():
-        transformer_options = transformer_options.copy()
-        transformer_options[_H3_PACKED_LATENT_KEY] = x.to(torch.float32)
-    return executor(
-        x,
-        t,
-        c_concat,
-        c_crossattn,
-        control,
-        transformer_options,
-        **kwargs,
-    )
-
-
-def _h3_fp32_latent_io_wrapper(
-    executor,
-    x,
-    timestep,
-    context,
-    transformer_options=None,
-    minimax_payload=None,
-    **kwargs,
-):
-    if transformer_options is None:
-        transformer_options = {}
-    fp32_x = None
-    packed_x = transformer_options.get(_H3_PACKED_LATENT_KEY)
-    if isinstance(x, (list, tuple)) and len(x) > 0 and all(
-        isinstance(value, torch.Tensor) for value in x
-    ):
-        shapes = [value.shape for value in x]
-        expected_values = sum(math.prod(shape[1:]) for shape in shapes)
-        if (
-            isinstance(packed_x, torch.Tensor)
-            and packed_x.ndim == 3
-            and packed_x.shape[0] == shapes[0][0]
-            and packed_x.shape[-1] == expected_values
-        ):
-            fp32_x = comfy.utils.unpack_latents(packed_x, shapes)
-        else:
-            fp32_x = [
-                value.to(torch.float32) if value.is_floating_point() else value
-                for value in x
-            ]
-        if isinstance(x, tuple):
-            fp32_x = tuple(fp32_x)
-
-    clean_transformer_options = transformer_options.copy()
-    clean_transformer_options.pop(_H3_PACKED_LATENT_KEY, None)
-    return executor(
-        fp32_x if fp32_x is not None else x,
-        timestep,
-        context,
-        clean_transformer_options,
-        minimax_payload=minimax_payload,
-        **kwargs,
-    )
-
-
-def _install_h3_fp32_latent_io(model) -> bool:
-    if not _is_minimax_h3(model):
-        return False
-    model.add_wrapper_with_key(
-        comfy.patcher_extension.WrappersMP.APPLY_MODEL,
-        _H3_FP32_LATENT_KEY,
-        _h3_capture_fp32_latent_wrapper,
-    )
-    model.add_wrapper_with_key(
-        comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
-        _H3_FP32_LATENT_KEY,
-        _h3_fp32_latent_io_wrapper,
-    )
-    LOG.info(
-        "MiniMax H3 latent I/O kept in FP32 while ConvRot transformer compute remains FP16"
-    )
-    return True
-
-
 def load_convrot_model(
     model_path: str | Path,
     force_int8_gemm: bool = False,
@@ -613,7 +506,6 @@ def load_convrot_model(
         loaded.w8a8,
     )
     apply_attention_backend(model, attention_backend)
-    _install_h3_fp32_latent_io(model)
     model.cached_patcher_init = (
         load_convrot_model,
         (str(model_path), force_int8_gemm, attention_backend),

@@ -202,10 +202,7 @@ The script writes original metadata and basic provenance to
   independently of the selected attention backend. This avoids FP32 or BF16
   intermediate activations around the INT4/INT8 layers and keeps the runtime
   compatible with Turing GPUs. Loading fails instead of silently falling back
-  if ComfyUI does not apply FP16. MiniMax H3 is handled as a mixed-precision
-  exception: its packed video/audio latent input and output remain FP32 while
-  the transformer hidden state and ConvRot GEMMs remain FP16. This avoids the
-  FP32-to-FP16-to-FP32 output round trip that can overflow H3 audio velocity.
+  if ComfyUI does not apply FP16.
   Legacy per-row W8 ConvRot descriptors with a missing format or
   `format=int8_rowwise` are normalized in memory to native
   `int8_tensorwise`; the packed weights are not rewritten.
