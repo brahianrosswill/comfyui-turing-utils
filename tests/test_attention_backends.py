@@ -126,23 +126,36 @@ class AttentionBackendsTest(unittest.TestCase):
         torch.testing.assert_close(out, (q.half() + k.half() + v.half()).float())
 
     def test_sage_does_not_recast_supported_qkv_dtype(self):
-        captured = {}
+        for dtype in (torch.float16, torch.bfloat16):
+            captured = {}
 
-        def sage(q, k, v, *args, **kwargs):
-            captured["q"] = q
-            return q
+            def sage(q, k, v, *args, **kwargs):
+                captured["q"] = q
+                return q
 
-        with mock.patch(
-            "comfy.ldm.modules.attention.get_attention_function",
-            side_effect=lambda name, default: sage if name == "sage" else default,
-        ):
-            override = attention_backends.make_attention_override("sage_attn")
+            with (
+                self.subTest(dtype=dtype),
+                mock.patch(
+                    "comfy.ldm.modules.attention.get_attention_function",
+                    side_effect=lambda name, default: (
+                        sage if name == "sage" else default
+                    ),
+                ),
+            ):
+                override = attention_backends.make_attention_override("sage_attn")
 
-        q = torch.randn(1, 2, 4, 8, dtype=torch.float16)
-        out = override(lambda *args, **kwargs: None, q, q, q, 2, skip_reshape=True)
+            q = torch.randn(1, 2, 4, 8, dtype=dtype)
+            out = override(
+                lambda *args, **kwargs: None,
+                q,
+                q,
+                q,
+                2,
+                skip_reshape=True,
+            )
 
-        self.assertIs(captured["q"], q)
-        self.assertIs(out, q)
+            self.assertIs(captured["q"], q)
+            self.assertIs(out, q)
 
     def test_sage_fp32_compat_runs_through_comfy_attention_wrapper(self):
         captured = {}

@@ -125,23 +125,26 @@ def _select_attention_backend(option: str) -> tuple[AttentionBackend, Callable]:
 
 def make_attention_override(option: str) -> Callable | None:
     backend, target = _select_attention_backend(option)
-    logged_fp32_compat = False
+    logged_dtype_compat = False
 
     def attention_override(original: Callable, *args, **kwargs):
-        nonlocal logged_fp32_compat
+        nonlocal logged_dtype_compat
         if (
             backend.option == "sage_attn"
             and len(args) >= 3
             and all(isinstance(value, torch.Tensor) for value in args[:3])
-            and args[0].dtype == torch.float32
+            and any(
+                value.dtype not in {torch.float16, torch.bfloat16}
+                for value in args[:3]
+            )
         ):
             q, k, v = args[:3]
-            if not logged_fp32_compat:
+            if not logged_dtype_compat:
                 LOG.info(
-                    "SVDInt4 Sage attention FP32 compatibility: casting Q/K/V to FP16 "
-                    "for the attention kernel and restoring FP32 output"
+                    "SVDInt4 Sage attention dtype compatibility: casting Q/K/V to FP16 "
+                    "for the attention kernel and restoring the original output dtype"
                 )
-                logged_fp32_compat = True
+                logged_dtype_compat = True
             out = target(
                 q.to(torch.float16),
                 k.to(torch.float16),

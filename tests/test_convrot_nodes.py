@@ -17,6 +17,7 @@ COMFY_ROOT = PLUGIN_ROOT.parents[1]
 sys.path.insert(0, str(COMFY_ROOT))
 
 import comfy.ops  # noqa: E402
+import comfy.patcher_extension  # noqa: E402
 import comfy.sd  # noqa: E402
 import nodes as comfy_nodes  # noqa: E402
 
@@ -28,6 +29,9 @@ from convrot_nodes import (  # noqa: E402
     ConvRotSummary,
     _convrot_model_names,
     _convrot_skip_reason,
+    _h3_capture_fp32_latent_wrapper,
+    _h3_fp32_latent_io_wrapper,
+    _install_h3_fp32_latent_io,
     _validate_runtime_support,
     configure_convrot_activation,
     load_convrot_clip,
@@ -541,6 +545,89 @@ class FakeModel:
 
 
 class ConvRotCLIPLoaderTest(unittest.TestCase):
+    def test_h3_latent_io_uses_original_fp32_values_around_fp16_transformer(self):
+        video = torch.tensor([[[[[65520.0, 1.25]]]]], dtype=torch.float32)
+        audio = torch.tensor([[[2.5, -3.75]]], dtype=torch.float32)
+        packed, shapes = comfy.utils.pack_latents([video, audio])
+        context = torch.zeros((1, 1, 4), dtype=torch.float16)
+        observed = {}
+
+        def diffusion_executor(
+            x,
+            timestep,
+            inner_context,
+            transformer_options,
+            minimax_payload=None,
+            **kwargs,
+        ):
+            observed["x"] = x
+            observed["context"] = inner_context
+            observed["transformer_options"] = transformer_options
+            return [value.clone() for value in x]
+
+        def apply_executor(
+            x,
+            t,
+            c_concat,
+            c_crossattn,
+            control,
+            transformer_options,
+            **kwargs,
+        ):
+            fp16_x = comfy.utils.unpack_latents(x.to(torch.float16), shapes)
+            self.assertTrue(torch.isinf(fp16_x[0]).any())
+            return _h3_fp32_latent_io_wrapper(
+                diffusion_executor,
+                fp16_x,
+                t,
+                c_crossattn,
+                transformer_options,
+            )
+
+        output = _h3_capture_fp32_latent_wrapper(
+            apply_executor,
+            packed,
+            torch.ones(1),
+            None,
+            context,
+            None,
+            {},
+        )
+
+        self.assertEqual([value.dtype for value in observed["x"]], [torch.float32] * 2)
+        self.assertEqual(observed["context"].dtype, torch.float16)
+        self.assertNotIn("svdint4_h3_fp32_packed_latent", observed["transformer_options"])
+        self.assertTrue(torch.isfinite(output[0]).all())
+        torch.testing.assert_close(output[0], video)
+        torch.testing.assert_close(output[1], audio)
+
+    def test_h3_latent_io_wrappers_are_only_installed_for_h3(self):
+        class FakePatcher:
+            def __init__(self, image_model):
+                self.model = SimpleNamespace(
+                    model_config=SimpleNamespace(
+                        unet_config={"image_model": image_model}
+                    )
+                )
+                self.wrappers = []
+
+            def add_wrapper_with_key(self, wrapper_type, key, wrapper):
+                self.wrappers.append((wrapper_type, key, wrapper))
+
+        h3 = FakePatcher("minimax_h3")
+        other = FakePatcher("wan")
+
+        self.assertTrue(_install_h3_fp32_latent_io(h3))
+        self.assertFalse(_install_h3_fp32_latent_io(other))
+        self.assertEqual(
+            [wrapper_type for wrapper_type, _, _ in h3.wrappers],
+            [
+                comfy.patcher_extension.WrappersMP.APPLY_MODEL,
+                comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
+            ],
+        )
+        self.assertEqual(other.wrappers, [])
+
     def test_load_model_defaults_to_auto_and_preserves_it_for_reload(self):
         state_dict = {
             "model.diffusion_model.blocks.0.ffn.0.comfy_quant": quant_tensor(
