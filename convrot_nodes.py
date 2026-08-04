@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import json
 import logging
 import math
 import struct
 import sys
-import threading
 from pathlib import Path
 
 import folder_paths
@@ -23,14 +21,12 @@ try:
         apply_attention_backend,
         attention_backend_choices,
         normalize_attention_backend,
-        resolve_attention_backend,
     )
 except ImportError:
     from attention_backends import (
         apply_attention_backend,
         attention_backend_choices,
         normalize_attention_backend,
-        resolve_attention_backend,
     )
 
 
@@ -43,7 +39,6 @@ W8_FORMAT = "int8_tensorwise"
 LEGACY_W8_FORMAT = "int8_rowwise"
 MAX_SAFETENSORS_HEADER_SIZE = 128 * 1024 * 1024
 MAX_QUANT_CONFIG_SIZE = 1024 * 1024
-_MODEL_DTYPE_OVERRIDE_LOCK = threading.RLock()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -411,50 +406,6 @@ def _validate_runtime_support(expected: ConvRotSummary, device: torch.device | N
         )
 
 
-@contextlib.contextmanager
-def _temporary_model_supported_dtype(model_config, dtype: torch.dtype):
-    config_class = type(model_config)
-    had_class_override = "supported_inference_dtypes" in config_class.__dict__
-    original_class_value = config_class.__dict__.get("supported_inference_dtypes")
-    original_supported = list(model_config.supported_inference_dtypes)
-    forced_supported = [dtype, *(value for value in original_supported if value != dtype)]
-
-    with _MODEL_DTYPE_OVERRIDE_LOCK:
-        config_class.supported_inference_dtypes = forced_supported
-        try:
-            yield forced_supported
-        finally:
-            if had_class_override:
-                config_class.supported_inference_dtypes = original_class_value
-            else:
-                del config_class.supported_inference_dtypes
-
-
-def _sage_load_dtype(
-    state_dict,
-    metadata,
-    diffusion_model_prefix: str,
-) -> tuple[object | None, torch.dtype | None]:
-    model_config = comfy.model_detection.model_config_from_unet(
-        state_dict,
-        diffusion_model_prefix,
-        metadata=metadata,
-    )
-    if model_config is None:
-        return None, None
-
-    parameters = comfy.utils.calculate_parameters(state_dict, diffusion_model_prefix)
-    weight_dtype = comfy.utils.weight_dtype(state_dict, diffusion_model_prefix)
-    if model_config.quant_config is not None:
-        weight_dtype = None
-    default_dtype = comfy.model_management.unet_dtype(
-        model_params=parameters,
-        supported_dtypes=list(model_config.supported_inference_dtypes),
-        weight_dtype=weight_dtype,
-    )
-    return model_config, torch.bfloat16 if default_dtype == torch.bfloat16 else torch.float16
-
-
 def load_convrot_model(
     model_path: str | Path,
     force_int8_gemm: bool = False,
@@ -463,7 +414,6 @@ def load_convrot_model(
     disable_dynamic: bool = False,
 ):
     attention_backend = normalize_attention_backend(attention_backend)
-    selected_attention_backend = resolve_attention_backend(attention_backend)
     model_path = Path(model_path)
     state_dict, metadata = comfy.utils.load_torch_file(str(model_path), return_metadata=True)
     diffusion_model_prefix = comfy.model_detection.unet_prefix_from_state_dict(state_dict)
@@ -476,49 +426,13 @@ def load_convrot_model(
         model_prefix=diffusion_model_prefix,
     )
     _validate_runtime_support(expected)
-    model_options = {}
-    model_config = None
-    sage_dtype = None
-    dtype_context = contextlib.nullcontext(None)
-    if selected_attention_backend == "sage_attn":
-        model_config, sage_dtype = _sage_load_dtype(
-            state_dict,
-            metadata,
-            diffusion_model_prefix,
-        )
-        if model_config is None:
-            raise RuntimeError(
-                "Sage attention dtype selection could not detect the ConvRot model config "
-                f"before loading {model_path}"
-            )
-        model_options["dtype"] = sage_dtype
-        dtype_context = _temporary_model_supported_dtype(model_config, sage_dtype)
-
-    with dtype_context as forced_supported:
-        model = comfy.sd.load_diffusion_model_state_dict(
-            state_dict,
-            model_options=model_options,
-            metadata=metadata,
-            disable_dynamic=disable_dynamic,
-        )
+    model = comfy.sd.load_diffusion_model_state_dict(
+        state_dict,
+        metadata=metadata,
+        disable_dynamic=disable_dynamic,
+    )
     if model is None:
         raise RuntimeError(f"ComfyUI could not detect a supported model config from {model_path}")
-
-    if sage_dtype is not None:
-        loaded_model_config = getattr(model.model, "model_config", None)
-        if loaded_model_config is not None and forced_supported is not None:
-            loaded_model_config.supported_inference_dtypes = list(forced_supported)
-        get_dtype_inference = getattr(model.model, "get_dtype_inference", None)
-        actual_dtype = get_dtype_inference() if callable(get_dtype_inference) else None
-        if actual_dtype is not None and actual_dtype != sage_dtype:
-            raise RuntimeError(
-                "Sage attention model dtype selection was not applied: "
-                f"expected {sage_dtype}, loaded {actual_dtype}"
-            )
-        LOG.info(
-            "SVDInt4 Sage attention model compute dtype: %s",
-            sage_dtype,
-        )
 
     loaded = _loaded_convrot_summary(model)
     if loaded != expected:

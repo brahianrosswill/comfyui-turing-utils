@@ -198,12 +198,6 @@ The script writes original metadata and basic provenance to
   activations. W4A8 requires an enabled comfy-kitchen CUDA backend because its
   eager fallback always computes W4A4. `patch_attention=auto` selects
   SageAttention first, Flash Attention second, and PyTorch SDPA as the fallback.
-  When SageAttention is selected (explicitly or through `auto`), the loader
-  keeps ComfyUI's BF16 choice; any other default compute dtype is changed to
-  FP16 while the model is constructed. This keeps the model activations and QKV
-  Sage-compatible without an FP32 activation-memory penalty. The attention
-  wrapper still converts an unexpected unsupported QKV dtype to FP16 as a
-  fallback.
   Legacy per-row W8 ConvRot descriptors with a missing format or
   `format=int8_rowwise` are normalized in memory to native
   `int8_tensorwise`; the packed weights are not rewritten.
