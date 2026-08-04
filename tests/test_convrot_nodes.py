@@ -521,10 +521,21 @@ class FakeCLIP:
         self.patcher = SimpleNamespace(cached_patcher_init=None)
 
 
+class FakeModelConfig:
+    supported_inference_dtypes = [torch.bfloat16, torch.float32]
+
+
 class FakeModel:
-    def __init__(self, weight_format: str, activation_dtype: str):
+    def __init__(
+        self,
+        weight_format: str,
+        activation_dtype: str,
+        inference_dtype: torch.dtype = torch.float16,
+    ):
         self.model = torch.nn.Module()
         self.model.layer = FakeQuantLinear(weight_format, activation_dtype)
+        self.model.model_config = FakeModelConfig()
+        self.model.get_dtype_inference = lambda: inference_dtype
         self.model_options = {}
         self.cached_patcher_init = None
 
@@ -540,6 +551,15 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
             ),
         }
         fake_model = FakeModel("convrot_w4a4", "int4")
+        detected_config = FakeModelConfig()
+        observed = {}
+
+        def fake_load_state_dict(_state_dict, **kwargs):
+            observed["model_options"] = kwargs["model_options"].copy()
+            observed["supported_dtypes"] = list(
+                FakeModelConfig.supported_inference_dtypes
+            )
+            return fake_model
 
         with (
             mock.patch("comfy.utils.load_torch_file", return_value=(state_dict, {})),
@@ -548,12 +568,33 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
                 return_value="model.diffusion_model.",
             ),
             mock.patch("convrot_nodes._validate_runtime_support"),
-            mock.patch("comfy.sd.load_diffusion_model_state_dict", return_value=fake_model),
+            mock.patch(
+                "convrot_nodes._detect_convrot_model_config",
+                return_value=detected_config,
+            ),
+            mock.patch(
+                "comfy.sd.load_diffusion_model_state_dict",
+                side_effect=fake_load_state_dict,
+            ) as load_state_dict,
             mock.patch("convrot_nodes.apply_attention_backend") as apply_backend,
         ):
             loaded = load_convrot_model("model.safetensors")
 
         self.assertIs(loaded, fake_model)
+        self.assertEqual(
+            observed["model_options"],
+            {"dtype": torch.float16},
+        )
+        self.assertEqual(observed["supported_dtypes"][0], torch.float16)
+        load_state_dict.assert_called_once()
+        self.assertEqual(
+            FakeModelConfig.supported_inference_dtypes,
+            [torch.bfloat16, torch.float32],
+        )
+        self.assertEqual(
+            fake_model.model.model_config.supported_inference_dtypes[0],
+            torch.float16,
+        )
         apply_backend.assert_called_once_with(fake_model, "auto")
         self.assertEqual(
             fake_model.cached_patcher_init,
@@ -562,6 +603,91 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
                 ("model.safetensors", False, "auto"),
             ),
         )
+
+    def test_load_model_forces_fp16_independently_of_attention_backend(self):
+        formats = (
+            ({"format": "convrot_w4a4"}, "convrot_w4a4", "int4"),
+            (
+                {"format": "int8_tensorwise", "convrot": True},
+                "int8_tensorwise",
+                "int8",
+            ),
+        )
+        for config, weight_format, activation_dtype in formats:
+            for attention_backend in ("sage_attn", "flash_attn", "sdpa"):
+                state_dict = {
+                    "blocks.0.ffn.0.comfy_quant": quant_tensor(config)
+                }
+                fake_model = FakeModel(weight_format, activation_dtype)
+
+                with (
+                    self.subTest(
+                        weight_format=weight_format,
+                        attention_backend=attention_backend,
+                    ),
+                    mock.patch(
+                        "comfy.utils.load_torch_file",
+                        return_value=(state_dict, {}),
+                    ),
+                    mock.patch(
+                        "comfy.model_detection.unet_prefix_from_state_dict",
+                        return_value="",
+                    ),
+                    mock.patch("convrot_nodes._validate_runtime_support"),
+                    mock.patch(
+                        "convrot_nodes._detect_convrot_model_config",
+                        return_value=FakeModelConfig(),
+                    ),
+                    mock.patch(
+                        "comfy.sd.load_diffusion_model_state_dict",
+                        return_value=fake_model,
+                    ) as load_state_dict,
+                    mock.patch(
+                        "convrot_nodes.apply_attention_backend"
+                    ) as apply_backend,
+                ):
+                    loaded = load_convrot_model(
+                        "model.safetensors",
+                        attention_backend=attention_backend,
+                    )
+
+                self.assertIs(loaded, fake_model)
+                self.assertEqual(
+                    load_state_dict.call_args.kwargs["model_options"]["dtype"],
+                    torch.float16,
+                )
+                apply_backend.assert_called_once_with(fake_model, attention_backend)
+
+    def test_load_model_rejects_an_unapplied_fp16_dtype(self):
+        state_dict = {
+            "blocks.0.ffn.0.comfy_quant": quant_tensor(
+                {"format": "convrot_w4a4"}
+            )
+        }
+        fake_model = FakeModel(
+            "convrot_w4a4",
+            "int4",
+            inference_dtype=torch.float32,
+        )
+
+        with (
+            mock.patch("comfy.utils.load_torch_file", return_value=(state_dict, {})),
+            mock.patch(
+                "comfy.model_detection.unet_prefix_from_state_dict",
+                return_value="",
+            ),
+            mock.patch("convrot_nodes._validate_runtime_support"),
+            mock.patch(
+                "convrot_nodes._detect_convrot_model_config",
+                return_value=FakeModelConfig(),
+            ),
+            mock.patch(
+                "comfy.sd.load_diffusion_model_state_dict",
+                return_value=fake_model,
+            ),
+            self.assertRaisesRegex(RuntimeError, "dtype selection was not applied"),
+        ):
+            load_convrot_model("model.safetensors", attention_backend="sdpa")
 
     def test_load_clip_forces_mixed_ops_and_preserves_activation_override(self):
         state_dict = {
