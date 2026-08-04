@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import json
 import logging
 import math
 import struct
 import sys
+import threading
 from pathlib import Path
 
 import folder_paths
@@ -39,6 +41,7 @@ W8_FORMAT = "int8_tensorwise"
 LEGACY_W8_FORMAT = "int8_rowwise"
 MAX_SAFETENSORS_HEADER_SIZE = 128 * 1024 * 1024
 MAX_QUANT_CONFIG_SIZE = 1024 * 1024
+_MODEL_DTYPE_OVERRIDE_LOCK = threading.RLock()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -406,6 +409,33 @@ def _validate_runtime_support(expected: ConvRotSummary, device: torch.device | N
         )
 
 
+@contextlib.contextmanager
+def _temporary_model_supported_dtype(model_config, dtype: torch.dtype):
+    config_class = type(model_config)
+    had_class_override = "supported_inference_dtypes" in config_class.__dict__
+    original_class_value = config_class.__dict__.get("supported_inference_dtypes")
+    original_supported = list(model_config.supported_inference_dtypes)
+    forced_supported = [dtype, *(value for value in original_supported if value != dtype)]
+
+    with _MODEL_DTYPE_OVERRIDE_LOCK:
+        config_class.supported_inference_dtypes = forced_supported
+        try:
+            yield forced_supported
+        finally:
+            if had_class_override:
+                config_class.supported_inference_dtypes = original_class_value
+            else:
+                del config_class.supported_inference_dtypes
+
+
+def _detect_convrot_model_config(state_dict, metadata, diffusion_model_prefix: str):
+    return comfy.model_detection.model_config_from_unet(
+        state_dict,
+        diffusion_model_prefix,
+        metadata=metadata,
+    )
+
+
 def load_convrot_model(
     model_path: str | Path,
     force_int8_gemm: bool = False,
@@ -426,13 +456,40 @@ def load_convrot_model(
         model_prefix=diffusion_model_prefix,
     )
     _validate_runtime_support(expected)
-    model = comfy.sd.load_diffusion_model_state_dict(
+    model_config = _detect_convrot_model_config(
         state_dict,
-        metadata=metadata,
-        disable_dynamic=disable_dynamic,
+        metadata,
+        diffusion_model_prefix,
     )
+    if model_config is None:
+        raise RuntimeError(
+            "FP16 ConvRot loading could not detect the model config before loading "
+            f"{model_path}"
+        )
+
+    with _temporary_model_supported_dtype(model_config, torch.float16) as forced_supported:
+        model = comfy.sd.load_diffusion_model_state_dict(
+            state_dict,
+            model_options={"dtype": torch.float16},
+            metadata=metadata,
+            disable_dynamic=disable_dynamic,
+        )
     if model is None:
         raise RuntimeError(f"ComfyUI could not detect a supported model config from {model_path}")
+
+    loaded_model_config = getattr(model.model, "model_config", None)
+    if loaded_model_config is not None:
+        loaded_model_config.supported_inference_dtypes = list(forced_supported)
+    get_dtype_inference = getattr(model.model, "get_dtype_inference", None)
+    if not callable(get_dtype_inference):
+        raise RuntimeError("FP16 ConvRot loading could not verify the model inference dtype")
+    actual_dtype = get_dtype_inference()
+    if actual_dtype != torch.float16:
+        raise RuntimeError(
+            "FP16 ConvRot dtype selection was not applied: "
+            f"expected {torch.float16}, loaded {actual_dtype}"
+        )
+    LOG.info("ConvRot DiT model compute dtype forced to %s", torch.float16)
 
     loaded = _loaded_convrot_summary(model)
     if loaded != expected:
