@@ -388,6 +388,60 @@ class ConvRotModelFilterTest(unittest.TestCase):
 
             self.assertIsNone(_convrot_skip_reason(path))
 
+    def test_minimax_h3_int8_convrot_text_encoder_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._save(
+                directory,
+                "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+                {
+                    "model.embed_tokens.comfy_quant": quant_tensor(
+                        {"format": "int8_tensorwise"}
+                    ),
+                    "model.layers.0.mlp.down_proj.comfy_quant": quant_tensor(
+                        {
+                            "format": "int8_tensorwise",
+                            "convrot": True,
+                            "convrot_groupsize": 256,
+                        }
+                    ),
+                },
+                metadata={
+                    "minimax_h3_te": json.dumps(
+                        {
+                            "num_hidden_layers": 50,
+                            "output": "unnormalized_hidden_after_layer_50",
+                        }
+                    )
+                },
+            )
+
+            self.assertIsNone(_convrot_skip_reason(path))
+
+    def test_minimax_h3_int4_convrot_text_encoder_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._save(
+                directory,
+                "qwen3vl_32b_minimax_h3_int4_convrot.safetensors",
+                {
+                    "model.layers.0.mlp.down_proj.comfy_quant": quant_tensor(
+                        {
+                            "format": "convrot_w4a4",
+                            "convrot_groupsize": 256,
+                        }
+                    )
+                },
+                metadata={
+                    "minimax_h3_te": json.dumps(
+                        {
+                            "num_hidden_layers": 50,
+                            "output": "unnormalized_hidden_after_layer_50",
+                        }
+                    )
+                },
+            )
+
+            self.assertIsNone(_convrot_skip_reason(path))
+
     def test_dense_and_non_convrot_quantized_models_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             dense = self._save(

@@ -3,12 +3,13 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import math
+import struct
 import sys
 from pathlib import Path
 
 import folder_paths
 import torch
-from safetensors import safe_open
 
 import comfy.model_detection
 import comfy.model_management
@@ -36,6 +37,8 @@ MODEL_EXTENSIONS = {".safetensors", ".sft"}
 W4_FORMAT = "convrot_w4a4"
 W8_FORMAT = "int8_tensorwise"
 LEGACY_W8_FORMAT = "int8_rowwise"
+MAX_SAFETENSORS_HEADER_SIZE = 128 * 1024 * 1024
+MAX_QUANT_CONFIG_SIZE = 1024 * 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -127,27 +130,103 @@ def _encode_quant_tensor(config: dict) -> torch.Tensor:
     return torch.tensor(list(json.dumps(config).encode("utf-8")), dtype=torch.uint8)
 
 
+def _read_safetensors_header(model_path: Path) -> tuple[dict, int, int]:
+    file_size = model_path.stat().st_size
+    with model_path.open("rb") as handle:
+        raw_length = handle.read(8)
+        if len(raw_length) != 8:
+            raise ValueError("file is too short to contain a safetensors header")
+        header_size = struct.unpack("<Q", raw_length)[0]
+        if header_size == 0 or header_size > MAX_SAFETENSORS_HEADER_SIZE:
+            raise ValueError(f"invalid safetensors header size {header_size}")
+        data_start = 8 + header_size
+        if data_start > file_size:
+            raise ValueError(
+                f"safetensors header ends at byte {data_start}, beyond file size {file_size}"
+            )
+        raw_header = handle.read(header_size)
+
+    try:
+        header = json.loads(raw_header)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("safetensors header contains invalid JSON") from exc
+    if not isinstance(header, dict):
+        raise ValueError("safetensors header must be an object")
+    return header, data_start, file_size
+
+
+def _read_quant_config(
+    handle,
+    tensor_info: dict,
+    key: str,
+    data_start: int,
+    file_size: int,
+) -> dict:
+    if not isinstance(tensor_info, dict):
+        raise ValueError(f"{key} has an invalid safetensors tensor descriptor")
+    if tensor_info.get("dtype") != "U8":
+        raise ValueError(f"{key} must use U8 storage")
+
+    shape = tensor_info.get("shape")
+    offsets = tensor_info.get("data_offsets")
+    if (
+        not isinstance(shape, list)
+        or any(not isinstance(size, int) or isinstance(size, bool) or size < 0 for size in shape)
+        or not isinstance(offsets, list)
+        or len(offsets) != 2
+        or any(not isinstance(offset, int) or isinstance(offset, bool) for offset in offsets)
+    ):
+        raise ValueError(f"{key} has invalid shape or data offsets")
+
+    relative_start, relative_end = offsets
+    config_size = relative_end - relative_start
+    if config_size != math.prod(shape):
+        raise ValueError(f"{key} byte length does not match its U8 shape")
+    if config_size > MAX_QUANT_CONFIG_SIZE:
+        raise ValueError(f"{key} is too large to be quantization JSON")
+    absolute_start = data_start + relative_start
+    absolute_end = data_start + relative_end
+    if relative_start < 0 or absolute_end < absolute_start or absolute_end > file_size:
+        raise ValueError(f"{key} data offsets are outside the safetensors file")
+
+    handle.seek(absolute_start)
+    raw_config = handle.read(config_size)
+    if len(raw_config) != config_size:
+        raise ValueError(f"{key} tensor data is truncated")
+    try:
+        config = json.loads(raw_config)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{key} contains invalid quantization JSON") from exc
+    if not isinstance(config, dict):
+        raise ValueError(f"{key} quantization JSON must be an object")
+    return config
+
+
 def _convrot_skip_reason(model_path: str | Path) -> str | None:
     model_path = Path(model_path)
     if model_path.suffix.lower() not in MODEL_EXTENSIONS:
         return f"unsupported file extension {model_path.suffix!r}"
 
     try:
-        with safe_open(model_path, framework="pt", device="cpu") as handle:
-            metadata = handle.metadata() or {}
-            raw_header = metadata.get("_quantization_metadata")
-            if raw_header is not None:
-                header = json.loads(raw_header)
-                if not isinstance(header, dict) or not isinstance(header.get("layers"), dict):
-                    return "safetensors _quantization_metadata must contain a layers object"
-                for layer_name, config in header["layers"].items():
-                    if _classify_config(config, layer_name, True) is not None:
-                        return None
+        tensor_index, data_start, file_size = _read_safetensors_header(model_path)
+        metadata = tensor_index.get("__metadata__", {})
+        if not isinstance(metadata, dict):
+            return "safetensors __metadata__ must be an object"
 
-            for key in handle.keys():
-                if not key.endswith(".comfy_quant"):
+        raw_quantization = metadata.get("_quantization_metadata")
+        if raw_quantization is not None:
+            quantization = json.loads(raw_quantization)
+            if not isinstance(quantization, dict) or not isinstance(quantization.get("layers"), dict):
+                return "safetensors _quantization_metadata must contain a layers object"
+            for layer_name, config in quantization["layers"].items():
+                if _classify_config(config, layer_name, True) is not None:
+                    return None
+
+        with model_path.open("rb") as handle:
+            for key, tensor_info in tensor_index.items():
+                if key == "__metadata__" or not key.endswith(".comfy_quant"):
                     continue
-                config = _decode_quant_tensor(handle.get_tensor(key), key)
+                config = _read_quant_config(handle, tensor_info, key, data_start, file_size)
                 if _classify_config(config, key[: -len(".comfy_quant")], True) is not None:
                     return None
     except Exception as exc:
@@ -169,7 +248,8 @@ def _convrot_model_names(folder_name: str) -> list[str]:
         if skip_reason is None:
             names.append(name)
         else:
-            LOG.debug("Skipping ConvRot candidate %s: %s", name, skip_reason)
+            log = LOG.warning if "convrot" in name.lower() else LOG.debug
+            log("Skipping ConvRot candidate %s: %s", name, skip_reason)
     return names
 
 
