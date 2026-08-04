@@ -15,10 +15,12 @@ from safetensors.torch import save_file
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 COMFY_ROOT = PLUGIN_ROOT.parents[1]
 sys.path.insert(0, str(COMFY_ROOT))
-sys.path.insert(0, str(PLUGIN_ROOT))
 
 import comfy.ops  # noqa: E402
 import comfy.sd  # noqa: E402
+import nodes as comfy_nodes  # noqa: E402
+
+sys.path.insert(0, str(PLUGIN_ROOT))
 
 from convrot_nodes import (  # noqa: E402
     ConvRotCLIPLoader,
@@ -608,6 +610,8 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
         inputs = ConvRotCLIPLoader.INPUT_TYPES()
         self.assertIn("clip_name", inputs["required"])
         self.assertIn("type", inputs["required"])
+        self.assertIn("mage", inputs["required"]["type"][0])
+        self.assertIn("minimax", inputs["required"]["type"][0])
         self.assertEqual(
             inputs["required"]["force_int8_gemm"],
             (
@@ -624,6 +628,42 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
         self.assertNotIn("activation_dtype", inputs["required"])
         self.assertIn("device", inputs["optional"])
         self.assertEqual(ConvRotCLIPLoader.RETURN_TYPES, ("CLIP",))
+
+    def test_node_reads_clip_types_from_official_loader(self):
+        official_types = ["stable_diffusion", "mage", "minimax"]
+        with (
+            mock.patch.object(
+                comfy_nodes.CLIPLoader,
+                "INPUT_TYPES",
+                return_value={"required": {"type": (official_types,)}},
+            ),
+            mock.patch("convrot_nodes._convrot_model_names", return_value=[]),
+        ):
+            inputs = ConvRotCLIPLoader.INPUT_TYPES()
+
+        self.assertEqual(inputs["required"]["type"][0], tuple(official_types))
+
+    def test_node_maps_new_official_clip_type_to_enum(self):
+        fake_clip = object()
+        with (
+            mock.patch(
+                "convrot_nodes._official_clip_types",
+                return_value=("stable_diffusion", "minimax"),
+            ),
+            mock.patch(
+                "convrot_nodes._resolve_convrot_model_path",
+                return_value="/models/minimax.safetensors",
+            ),
+            mock.patch(
+                "convrot_nodes.load_convrot_clip", return_value=fake_clip
+            ) as load_clip,
+        ):
+            result = ConvRotCLIPLoader().load_clip(
+                "minimax.safetensors", type="minimax"
+            )
+
+        self.assertEqual(result, (fake_clip,))
+        self.assertEqual(load_clip.call_args.kwargs["clip_type"], comfy.sd.CLIPType.MINIMAX)
 
     def test_diffusion_node_uses_force_int8_gemm_boolean(self):
         inputs = ConvRotDiffusionModelLoader.INPUT_TYPES()

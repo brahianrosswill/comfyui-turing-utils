@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import sys
 from pathlib import Path
 
 import folder_paths
@@ -32,34 +33,6 @@ LOG = logging.getLogger("comfyui-svdint4")
 DIFFUSION_FOLDER_NAME = "diffusion_models"
 CLIP_FOLDER_NAME = "text_encoders"
 MODEL_EXTENSIONS = {".safetensors", ".sft"}
-CLIP_TYPES = (
-    "stable_diffusion",
-    "stable_cascade",
-    "sd3",
-    "stable_audio",
-    "mochi",
-    "ltxv",
-    "pixart",
-    "cosmos",
-    "lumina2",
-    "wan",
-    "hidream",
-    "chroma",
-    "ace",
-    "omnigen2",
-    "qwen_image",
-    "hunyuan_image",
-    "flux2",
-    "ovis",
-    "longcat_image",
-    "cogvideox",
-    "lens",
-    "pixeldit",
-    "ideogram4",
-    "boogu",
-    "krea2",
-    "joyimage",
-)
 W4_FORMAT = "convrot_w4a4"
 W8_FORMAT = "int8_tensorwise"
 LEGACY_W8_FORMAT = "int8_rowwise"
@@ -70,6 +43,14 @@ class ConvRotSummary:
     w4a4: int = 0
     w4a8: int = 0
     w8a8: int = 0
+
+
+def _official_clip_types() -> tuple[str, ...]:
+    comfy_nodes = sys.modules.get("nodes")
+    if comfy_nodes is None or not hasattr(comfy_nodes, "CLIPLoader"):
+        raise RuntimeError("ComfyUI's official CLIPLoader is not available")
+    choices = comfy_nodes.CLIPLoader.INPUT_TYPES()["required"]["type"][0]
+    return tuple(choices)
 
 
 def _params(config: dict, layer_name: str) -> dict:
@@ -519,6 +500,7 @@ class ConvRotDiffusionModelLoader:
 class ConvRotCLIPLoader:
     @classmethod
     def INPUT_TYPES(cls):
+        clip_types = _official_clip_types()
         return {
             "required": {
                 "clip_name": (
@@ -530,7 +512,7 @@ class ConvRotCLIPLoader:
                         )
                     },
                 ),
-                "type": (CLIP_TYPES,),
+                "type": (clip_types,),
                 "force_int8_gemm": (
                     "BOOLEAN",
                     {
@@ -560,11 +542,15 @@ class ConvRotCLIPLoader:
         force_int8_gemm: bool = False,
         device: str = "default",
     ):
-        if type not in CLIP_TYPES:
-            raise ValueError(f"Unsupported ConvRot CLIP type {type!r}; expected one of {CLIP_TYPES}")
+        clip_types = _official_clip_types()
+        if type not in clip_types:
+            raise ValueError(f"Unsupported ConvRot CLIP type {type!r}; expected one of {clip_types}")
         if device not in {"default", "cpu"}:
             raise ValueError(f"Unsupported ConvRot CLIP device {device!r}; expected 'default' or 'cpu'")
-        clip_type = getattr(comfy.sd.CLIPType, type.upper())
+        try:
+            clip_type = comfy.sd.CLIPType[type.upper()]
+        except KeyError as exc:
+            raise RuntimeError(f"ComfyUI CLIPLoader exposes type {type!r} without a matching CLIPType") from exc
         model_options = {}
         if device == "cpu":
             model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")

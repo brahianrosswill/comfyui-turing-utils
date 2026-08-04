@@ -204,9 +204,10 @@ The script writes original metadata and basic provenance to
 
 - `Load ConvRot CLIP`
   Loads one ConvRot text encoder from `models/text_encoders` with the same
-  `force_int8_gemm` behavior. It supports the text encoder types exposed by
-  ComfyUI's single CLIP loader, verifies that every declared ConvRot layer was
-  loaded through mixed-precision ops, and rejects W4A8 on a CPU load device.
+  `force_int8_gemm` behavior. Its type list is read dynamically from ComfyUI's
+  single CLIP loader, so newly added official types appear without a plugin
+  update. It verifies that every declared ConvRot layer was loaded through
+  mixed-precision ops and rejects W4A8 on a CPU load device.
 
 - `Load SVDInt4 DiT`
   Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
