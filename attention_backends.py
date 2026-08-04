@@ -4,6 +4,8 @@ import dataclasses
 import logging
 from collections.abc import Callable
 
+import torch
+
 
 LOG = logging.getLogger("comfyui-svdint4")
 
@@ -123,8 +125,31 @@ def _select_attention_backend(option: str) -> tuple[AttentionBackend, Callable]:
 
 def make_attention_override(option: str) -> Callable | None:
     backend, target = _select_attention_backend(option)
+    logged_fp32_compat = False
 
     def attention_override(original: Callable, *args, **kwargs):
+        nonlocal logged_fp32_compat
+        if (
+            backend.option == "sage_attn"
+            and len(args) >= 3
+            and all(isinstance(value, torch.Tensor) for value in args[:3])
+            and args[0].dtype == torch.float32
+        ):
+            q, k, v = args[:3]
+            if not logged_fp32_compat:
+                LOG.info(
+                    "SVDInt4 Sage attention FP32 compatibility: casting Q/K/V to FP16 "
+                    "for the attention kernel and restoring FP32 output"
+                )
+                logged_fp32_compat = True
+            out = target(
+                q.to(torch.float16),
+                k.to(torch.float16),
+                v.to(torch.float16),
+                *args[3:],
+                **kwargs,
+            )
+            return out.to(q.dtype)
         return target(*args, **kwargs)
 
     attention_override.svdint4_attention_backend = backend.option

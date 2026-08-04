@@ -99,6 +99,105 @@ class AttentionBackendsTest(unittest.TestCase):
             "sdpa",
         )
 
+    def test_sage_casts_fp32_qkv_to_fp16_and_restores_output_dtype(self):
+        captured = {}
+
+        def sage(q, k, v, *args, **kwargs):
+            captured["q"] = q
+            captured["k"] = k
+            captured["v"] = v
+            return q + k + v
+
+        with mock.patch(
+            "comfy.ldm.modules.attention.get_attention_function",
+            side_effect=lambda name, default: sage if name == "sage" else default,
+        ):
+            override = attention_backends.make_attention_override("sage_attn")
+
+        q = torch.randn(1, 2, 4, 8, dtype=torch.float32)
+        k = torch.randn(1, 2, 4, 8, dtype=torch.float32)
+        v = torch.randn(1, 2, 4, 8, dtype=torch.float32)
+        out = override(lambda *args, **kwargs: None, q, k, v, 2, skip_reshape=True)
+
+        self.assertEqual(captured["q"].dtype, torch.float16)
+        self.assertEqual(captured["k"].dtype, torch.float16)
+        self.assertEqual(captured["v"].dtype, torch.float16)
+        self.assertEqual(out.dtype, torch.float32)
+        torch.testing.assert_close(out, (q.half() + k.half() + v.half()).float())
+
+    def test_sage_does_not_recast_supported_qkv_dtype(self):
+        captured = {}
+
+        def sage(q, k, v, *args, **kwargs):
+            captured["q"] = q
+            return q
+
+        with mock.patch(
+            "comfy.ldm.modules.attention.get_attention_function",
+            side_effect=lambda name, default: sage if name == "sage" else default,
+        ):
+            override = attention_backends.make_attention_override("sage_attn")
+
+        q = torch.randn(1, 2, 4, 8, dtype=torch.float16)
+        out = override(lambda *args, **kwargs: None, q, q, q, 2, skip_reshape=True)
+
+        self.assertIs(captured["q"], q)
+        self.assertIs(out, q)
+
+    def test_sage_fp32_compat_runs_through_comfy_attention_wrapper(self):
+        captured = {}
+
+        def sage_kernel(q, k, v, **kwargs):
+            captured["q_dtype"] = q.dtype
+            captured["tensor_layout"] = kwargs["tensor_layout"]
+            return q
+
+        model = FakeModel()
+        with (
+            mock.patch(
+                "comfy.ldm.modules.attention.get_attention_function",
+                side_effect=lambda name, default: (
+                    attention.attention_sage if name == "sage" else default
+                ),
+            ),
+            mock.patch("comfy.ldm.modules.attention.sageattn", side_effect=sage_kernel),
+        ):
+            attention_backends.apply_attention_backend(model, "sage_attn")
+            transformer_options = model.model_options["transformer_options"]
+            q = torch.randn(1, 2, 4, 8, dtype=torch.float32)
+            out = attention.optimized_attention(
+                q,
+                q,
+                q,
+                heads=2,
+                skip_reshape=True,
+                transformer_options=transformer_options,
+            )
+
+        self.assertEqual(captured["q_dtype"], torch.float16)
+        self.assertEqual(captured["tensor_layout"], "HND")
+        self.assertEqual(out.dtype, torch.float32)
+        self.assertEqual(tuple(out.shape), (1, 4, 16))
+
+    def test_sdpa_keeps_fp32_qkv_unchanged(self):
+        captured = {}
+
+        def sdpa(q, k, v, *args, **kwargs):
+            captured["q"] = q
+            return q
+
+        with mock.patch(
+            "comfy.ldm.modules.attention.get_attention_function",
+            side_effect=lambda name, default: sdpa if name == "pytorch" else default,
+        ):
+            override = attention_backends.make_attention_override("sdpa")
+
+        q = torch.randn(1, 2, 4, 8, dtype=torch.float32)
+        out = override(lambda *args, **kwargs: None, q, q, q, 2, skip_reshape=True)
+
+        self.assertIs(captured["q"], q)
+        self.assertIs(out, q)
+
     def test_sdpa_backend_overrides_optimized_attention(self):
         model = FakeModel()
         attention_backends.apply_attention_backend(model, "sdpa")
