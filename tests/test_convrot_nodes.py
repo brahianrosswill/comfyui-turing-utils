@@ -17,6 +17,7 @@ COMFY_ROOT = PLUGIN_ROOT.parents[1]
 sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
+import comfy.ops  # noqa: E402
 import comfy.sd  # noqa: E402
 
 from convrot_nodes import (  # noqa: E402
@@ -129,6 +130,80 @@ class ConvRotActivationTest(unittest.TestCase):
         _, summary = configure_convrot_activation(state_dict, None, True)
 
         self.assertEqual(summary, ConvRotSummary(w4a8=1, w8a8=1))
+
+    def test_legacy_w8_metadata_without_format_is_normalized(self):
+        key = "double_blocks.0.img_attn.qkv.comfy_quant"
+        state_dict = {
+            key: quant_tensor(
+                {"convrot": True, "convrot_groupsize": 256, "per_row": True}
+            )
+        }
+
+        _, summary = configure_convrot_activation(state_dict, None, False)
+
+        self.assertEqual(summary, ConvRotSummary(w8a8=1))
+        self.assertEqual(quant_config(state_dict[key])["format"], "int8_tensorwise")
+
+    def test_legacy_int8_rowwise_format_is_normalized(self):
+        metadata = {
+            "_quantization_metadata": json.dumps(
+                {
+                    "layers": {
+                        "double_blocks.0.img_attn.qkv": {
+                            "format": "int8_rowwise",
+                            "convrot": True,
+                            "convrot_groupsize": 256,
+                            "per_row": True,
+                        }
+                    }
+                }
+            )
+        }
+
+        updated, summary = configure_convrot_activation({}, metadata, False)
+
+        config = json.loads(updated["_quantization_metadata"])["layers"][
+            "double_blocks.0.img_attn.qkv"
+        ]
+        self.assertEqual(summary, ConvRotSummary(w8a8=1))
+        self.assertEqual(config["format"], "int8_tensorwise")
+
+    def test_legacy_w8_metadata_requires_per_row_layout(self):
+        state_dict = {
+            "blocks.0.ffn.0.comfy_quant": quant_tensor(
+                {"convrot": True, "convrot_groupsize": 256}
+            )
+        }
+
+        with self.assertRaisesRegex(ValueError, "unsupported weight format None"):
+            configure_convrot_activation(state_dict, None, False)
+
+    def test_normalized_legacy_w8_loads_with_native_comfy_ops(self):
+        state_dict = {
+            "layer.weight": torch.zeros((8, 256), dtype=torch.int8),
+            "layer.weight_scale": torch.ones((8, 1), dtype=torch.float32),
+            "layer.comfy_quant": quant_tensor(
+                {
+                    "convrot": True,
+                    "convrot_groupsize": 256,
+                    "per_row": True,
+                }
+            ),
+        }
+        configure_convrot_activation(state_dict, None, False)
+        operations = comfy.ops.mixed_precision_ops(
+            {"mixed_ops": True}, compute_dtype=torch.bfloat16
+        )
+        model = torch.nn.Module()
+        model.layer = operations.Linear(256, 8, bias=False, device=torch.device("cpu"))
+
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+        self.assertEqual(missing, [])
+        self.assertEqual(unexpected, [])
+        self.assertEqual(model.layer.quant_format, "int8_tensorwise")
+        self.assertTrue(model.layer.weight._params.convrot)
+        self.assertEqual(model.layer.weight._params.convrot_groupsize, 256)
 
     def test_false_preserves_explicit_w4a8(self):
         state_dict = {
@@ -289,6 +364,24 @@ class ConvRotModelFilterTest(unittest.TestCase):
                 "convrot.safetensors",
                 {"blocks.0.ffn.0.weight": torch.zeros((1, 1))},
                 metadata,
+            )
+
+            self.assertIsNone(_convrot_skip_reason(path))
+
+    def test_legacy_w8_tensor_metadata_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._save(
+                directory,
+                "legacy-convrot.safetensors",
+                {
+                    "double_blocks.0.img_attn.qkv.comfy_quant": quant_tensor(
+                        {
+                            "convrot": True,
+                            "convrot_groupsize": 256,
+                            "per_row": True,
+                        }
+                    )
+                },
             )
 
             self.assertIsNone(_convrot_skip_reason(path))

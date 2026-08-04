@@ -62,6 +62,7 @@ CLIP_TYPES = (
 )
 W4_FORMAT = "convrot_w4a4"
 W8_FORMAT = "int8_tensorwise"
+LEGACY_W8_FORMAT = "int8_rowwise"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -82,10 +83,20 @@ def _config_value(config: dict, params: dict, name: str, default):
     return config[name] if name in config else params.get(name, default)
 
 
+def _normalize_legacy_config(config: dict, layer_name: str) -> None:
+    params = _params(config, layer_name)
+    quant_format = config.get("format")
+    convrot = _config_value(config, params, "convrot", False)
+    per_row = _config_value(config, params, "per_row", False)
+    if (quant_format is None or quant_format == LEGACY_W8_FORMAT) and convrot is True and per_row is True:
+        config["format"] = W8_FORMAT
+
+
 def _classify_config(config: dict, layer_name: str, force_int8_gemm: bool) -> tuple[str, str] | None:
     if not isinstance(config, dict):
         raise ValueError(f"Quantization metadata for layer {layer_name} must be an object")
 
+    _normalize_legacy_config(config, layer_name)
     quant_format = config.get("format")
     params = _params(config, layer_name)
     if quant_format == W4_FORMAT:
