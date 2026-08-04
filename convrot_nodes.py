@@ -48,11 +48,21 @@ class ConvRotSummary:
     w8a8: int = 0
 
 
-def _official_clip_types() -> tuple[str, ...]:
+def _official_clip_loader_inputs() -> dict:
     comfy_nodes = sys.modules.get("nodes")
     if comfy_nodes is None or not hasattr(comfy_nodes, "CLIPLoader"):
         raise RuntimeError("ComfyUI's official CLIPLoader is not available")
-    choices = comfy_nodes.CLIPLoader.INPUT_TYPES()["required"]["type"][0]
+    inputs = comfy_nodes.CLIPLoader.INPUT_TYPES()
+    if not isinstance(inputs, dict) or not isinstance(inputs.get("required"), dict):
+        raise RuntimeError("ComfyUI's official CLIPLoader returned invalid input definitions")
+    return inputs
+
+
+def _official_clip_types() -> tuple[str, ...]:
+    required = _official_clip_loader_inputs()["required"]
+    if "type" not in required or not required["type"]:
+        raise RuntimeError("ComfyUI's official CLIPLoader does not expose a type input")
+    choices = required["type"][0]
     return tuple(choices)
 
 
@@ -580,19 +590,17 @@ class ConvRotDiffusionModelLoader:
 class ConvRotCLIPLoader:
     @classmethod
     def INPUT_TYPES(cls):
-        clip_types = _official_clip_types()
+        official_inputs = _official_clip_loader_inputs()
+        official_required = official_inputs["required"]
+        if "clip_name" not in official_required or "type" not in official_required:
+            raise RuntimeError(
+                "ComfyUI's official CLIPLoader must expose clip_name and type inputs"
+            )
+        official_optional = official_inputs.get("optional", {})
         return {
             "required": {
-                "clip_name": (
-                    _convrot_model_names(CLIP_FOLDER_NAME),
-                    {
-                        "tooltip": (
-                            "ConvRot CLIP file from ComfyUI/models/text_encoders. "
-                            "Files without supported ConvRot quantization metadata are hidden."
-                        )
-                    },
-                ),
-                "type": (clip_types,),
+                "clip_name": official_required["clip_name"],
+                "type": official_required["type"],
                 "force_int8_gemm": (
                     "BOOLEAN",
                     {
@@ -604,9 +612,11 @@ class ConvRotCLIPLoader:
                     },
                 ),
             },
-            "optional": {
-                "device": (("default", "cpu"), {"advanced": True}),
-            },
+            "optional": (
+                {"device": official_optional["device"]}
+                if "device" in official_optional
+                else {}
+            ),
         }
 
     RETURN_TYPES = ("CLIP",)

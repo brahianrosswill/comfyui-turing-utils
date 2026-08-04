@@ -430,14 +430,6 @@ class ConvRotModelFilterTest(unittest.TestCase):
                         }
                     )
                 },
-                metadata={
-                    "minimax_h3_te": json.dumps(
-                        {
-                            "num_hidden_layers": 50,
-                            "output": "unnormalized_hidden_after_layer_50",
-                        }
-                    )
-                },
             )
 
             self.assertIsNone(_convrot_skip_reason(path))
@@ -685,17 +677,31 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
 
     def test_node_reads_clip_types_from_official_loader(self):
         official_types = ["stable_diffusion", "mage", "minimax"]
+        official_names = [
+            "qwen3vl_32b_minimax_h3_int4_convrot.safetensors",
+            "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+        ]
+        official_device = (("default", "cpu"), {"advanced": True})
         with (
             mock.patch.object(
                 comfy_nodes.CLIPLoader,
                 "INPUT_TYPES",
-                return_value={"required": {"type": (official_types,)}},
+                return_value={
+                    "required": {
+                        "clip_name": (official_names,),
+                        "type": (official_types,),
+                    },
+                    "optional": {"device": official_device},
+                },
             ),
-            mock.patch("convrot_nodes._convrot_model_names", return_value=[]),
+            mock.patch("convrot_nodes._convrot_model_names") as filter_names,
         ):
             inputs = ConvRotCLIPLoader.INPUT_TYPES()
 
-        self.assertEqual(inputs["required"]["type"][0], tuple(official_types))
+        self.assertIs(inputs["required"]["clip_name"][0], official_names)
+        self.assertIs(inputs["required"]["type"][0], official_types)
+        self.assertIs(inputs["optional"]["device"], official_device)
+        filter_names.assert_not_called()
 
     def test_node_maps_new_official_clip_type_to_enum(self):
         fake_clip = object()
