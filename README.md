@@ -356,6 +356,23 @@ use BF16 activation storage by default; the packed SVDInt4 linear kernel still
 uses its native FP16 compute path internally and restores the surrounding
 activation dtype on output.
 
+`fatal error C1083: cannot open include file: 'nv/target'`
+
+CUDA 12.x obtains this header from CCCL. In an NVIDIA Conda CUDA 12.8
+environment, install the matching package and retry the independent kernel
+installation:
+
+```bat
+conda install -n comfyui -c nvidia cuda-cccl=12.8.90
+set SVDINT4_ARCH_LIST=7.5
+python -m pip install -v --no-build-isolation -e .\kernel
+```
+
+The build automatically discovers Conda's
+`Library\include\targets\x64` layout. For a custom CCCL installation, set
+`SVDINT4_CCCL_INCLUDE_DIR` to the directory that directly contains
+`nv\target`.
+
 `fatal error C1083: ... cusparse.h: No such file or directory`
 
 Update to the latest `comfyui-svdint4` commit. Older builds included heavy

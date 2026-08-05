@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "svdint4-kernel"
-version = "0.3.0"
+version = "0.3.1"
 description = "SVDQuant INT4 kernels with bundled Turing operators and SageAttention2"
 readme = "README.md"
 requires-python = ">=3.10"

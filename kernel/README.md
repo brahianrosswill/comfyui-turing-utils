@@ -71,6 +71,18 @@ heavy `torch/extension.h` and `ATen/cuda/CUDAContext.h` headers so split CUDA
 environments do not need cuSPARSE development headers just to compile the
 Python extension wrapper.
 
+NVIDIA's CUDA 12.8 Conda packages place CCCL under
+`%CONDA_PREFIX%\Library\include\targets\x64`. The build adds that directory
+automatically when it contains `nv\target`. If the header is absent, install
+the matching package before rebuilding:
+
+```bat
+conda install -c nvidia cuda-cccl=12.8.90
+```
+
+For a custom location, set `SVDINT4_CCCL_INCLUDE_DIR` to the directory that
+directly contains `nv\target`.
+
 If PyTorch prints `Error checking compiler version for cl`, MSVC is likely
 emitting localized diagnostics that PyTorch cannot decode with the active
 Windows code page. The build script sets `VSLANG=1033` automatically on Windows.

@@ -1,5 +1,7 @@
 import os
 import platform
+import shutil
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -11,7 +13,73 @@ if IS_WINDOWS:
     os.environ.setdefault("VSLANG", "1033")
 
 from setuptools import find_packages, setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
+
+
+def _windows_cccl_include_dirs() -> list[str]:
+    """Locate the target-specific CCCL headers omitted from some Conda nvcc paths."""
+    if not IS_WINDOWS:
+        return []
+
+    candidates: list[Path] = []
+    override = os.environ.get("SVDINT4_CCCL_INCLUDE_DIR")
+    if override:
+        candidates.append(Path(override))
+
+    prefixes = [Path(sys.prefix)]
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        prefixes.insert(0, Path(conda_prefix))
+    for prefix in prefixes:
+        candidates.extend(
+            [
+                prefix / "Library" / "include" / "targets" / "x64",
+                prefix / "Library" / "include" / "cccl",
+                prefix / "Library" / "include",
+                prefix / "include" / "cccl",
+                prefix / "include",
+            ]
+        )
+
+    cuda_roots: list[Path] = []
+    for value in (CUDA_HOME, os.environ.get("CUDA_PATH")):
+        if value:
+            cuda_roots.append(Path(value))
+    nvcc = shutil.which("nvcc")
+    if nvcc:
+        cuda_roots.append(Path(nvcc).resolve().parent.parent)
+    for cuda_root in cuda_roots:
+        candidates.extend(
+            [
+                cuda_root / "include" / "targets" / "x64",
+                cuda_root / "include" / "cccl",
+                cuda_root / "include",
+                cuda_root / "targets" / "x64" / "include",
+            ]
+        )
+
+    for entry in sys.path:
+        if entry:
+            candidates.append(Path(entry) / "nvidia" / "cuda_cccl" / "include")
+
+    found: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = os.path.normcase(os.path.abspath(candidate))
+        if key in seen:
+            continue
+        seen.add(key)
+        if (candidate / "nv" / "target").is_file():
+            found.append(str(candidate.resolve()))
+    if found:
+        return found
+
+    raise RuntimeError(
+        "CUDA CCCL headers are missing or undiscoverable: nv/target was not found. "
+        "For a CUDA 12.8 Conda environment on Windows, install them with "
+        "`conda install -c nvidia cuda-cccl=12.8.90`, or set "
+        "SVDINT4_CCCL_INCLUDE_DIR to the directory containing nv/target."
+    )
 
 
 def _arch_list() -> str:
@@ -29,6 +97,7 @@ def _arch_list() -> str:
 
 ARCH_LIST = _arch_list()
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", ARCH_LIST)
+CCCL_INCLUDE_DIRS = _windows_cccl_include_dirs()
 
 COMMON_DEFINES = [
     "-DENABLE_BF16=1",
@@ -119,6 +188,7 @@ core_ext = CUDAExtension(
     ],
     include_dirs=[
         str((ROOT / "csrc").resolve()),
+        *CCCL_INCLUDE_DIRS,
     ],
     extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS},
 )
@@ -139,6 +209,7 @@ if _includes_sm75():
     sage2_include_dirs = [
         str((ROOT / "csrc" / "turing").resolve()),
         str((ROOT / "csrc" / "turing" / "sage2").resolve()),
+        *CCCL_INCLUDE_DIRS,
     ]
     ext_modules.extend(
         [
@@ -167,7 +238,7 @@ if _includes_sm75():
 
 setup(
     name="svdint4-kernel",
-    version="0.3.0",
+    version="0.3.1",
     packages=find_packages(),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
