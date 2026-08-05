@@ -252,15 +252,16 @@ run the tensor-core path. On Ampere, Ada, and newer GPUs the plugin requests
 BF16 but continues to use the normal installed backends.
 
 The Turing linear dispatch reuses comfy-kitchen's official sm75 W4A4 and W8A8
-kernels. W4A8 is supplied by the local backend: it consumes the original packed
-W4 weight directly, fuses nibble unpacking, INT8 dot products, scaling, bias,
-and BF16 storage, and never materializes a full W8 copy of the weight. Its
-static shared-memory footprint is 2 KiB. Activation rotation uses the fused
-Kitchen quantizer only while its calculated request remains below 48 KiB; H3's
-larger hidden widths use Kitchen's staged BF16 rotation instead of opting into
-64 KiB or creating an FP32 activation buffer. On a non-sm75 tensor the local
-backend constraint does not match, so comfy-kitchen selects its official
-backend.
+GEMM kernels. W4A8 is supplied by the local backend: it consumes the original
+packed W4 weight directly, fuses nibble unpacking, INT8 dot products, scaling,
+bias, and BF16 storage, and never materializes a full W8 copy of the weight. Its
+static shared-memory footprint is 2 KiB. W8A8 and W4A8 activation rotations use
+Kitchen's staged BF16 INT8 quantizer whenever the fused row would reach the
+48 KiB limit. W4A4 keeps fused A4 quantization while it fits and otherwise uses
+Kitchen's grouped FHT rotation followed by row-wise INT4 quantization. None of
+the three paths falls back to a dense Hadamard matmul on supported sm75 devices.
+On a non-sm75 tensor the local backend constraint does not match, so
+comfy-kitchen selects its official backend.
 
 The bundled attention backend is derived from wjie98's full SM75
 SageAttention2 path and does not import or require the standalone

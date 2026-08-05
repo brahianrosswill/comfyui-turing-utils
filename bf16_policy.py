@@ -59,10 +59,10 @@ def _preflight_turing(summary, device: torch.device, attention_backend: str) -> 
         if summary.w8a8 and "int8_linear" not in capabilities:
             raise RuntimeError("Kitchen W8A8 support is unavailable on Turing")
 
+        if not register_backend() or not backend_available():
+            raise RuntimeError("the bundled Turing ConvRot backend could not be registered")
         preflight_kitchen(device, bool(summary.w4a4), bool(summary.w8a8))
         if summary.w4a8:
-            if not register_backend() or not backend_available():
-                raise RuntimeError("the bundled Turing W4A8 backend could not be registered")
             preflight_w4a8(device)
 
     if attention_backend in {"auto", "sage_attn"}:
