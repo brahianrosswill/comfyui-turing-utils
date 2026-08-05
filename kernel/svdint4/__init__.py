@@ -4,6 +4,7 @@ from .ops import (
     linear_svd,
     quantize_act_lora,
     svd_int4_linear,
+    turing_segmented_rms_adaln,
     turing_swiglu_int8_convrot_quantize,
     turing_w4a8_linear,
 )
@@ -19,7 +20,7 @@ from .packing import (
 )
 from . import turing_sage2
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 __all__ = [
     "PackedInt4Weight",
@@ -33,6 +34,7 @@ __all__ = [
     "pack_svd_up",
     "quantize_act_lora",
     "svd_int4_linear",
+    "turing_segmented_rms_adaln",
     "turing_swiglu_int8_convrot_quantize",
     "turing_w4a8_linear",
     "turing_sage2",

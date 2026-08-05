@@ -35,4 +35,12 @@ void turing_swiglu_int8_convrot_quantize(Tensor input,
                                           Tensor output,
                                           Tensor scales);
 
+void turing_segmented_rms_adaln(Tensor input,
+                                 Tensor weight,
+                                 Tensor scale,
+                                 Tensor shift,
+                                 Tensor segments,
+                                 Tensor output,
+                                 float epsilon);
+
 }  // namespace svdint4::kernels

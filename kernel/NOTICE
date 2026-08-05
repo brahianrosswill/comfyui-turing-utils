@@ -2,12 +2,12 @@ svdint4 includes an Apache-2.0 derived minimal binding around the Nunchaku
 W4A4/SVDQuant CUDA kernel path.
 
 The package exposes INT4 GEMM, activation quantization, SVD correction, packed
-Turing W4A8, and a bundled Turing SageAttention2 path. Model wrappers,
-RoPE/RMSNorm fusion, W8A8, AWQ, NVFP4, cache logic, and pipeline integrations
-are intentionally omitted.
+Turing W4A8, and a bundled Turing SageAttention2 path. Model wrappers, RoPE
+fusion, W8A8, AWQ, NVFP4, cache logic, and pipeline integrations are
+intentionally omitted.
 
-The staged Turing ConvRot quantizer under `csrc/turing/convrot_quant.cu` is
-derived from comfy-kitchen's Apache-2.0 CUDA implementation:
+The staged Turing ConvRot quantizer and segmented RMSNorm+AdaLN kernel under
+`csrc/turing/` are derived from comfy-kitchen's Apache-2.0 CUDA implementation:
 
   https://github.com/Comfy-Org/comfy-kitchen
 

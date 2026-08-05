@@ -57,6 +57,45 @@ def turing_swiglu_int8_convrot_quantize(
     return _C.turing_swiglu_int8_convrot_quantize(x.contiguous(), group_size)
 
 
+def turing_segmented_rms_adaln(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    segments: torch.Tensor,
+    epsilon: float = 1.0e-5,
+) -> torch.Tensor:
+    """Fused affine RMSNorm and segmented AdaLN modulation."""
+    if x.device.type != "cuda":
+        raise RuntimeError("SVDInt4 segmented RMSNorm+AdaLN requires CUDA tensors")
+    major, minor = torch.cuda.get_device_capability(x.device)
+    if (major, minor) < (7, 5):
+        raise RuntimeError("SVDInt4 segmented RMSNorm+AdaLN requires sm75 or newer")
+    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError("segmented RMSNorm+AdaLN input must be float16, bfloat16, or float32")
+    if x.ndim != 2:
+        raise ValueError("segmented RMSNorm+AdaLN input must be 2D [M, K]")
+    if weight.device != x.device or scale.device != x.device or shift.device != x.device:
+        raise ValueError("weight, scale, and shift must be on the input device")
+    weight = weight.to(dtype=x.dtype).contiguous()
+    scale = scale.to(dtype=x.dtype)
+    shift = shift.to(dtype=x.dtype)
+    if scale.stride(-1) != 1:
+        scale = scale.contiguous()
+    if shift.stride(-1) != 1:
+        shift = shift.contiguous()
+    if segments.device != x.device or segments.dtype != torch.int32:
+        raise ValueError("segments must be an int32 tensor on the input device")
+    return _C.turing_segmented_rms_adaln(
+        x.contiguous(),
+        weight,
+        scale,
+        shift,
+        segments.contiguous(),
+        epsilon,
+    )
+
+
 def quantize_act_lora(
     x: torch.Tensor,
     svd_down_packed: torch.Tensor,

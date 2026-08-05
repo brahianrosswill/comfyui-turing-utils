@@ -34,6 +34,11 @@ try:
 except ImportError:
     from bf16_policy import select_compute_dtype
 
+try:
+    from .turing_fusions import apply_turing_fusions
+except ImportError:
+    from turing_fusions import apply_turing_fusions
+
 
 LOG = logging.getLogger("comfyui-svdint4")
 DIFFUSION_FOLDER_NAME = "diffusion_models"
@@ -468,6 +473,7 @@ def load_convrot_model(
     )
     if compute_dtype is not None:
         model.set_model_compute_dtype(compute_dtype)
+    apply_turing_fusions(model, load_device)
     apply_attention_backend(model, attention_backend, device=load_device)
     model.cached_patcher_init = (
         load_convrot_model,

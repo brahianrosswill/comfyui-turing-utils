@@ -2,10 +2,11 @@
 
 CUDA/PyTorch extension used by ComfyUI SVDInt4.
 
-In addition to the SVDQuant path, version 0.3 provides exact-sm75 packed W4A8
-and a self-contained SageAttention2 backend. The attention extensions support
-FP16/BF16, GQA, HND/NHD, different Q/KV lengths, causal and variable-length
-execution without the standalone `sageattention` package.
+In addition to the SVDQuant path, version 0.4 provides exact-sm75 packed W4A8,
+staged activation fusions, and a self-contained SageAttention2 backend. The
+attention extensions support FP16/BF16, GQA, HND/NHD, different Q/KV lengths,
+causal and variable-length execution without the standalone `sageattention`
+package.
 
 Most users should install it from the parent `comfyui-svdint4` directory:
 
@@ -24,6 +25,7 @@ csrc/
   svdint4/                                SVDInt4 and SVD correction kernels
   turing/
     convrot_quant.cu                      staged SwiGLU + INT8 ConvRot quantizer
+    segmented_rms_adaln.cu                affine segmented RMSNorm + AdaLN
     w4a8.cu                               packed Turing W4A8 kernel
     sage2/                                bundled SM75 SageAttention2 kernels
 svdint4/
@@ -108,6 +110,7 @@ print("kernel api:", callable(svd_int4_linear))
 print("Turing SageAttention2:", svdint4.turing_sage2.available())
 print("Turing W4A8 api:", callable(svdint4.turing_w4a8_linear))
 print("Turing fused SwiGLU api:", callable(svdint4.turing_swiglu_int8_convrot_quantize))
+print("Turing RMSNorm+AdaLN api:", callable(svdint4.turing_segmented_rms_adaln))
 PY
 ```
 

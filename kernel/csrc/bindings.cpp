@@ -3,6 +3,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <torch/csrc/utils/pybind.h>
 
+#include <cmath>
 #include <optional>
 #include <tuple>
 #include <vector>
@@ -97,6 +98,14 @@ void check_half_like(const at::Tensor &t, const char *name) {
     TORCH_CHECK(t.scalar_type() == at::kHalf || t.scalar_type() == at::kBFloat16,
                 name,
                 " must be float16 or bfloat16");
+}
+
+void check_float_like(const at::Tensor &t, const char *name) {
+    TORCH_CHECK(t.scalar_type() == at::kHalf ||
+                    t.scalar_type() == at::kBFloat16 ||
+                    t.scalar_type() == at::kFloat,
+                name,
+                " must be float16, bfloat16, or float32");
 }
 
 Tensor maybe_tensor(const std::optional<at::Tensor> &value) {
@@ -360,6 +369,75 @@ std::tuple<at::Tensor, at::Tensor> turing_swiglu_int8_convrot_quantize(
     return {output, scales};
 }
 
+at::Tensor turing_segmented_rms_adaln(at::Tensor input,
+                                       at::Tensor weight,
+                                       at::Tensor scale,
+                                       at::Tensor shift,
+                                       at::Tensor segments,
+                                       double epsilon) {
+    input = input.contiguous();
+    weight = weight.contiguous();
+    segments = segments.contiguous();
+    check_cuda_2d(input, "input");
+    check_float_like(input, "input");
+    TORCH_CHECK(weight.is_cuda() && weight.dim() == 1 && weight.is_contiguous(),
+                "weight must be a contiguous 1D CUDA tensor");
+    TORCH_CHECK(scale.is_cuda() && scale.dim() == 2 && scale.stride(1) == 1,
+                "scale must be a CUDA matrix with contiguous rows");
+    TORCH_CHECK(shift.is_cuda() && shift.dim() == 2 && shift.stride(1) == 1,
+                "shift must be a CUDA matrix with contiguous rows");
+    TORCH_CHECK(segments.is_cuda() && segments.dim() == 2 && segments.is_contiguous(),
+                "segments must be a contiguous 2D CUDA tensor");
+    TORCH_CHECK(segments.scalar_type() == at::kInt && segments.size(1) == 3,
+                "segments must be int32 [start, stop, modulation_row] triples");
+    TORCH_CHECK(input.device() == weight.device() &&
+                    input.device() == scale.device() &&
+                    input.device() == shift.device() &&
+                    input.device() == segments.device(),
+                "all segmented RMSNorm+AdaLN tensors must use the same CUDA device");
+    TORCH_CHECK(weight.scalar_type() == input.scalar_type() &&
+                    scale.scalar_type() == input.scalar_type() &&
+                    shift.scalar_type() == input.scalar_type(),
+                "weight, scale, and shift dtypes must match input");
+
+    const int64_t rows = input.size(0);
+    const int64_t hidden = input.size(1);
+    TORCH_CHECK(rows > 0 && hidden > 0,
+                "segmented RMSNorm+AdaLN input dimensions must be positive");
+    TORCH_CHECK(weight.numel() == hidden,
+                "RMSNorm weight length must match the input hidden dimension");
+    TORCH_CHECK(scale.size(0) > 0 && scale.size(1) == hidden,
+                "scale must be [modulation_rows, hidden]");
+    TORCH_CHECK(shift.sizes() == scale.sizes(), "shift shape must match scale shape");
+    TORCH_CHECK(segments.size(0) > 0, "segments must contain at least one row");
+    TORCH_CHECK(rows <= std::numeric_limits<int>::max() &&
+                    hidden <= std::numeric_limits<int>::max() &&
+                    scale.size(0) <= std::numeric_limits<int>::max() &&
+                    scale.stride(0) <= std::numeric_limits<int>::max() &&
+                    shift.stride(0) <= std::numeric_limits<int>::max() &&
+                    segments.size(0) <= std::numeric_limits<int>::max(),
+                "segmented RMSNorm+AdaLN dimensions exceed the CUDA kernel range");
+    TORCH_CHECK(std::isfinite(epsilon) && epsilon > 0.0,
+                "RMSNorm epsilon must be finite and positive");
+
+    const at::cuda::CUDAGuard device_guard(input.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major > 7 || (properties->major == 7 && properties->minor >= 5),
+                "segmented RMSNorm+AdaLN requires sm75 or newer");
+
+    at::Tensor output = at::empty_like(input);
+    TorchOpContext ctx;
+    svdint4::kernels::turing_segmented_rms_adaln(
+        from_torch(input),
+        from_torch(weight),
+        from_torch(scale),
+        from_torch(shift),
+        from_torch(segments),
+        from_torch(output),
+        static_cast<float>(epsilon));
+    return output;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -406,4 +484,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &turing_swiglu_int8_convrot_quantize,
           pybind11::arg("input"),
           pybind11::arg("group_size") = 256);
+    m.def("turing_segmented_rms_adaln",
+          &turing_segmented_rms_adaln,
+          pybind11::arg("input"),
+          pybind11::arg("weight"),
+          pybind11::arg("scale"),
+          pybind11::arg("shift"),
+          pybind11::arg("segments"),
+          pybind11::arg("epsilon") = 1.0e-5);
 }

@@ -240,10 +240,10 @@ The script writes original metadata and basic provenance to
 Both diffusion loaders select BF16 by default when the detected ComfyUI model
 configuration declares it as a supported inference dtype. Explicit ComfyUI
 command-line dtype selections still win. The policy sets only the model
-inference/compute boundary through the model patcher; it does not recursively
-cast modules or replace normalization, RoPE, modulation, input, or output
-logic. Their existing FP32 reductions and other intentional precision islands
-therefore remain under ComfyUI/model control.
+inference/compute boundary through the model patcher and does not recursively
+cast modules, RoPE, input, or output logic. Existing intentional precision
+islands remain under ComfyUI/model control. The separate, narrowly matched
+Turing RMSNorm+AdaLN fusion described below retains FP32 internal arithmetic.
 
 On exact-sm75 Tensor Core GPUs (T4 and RTX 20-series), this avoids ComfyUI's
 normal BF16-to-FP32 fallback after the bundled operators pass startup
@@ -265,6 +265,14 @@ uses Kitchen's grouped FHT rotation followed by row-wise INT4 quantization. None
 of the three paths falls back to a dense Hadamard matmul on supported sm75
 devices. On a non-sm75 tensor the local backend constraint does not match, so
 comfy-kitchen selects its official backend.
+
+Compatible DiT blocks on exact-sm75 GPUs also use the bundled affine
+RMSNorm+AdaLN operator. It keeps the RMS reduction and modulation arithmetic in
+FP32, writes the original FP16/BF16/FP32 activation dtype, reads nonuniform
+contiguous token segments without expanding scale/shift across the sequence,
+and uses less than 1 KiB of static shared memory. The optimization is enabled
+automatically after model load and has no loader control. Other architectures
+and unmatched block layouts retain their normal ComfyUI implementation.
 
 The bundled attention backend is derived from wjie98's full SM75
 SageAttention2 path and does not import or require the standalone

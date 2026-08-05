@@ -185,6 +185,7 @@ core_ext = CUDAExtension(
         "csrc/svdint4/dispatcher.cu",
         "csrc/svdint4/gemm_instantiations.cu",
         "csrc/turing/convrot_quant.cu",
+        "csrc/turing/segmented_rms_adaln.cu",
         "csrc/turing/w4a8.cu",
     ],
     include_dirs=[
@@ -239,7 +240,7 @@ if _includes_sm75():
 
 setup(
     name="svdint4-kernel",
-    version="0.3.1",
+    version="0.4.0",
     packages=find_packages(),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
