@@ -270,14 +270,15 @@ and head dimensions up to 128 (smaller dimensions are padded internally). Q/K
 are quantized to INT8 per warp; V is staged as FP16 for SM75 tensor cores;
 online softmax and PV accumulation use FP32; the result is written in the
 original FP16/BF16 dtype. Dynamic shared memory tops out at 32 KiB, below the
-48 KiB default target.
+48 KiB default target. If the calling model supplies FP32 Q/K/V, only the
+attention boundary is narrowed to BF16 and the result is restored to FP32;
+the rest of the model remains under its existing dtype policy.
 
 ComfyUI attention masks, disabled low-precision attention, and head dimensions
-outside that contract use the original ComfyUI attention function. FP32 is
-never silently narrowed: the bundled SM75 backend reports it as unsupported,
-while the standalone Sage backend on non-Turing GPUs hands FP32 back to
-ComfyUI. Failure of a required SM75 kernel is reported before model allocation
-instead of silently reverting the whole model to FP32.
+outside that contract use the original ComfyUI attention function without a
+dtype conversion. The standalone Sage backend on non-Turing GPUs likewise
+hands FP32 back to ComfyUI. Failure of a required SM75 kernel is reported before
+model allocation instead of silently reverting the whole model to FP32.
 
 Packed SVDInt4 weights are represented as ComfyUI QuantizedTensor weights so
 ComfyUI can account for and move their qweight, scales, smooth factors, and SVD

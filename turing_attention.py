@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 
 import torch
@@ -12,8 +13,13 @@ except ImportError:
     from turing_ops import is_supported_turing_device
 
 
+LOG = logging.getLogger("comfyui-svdint4")
+
+
 SUPPORTED_DTYPES = (torch.float16, torch.bfloat16)
+SUPPORTED_INPUT_DTYPES = (*SUPPORTED_DTYPES, torch.float32)
 _PREFLIGHTED_DEVICES: set[int] = set()
+_LOGGED_FP32_COMPAT = False
 
 
 def available() -> bool:
@@ -70,6 +76,8 @@ def attention(
     skip_output_reshape: bool = False,
     **kwargs,
 ) -> torch.Tensor:
+    global _LOGGED_FP32_COMPAT
+
     fallback_args = (q, k, v, heads)
     fallback_kwargs = {
         "mask": mask,
@@ -86,10 +94,12 @@ def attention(
         return original(*fallback_args, **fallback_kwargs)
     if q.dtype != k.dtype or q.dtype != v.dtype:
         raise RuntimeError(f"Turing SageAttention2 requires matching Q/K/V dtypes, got {q.dtype}, {k.dtype}, {v.dtype}")
-    if q.dtype not in SUPPORTED_DTYPES:
-        raise RuntimeError(f"Turing SageAttention2 supports FP16 or BF16 Q/K/V, got {q.dtype}")
+    if q.dtype not in SUPPORTED_INPUT_DTYPES:
+        raise RuntimeError(f"Turing SageAttention2 supports FP16, BF16, or FP32 Q/K/V, got {q.dtype}")
     if q.device != k.device or q.device != v.device:
         raise RuntimeError("Turing SageAttention2 requires Q/K/V on the same CUDA device")
+
+    input_dtype = q.dtype
 
     enable_gqa = bool(kwargs.get("enable_gqa", False))
     if skip_reshape:
@@ -107,6 +117,17 @@ def attention(
     if head_dim <= 0 or head_dim > 128:
         return original(*fallback_args, **fallback_kwargs)
 
+    if input_dtype == torch.float32:
+        if not _LOGGED_FP32_COMPAT:
+            LOG.info(
+                "SVDInt4 Turing SageAttention2 FP32 compatibility: casting Q/K/V "
+                "to BF16 for the attention kernel and restoring FP32 output"
+            )
+            _LOGGED_FP32_COMPAT = True
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
+
     output = _sageattn(
         q,
         k,
@@ -118,8 +139,13 @@ def attention(
     )
     if tensor_layout == "HND":
         if skip_output_reshape:
-            return output
-        return output.transpose(1, 2).reshape(batch, -1, heads * head_dim)
-    if skip_output_reshape:
-        return output.transpose(1, 2)
-    return output.reshape(batch, -1, heads * head_dim)
+            result = output
+        else:
+            result = output.transpose(1, 2).reshape(batch, -1, heads * head_dim)
+    elif skip_output_reshape:
+        result = output.transpose(1, 2)
+    else:
+        result = output.reshape(batch, -1, heads * head_dim)
+    if result.dtype != input_dtype:
+        result = result.to(input_dtype)
+    return result

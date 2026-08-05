@@ -16,13 +16,36 @@ import turing_attention  # noqa: E402
 
 
 class TuringAttentionContractTest(unittest.TestCase):
-    def test_rejects_fp32_without_silently_narrowing(self):
+    def test_fp32_uses_bf16_kernel_and_restores_fp32_output(self):
         q = torch.zeros((1, 1, 32, 128), dtype=torch.float32)
+        kernel_output = torch.ones_like(q, dtype=torch.bfloat16)
         with (
             mock.patch("turing_attention.is_supported_turing_device", return_value=True),
-            self.assertRaisesRegex(RuntimeError, "supports FP16 or BF16"),
+            mock.patch("turing_attention._sageattn", return_value=kernel_output) as sage,
         ):
-            turing_attention.attention(mock.Mock(), q, q, q, 1, skip_reshape=True)
+            output = turing_attention.attention(
+                mock.Mock(), q, q, q, 1,
+                skip_reshape=True, skip_output_reshape=True
+            )
+        q_arg, k_arg, v_arg = sage.call_args.args[:3]
+        self.assertEqual(q_arg.dtype, torch.bfloat16)
+        self.assertEqual(k_arg.dtype, torch.bfloat16)
+        self.assertEqual(v_arg.dtype, torch.bfloat16)
+        self.assertEqual(output.dtype, torch.float32)
+        torch.testing.assert_close(output, kernel_output.float())
+
+    def test_unsupported_fp32_head_dimension_falls_back_without_casting(self):
+        q = torch.zeros((1, 1, 32, 256), dtype=torch.float32)
+        original = mock.Mock(return_value=q)
+        with (
+            mock.patch("turing_attention.is_supported_turing_device", return_value=True),
+            mock.patch("turing_attention._sageattn") as sage,
+        ):
+            output = turing_attention.attention(original, q, q, q, 1, skip_reshape=True)
+        self.assertIs(output, q)
+        original.assert_called_once()
+        self.assertIs(original.call_args.args[0], q)
+        sage.assert_not_called()
 
     def test_mask_uses_original_attention(self):
         q = torch.zeros((1, 1, 32, 128), dtype=torch.bfloat16)
