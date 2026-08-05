@@ -40,6 +40,23 @@ def turing_w4a8_linear(
     )
 
 
+def turing_swiglu_int8_convrot_quantize(
+    x: torch.Tensor,
+    group_size: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse SwiGLU into the first pass of staged ConvRot INT8 quantization."""
+    if x.device.type != "cuda":
+        raise RuntimeError("SVDInt4 Turing SwiGLU ConvRot requires CUDA tensors")
+    major, minor = torch.cuda.get_device_capability(x.device)
+    if (major, minor) < (7, 5):
+        raise RuntimeError("SVDInt4 Turing SwiGLU ConvRot requires sm75 or newer")
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("SwiGLU ConvRot input must be float16 or bfloat16")
+    if x.ndim != 2:
+        raise ValueError("SwiGLU ConvRot input must be 2D [M, 2K]")
+    return _C.turing_swiglu_int8_convrot_quantize(x.contiguous(), group_size)
+
+
 def quantize_act_lora(
     x: torch.Tensor,
     svd_down_packed: torch.Tensor,

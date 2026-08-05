@@ -205,12 +205,32 @@ def _convrot_int4_shared_memory_bytes(rows: int, hidden_size: int, element_size:
     return (hidden_size + groups_in_flight * scratch_buffers * 256) * element_size
 
 
-def _quantize_turing_int8_activation(x2d: torch.Tensor, group_size: int):
+def _quantize_turing_int8_activation(
+    x2d: torch.Tensor,
+    group_size: int,
+    input_act: str | None = None,
+):
     from comfy_kitchen.backends import cuda as kitchen_cuda
 
-    requested_shared = _convrot_int8_shared_memory_bytes(x2d.shape[0], x2d.shape[1])
+    if input_act not in (None, "none", "swiglu"):
+        raise ValueError(f"unsupported fused Turing INT8 activation: {input_act!r}")
+    hidden_size = x2d.shape[1] // 2 if input_act == "swiglu" else x2d.shape[1]
+    requested_shared = _convrot_int8_shared_memory_bytes(x2d.shape[0], hidden_size)
     if requested_shared < TURING_SHARED_MEMORY_LIMIT:
+        if input_act == "swiglu":
+            return kitchen_cuda.quantize_int8_rowwise_convrot64(
+                x2d, group_size, input_act="swiglu"
+            )
         return kitchen_cuda.quantize_int8_rowwise_convrot64(x2d, group_size)
+    if input_act == "swiglu":
+        try:
+            from svdint4 import turing_swiglu_int8_convrot_quantize
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "SVDInt4 Turing W8A8 SwiGLU requires an updated svdint4-kernel; "
+                "reinstall the kernel package"
+            ) from exc
+        return turing_swiglu_int8_convrot_quantize(x2d, group_size)
     staged = getattr(kitchen_cuda, "quantize_int8_convrot_staged", None)
     if staged is None:
         raise RuntimeError(
@@ -270,8 +290,15 @@ def int8_linear(
 
     original_shape = x.shape
     x2d = x.reshape(-1, original_shape[-1]).contiguous()
-    x2d = apply_input_act(x2d, input_act)
-    qactivation, activation_scale = _quantize_turing_int8_activation(x2d, convrot_groupsize)
+    if input_act == "swiglu":
+        qactivation, activation_scale = _quantize_turing_int8_activation(
+            x2d, convrot_groupsize, input_act="swiglu"
+        )
+    else:
+        x2d = apply_input_act(x2d, input_act)
+        qactivation, activation_scale = _quantize_turing_int8_activation(
+            x2d, convrot_groupsize
+        )
 
     # This Kitchen fallback is a generic INT8 GEMM once both operands are INT8.
     quantized_linear = getattr(kitchen_cuda, "_int4_linear_via_int8_values", None)

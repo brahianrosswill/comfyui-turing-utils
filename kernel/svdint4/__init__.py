@@ -4,6 +4,7 @@ from .ops import (
     linear_svd,
     quantize_act_lora,
     svd_int4_linear,
+    turing_swiglu_int8_convrot_quantize,
     turing_w4a8_linear,
 )
 from .packing import (
@@ -32,6 +33,7 @@ __all__ = [
     "pack_svd_up",
     "quantize_act_lora",
     "svd_int4_linear",
+    "turing_swiglu_int8_convrot_quantize",
     "turing_w4a8_linear",
     "turing_sage2",
     "unpack_svd_down",

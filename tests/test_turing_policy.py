@@ -166,18 +166,20 @@ class BF16PolicyTest(unittest.TestCase):
         qactivation = torch.zeros((2, 5376), dtype=torch.int8)
         activation_scale = torch.ones((2, 1), dtype=torch.float32)
         output = torch.zeros((2, 8), dtype=torch.bfloat16)
+        fused_swiglu = mock.Mock(return_value=(qactivation, activation_scale))
         with (
             mock.patch.object(turing_ops, "is_supported_turing_device", return_value=True),
-            mock.patch.object(
-                turing_ops,
-                "_quantize_turing_int8_activation",
-                return_value=(qactivation, activation_scale),
-            ) as quantize,
             mock.patch.object(
                 kitchen_cuda,
                 "_int4_linear_via_int8_values",
                 return_value=output,
             ) as linear,
+            mock.patch.dict(
+                sys.modules,
+                {"svdint4": SimpleNamespace(
+                    turing_swiglu_int8_convrot_quantize=fused_swiglu
+                )},
+            ),
         ):
             result = turing_ops.int8_linear(
                 x,
@@ -189,16 +191,9 @@ class BF16PolicyTest(unittest.TestCase):
                 input_act="swiglu",
             )
         self.assertTrue(torch.equal(result, output))
-        activated = quantize.call_args.args[0]
-        self.assertEqual(activated.shape, (2, 5376))
-        self.assertTrue(
-            torch.allclose(
-                activated.float(),
-                torch.full_like(activated.float(), 0.7310586),
-                atol=1.0e-3,
-                rtol=0.0,
-            )
-        )
+        fused_swiglu.assert_called_once()
+        torch.testing.assert_close(fused_swiglu.call_args.args[0], x)
+        self.assertEqual(fused_swiglu.call_args.args[1], 256)
         linear.assert_called_once()
         self.assertEqual(linear.call_args.args[3].shape, (8,))
 

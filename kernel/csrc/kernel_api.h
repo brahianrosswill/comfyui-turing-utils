@@ -29,4 +29,10 @@ void turing_w4a8_linear(Tensor activation,
                         Tensor bias,
                         Tensor output);
 
+void turing_swiglu_int8_convrot_quantize(Tensor input,
+                                          Tensor rotated,
+                                          Tensor partial_absmax,
+                                          Tensor output,
+                                          Tensor scales);
+
 }  // namespace svdint4::kernels

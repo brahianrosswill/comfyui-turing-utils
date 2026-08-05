@@ -184,6 +184,7 @@ core_ext = CUDAExtension(
         "csrc/bindings.cpp",
         "csrc/svdint4/dispatcher.cu",
         "csrc/svdint4/gemm_instantiations.cu",
+        "csrc/turing/convrot_quant.cu",
         "csrc/turing/w4a8.cu",
     ],
     include_dirs=[

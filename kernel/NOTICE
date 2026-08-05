@@ -6,6 +6,11 @@ Turing W4A8, and a bundled Turing SageAttention2 path. Model wrappers,
 RoPE/RMSNorm fusion, W8A8, AWQ, NVFP4, cache logic, and pipeline integrations
 are intentionally omitted.
 
+The staged Turing ConvRot quantizer under `csrc/turing/convrot_quant.cu` is
+derived from comfy-kitchen's Apache-2.0 CUDA implementation:
+
+  https://github.com/Comfy-Org/comfy-kitchen
+
 The CUDA kernel subset under csrc/svdint4 is derived from Nunchaku:
 
   https://github.com/nunchaku-ai/nunchaku

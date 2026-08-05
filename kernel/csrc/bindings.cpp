@@ -322,6 +322,44 @@ at::Tensor turing_w4a8_linear(at::Tensor activation,
     return output;
 }
 
+std::tuple<at::Tensor, at::Tensor> turing_swiglu_int8_convrot_quantize(
+    at::Tensor input, int64_t group_size) {
+    input = input.contiguous();
+    check_cuda_2d(input, "input");
+    check_half_like(input, "input");
+    TORCH_CHECK(group_size == 256, "SwiGLU staged ConvRot only supports group_size=256");
+    TORCH_CHECK(input.size(1) % 2 == 0, "SwiGLU input width must be even");
+
+    const int64_t rows = input.size(0);
+    const int64_t hidden = input.size(1) / 2;
+    TORCH_CHECK(rows > 0, "SwiGLU staged ConvRot requires at least one row");
+    TORCH_CHECK(hidden > 0 && hidden % group_size == 0,
+                "activated SwiGLU width must be positive and divisible by 256");
+    TORCH_CHECK(rows <= std::numeric_limits<int>::max() &&
+                    hidden <= std::numeric_limits<int>::max(),
+                "SwiGLU staged ConvRot dimensions exceed the CUDA kernel range");
+
+    const at::cuda::CUDAGuard device_guard(input.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major > 7 || (properties->major == 7 && properties->minor >= 5),
+                "SwiGLU staged ConvRot requires sm75 or newer");
+
+    at::Tensor rotated = at::empty({rows, hidden}, input.options());
+    at::Tensor partial_absmax = at::empty(
+        {rows, hidden / group_size}, input.options().dtype(at::kFloat));
+    at::Tensor output = at::empty({rows, hidden}, input.options().dtype(at::kChar));
+    at::Tensor scales = at::empty({rows, 1}, input.options().dtype(at::kFloat));
+
+    TorchOpContext ctx;
+    svdint4::kernels::turing_swiglu_int8_convrot_quantize(
+        from_torch(input),
+        from_torch(rotated),
+        from_torch(partial_absmax),
+        from_torch(output),
+        from_torch(scales));
+    return {output, scales};
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -364,4 +402,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("activation_scale"),
           pybind11::arg("weight_scale"),
           pybind11::arg("bias") = std::nullopt);
+    m.def("turing_swiglu_int8_convrot_quantize",
+          &turing_swiglu_int8_convrot_quantize,
+          pybind11::arg("input"),
+          pybind11::arg("group_size") = 256);
 }

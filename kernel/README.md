@@ -23,6 +23,7 @@ csrc/
   bindings.cpp, kernel_api.h, runtime.h   shared binding/ABI support
   svdint4/                                SVDInt4 and SVD correction kernels
   turing/
+    convrot_quant.cu                      staged SwiGLU + INT8 ConvRot quantizer
     w4a8.cu                               packed Turing W4A8 kernel
     sage2/                                bundled SM75 SageAttention2 kernels
 svdint4/
@@ -106,6 +107,7 @@ print("svdint4:", svdint4.__file__)
 print("kernel api:", callable(svd_int4_linear))
 print("Turing SageAttention2:", svdint4.turing_sage2.available())
 print("Turing W4A8 api:", callable(svdint4.turing_w4a8_linear))
+print("Turing fused SwiGLU api:", callable(svdint4.turing_swiglu_int8_convrot_quantize))
 PY
 ```
 
