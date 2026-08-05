@@ -123,43 +123,55 @@ def _select_attention_backend(option: str) -> tuple[AttentionBackend, Callable]:
     raise RuntimeError("No supported attention backend is available")
 
 
-def make_attention_override(option: str) -> Callable | None:
-    backend, target = _select_attention_backend(option)
-    logged_fp32_compat = False
+def _use_bundled_turing_sage(option: str, device: torch.device | None) -> bool:
+    if device is None or normalize_attention_backend(option) not in {"auto", "sage_attn"}:
+        return False
+    try:
+        from .turing_ops import is_supported_turing_device
+    except ImportError:
+        from turing_ops import is_supported_turing_device
+    return is_supported_turing_device(device)
+
+
+def make_attention_override(option: str, device: torch.device | None = None) -> Callable | None:
+    option = normalize_attention_backend(option)
+    bundled_turing = _use_bundled_turing_sage(option, device)
+    if bundled_turing:
+        try:
+            from . import turing_attention
+        except ImportError:
+            import turing_attention
+        if not turing_attention.available():
+            raise RuntimeError(
+                "The bundled Turing SageAttention2 extensions are unavailable. "
+                "Rebuild svdint4-kernel with SVDINT4_ARCH_LIST including 7.5."
+            )
+        turing_attention.preflight(device)
+        backend = AttentionBackend("turing_sage2", None, "bundled Turing SageAttention2")
+        target = turing_attention.attention
+    else:
+        backend, target = _select_attention_backend(option)
 
     def attention_override(original: Callable, *args, **kwargs):
-        nonlocal logged_fp32_compat
+        if bundled_turing:
+            return target(original, *args, **kwargs)
         if (
             backend.option == "sage_attn"
             and len(args) >= 3
             and all(isinstance(value, torch.Tensor) for value in args[:3])
-            and args[0].dtype == torch.float32
+            and any(value.dtype == torch.float32 for value in args[:3])
         ):
-            q, k, v = args[:3]
-            if not logged_fp32_compat:
-                LOG.info(
-                    "SVDInt4 Sage attention FP32 compatibility: casting Q/K/V to FP16 "
-                    "for the attention kernel and restoring FP32 output"
-                )
-                logged_fp32_compat = True
-            out = target(
-                q.to(torch.float16),
-                k.to(torch.float16),
-                v.to(torch.float16),
-                *args[3:],
-                **kwargs,
-            )
-            return out.to(q.dtype)
+            return original(*args, **kwargs)
         return target(*args, **kwargs)
 
     attention_override.svdint4_attention_backend = backend.option
     return attention_override
 
 
-def apply_attention_backend(model, option: str):
+def apply_attention_backend(model, option: str, device: torch.device | None = None):
     option = normalize_attention_backend(option)
     transformer_options = model.model_options.setdefault("transformer_options", {})
-    override = make_attention_override(option)
+    override = make_attention_override(option, device=device)
     selected = override.svdint4_attention_backend
     transformer_options["optimized_attention_override"] = override
     transformer_options["svdint4_attention_backend"] = selected

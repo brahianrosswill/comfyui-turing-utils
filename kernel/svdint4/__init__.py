@@ -1,4 +1,11 @@
-from .ops import SVDInt4Linear, gemm_svd, linear_svd, quantize_act_lora, svd_int4_linear
+from .ops import (
+    SVDInt4Linear,
+    gemm_svd,
+    linear_svd,
+    quantize_act_lora,
+    svd_int4_linear,
+    turing_w4a8_linear,
+)
 from .packing import (
     PackedInt4Weight,
     pack_bias,
@@ -9,6 +16,9 @@ from .packing import (
     unpack_svd_down,
     unpack_svd_up,
 )
+from . import turing_sage2
+
+__version__ = "0.3.0"
 
 __all__ = [
     "PackedInt4Weight",
@@ -22,6 +32,8 @@ __all__ = [
     "pack_svd_up",
     "quantize_act_lora",
     "svd_int4_linear",
+    "turing_w4a8_linear",
+    "turing_sage2",
     "unpack_svd_down",
     "unpack_svd_up",
 ]

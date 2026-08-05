@@ -10,6 +10,8 @@ import torch.nn as nn
 from safetensors import safe_open
 
 import comfy.lora
+import comfy.model_detection
+import comfy.model_management
 import comfy.ops
 import comfy.sd
 import comfy.weight_adapter
@@ -17,9 +19,11 @@ from comfy.patcher_extension import CallbacksMP
 
 try:
     from .attention_backends import apply_attention_backend, normalize_attention_backend
+    from .bf16_policy import select_compute_dtype
     from .model_format import validate_svdint4_metadata
 except ImportError:
     from attention_backends import apply_attention_backend, normalize_attention_backend
+    from bf16_policy import select_compute_dtype
     from model_format import validate_svdint4_metadata
 
 try:
@@ -46,6 +50,13 @@ REQUIRED_FIELDS = {"qweight", "wscales", "svd_down", "svd_up"}
 COMPUTE_DTYPE = torch.float16
 SVDINT4_LAYOUT_NAME = "SVDInt4PackedLayout"
 SVDINT4_STATE_PREFIX = "svdint4_"
+
+
+@dataclasses.dataclass(frozen=True)
+class _NoConvRot:
+    w4a4: int = 0
+    w4a8: int = 0
+    w8a8: int = 0
 
 
 def _kernel_install_hint() -> str:
@@ -1098,13 +1109,24 @@ def load_svdint4_model(
     _install_svdint4_lora_key_map()
     model_path = Path(model_path)
     state_dict, metadata, packed_layer_tensors = build_loader_state_dict(model_path)
+    diffusion_model_prefix = comfy.model_detection.unet_prefix_from_state_dict(state_dict)
+    model_config = comfy.model_detection.model_config_from_unet(
+        state_dict,
+        diffusion_model_prefix,
+        metadata=metadata,
+    )
+    load_device = comfy.model_management.get_torch_device()
+    compute_dtype = select_compute_dtype(model_config, load_device, _NoConvRot(), attention_backend)
     packed_bytes = sum(_tensor_nbytes(tensor) for fields in packed_layer_tensors.values() for tensor in fields.values())
     packed_state_bytes = packed_bytes if _HAS_COMFY_QUANTIZED_TENSOR else 0
     unused_packed_layers: tuple[str, ...] = ()
     try:
+        model_options = {"custom_operations": SVDInt4Ops(packed_layer_tensors)}
+        if compute_dtype is not None:
+            model_options["dtype"] = compute_dtype
         model = comfy.sd.load_diffusion_model_state_dict(
             state_dict,
-            model_options={"custom_operations": SVDInt4Ops(packed_layer_tensors)},
+            model_options=model_options,
             metadata=metadata,
             disable_dynamic=disable_dynamic,
         )
@@ -1162,6 +1184,8 @@ def load_svdint4_model(
     model.add_callback(CallbacksMP.ON_CLONE, _clone_svdint4_lora_overlay_state)
     model.add_callback(CallbacksMP.ON_DETACH, _clear_adapter_staging_runtime)
     model.add_callback(CallbacksMP.ON_CLEANUP, _clear_adapter_staging_runtime)
-    apply_attention_backend(model, attention_backend)
+    if compute_dtype is not None:
+        model.set_model_compute_dtype(compute_dtype)
+    apply_attention_backend(model, attention_backend, device=load_device)
     model.cached_patcher_init = (load_svdint4_model, (str(model_path), attention_backend))
     return model

@@ -274,6 +274,54 @@ at::Tensor linear_svd(at::Tensor input,
                     std::move(lora_scales));
 }
 
+at::Tensor turing_w4a8_linear(at::Tensor activation,
+                              at::Tensor weight,
+                              at::Tensor activation_scale,
+                              at::Tensor weight_scale,
+                              std::optional<at::Tensor> bias) {
+    activation = activation.contiguous();
+    weight = weight.contiguous();
+    activation_scale = activation_scale.to(at::kFloat).contiguous();
+    weight_scale = weight_scale.to(at::kFloat).contiguous();
+    if (bias.has_value()) {
+        bias = bias.value().to(at::kFloat).contiguous();
+    }
+
+    check_cuda_2d(activation, "activation");
+    check_cuda_2d(weight, "weight");
+    TORCH_CHECK(activation.scalar_type() == at::kChar, "activation must be int8");
+    TORCH_CHECK(weight.scalar_type() == at::kChar, "weight must be packed int8 storage");
+    TORCH_CHECK(activation.device() == weight.device(), "activation and weight must be on the same CUDA device");
+    TORCH_CHECK(activation_scale.is_cuda() && weight_scale.is_cuda(), "scales must be CUDA tensors");
+    TORCH_CHECK(activation_scale.device() == activation.device() && weight_scale.device() == activation.device(),
+                "scales must be on the activation device");
+    TORCH_CHECK(activation.size(1) % 4 == 0, "activation K must be divisible by 4");
+    TORCH_CHECK(weight.size(1) * 2 == activation.size(1), "packed weight K must match activation K");
+    TORCH_CHECK(activation_scale.numel() == activation.size(0), "activation_scale must contain one value per row");
+    TORCH_CHECK(weight_scale.numel() == weight.size(0), "weight_scale must contain one value per output channel");
+    if (bias.has_value()) {
+        TORCH_CHECK(bias.value().is_cuda() && bias.value().device() == activation.device(),
+                    "bias must be on the activation device");
+        TORCH_CHECK(bias.value().numel() == weight.size(0), "bias must contain one value per output channel");
+    }
+
+    const at::cuda::CUDAGuard device_guard(activation.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major == 7 && properties->minor == 5,
+                "turing_w4a8_linear requires NVIDIA Turing/sm75");
+
+    at::Tensor output = at::empty(
+        {activation.size(0), weight.size(0)}, activation.options().dtype(at::kBFloat16));
+    TorchOpContext ctx;
+    svdint4::kernels::turing_w4a8_linear(from_torch(activation),
+                                          from_torch(weight),
+                                          from_torch(activation_scale),
+                                          from_torch(weight_scale),
+                                          maybe_tensor(bias),
+                                          from_torch(output));
+    return output;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -309,4 +357,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("act_unsigned") = false,
           pybind11::arg("lora_scales") = std::vector<float>{},
           pybind11::arg("pad_size") = 256);
+    m.def("turing_w4a8_linear",
+          &turing_w4a8_linear,
+          pybind11::arg("activation"),
+          pybind11::arg("weight"),
+          pybind11::arg("activation_scale"),
+          pybind11::arg("weight_scale"),
+          pybind11::arg("bias") = std::nullopt);
 }

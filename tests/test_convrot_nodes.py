@@ -527,6 +527,10 @@ class FakeModel:
         self.model.layer = FakeQuantLinear(weight_format, activation_dtype)
         self.model_options = {}
         self.cached_patcher_init = None
+        self.compute_dtype = None
+
+    def set_model_compute_dtype(self, dtype):
+        self.compute_dtype = dtype
 
 
 class ConvRotCLIPLoaderTest(unittest.TestCase):
@@ -547,14 +551,21 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
                 "comfy.model_detection.unet_prefix_from_state_dict",
                 return_value="model.diffusion_model.",
             ),
+            mock.patch(
+                "comfy.model_detection.model_config_from_unet",
+                return_value=SimpleNamespace(unet_config={"image_model": "wan"}),
+            ),
             mock.patch("convrot_nodes._validate_runtime_support"),
-            mock.patch("comfy.sd.load_diffusion_model_state_dict", return_value=fake_model),
+            mock.patch("convrot_nodes.select_compute_dtype", return_value=None),
+            mock.patch("comfy.sd.load_diffusion_model_state_dict", return_value=fake_model) as load_state,
             mock.patch("convrot_nodes.apply_attention_backend") as apply_backend,
         ):
             loaded = load_convrot_model("model.safetensors")
 
         self.assertIs(loaded, fake_model)
-        apply_backend.assert_called_once_with(fake_model, "auto")
+        self.assertEqual(load_state.call_args.kwargs["model_options"], {})
+        self.assertIsNone(fake_model.compute_dtype)
+        apply_backend.assert_called_once_with(fake_model, "auto", device=torch.device("cuda", 0))
         self.assertEqual(
             fake_model.cached_patcher_init,
             (
@@ -562,6 +573,32 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
                 ("model.safetensors", False, "auto"),
             ),
         )
+
+    def test_selected_bf16_is_scoped_to_the_model_patcher(self):
+        state_dict = {
+            "model.diffusion_model.blocks.0.ffn.0.comfy_quant": quant_tensor(
+                {"format": "convrot_w4a4"}
+            )
+        }
+        fake_model = FakeModel("convrot_w4a4", "int4")
+        model_config = SimpleNamespace(unet_config={"image_model": "minimax_h3"})
+
+        with (
+            mock.patch("comfy.utils.load_torch_file", return_value=(state_dict, {})),
+            mock.patch("comfy.model_detection.unet_prefix_from_state_dict", return_value="model.diffusion_model."),
+            mock.patch("comfy.model_detection.model_config_from_unet", return_value=model_config),
+            mock.patch("comfy.model_management.get_torch_device", return_value=torch.device("cuda", 0)),
+            mock.patch("convrot_nodes._validate_runtime_support"),
+            mock.patch("convrot_nodes.select_compute_dtype", return_value=torch.bfloat16),
+            mock.patch("comfy.sd.load_diffusion_model_state_dict", return_value=fake_model) as load_state,
+            mock.patch("convrot_nodes.apply_attention_backend") as apply_backend,
+        ):
+            loaded = load_convrot_model("model.safetensors")
+
+        self.assertIs(loaded, fake_model)
+        self.assertEqual(load_state.call_args.kwargs["model_options"], {"dtype": torch.bfloat16})
+        self.assertEqual(fake_model.compute_dtype, torch.bfloat16)
+        apply_backend.assert_called_once_with(fake_model, "auto", device=torch.device("cuda", 0))
 
     def test_load_clip_forces_mixed_ops_and_preserves_activation_override(self):
         state_dict = {
@@ -735,6 +772,7 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
             ("auto", "sage_attn", "flash_attn", "sdpa"),
         )
         self.assertEqual(inputs["optional"]["patch_attention"][1]["default"], "auto")
+        self.assertNotIn("turing_bf16_mode", inputs["optional"])
 
     def test_diffusion_node_forwards_attention_backend(self):
         fake_model = object()

@@ -20,6 +20,26 @@ def _validate_cuda_kernel_runtime(x: torch.Tensor, dtype: torch.dtype) -> None:
         raise RuntimeError("SVDInt4 bfloat16 kernels require Ampere/sm80 or newer")
 
 
+def turing_w4a8_linear(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if activation.device.type != "cuda":
+        raise RuntimeError("SVDInt4 Turing W4A8 requires CUDA tensors")
+    if torch.cuda.get_device_capability(activation.device) != (7, 5):
+        raise RuntimeError("SVDInt4 Turing W4A8 requires NVIDIA Turing/sm75")
+    return _C.turing_w4a8_linear(
+        activation.contiguous(),
+        weight.contiguous(),
+        activation_scale.contiguous(),
+        weight_scale.contiguous(),
+        None if bias is None else bias.contiguous(),
+    )
+
+
 def quantize_act_lora(
     x: torch.Tensor,
     svd_down_packed: torch.Tensor,

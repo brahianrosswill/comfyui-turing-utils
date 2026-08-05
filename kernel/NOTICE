@@ -1,17 +1,29 @@
 svdint4 includes an Apache-2.0 derived minimal binding around the Nunchaku
 W4A4/SVDQuant CUDA kernel path.
 
-Only the INT4 GEMM, activation quantization, and SVD correction path are
-exposed here. Model wrappers, attention/RoPE/RMSNorm fusion, W8A8, AWQ,
-NVFP4, cache logic, and pipeline integrations are intentionally omitted.
+The package exposes INT4 GEMM, activation quantization, SVD correction, packed
+Turing W4A8, and a bundled Turing SageAttention2 path. Model wrappers,
+RoPE/RMSNorm fusion, W8A8, AWQ, NVFP4, cache logic, and pipeline integrations
+are intentionally omitted.
 
-The flattened CUDA kernel subset under csrc/ is derived from Nunchaku:
+The CUDA kernel subset under csrc/svdint4 is derived from Nunchaku:
 
   https://github.com/nunchaku-ai/nunchaku
 
 Nunchaku is licensed under the Apache License, Version 2.0. A copy of the
 original license text is kept in LICENSES/nunchaku-LICENCE.txt.
 
-The derived subset has been reduced and flattened to the files required for
-INT4 GEMM, activation quantization, and SVD correction dispatch. The package
-build no longer depends on a sibling nunchaku checkout.
+The derived subset has been reduced to the files required for INT4 GEMM,
+activation quantization, and SVD correction dispatch. The package build no
+longer depends on a sibling nunchaku checkout.
+
+The SM75 attention sources are derived from wjie98's Apache-2.0 SageAttention
+branch `feature/turing-sm75-backend`, commit
+`abc695cb9ed9572deb83fd9bb85f0fb815347ebd`, itself derived from SageAttention:
+
+  https://github.com/wjie98/SageAttention/tree/feature/turing-sm75-backend
+  https://github.com/thu-ml/SageAttention
+
+The vendored CUDA and Python support is kept under `csrc/turing/sage2` and
+`svdint4/turing_sage2`. SageAttention is licensed under the Apache License,
+Version 2.0; its license text is in LICENSES/sageattention-LICENSE.txt.

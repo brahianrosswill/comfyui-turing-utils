@@ -27,7 +27,8 @@ def _arch_list() -> str:
     return ";".join(arches)
 
 
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", _arch_list())
+ARCH_LIST = _arch_list()
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", ARCH_LIST)
 
 COMMON_DEFINES = [
     "-DENABLE_BF16=1",
@@ -108,12 +109,13 @@ else:
     ]
 
 
-ext = CUDAExtension(
+core_ext = CUDAExtension(
     name="svdint4._C",
     sources=[
         "csrc/bindings.cpp",
-        "csrc/dispatcher.cu",
-        "csrc/gemm_instantiations.cu",
+        "csrc/svdint4/dispatcher.cu",
+        "csrc/svdint4/gemm_instantiations.cu",
+        "csrc/turing/w4a8.cu",
     ],
     include_dirs=[
         str((ROOT / "csrc").resolve()),
@@ -122,10 +124,51 @@ ext = CUDAExtension(
 )
 
 
+def _includes_sm75() -> bool:
+    return any(arch.split("+")[0] == "7.5" for arch in ARCH_LIST.split(";") if arch)
+
+
+ext_modules = [core_ext]
+if _includes_sm75():
+    sm75_nvcc_flags = [
+        *NVCC_FLAGS,
+        "--use_fast_math",
+        "-gencode",
+        "arch=compute_75,code=sm_75",
+    ]
+    sage2_include_dirs = [
+        str((ROOT / "csrc" / "turing").resolve()),
+        str((ROOT / "csrc" / "turing" / "sage2").resolve()),
+    ]
+    ext_modules.extend(
+        [
+            CUDAExtension(
+                name="svdint4._sage_qattn_sm75",
+                sources=[
+                    "csrc/turing/sage2/pybind_sm75.cpp",
+                    "csrc/turing/sage2/qk_int_sv_f16_cuda_sm75.cu",
+                    "csrc/turing/sage2/qk_int_sv_f16_varlen_cuda_sm75.cu",
+                ],
+                include_dirs=sage2_include_dirs,
+                extra_compile_args={"cxx": CXX_FLAGS, "nvcc": sm75_nvcc_flags},
+            ),
+            CUDAExtension(
+                name="svdint4._sage_fused_sm75",
+                sources=[
+                    "csrc/turing/sage2/pybind_fused.cpp",
+                    "csrc/turing/sage2/fused.cu",
+                ],
+                include_dirs=sage2_include_dirs,
+                extra_compile_args={"cxx": CXX_FLAGS, "nvcc": sm75_nvcc_flags},
+            ),
+        ]
+    )
+
+
 setup(
     name="svdint4-kernel",
-    version="0.1.0",
+    version="0.3.0",
     packages=find_packages(),
-    ext_modules=[ext],
+    ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
 )

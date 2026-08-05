@@ -22,4 +22,11 @@ void quantize_act_lora(Tensor input,
                        Tensor lora_act_out,
                        Tensor smooth);
 
+void turing_w4a8_linear(Tensor activation,
+                        Tensor weight,
+                        Tensor activation_scale,
+                        Tensor weight_scale,
+                        Tensor bias,
+                        Tensor output);
+
 }  // namespace svdint4::kernels

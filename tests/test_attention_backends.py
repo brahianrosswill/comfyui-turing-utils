@@ -99,15 +99,9 @@ class AttentionBackendsTest(unittest.TestCase):
             "sdpa",
         )
 
-    def test_sage_casts_fp32_qkv_to_fp16_and_restores_output_dtype(self):
-        captured = {}
-
-        def sage(q, k, v, *args, **kwargs):
-            captured["q"] = q
-            captured["k"] = k
-            captured["v"] = v
-            return q + k + v
-
+    def test_external_sage_sends_fp32_qkv_to_original_attention(self):
+        sage = mock.Mock()
+        original = mock.Mock(return_value="original")
         with mock.patch(
             "comfy.ldm.modules.attention.get_attention_function",
             side_effect=lambda name, default: sage if name == "sage" else default,
@@ -115,15 +109,24 @@ class AttentionBackendsTest(unittest.TestCase):
             override = attention_backends.make_attention_override("sage_attn")
 
         q = torch.randn(1, 2, 4, 8, dtype=torch.float32)
-        k = torch.randn(1, 2, 4, 8, dtype=torch.float32)
-        v = torch.randn(1, 2, 4, 8, dtype=torch.float32)
-        out = override(lambda *args, **kwargs: None, q, k, v, 2, skip_reshape=True)
+        self.assertEqual(override(original, q, q, q, 2, skip_reshape=True), "original")
+        original.assert_called_once()
+        sage.assert_not_called()
 
-        self.assertEqual(captured["q"].dtype, torch.float16)
-        self.assertEqual(captured["k"].dtype, torch.float16)
-        self.assertEqual(captured["v"].dtype, torch.float16)
-        self.assertEqual(out.dtype, torch.float32)
-        torch.testing.assert_close(out, (q.half() + k.half() + v.half()).float())
+    def test_external_sage_sends_mixed_qkv_to_original_attention(self):
+        sage = mock.Mock()
+        original = mock.Mock(return_value="original")
+        with mock.patch(
+            "comfy.ldm.modules.attention.get_attention_function",
+            side_effect=lambda name, default: sage if name == "sage" else default,
+        ):
+            override = attention_backends.make_attention_override("sage_attn")
+
+        bf16 = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+        fp32 = bf16.float()
+        self.assertEqual(override(original, bf16, fp32, bf16, 2, skip_reshape=True), "original")
+        original.assert_called_once()
+        sage.assert_not_called()
 
     def test_sage_does_not_recast_supported_qkv_dtype(self):
         captured = {}
@@ -144,14 +147,7 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertIs(captured["q"], q)
         self.assertIs(out, q)
 
-    def test_sage_fp32_compat_runs_through_comfy_attention_wrapper(self):
-        captured = {}
-
-        def sage_kernel(q, k, v, **kwargs):
-            captured["q_dtype"] = q.dtype
-            captured["tensor_layout"] = kwargs["tensor_layout"]
-            return q
-
+    def test_sage_fp32_fallback_runs_through_comfy_attention_wrapper(self):
         model = FakeModel()
         with (
             mock.patch(
@@ -160,12 +156,12 @@ class AttentionBackendsTest(unittest.TestCase):
                     attention.attention_sage if name == "sage" else default
                 ),
             ),
-            mock.patch("comfy.ldm.modules.attention.sageattn", side_effect=sage_kernel),
+            mock.patch("comfy.ldm.modules.attention.sageattn") as sage,
         ):
             attention_backends.apply_attention_backend(model, "sage_attn")
             transformer_options = model.model_options["transformer_options"]
             q = torch.randn(1, 2, 4, 8, dtype=torch.float32)
-            out = attention.optimized_attention(
+            output = attention.optimized_attention(
                 q,
                 q,
                 q,
@@ -173,11 +169,8 @@ class AttentionBackendsTest(unittest.TestCase):
                 skip_reshape=True,
                 transformer_options=transformer_options,
             )
-
-        self.assertEqual(captured["q_dtype"], torch.float16)
-        self.assertEqual(captured["tensor_layout"], "HND")
-        self.assertEqual(out.dtype, torch.float32)
-        self.assertEqual(tuple(out.shape), (1, 4, 16))
+        self.assertEqual(output.shape, (1, 4, 16))
+        sage.assert_not_called()
 
     def test_sdpa_keeps_fp32_qkv_unchanged(self):
         captured = {}
@@ -210,6 +203,39 @@ class AttentionBackendsTest(unittest.TestCase):
         v = torch.randn(1, 8, 16)
         out = attention.optimized_attention(q, k, v, heads=2, transformer_options=transformer_options)
         self.assertEqual(tuple(out.shape), (1, 8, 16))
+
+    def test_turing_auto_uses_bundled_sageattention2(self):
+        model = FakeModel()
+        q = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+        with (
+            mock.patch("turing_ops.is_supported_turing_device", return_value=True),
+            mock.patch("turing_attention.available", return_value=True),
+            mock.patch("turing_attention.preflight") as preflight,
+            mock.patch("turing_attention.attention", return_value=q) as kernel,
+        ):
+            attention_backends.apply_attention_backend(model, "auto", device=torch.device("cuda", 0))
+            override = model.model_options["transformer_options"]["optimized_attention_override"]
+            out = override(lambda *args, **kwargs: None, q, q, q, 2, skip_reshape=True)
+
+        self.assertIs(out, q)
+        kernel.assert_called_once()
+        preflight.assert_called_once_with(torch.device("cuda", 0))
+        self.assertEqual(
+            model.model_options["transformer_options"]["svdint4_attention_backend"],
+            "turing_sage2",
+        )
+
+    def test_turing_explicit_non_sage_backend_is_honored(self):
+        flash = lambda *args, **kwargs: None
+        with (
+            mock.patch("turing_ops.is_supported_turing_device", return_value=True),
+            mock.patch(
+                "comfy.ldm.modules.attention.get_attention_function",
+                side_effect=lambda name, default: flash if name == "flash" else default,
+            ),
+        ):
+            override = attention_backends.make_attention_override("flash_attn", device=torch.device("cuda", 0))
+        self.assertEqual(override.svdint4_attention_backend, "flash_attn")
 
 
 if __name__ == "__main__":

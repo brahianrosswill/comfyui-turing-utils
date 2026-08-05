@@ -29,6 +29,11 @@ except ImportError:
         normalize_attention_backend,
     )
 
+try:
+    from .bf16_policy import select_compute_dtype
+except ImportError:
+    from bf16_policy import select_compute_dtype
+
 
 LOG = logging.getLogger("comfyui-svdint4")
 DIFFUSION_FOLDER_NAME = "diffusion_models"
@@ -425,9 +430,22 @@ def load_convrot_model(
         force_int8_gemm,
         model_prefix=diffusion_model_prefix,
     )
-    _validate_runtime_support(expected)
+    load_device = comfy.model_management.get_torch_device()
+    _validate_runtime_support(expected, load_device)
+    model_config = comfy.model_detection.model_config_from_unet(
+        state_dict,
+        diffusion_model_prefix,
+        metadata=metadata,
+    )
+    compute_dtype = select_compute_dtype(
+        model_config,
+        load_device,
+        expected,
+        attention_backend,
+    )
     model = comfy.sd.load_diffusion_model_state_dict(
         state_dict,
+        model_options={"dtype": compute_dtype} if compute_dtype is not None else {},
         metadata=metadata,
         disable_dynamic=disable_dynamic,
     )
@@ -448,7 +466,9 @@ def load_convrot_model(
         loaded.w4a8,
         loaded.w8a8,
     )
-    apply_attention_backend(model, attention_backend)
+    if compute_dtype is not None:
+        model.set_model_compute_dtype(compute_dtype)
+    apply_attention_backend(model, attention_backend, device=load_device)
     model.cached_patcher_init = (
         load_convrot_model,
         (str(model_path), force_int8_gemm, attention_backend),
@@ -584,7 +604,13 @@ class ConvRotDiffusionModelLoader:
         patch_attention: str = "auto",
     ):
         model_path = _resolve_convrot_model_path(DIFFUSION_FOLDER_NAME, unet_name)
-        return (load_convrot_model(model_path, force_int8_gemm, attention_backend=patch_attention),)
+        return (
+            load_convrot_model(
+                model_path,
+                force_int8_gemm,
+                attention_backend=patch_attention,
+            ),
+        )
 
 
 class ConvRotCLIPLoader:
