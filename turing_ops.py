@@ -282,26 +282,14 @@ def int8_linear(
     expanded_weight_scale = weight_scale.reshape(-1)
     if expanded_weight_scale.numel() == 1:
         expanded_weight_scale = expanded_weight_scale.expand(output_channels).contiguous()
-
-    # SM75 has no native FP32 -> BF16 conversion.  Kitchen's fused BF16
-    # epilogue therefore expands into a large software-conversion sequence.
-    # Keep the public/storage contract BF16, but run this diagnostic path with
-    # an FP32 GEMM epilogue and perform the final narrowing in a standalone
-    # conversion kernel.  Besides isolating the epilogue cost, this keeps the
-    # staged activation quantizer and INT8 GEMM selection unchanged.
-    gemm_output_dtype = (
-        torch.float32 if output_dtype == torch.bfloat16 else output_dtype
-    )
     output = quantized_linear(
         qactivation,
         weight.contiguous(),
         activation_scale,
         expanded_weight_scale,
         bias,
-        gemm_output_dtype,
+        output_dtype,
     )
-    if gemm_output_dtype != output_dtype:
-        output = output.to(output_dtype)
     return output.reshape(*original_shape[:-1], output_channels)
 
 
