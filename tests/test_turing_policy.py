@@ -165,7 +165,8 @@ class BF16PolicyTest(unittest.TestCase):
         weight_scale = torch.ones((), dtype=torch.float32)
         qactivation = torch.zeros((2, 5376), dtype=torch.int8)
         activation_scale = torch.ones((2, 1), dtype=torch.float32)
-        output = torch.zeros((2, 8), dtype=torch.bfloat16)
+        gemm_output = torch.zeros((2, 8), dtype=torch.float32)
+        expected_output = gemm_output.to(torch.bfloat16)
         with (
             mock.patch.object(turing_ops, "is_supported_turing_device", return_value=True),
             mock.patch.object(
@@ -176,7 +177,7 @@ class BF16PolicyTest(unittest.TestCase):
             mock.patch.object(
                 kitchen_cuda,
                 "_int4_linear_via_int8_values",
-                return_value=output,
+                return_value=gemm_output,
             ) as linear,
         ):
             result = turing_ops.int8_linear(
@@ -188,7 +189,8 @@ class BF16PolicyTest(unittest.TestCase):
                 convrot_groupsize=256,
                 input_act="swiglu",
             )
-        self.assertTrue(torch.equal(result, output))
+        self.assertTrue(torch.equal(result, expected_output))
+        self.assertIs(result.dtype, torch.bfloat16)
         activated = quantize.call_args.args[0]
         self.assertEqual(activated.shape, (2, 5376))
         self.assertTrue(
@@ -201,6 +203,7 @@ class BF16PolicyTest(unittest.TestCase):
         )
         linear.assert_called_once()
         self.assertEqual(linear.call_args.args[3].shape, (8,))
+        self.assertIs(linear.call_args.args[5], torch.float32)
 
     def test_w4a8_linear_uses_shared_staged_quantizer(self):
         x = torch.empty((2, 5376), dtype=torch.bfloat16)
