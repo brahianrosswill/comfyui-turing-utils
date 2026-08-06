@@ -29,6 +29,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("token_block_mean_cuda", &token_block_mean_cuda, "token_block_mean_cuda");
   m.def("quant_query_per_thread_int4_cuda", &quant_query_per_thread_int4_cuda, "quant_query_per_thread_int4_cuda");
   m.def("quant_key_per_thread_int4_cuda", &quant_key_per_thread_int4_cuda, "quant_key_per_thread_int4_cuda");
+  m.def("quant_query_per_thread_int4_fused_cuda", &quant_query_per_thread_int4_fused_cuda, "Fused Q block smoothing and official-layout per-thread INT4 quantization");
+  m.def("quant_key_per_thread_int4_fused_cuda", &quant_key_per_thread_int4_fused_cuda, "Fused centered-K official-layout per-thread INT4 quantization");
+  m.def("sage2_score_correction_cuda", &sage2_score_correction_cuda, "FP16 Tensor Core Sage2 score correction with FP32 output");
 
   m.def("sub_mean_cuda", py::overload_cast<at::Tensor, at::Tensor, at::Tensor, int>(&sub_mean_cuda), "sub_mean_cuda");
 

@@ -28,7 +28,7 @@ except ImportError:
 
 LOG = logging.getLogger("comfyui-svdint4")
 MIN_KITCHEN_VERSION = (0, 2, 26)
-MIN_KERNEL_VERSION = (0, 6, 0)
+MIN_KERNEL_VERSION = (0, 6, 1)
 _CONVROT_W4_LAYOUT = "TensorCoreConvRotW4A4Layout"
 _TENSORWISE_INT8_LAYOUT = "TensorWiseINT8Layout"
 
@@ -138,7 +138,7 @@ def prepare_turing_runtime(
     if bundled_attention:
         if not bundled_available():
             raise RuntimeError("the bundled Turing Sage extensions are unavailable")
-        variant = "sage2" if attention_backend in {"auto", "sage_attn"} else attention_backend
+        variant = "sage_" if attention_backend in {"auto", "sage_attn"} else attention_backend
         preflight_bundled(device, variant)
 
 

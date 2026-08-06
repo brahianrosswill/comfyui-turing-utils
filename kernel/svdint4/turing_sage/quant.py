@@ -71,6 +71,116 @@ def per_thread_int4(
     return q_int4, q_scale, k_int4, k_scale, q_mean, k_mean
 
 
+def per_thread_int4_fused(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    tensor_layout: str = "HND",
+    smooth_q: bool = True,
+    smooth_k: bool = True,
+):
+    """Official-layout INT4 preprocessing with fused smoothing where local.
+
+    Q block means are produced in the same CTA that quantizes the corresponding
+    64-token block. Centered K quantization uses one CTA per 64-token block;
+    its sequence-wide mean remains a separate reduction because it crosses all
+    K blocks.
+    """
+    if tensor_layout == "HND":
+        batch, q_heads, q_tokens, head_dim = q.shape
+        _, kv_heads, kv_tokens, _ = k.shape
+    elif tensor_layout == "NHD":
+        batch, q_tokens, q_heads, head_dim = q.shape
+        _, kv_tokens, kv_heads, _ = k.shape
+    else:
+        raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+    if head_dim % 2:
+        raise ValueError("INT4 Q/K require an even head dimension")
+
+    q_shape = list(q.shape)
+    k_shape = list(k.shape)
+    q_shape[-1] //= 2
+    k_shape[-1] //= 2
+    q_int4 = torch.empty(q_shape, dtype=torch.int8, device=q.device)
+    k_int4 = torch.empty(k_shape, dtype=torch.int8, device=k.device)
+    q_blocks = (q_tokens + 63) // 64
+    k_blocks = (kv_tokens + 63) // 64
+    q_scale = torch.empty(
+        (batch, q_heads, q_blocks * 32), device=q.device, dtype=torch.float32
+    )
+    k_scale = torch.empty(
+        (batch, kv_heads, k_blocks * 4), device=k.device, dtype=torch.float32
+    )
+    empty_mean = torch.empty((0,), device=q.device, dtype=torch.float32)
+    layout_id = 0 if tensor_layout == "NHD" else 1
+
+    if smooth_q:
+        q_mean = torch.empty(
+            (batch, q_heads, q_blocks, head_dim),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        _fused.quant_query_per_thread_int4_fused_cuda(
+            q, q_mean, q_int4, q_scale, layout_id
+        )
+    else:
+        q_mean = empty_mean
+        _fused.quant_query_per_thread_int4_cuda(
+            q, q_mean, q_int4, q_scale, layout_id, False
+        )
+
+    if smooth_k:
+        k_mean = token_block_mean(k, kv_tokens, tensor_layout)
+        _fused.quant_key_per_thread_int4_fused_cuda(
+            k, k_mean, k_int4, k_scale, layout_id
+        )
+    else:
+        k_mean = empty_mean
+        _fused.quant_key_per_thread_int4_cuda(
+            k, k_mean, k_int4, k_scale, layout_id, False
+        )
+    return q_int4, q_scale, k_int4, k_scale, q_mean, k_mean
+
+
+def sage2_score_correction(
+    q_mean: torch.Tensor,
+    k: torch.Tensor,
+    k_mean: torch.Tensor,
+    tensor_layout: str = "HND",
+    smooth_k: bool = True,
+) -> torch.Tensor:
+    """Compute the Q-smoothing score correction with FP16 TC/FP32 accumulation.
+
+    The result has one correction row per 64-token Q block. It is deliberately
+    kept separate from the packed INT4 score kernel so the correction path can
+    be validated and profiled independently from the unchanged INT4 MMA.
+    """
+    if tensor_layout == "HND":
+        batch, kv_heads, kv_tokens, _ = k.shape
+    elif tensor_layout == "NHD":
+        batch, kv_tokens, kv_heads, _ = k.shape
+    else:
+        raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+    if q_mean.ndim != 4 or q_mean.size(0) != batch:
+        raise ValueError("q_mean must have shape [B, Hq, Qblocks, D]")
+    if q_mean.size(1) % kv_heads:
+        raise ValueError("Q heads must be divisible by KV heads")
+    correction = torch.empty(
+        (batch, q_mean.size(1), q_mean.size(2), kv_tokens),
+        device=k.device,
+        dtype=torch.float32,
+    )
+    empty_mean = torch.empty((0,), device=k.device, dtype=torch.float32)
+    _fused.sage2_score_correction_cuda(
+        q_mean,
+        k,
+        k_mean if smooth_k else empty_mean,
+        correction,
+        0 if tensor_layout == "NHD" else 1,
+        smooth_k,
+    )
+    return correction
+
+
 def per_block_int8(
     q: torch.Tensor,
     k: torch.Tensor,

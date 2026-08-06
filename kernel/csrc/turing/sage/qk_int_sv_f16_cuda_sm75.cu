@@ -49,10 +49,14 @@ template<uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K, uint3
         typename DTypeSVAccum = float, bool use_inst_buffer = false, typename DTypeOut = half,
         typename DTypeV = half, ComputeUnit DenominatorAccumUnit = ComputeUnit::kTensorCore,
         MaskMode mask_mode = MaskMode::kNone, bool return_lse = false, bool fuse_v_mean=false,
-        bool fuse_q_mean_correction=false, bool fuse_k_mean=false>
+        bool fuse_q_mean_correction=false, bool fuse_k_mean=false,
+        bool use_precomputed_score_correction=false>
 __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__restrict__ K, DTypeV *__restrict__ V, DTypeOut *__restrict__ O, float *__restrict__ Lse,
                       float *__restrict__ Q_scale, float *__restrict__ K_scale, DTypeOut *__restrict__ V_mean,
                       uint16_t *__restrict__ K_original, float *__restrict__ Q_mean, float *__restrict__ K_mean,
+                      float *__restrict__ Score_correction,
+                      const uint32_t q_block_start, const uint32_t num_q_blocks,
+                      const uint32_t score_correction_q_blocks,
                       const uint32_t qo_len, const uint32_t kv_len, const uint32_t num_kv_groups,
                       const uint32_t stride_bz_q, const uint32_t stride_seq_q, const uint32_t stride_h_q,
                       const uint32_t stride_bz_k, const uint32_t stride_seq_k, const uint32_t stride_h_k,
@@ -74,6 +78,10 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
   static_assert(!fuse_v_mean || std::is_same<DTypeSVAccum, half>::value, "fuse_v_mean only supports half");
   static_assert(!fuse_q_mean_correction || DTypeQK == DataType::kInt4,
                 "Q-mean correction is only used by packed INT4 attention");
+  static_assert(!use_precomputed_score_correction || DTypeQK == DataType::kInt4,
+                "Precomputed score correction is only used by packed INT4 attention");
+  static_assert(!(fuse_q_mean_correction && use_precomputed_score_correction),
+                "Score correction must be computed either in the attention CTA or ahead of it");
   static_assert(CTA_Q / CTA_K <= 2); // for efficient causal implementation
 
   using DTypeOut2 = typename std::conditional<std::is_same<DTypeOut, half>::value, half2, nv_bfloat162>::type;
@@ -97,7 +105,8 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
 
   // maximize L2 hit rate
   const uint32_t batch_id = blockIdx.z;
-  const uint32_t bx = blockIdx.x;
+  const uint32_t local_bx = blockIdx.x;
+  const uint32_t bx = q_block_start + local_bx;
   const uint32_t num_qo_heads = gridDim.y;
   const uint32_t head_id = blockIdx.y;
 
@@ -114,17 +123,17 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
 
   if constexpr (Q_GRAN == QuantGranularity::kPerBlock)
   {
-    const uint32_t num_block_q = gridDim.x;
+    const uint32_t num_block_q = num_q_blocks;
     q_scale_idx = batch_id * num_qo_heads * num_block_q + head_id * num_block_q + bx;
   }
   else if constexpr (Q_GRAN == QuantGranularity::kPerWarp)
   {
-    const uint32_t num_warp_block_q = gridDim.x * num_warps_q;
+    const uint32_t num_warp_block_q = num_q_blocks * num_warps_q;
     q_scale_idx = batch_id * num_qo_heads * num_warp_block_q + head_id * num_warp_block_q + bx * num_warps_q + get_warp_idx_q<num_warps_q, num_warps_k>();
   }
   else if constexpr (Q_GRAN == QuantGranularity::kPerThread)
   {
-    const uint32_t num_warp_block_q = gridDim.x * num_warps_q;
+    const uint32_t num_warp_block_q = num_q_blocks * num_warps_q;
     q_scale_idx = batch_id * num_qo_heads * (num_warp_block_q * 8) + head_id * (num_warp_block_q * 8) + bx * (num_warps_q * 8) + get_warp_idx_q<num_warps_q, num_warps_k>() * 8 + lane_id / 4;
   }
 
@@ -205,7 +214,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
     const uint32_t linear_thread = warp_id * WARP_SIZE + lane_id;
     constexpr uint32_t num_threads = num_warps * WARP_SIZE;
     const float *q_mean_ptr = Q_mean +
-        ((batch_id * num_qo_heads + head_id) * gridDim.x + bx) * head_dim;
+        ((batch_id * num_qo_heads + head_id) * num_q_blocks + bx) * head_dim;
     for (uint32_t dim = linear_thread; dim < head_dim; dim += num_threads)
     {
       smem_Q_mean[dim] = q_mean_ptr[dim];
@@ -316,6 +325,23 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
       }
       __syncthreads();
     }
+    else if constexpr (use_precomputed_score_correction)
+    {
+      __syncthreads();
+      const uint32_t linear_thread = warp_id * WARP_SIZE + lane_id;
+      constexpr uint32_t num_threads = num_warps * WARP_SIZE;
+      const float *correction_ptr = Score_correction +
+          ((batch_id * num_qo_heads + head_id) * score_correction_q_blocks +
+           local_bx) * kv_len;
+      for (uint32_t local_token = linear_thread; local_token < CTA_K;
+           local_token += num_threads)
+      {
+        const uint32_t token = tile_start + local_token;
+        smem_score_correction[local_token] =
+            token < kv_len ? correction_ptr[token] : 0.0f;
+      }
+      __syncthreads();
+    }
   };
 
   // load Q with predicate
@@ -389,7 +415,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
 #pragma unroll
         for (uint32_t k = 0; k < 8; k++)
         {
-          if constexpr (fuse_q_mean_correction)
+          if constexpr (fuse_q_mean_correction || use_precomputed_score_correction)
           {
             const uint32_t local_k = 2 * (lane_id % 4) + fk * 16 +
                                      8 * (k / 4) + k % 2;
@@ -410,12 +436,16 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
     if constexpr (std::is_same<DTypeSVAccum, float>::value)
     {
       update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, false, false, false>(
-          RS_f32, RO, m, d, fuse_q_mean_correction ? original_sm_scale : sm_scale);
+          RS_f32, RO, m, d,
+          (fuse_q_mean_correction || use_precomputed_score_correction)
+              ? original_sm_scale : sm_scale);
     }
     else if constexpr (std::is_same<DTypeSVAccum, half>::value)
     {
       update_mdo<num_tiles_q, num_tiles_k, num_tiles_v, true, false, false>(
-          RS_f32, RO, m, d, fuse_q_mean_correction ? original_sm_scale : sm_scale);
+          RS_f32, RO, m, d,
+          (fuse_q_mean_correction || use_precomputed_score_correction)
+              ? original_sm_scale : sm_scale);
     }
 
     if constexpr (DenominatorAccumUnit == ComputeUnit::kCudaCore)
@@ -500,7 +530,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
           const uint32_t local_k = 2 * (lane_id % 4) + fk * 16 +
                                    8 * (k / 4) + k % 2;
           RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]) * dequant_scale;
-          if constexpr (fuse_q_mean_correction)
+          if constexpr (fuse_q_mean_correction || use_precomputed_score_correction)
           {
             RS_f32[fq][fk][k] += smem_score_correction[local_k];
           }
@@ -605,7 +635,7 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
             const uint32_t local_k = 2 * (lane_id % 4) + fk * 16 +
                                      8 * (k / 4) + k % 2;
             RS_f32[fq][fk][k] = __int2float_rz(RS[fq][fk][k]) * dequant_scale;
-            if constexpr (fuse_q_mean_correction)
+            if constexpr (fuse_q_mean_correction || use_precomputed_score_correction)
             {
               RS_f32[fq][fk][k] += smem_score_correction[local_k];
             }
@@ -801,7 +831,8 @@ template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K,
           uint32_t HEAD_DIM, int QK_QUANT_GRAN, typename DTypeSVAccum,
           bool use_inst_buffer, typename DTypeOut, typename DTypeV, MaskMode mask_mode,
           bool RETURN_LSE, bool fuse_v_mean, DataType DTypeQK = DataType::kInt8,
-          bool fuse_q_mean_correction = false, bool fuse_k_mean = false>
+          bool fuse_q_mean_correction = false, bool fuse_k_mean = false,
+          bool use_precomputed_score_correction = false>
 static void launch_qk_int_sv_f16_attn(at::Tensor query,
                                       at::Tensor key,
                                       at::Tensor value,
@@ -834,8 +865,17 @@ static void launch_qk_int_sv_f16_attn(at::Tensor query,
                                       at::Tensor key_mean = at::Tensor(),
                                       int stride_bz_ko = 0,
                                       int stride_seq_ko = 0,
-                                      int stride_h_ko = 0)
+                                      int stride_h_ko = 0,
+                                      at::Tensor score_correction = at::Tensor(),
+                                      int q_block_start = 0,
+                                      int q_block_count = -1)
 {
+  const int num_q_blocks = div_ceil(qo_len, CTA_Q);
+  if (q_block_count < 0)
+    q_block_count = num_q_blocks - q_block_start;
+  TORCH_CHECK(q_block_start >= 0 && q_block_count > 0 &&
+                  q_block_start + q_block_count <= num_q_blocks,
+              "invalid Q-block launch range");
   if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp))
   {
     CHECK_SHAPE(query_scale, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q) * (CTA_Q / WARP_Q));
@@ -872,12 +912,22 @@ static void launch_qk_int_sv_f16_attn(at::Tensor query,
       CHECK_SHAPE(key_mean, batch_size, num_kv_heads, 1, HEAD_DIM);
     }
   }
+  if constexpr (use_precomputed_score_correction)
+  {
+    CHECK_CUDA(score_correction);
+    CHECK_CONTIGUOUS(score_correction);
+    CHECK_DTYPE(score_correction, at::ScalarType::Float);
+    CHECK_DIMS(score_correction, 4);
+    CHECK_SHAPE(score_correction, batch_size, num_qo_heads,
+                q_block_count, kv_len);
+  }
 
   constexpr size_t qk_smem_stride =
       DTypeQK == DataType::kInt4 ? HEAD_DIM / 2 : HEAD_DIM;
-  constexpr size_t correction_smem = fuse_q_mean_correction
-      ? (HEAD_DIM + (fuse_k_mean ? HEAD_DIM : 0) + CTA_K) * sizeof(float)
-      : 0;
+  constexpr size_t correction_smem =
+      fuse_q_mean_correction
+          ? (HEAD_DIM + (fuse_k_mean ? HEAD_DIM : 0) + CTA_K) * sizeof(float)
+          : (use_precomputed_score_correction ? CTA_K * sizeof(float) : 0);
   constexpr size_t smem_max = std::max(
       (CTA_Q + CTA_K) * qk_smem_stride + CTA_K * HEAD_DIM * sizeof(half) +
           correction_smem,
@@ -891,11 +941,12 @@ static void launch_qk_int_sv_f16_attn(at::Tensor query,
                                                DTypeSVAccum, use_inst_buffer, DTypeOut, DTypeV,
                                                ComputeUnit::kTensorCore, mask_mode,
                                                RETURN_LSE, fuse_v_mean,
-                                               fuse_q_mean_correction, fuse_k_mean>;
+                                               fuse_q_mean_correction, fuse_k_mean,
+                                               use_precomputed_score_correction>;
 
   cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
 
-  dim3 grid(div_ceil(qo_len, CTA_Q), num_qo_heads, batch_size);
+  dim3 grid(q_block_count, num_qo_heads, batch_size);
   dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
 
   kernel_func<<<grid, block, smem_max>>>(
@@ -910,6 +961,10 @@ static void launch_qk_int_sv_f16_attn(at::Tensor query,
       (fuse_q_mean_correction) ? reinterpret_cast<uint16_t*>(key_original.data_ptr()) : nullptr,
       (fuse_q_mean_correction) ? reinterpret_cast<float*>(query_mean.data_ptr()) : nullptr,
       (fuse_q_mean_correction && fuse_k_mean) ? reinterpret_cast<float*>(key_mean.data_ptr()) : nullptr,
+      (use_precomputed_score_correction) ? reinterpret_cast<float*>(score_correction.data_ptr()) : nullptr,
+      q_block_start,
+      num_q_blocks,
+      q_block_count,
       qo_len,
       kv_len,
       num_kv_groups,
@@ -1497,7 +1552,7 @@ at::Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(at::Tensor query,
   return lse;
 }
 
-at::Tensor qk_int4_sv_f16_accum_f16_attn(
+static at::Tensor qk_int4_sv_f16_accum_f16_f32_attn_impl(
                     at::Tensor query,
                     at::Tensor key,
                     at::Tensor value,
@@ -1512,7 +1567,11 @@ at::Tensor qk_int4_sv_f16_accum_f16_attn(
                     float sm_scale,
                     int return_lse,
                     int smooth_q,
-                    int smooth_k)
+                    int smooth_k,
+                    at::Tensor score_correction,
+                    bool use_precomputed_score_correction,
+                    int q_block_start,
+                    int q_block_count)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
@@ -1545,7 +1604,7 @@ at::Tensor qk_int4_sv_f16_accum_f16_attn(
   TORCH_CHECK(smooth_q == 0 || smooth_q == 1, "smooth_q must be 0 or 1");
   TORCH_CHECK(smooth_k == 0 || smooth_k == 1, "smooth_k must be 0 or 1");
 
-  if (smooth_q)
+  if (smooth_q && !use_precomputed_score_correction)
   {
     CHECK_CUDA(key_original);
     CHECK_CUDA(query_mean);
@@ -1594,7 +1653,7 @@ at::Tensor qk_int4_sv_f16_accum_f16_attn(
     stride_h_k = key.stride(2);
     stride_h_v = value.stride(2);
     stride_h_o = output.stride(2);
-    if (smooth_q)
+    if (smooth_q && !use_precomputed_score_correction)
     {
       CHECK_SHAPE(key_original, batch_size, kv_len, num_kv_heads, head_dim);
       stride_seq_ko = key_original.stride(1);
@@ -1618,7 +1677,7 @@ at::Tensor qk_int4_sv_f16_accum_f16_attn(
     stride_h_k = key.stride(1);
     stride_h_v = value.stride(1);
     stride_h_o = output.stride(1);
-    if (smooth_q)
+    if (smooth_q && !use_precomputed_score_correction)
     {
       CHECK_SHAPE(key_original, batch_size, num_kv_heads, kv_len, head_dim);
       stride_seq_ko = key_original.stride(2);
@@ -1648,10 +1707,24 @@ at::Tensor qk_int4_sv_f16_accum_f16_attn(
         DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
           DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(value_dtype, DTypeV, {
             constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
-            if (smooth_q && smooth_k)
+            if (use_precomputed_score_correction)
             {
               launch_qk_int_sv_f16_attn<64, 64, 16, 64, HEAD_DIM, 3,
-                  half, false, DTypeOut, DTypeV, mask_mode, RETURN_LSE, false,
+                  float, true, DTypeOut, DTypeV, mask_mode, RETURN_LSE, false,
+                  DataType::kInt4, false, false, true>(
+                  query, key, value, output, query_scale, key_scale, at::Tensor(), lse,
+                  batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads, num_kv_groups,
+                  query.stride(0), stride_seq_q, stride_h_q,
+                  key.stride(0), stride_seq_k, stride_h_k,
+                  value.stride(0), stride_seq_v, stride_h_v,
+                  output.stride(0), stride_seq_o, stride_h_o, sm_scale,
+                  at::Tensor(), at::Tensor(), at::Tensor(), 0, 0, 0,
+                  score_correction, q_block_start, q_block_count);
+            }
+            else if (smooth_q && smooth_k)
+            {
+              launch_qk_int_sv_f16_attn<64, 64, 16, 64, HEAD_DIM, 3,
+                  float, true, DTypeOut, DTypeV, mask_mode, RETURN_LSE, false,
                   DataType::kInt4, true, true>(
                   query, key, value, output, query_scale, key_scale, at::Tensor(), lse,
                   batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads, num_kv_groups,
@@ -1665,7 +1738,7 @@ at::Tensor qk_int4_sv_f16_accum_f16_attn(
             else if (smooth_q)
             {
               launch_qk_int_sv_f16_attn<64, 64, 16, 64, HEAD_DIM, 3,
-                  half, false, DTypeOut, DTypeV, mask_mode, RETURN_LSE, false,
+                  float, true, DTypeOut, DTypeV, mask_mode, RETURN_LSE, false,
                   DataType::kInt4, true, false>(
                   query, key, value, output, query_scale, key_scale, at::Tensor(), lse,
                   batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads, num_kv_groups,
@@ -1679,7 +1752,7 @@ at::Tensor qk_int4_sv_f16_accum_f16_attn(
             else
             {
               launch_qk_int_sv_f16_attn<64, 64, 16, 64, HEAD_DIM, 3,
-                  half, false, DTypeOut, DTypeV, mask_mode, RETURN_LSE, false,
+                  float, true, DTypeOut, DTypeV, mask_mode, RETURN_LSE, false,
                   DataType::kInt4, false, false>(
                   query, key, value, output, query_scale, key_scale, at::Tensor(), lse,
                   batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads, num_kv_groups,
@@ -1694,4 +1767,48 @@ at::Tensor qk_int4_sv_f16_accum_f16_attn(
     });
   });
   return lse;
+}
+
+at::Tensor qk_int4_sv_f16_accum_f16_f32_attn(
+                    at::Tensor query,
+                    at::Tensor key,
+                    at::Tensor value,
+                    at::Tensor output,
+                    at::Tensor query_scale,
+                    at::Tensor key_scale,
+                    at::Tensor key_original,
+                    at::Tensor query_mean,
+                    at::Tensor key_mean,
+                    int tensor_layout,
+                    int is_causal,
+                    float sm_scale,
+                    int return_lse,
+                    int smooth_q,
+                    int smooth_k)
+{
+  return qk_int4_sv_f16_accum_f16_f32_attn_impl(
+      query, key, value, output, query_scale, key_scale, key_original,
+      query_mean, key_mean, tensor_layout, is_causal, sm_scale, return_lse,
+      smooth_q, smooth_k, at::Tensor(), false, 0, -1);
+}
+
+at::Tensor qk_int4_sv_f16_accum_f16_f32_precomputed_attn(
+                    at::Tensor query,
+                    at::Tensor key,
+                    at::Tensor value,
+                    at::Tensor output,
+                    at::Tensor query_scale,
+                    at::Tensor key_scale,
+                    at::Tensor score_correction,
+                    int tensor_layout,
+                    int is_causal,
+                    float sm_scale,
+                    int return_lse,
+                    int q_block_start,
+                    int q_block_count)
+{
+  return qk_int4_sv_f16_accum_f16_f32_attn_impl(
+      query, key, value, output, query_scale, key_scale, at::Tensor(),
+      at::Tensor(), at::Tensor(), tensor_layout, is_causal, sm_scale,
+      return_lse, 0, 0, score_correction, true, q_block_start, q_block_count);
 }

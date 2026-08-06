@@ -8,11 +8,15 @@ from .. import _sage_fused_sm75 as _fused
 from . import sm75_compile
 from .quant import (
     per_block_int8,
-    per_thread_int4,
+    per_thread_int4_fused,
+    sage2_score_correction,
     per_warp_int8,
     per_warp_int8_varlen,
     sub_mean,
 )
+
+
+_SAGE2_CORRECTION_WORKSPACE_BYTES = 128 * 1024 * 1024
 
 
 def _on_input_device(function):
@@ -102,7 +106,7 @@ def sageattn_hybrid(
     is_causal: bool = False,
     sm_scale: Optional[float] = None,
     return_lse: bool = False,
-    smooth_k: bool = True,
+    smooth_k: bool = False,
     pv_accum_dtype: str = "fp32",
     **kwargs: Any,
 ):
@@ -133,7 +137,12 @@ def sageattn_sage1(
     smooth_v: bool = False,
     **kwargs: Any,
 ):
-    """Turing SageAttention1: per-block INT8 Q/K and FP16 PV accumulation."""
+    """Turing SageAttention1 with stable mixed-precision PV accumulation.
+
+    Each 64-token PV tile uses FP16 Tensor Core MMA and is immediately folded
+    into an FP32 running accumulator.  Keeping the full sequence accumulator
+    in FP16 is unsafe for long video sequences whose V tensor has a DC bias.
+    """
     return sageattn_qk_int8_pv_fp16_cuda(
         q,
         k,
@@ -145,7 +154,7 @@ def sageattn_sage1(
         return_lse=return_lse,
         smooth_k=smooth_k,
         smooth_v=smooth_v,
-        pv_accum_dtype="fp16",
+        pv_accum_dtype="fp16+fp32",
     )
 
 
@@ -163,11 +172,12 @@ def sageattn_sage2(
     smooth_v: bool = False,
     **kwargs: Any,
 ):
-    """Turing Sage2 adaptation: packed INT4 Q/K and FP16 PV accumulation.
+    """Turing Sage2 adaptation: packed INT4 Q/K and stable mixed-precision PV.
 
     The official Sage2 FP8 PV path is unavailable on SM75. This adaptation
     keeps the official per-thread INT4 and Q/K smoothing strategy, while the
-    probability/value MMA uses native Turing FP16 accumulation.
+    probability/value MMA uses native Turing FP16 within each 64-token tile,
+    then folds the tile result into an FP32 running accumulator.
     """
     dtype = q.dtype
     if not q.is_cuda:
@@ -205,7 +215,7 @@ def sageattn_sage2(
     if sm_scale is None:
         sm_scale = head_dim_og**-0.5
 
-    q_int4, q_scale, k_int4, k_scale, q_mean, k_mean = per_thread_int4(
+    q_int4, q_scale, k_int4, k_scale, q_mean, k_mean = per_thread_int4_fused(
         q,
         k,
         tensor_layout=tensor_layout,
@@ -217,23 +227,79 @@ def sageattn_sage2(
     else:
         value_for_kernel, value_mean = v, None
     output = torch.empty_like(q)
-    lse = sm75_compile.qk_int4_sv_f16_accum_f16_attn(
-        q_int4,
-        k_int4,
-        value_for_kernel,
-        output,
-        q_scale,
-        k_scale,
-        k,
-        q_mean,
-        k_mean,
-        tensor_layout_id,
-        int(is_causal),
-        sm_scale,
-        int(return_lse),
-        int(smooth_q),
-        int(smooth_k),
-    )
+    if smooth_q:
+        batch = q.size(0)
+        q_heads = q_mean.size(1)
+        q_blocks = q_mean.size(2)
+        kv_tokens = k.size(2 if tensor_layout == "HND" else 1)
+        bytes_per_q_block = batch * q_heads * kv_tokens * 4
+        correction_blocks = max(
+            1, _SAGE2_CORRECTION_WORKSPACE_BYTES // bytes_per_q_block
+        )
+        # The correction GEMM computes 16 Q-block means per WMMA tile. Keep
+        # full tiles when the bounded workspace permits it.
+        if correction_blocks >= 16:
+            correction_blocks = (correction_blocks // 16) * 16
+        correction_blocks = min(q_blocks, correction_blocks)
+        if return_lse:
+            q_tokens = q.size(2 if tensor_layout == "HND" else 1)
+            lse = torch.empty(
+                (batch, q_heads, q_tokens), device=q.device, dtype=torch.float32
+            )
+        else:
+            lse = None
+
+        for q_block_start in range(0, q_blocks, correction_blocks):
+            q_block_count = min(correction_blocks, q_blocks - q_block_start)
+            q_mean_chunk = q_mean[
+                :, :, q_block_start : q_block_start + q_block_count
+            ].contiguous()
+            score_correction = sage2_score_correction(
+                q_mean_chunk,
+                k,
+                k_mean,
+                tensor_layout=tensor_layout,
+                smooth_k=smooth_k,
+            )
+            chunk_lse = sm75_compile.qk_int4_sv_f16_accum_f16_f32_precomputed_attn(
+                q_int4,
+                k_int4,
+                value_for_kernel,
+                output,
+                q_scale,
+                k_scale,
+                score_correction,
+                tensor_layout_id,
+                int(is_causal),
+                sm_scale,
+                int(return_lse),
+                q_block_start,
+                q_block_count,
+            )
+            if return_lse:
+                token_start = q_block_start * 64
+                token_end = min((q_block_start + q_block_count) * 64, q_tokens)
+                lse[:, :, token_start:token_end].copy_(
+                    chunk_lse[:, :, token_start:token_end]
+                )
+    else:
+        lse = sm75_compile.qk_int4_sv_f16_accum_f16_f32_attn(
+            q_int4,
+            k_int4,
+            value_for_kernel,
+            output,
+            q_scale,
+            k_scale,
+            k,
+            q_mean,
+            k_mean,
+            tensor_layout_id,
+            int(is_causal),
+            sm_scale,
+            int(return_lse),
+            0,
+            int(smooth_k),
+        )
     if value_mean is not None:
         head_axis = 1 if tensor_layout == "HND" else 2
         sequence_axis = 2 if tensor_layout == "HND" else 1
@@ -338,8 +404,8 @@ def _sageattn_varlen_hybrid(
 
 
 def sageattn(*args, **kwargs):
-    """Default bundled entry point: the Turing Sage2 adaptation."""
-    return sageattn_sage2(*args, **kwargs)
+    """Default bundled entry point: the stable direct-FP32 ``sage_`` path."""
+    return sageattn_hybrid(*args, **kwargs)
 
 
 sage_ = sageattn_hybrid
@@ -356,9 +422,9 @@ def sageattn_varlen(
     max_seqlen_k: int,
     is_causal: bool = False,
     sm_scale: Optional[float] = None,
-    smooth_k: bool = True,
+    smooth_k: bool = False,
     smooth_q: bool = True,
-    variant: str = "sage2",
+    variant: str = "sage_",
     **kwargs: Any,
 ) -> torch.Tensor:
     """Variable-length facade with sequence-local smoothing statistics."""

@@ -26,5 +26,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 
   m.def("qk_int8_sv_f16_accum_f16_attn_inst_buf", &qk_int8_sv_f16_accum_f16_attn_inst_buf, "QK int8 sv f16 accum f16 attn inst buf");
   m.def("qk_int8_sv_f16_varlen_accum_f32_attn", &qk_int8_sv_f16_varlen_accum_f32_attn, "Varlen QK int8 sv f16 accum f32 attn per warp");
-  m.def("qk_int4_sv_f16_accum_f16_attn", &qk_int4_sv_f16_accum_f16_attn, "Packed QK int4 per-thread, PV f16 accumulation attention for sm75");
+  m.def("qk_int4_sv_f16_accum_f16_f32_attn", &qk_int4_sv_f16_accum_f16_f32_attn, "Packed QK int4 per-thread, PV f16 tile with f32 running accumulation for sm75");
+  m.def("qk_int4_sv_f16_accum_f16_f32_precomputed_attn", &qk_int4_sv_f16_accum_f16_f32_precomputed_attn, "Packed QK int4 with precomputed FP32 score correction for sm75");
+  m.def("qk_int4_sv_f16_accum_f16_attn", &qk_int4_sv_f16_accum_f16_f32_attn, "Compatibility alias for stable packed QK int4 attention");
 }

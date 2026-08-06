@@ -254,7 +254,7 @@ if _includes_sm75():
 
 setup(
     name="svdint4-kernel",
-    version="0.6.0",
+    version="0.6.1",
     packages=find_packages(),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

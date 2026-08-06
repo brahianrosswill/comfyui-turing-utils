@@ -109,7 +109,7 @@ AUTO_BACKEND_PRIORITY = ("sage_attn", "flash_attn", "sdpa")
 
 
 def attention_backend_choices() -> tuple[str, ...]:
-    return ("auto", "sage2", "sage1", "sage_", "sage_attn", "flash_attn", "sdpa")
+    return ("auto", "sage_", "sage1", "sage2", "sage_attn", "flash_attn", "sdpa")
 
 
 def normalize_attention_backend(value: str | None) -> str:
@@ -167,7 +167,7 @@ def bundled_available() -> bool:
     return available()
 
 
-def _sageattn(*args, variant: str = "sage2", **kwargs):
+def _sageattn(*args, variant: str = "sage_", **kwargs):
     from svdint4 import turing_sage
 
     implementations = {
@@ -178,7 +178,7 @@ def _sageattn(*args, variant: str = "sage2", **kwargs):
     return implementations[variant](*args, **kwargs)
 
 
-def preflight_bundled(device: torch.device, variant: str = "sage2") -> None:
+def preflight_bundled(device: torch.device, variant: str = "sage_") -> None:
     if not is_supported_turing_device(device):
         raise RuntimeError(f"unsupported Turing device {device}")
     index = device.index if device.index is not None else torch.cuda.current_device()
@@ -217,7 +217,7 @@ def turing_sage_attention(
     attn_precision=None,
     skip_reshape: bool = False,
     skip_output_reshape: bool = False,
-    variant: str = "sage2",
+    variant: str = "sage_",
     **kwargs,
 ) -> torch.Tensor:
     global _LOGGED_FP32_COMPAT
@@ -306,7 +306,7 @@ def _bundled_turing_variant(option: str, device: torch.device | None) -> str | N
             raise RuntimeError(f"Attention backend {option!r} requires an NVIDIA sm75 Turing GPU")
         return None
     if option in {"auto", "sage_attn"}:
-        return "sage2"
+        return "sage_"
     return option if option in {"sage1", "sage2", "sage_"} else None
 
 

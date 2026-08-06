@@ -90,6 +90,28 @@ void quant_key_per_thread_int4_cuda(
                 int tensor_layout,
                 bool subtract_mean);
 
+void quant_query_per_thread_int4_fused_cuda(
+                at::Tensor input,
+                at::Tensor mean,
+                at::Tensor output,
+                at::Tensor scale,
+                int tensor_layout);
+
+void quant_key_per_thread_int4_fused_cuda(
+                at::Tensor input,
+                at::Tensor mean,
+                at::Tensor output,
+                at::Tensor scale,
+                int tensor_layout);
+
+void sage2_score_correction_cuda(
+                at::Tensor query_mean,
+                at::Tensor key,
+                at::Tensor key_mean,
+                at::Tensor output,
+                int tensor_layout,
+                bool subtract_key_mean);
+
 void sub_mean_cuda(
                 at::Tensor input,
                 at::Tensor mean,

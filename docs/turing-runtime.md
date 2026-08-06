@@ -62,30 +62,47 @@ changed from an exact-sm75 profile.
 
 ## Attention matrix
 
-On exact sm75, `auto` and `sage_attn` select bundled `sage2`; the standalone
-package is not required. The loader also exposes `sage1` and the temporary
-`sage_` accuracy baseline:
+On exact sm75, `auto` and `sage_attn` select bundled `sage_`; the standalone
+package is not required. This direct-FP32 path is the fastest and most stable
+current default. The loader also exposes experimental `sage1` and `sage2`:
 
 | Option | Q/K path | Smoothing | PV path |
 |---|---|---|---|
-| `sage2` | packed INT4, per-thread scales | blockwise Q mean + global K mean with fused score correction | FP16 inputs and FP16 accumulation |
-| `sage1` | INT8, one scale per 64-token CTA | global K mean fused into K quantization | FP16 inputs and FP16 accumulation |
-| `sage_` | INT8, per-16-token Q-warp scales | disabled by default to preserve the former behavior | FP16 inputs and FP32 accumulation |
+| `sage_` | INT8, per-16-token Q-warp scales | disabled | FP16 MMA with direct FP32 accumulation |
+| `sage1` | INT8, one scale per 64-token CTA | global K mean fused into K quantization | FP16 MMA per 64-token tile, then FP32 running accumulator |
+| `sage2` | packed INT4, per-thread scales | blockwise Q mean + global K mean with fused score correction | FP16 MMA per 64-token tile, then FP32 running accumulator |
 
-Integer QK MMA accumulates into INT32 in every variant; “FP16/FP32
-accumulation” above refers to the probability/value operation. The `sage2`
+Integer QK MMA accumulates into INT32 in every variant; the mixed accumulation
+above refers to the probability/value operation. The `sage2`
 path is a Turing adaptation of SageAttention2 rather than a bit-identical copy:
 SM75 has no official FP8 PV tensor-core path, so it uses native FP16 PV. Its
 SM75 INT4 MMA is decomposed into Turing `m8n8k32.s4` instructions.
 
+The current standalone SageAttention CUDA API also defaults its FP16-V path to
+FP32 PV accumulation. Its fully FP16 mode is an explicit faster option whose
+own API documentation warns about numerical instability and suggests V
+smoothing for biased inputs. The former bundled Sage1 selected that unsafe
+mode unconditionally; that is why it could fail on H3 even when the normal
+standalone path did not. The bundled stable modes do not require `smooth_v`.
+
 `sage2` follows the official outlier-smoothing identity. It subtracts a mean
 from each 64-token Q block and a global sequence mean from K during
-quantization, then computes the non-row-constant Q-mean correction inside each
-attention CTA. It never creates an N-by-N correction tensor. At D=128, packed
-Q/K, the FP16 V tile, FP32 Q/K means, and 64 correction values total about
-25.25 KiB shared memory, below the 48 KiB policy. Optional V smoothing is
-available for comparisons but defaults off because it necessarily creates a
-full smoothed FP16 V buffer and adds the mean back to output.
+quantization. Q smoothing and packed quantization share one CTA per block;
+centered K quantization likewise uses one CTA per block after the global mean
+reduction. The non-row-constant Q-mean correction is computed with native SM75
+FP16 Tensor Core MMA and FP32 accumulation, then added to the dequantized score
+inside the attention CTA. The INT4 score MMA itself is unchanged.
+
+The correction matrix is only 1/64 of a full score matrix, but it would still
+be unbounded for H3 video sequences. The runtime therefore processes Q blocks
+in chunks with a 128 MiB maximum FP32 correction workspace. Attention uses
+absolute Q-block indices across chunks, including causal masking and LSE. At
+D=128 the attention CTA uses about 24.25 KiB shared memory, below the 48 KiB
+policy. Optional V smoothing remains
+available only for explicit comparisons. The loader never enables it because
+it creates a full smoothed FP16 V buffer. Normal Sage1/Sage2 instead avoid
+long-sequence FP16 overflow by flushing every tile into FP32 without allocating
+a converted or smoothed V copy.
 
 FP16 and BF16 Q/K/V support HND/NHD, GQA, causal mode, unequal Q/KV sequence
 lengths, head dimensions through 128, and variable-length batches. The normal
@@ -122,6 +139,34 @@ than loading a native sm86 cubin, and the compatibility build forces the same
 CTA schedule selected on sm75. It does not replace the final
 exact-sm75 occupancy and end-to-end test.
 
+For N=2048, Hq=8, Hkv=4, D=128, and BF16 input, repeated A40 compute_75
+runs measured 0.256–0.264 ms for `sage_`, 0.281–0.298 ms for Sage1, and
+0.379–0.401 ms for Sage2. In the 30-iteration validation run the Q+K Sage2
+path spent about 0.126 ms in fused preprocessing, 0.020 ms in Tensor Core
+correction, and 0.249 ms in the attention kernel; the
+remaining time is allocation/dispatch. The previous scalar in-CTA correction
+alone took about 0.405 ms, before preprocessing. At N=8192 the same run
+measured 3.284 ms, 3.394 ms, and 4.095 ms respectively.
+
+These results explain both sides of Sage2 on Turing. Packed INT4 QK is not the
+regression, and the correction redesign removes the former near-2x slowdown.
+However, SM75 has no FP8 PV Tensor Core path, while exact score preservation
+still requires a correction workspace and an FP32 score addition. Sage2 is
+therefore now a meaningful experimental path but is not assumed faster than
+Sage1 or `sage_` on Turing. Exact-sm75 profiling remains the release gate for
+later architecture-specific scheduling.
+
+The corresponding Sage1 ablation measured 0.231 ms for the `sage_` per-warp,
+no-smoothing, direct-FP32 baseline; 0.233 ms after changing only Q/K to
+per-block; 0.251 ms after adding global K smoothing; and 0.257 ms after adding
+the FP16-tile/FP32-running PV buffer used by stable Sage1. The removed
+sequence-long FP16 accumulator measured 0.240 ms on this random input, but it
+is not a valid production option: with N=16384 and a V bias of 16 it overflowed
+while both stable accumulators remained finite. Thus Sage1 did not literally
+become `sage_`, but stabilization necessarily removed most of the old unsafe
+FP16 speed advantage. Its remaining differences are per-block scales and K
+smoothing; the latter improves the biased-profile MAE shown below.
+
 `kernel/scripts/compare_sage_precision.py` evaluates identical inputs against
 the installed official SageAttention INT8 API, bundled Sage1, and bundled
 Sage2. Although the current public attention API exposes INT8 QK, the package
@@ -129,7 +174,7 @@ still ships its official per-thread INT4 Triton quantizer source. The script
 invokes those source kernels directly, compares their raw INT4 codes with the
 bundled packed quantizer, and reconstructs Sage2's exact Q-mean score
 correction in FP32. This separates INT4 quantization loss, local-vs-official
-quantizer differences, and the additional SM75 online-softmax/FP16-PV loss.
+quantizer differences, and the additional SM75 online-softmax/mixed-PV loss.
 
 Run it once with the default Gaussian profile and once with `--profile biased`.
 The latter adds a sequence-invariant channel bias to K and a per-64-token block
@@ -143,16 +188,16 @@ One BF16 A40/compute_75 diagnostic run with SageAttention 2.2.0, ten seeds,
 sequence length 257, D=64/128, causal/non-causal cases, and two input scales
 produced the following aggregate MAE against FP32 SDPA:
 
-| Input profile | Bundled Sage1 INT8 | Official public INT8 | INT4 no smooth | INT4 Q+K smooth | Bundled Sage2 |
-|---|---:|---:|---:|---:|---:|
-| Gaussian | 0.000729 | 0.000746 | 0.010711 | 0.010604 | 0.010608 |
-| Biased | 0.001110 | 0.001156 | 0.021953 | 0.012704 | 0.012708 |
+| Input profile | `sage_` | Bundled Sage1 | Official INT8 | INT4 no smooth | INT4 Q+K smooth | Bundled Sage2 |
+|---|---:|---:|---:|---:|---:|---:|
+| Gaussian | 0.000694 | 0.000726 | 0.000746 | 0.010711 | 0.010604 | 0.010607 |
+| Biased | 0.001329 | 0.001107 | 0.001139 | 0.021953 | 0.012704 | 0.012707 |
 
 For Gaussian inputs, all 11,842,560 local and official-source INT4 codes were
 identical. The biased run differed on two codes (0.000017%); the complete
 local-vs-official INT4 mathematical output MAE was 1.15e-7. The bundled Sage2
-kernel differed from its FP32 INT4 mathematical reference by 1.45e-4 and
-1.73e-4 respectively, isolating the smaller online-softmax/FP16-PV component
+kernel differed from its FP32 INT4 mathematical reference by 1.37e-4 and
+1.63e-4 respectively, isolating the smaller online-softmax/mixed-PV component
 from the much larger INT4 quantization loss. One of 80 biased causal cases from
 the official public INT8 Triton API returned a non-finite output; the comparator
 records and reports such cases instead of dropping them. These numbers are

@@ -600,8 +600,8 @@ class ConvRotDiffusionModelLoader:
                         "default": "auto",
                         "tooltip": (
                             "Select this ConvRot model's attention backend. "
-                            "On Turing, auto uses bundled sage2; sage1 and sage_ select "
-                            "the bundled alternatives. Elsewhere auto tries installed "
+                            "On Turing, auto uses the stable bundled sage_; sage1 and sage2 "
+                            "select the experimental alternatives. Elsewhere auto tries installed "
                             "sage_attn, then flash_attn, then PyTorch SDPA."
                         ),
                     },

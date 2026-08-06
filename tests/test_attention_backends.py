@@ -27,7 +27,7 @@ class AttentionBackendsTest(unittest.TestCase):
     def test_backend_choices_are_stable(self):
         self.assertEqual(
             attention_backends.attention_backend_choices(),
-            ("auto", "sage2", "sage1", "sage_", "sage_attn", "flash_attn", "sdpa"),
+            ("auto", "sage_", "sage1", "sage2", "sage_attn", "flash_attn", "sdpa"),
         )
 
     def test_aliases_normalize_to_node_options(self):
@@ -42,7 +42,7 @@ class AttentionBackendsTest(unittest.TestCase):
 
         self.assertEqual(
             patch_attention[0],
-            ("auto", "sage2", "sage1", "sage_", "sage_attn", "flash_attn", "sdpa"),
+            ("auto", "sage_", "sage1", "sage2", "sage_attn", "flash_attn", "sdpa"),
         )
         self.assertEqual(patch_attention[1]["default"], "auto")
 
@@ -208,7 +208,7 @@ class AttentionBackendsTest(unittest.TestCase):
         out = comfy_attention.optimized_attention(q, k, v, heads=2, transformer_options=transformer_options)
         self.assertEqual(tuple(out.shape), (1, 8, 16))
 
-    def test_turing_auto_uses_bundled_sageattention2(self):
+    def test_turing_auto_uses_stable_bundled_sage_baseline(self):
         model = FakeModel()
         q = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
         with (
@@ -223,10 +223,10 @@ class AttentionBackendsTest(unittest.TestCase):
 
         self.assertIs(out, q)
         kernel.assert_called_once()
-        preflight.assert_called_once_with(torch.device("cuda", 0), "sage2")
+        preflight.assert_called_once_with(torch.device("cuda", 0), "sage_")
         self.assertEqual(
             model.model_options["transformer_options"]["svdint4_attention_backend"],
-            "sage2",
+            "sage_",
         )
 
     def test_turing_explicit_sage1_selects_bundled_variant(self):

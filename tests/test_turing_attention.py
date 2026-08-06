@@ -85,6 +85,7 @@ class TuringAttentionContractTest(unittest.TestCase):
                 skip_reshape=True,
                 is_causal=True,
                 scale=0.125,
+                variant="sage2",
             )
         self.assertTrue(sage.call_args.kwargs["is_causal"])
         self.assertEqual(sage.call_args.kwargs["sm_scale"], 0.125)

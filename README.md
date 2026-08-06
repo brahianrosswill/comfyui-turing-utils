@@ -34,7 +34,7 @@ The CUDA package remains a separate installation: Python-only plugin updates
 never invoke a compiler or JIT. Reinstall `svdint4-kernel` only when its CUDA
 sources or published kernel version change.
 The Turing runtime in this revision requires the independently installed
-`svdint4-kernel>=0.6.0` and reports a stale package before allocating the model.
+`svdint4-kernel>=0.6.1` and reports a stale package before allocating the model.
 
 Install the CUDA kernel in the same Python environment that runs ComfyUI:
 
@@ -212,8 +212,8 @@ The script writes original metadata and basic provenance to
   follows each layer's activation format, while `true` forces INT8 GEMM
   activations. W4A8 requires an enabled comfy-kitchen CUDA backend because its
   eager fallback always computes W4A4. On Turing, `patch_attention=auto`
-  selects the bundled `sage2`; elsewhere it selects installed SageAttention
-  first, Flash Attention second, and PyTorch SDPA as the fallback.
+  selects the stable bundled `sage_`; elsewhere it selects installed
+  SageAttention first, Flash Attention second, and PyTorch SDPA as the fallback.
   BF16 activation storage is selected automatically when the detected model
   declares BF16 inference support; there is no loader-only dtype switch.
   Legacy per-row W8 ConvRot descriptors with a missing format or
@@ -231,11 +231,12 @@ The script writes original metadata and basic provenance to
   Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
   returns a ComfyUI `MODEL`. `patch_attention=auto` uses the same SageAttention,
   Flash Attention, then PyTorch SDPA priority on non-Turing GPUs. On a supported
-  Turing GPU, `auto` selects the bundled `sage2` implementation. The explicit
-  `sage1` and `sage2` choices select the bundled SM75 variants, while `sage_`
-  temporarily retains the previous INT8-QK/FP32-PV hybrid for accuracy
-  comparisons. On non-Turing GPUs, `auto` still prefers the independently
-  installed SageAttention package and falls back through Flash Attention to
+  Turing GPU, `auto` selects the bundled `sage_` implementation. This is the
+  previous INT8-QK/FP32-PV path and remains the default because it is the most
+  stable and fastest of the current SM75 variants. The explicit `sage1` and
+  `sage2` choices select the experimental bundled alternatives. On non-Turing
+  GPUs, `auto` still prefers the independently installed SageAttention package
+  and falls back through Flash Attention to
   PyTorch SDPA.
 
 - `Bernini Context Windows`
@@ -295,22 +296,25 @@ control. Other architectures and unmatched block layouts retain their normal
 ComfyUI implementation.
 
 The bundled attention family is derived from wjie98's full SM75 path and does
-not import or require the standalone `sageattention` package. `sage1` uses
-per-block INT8 Q/K, global K smoothing, and FP16 probability/value
-accumulation. The default `sage2` uses packed per-thread INT4 Q/K, blockwise Q
-and global K smoothing, the exact Q-mean score correction, and FP16
-probability/value accumulation. This is a Turing adaptation: SM75 has neither
+not import or require the standalone `sageattention` package. The default
+`sage_` uses per-warp INT8 Q/K and direct FP32 probability/value accumulation.
+Experimental `sage1` uses per-block INT8 Q/K, global K smoothing, and FP16 MMA
+for one 64-token PV tile before folding it into an FP32 running accumulator.
+Experimental `sage2` uses packed per-thread INT4 Q/K, blockwise Q and global K
+smoothing, an FP16-Tensor-Core/FP32-accumulated Q-mean score correction, and
+the same stable mixed PV policy. Q/K preprocessing preserves the official
+packed-code layout exactly. Correction uses a bounded 128 MiB chunked
+workspace rather than an unbounded sequence-squared allocation. This is a
+Turing adaptation: SM75 has neither
 the FP8 PV path nor the newer tensor-core instructions used by upstream
-SageAttention2. The previous per-warp INT8-QK/FP32-PV implementation remains
-temporarily available as `sage_` for controlled accuracy comparisons.
+SageAttention2.
 
 All three variants accept FP16 or BF16 input/output, HND or NHD layout, causal
 attention, GQA, different Q/KV lengths, variable-length batches, and head
 dimensions up to 128 (smaller dimensions are padded internally). FP16 V is
 read directly; BF16 V is converted tile-by-tile as it enters FP16 shared
-memory, so no full-size FP16 V copy is allocated. The Sage2 Q/K means and
-score-correction scratch keep its dynamic shared-memory use below the 48 KiB
-target. If the calling model supplies FP32 Q/K/V, only the attention boundary
+memory, so no full-size FP16 V copy is allocated. Sage2 keeps its attention
+dynamic shared-memory use below the 48 KiB target. If the calling model supplies FP32 Q/K/V, only the attention boundary
 is narrowed to BF16 and the result is restored to FP32; the rest of the model
 remains under its existing dtype policy.
 

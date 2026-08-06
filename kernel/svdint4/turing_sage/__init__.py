@@ -47,7 +47,7 @@ def sageattn_hybrid(*args, **kwargs):
 sage_ = sageattn_hybrid
 
 
-def preflight(device: torch.device, variant: str = "sage2") -> None:
+def preflight(device: torch.device, variant: str = "sage_") -> None:
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError(f"Turing Sage requires CUDA, got {device}")
     if torch.cuda.get_device_capability(device) != (7, 5):

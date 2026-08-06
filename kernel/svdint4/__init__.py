@@ -24,7 +24,7 @@ from .packing import (
 )
 from . import turing_sage, turing_sage2
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 
 __all__ = [
     "PackedInt4Weight",

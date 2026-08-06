@@ -25,7 +25,7 @@ sys.path.insert(0, kernel_root)
 
 import torch
 
-from svdint4.turing_sage import sageattn_sage1, sageattn_sage2
+from svdint4.turing_sage import sageattn_hybrid, sageattn_sage1, sageattn_sage2
 from svdint4.turing_sage.quant import per_thread_int4
 
 
@@ -360,6 +360,7 @@ def main() -> None:
     official_int8, official_version = _official_int8_function()
     official_int4 = _official_int4_quantizers() is not None
     methods = {
+        "local-sage_-int8-per-warp-fp32": ErrorStats(),
         "local-sage1-int8": ErrorStats(),
         "local-sage1-int8-no-smooth": ErrorStats(),
         "local-paper-int4-math": ErrorStats(),
@@ -398,6 +399,9 @@ def main() -> None:
                             is_causal=is_causal, enable_gqa=True,
                         )
                         local_sage1 = sageattn_sage1(q, k, v, is_causal=is_causal)
+                        local_hybrid = sageattn_hybrid(
+                            q, k, v, is_causal=is_causal, smooth_k=False
+                        )
                         local_sage1_no_smooth = sageattn_sage1(
                             q, k, v, is_causal=is_causal, smooth_k=False
                         )
@@ -449,6 +453,9 @@ def main() -> None:
                                 is_causal=is_causal,
                             )
                         local_sage2 = sageattn_sage2(q, k, v, is_causal=is_causal)
+                        methods["local-sage_-int8-per-warp-fp32"].add(
+                            local_hybrid, reference
+                        )
                         methods["local-sage1-int8"].add(local_sage1, reference)
                         methods["local-sage1-int8-no-smooth"].add(
                             local_sage1_no_smooth, reference

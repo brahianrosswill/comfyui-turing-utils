@@ -2,13 +2,16 @@
 
 CUDA/PyTorch extension used by ComfyUI SVDInt4.
 
-In addition to the SVDQuant path, version 0.6 provides exact-sm75 packed W4A8,
+In addition to the SVDQuant path, version 0.6.1 provides exact-sm75 packed W4A8,
 W8/W4 staged and BF16 row-buffer activation fusions, and a self-contained
-Sage attention family. Bundled `sage1` uses per-block INT8 Q/K and FP16 PV;
-the Turing `sage2` adaptation uses packed per-thread INT4 Q/K, official-style
-Q/K smoothing, and FP16 PV. The former hybrid remains available as `sage_` for
-temporary accuracy comparison. All variants run without the standalone
-`sageattention` package.
+Sage attention family. Bundled `sage1` uses per-block INT8 Q/K and stable
+FP16-tile/FP32-running PV accumulation; the Turing `sage2` adaptation uses
+packed per-thread INT4 Q/K, official-style Q/K smoothing, and the same stable
+PV policy. Sage2 fuses block-local smoothing with quantization and computes its
+bounded, chunked score correction with FP16 Tensor Core MMA plus FP32
+accumulation. The per-warp INT8-QK/direct-FP32-PV `sage_` path is the default
+because it remains the fastest and most stable current choice. All variants
+run without the standalone `sageattention` package.
 
 Most users should install it from the parent `comfyui-svdint4` directory:
 
