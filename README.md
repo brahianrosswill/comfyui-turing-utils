@@ -12,7 +12,7 @@ Wan/Bernini context-window utilities.
 - Python 3.10 or newer
 - PyTorch with CUDA and ComfyUI
 - `comfy-kitchen>=0.2.26` for ConvRot model integration
-- the independently installed `comfyui-turing-utils-kernel>=0.7.0` on exact sm75
+- the independently installed `comfyui-turing-utils-kernel>=0.8.0` on exact sm75
 
 ## Installation
 
@@ -47,8 +47,10 @@ The ConvRot path reuses comfy-kitchen W8A8 and W4A4 operators and supplies a
 packed W4A8 SM75 Tensor Core kernel. Its row-buffer quantizers retain completed
 rows in BF16, use FP32 only for active rotation/reduction scratch, and stay under
 the default 48 KiB shared-memory limit. MiniMax-specific block integration is
-isolated in `minimax_adapter.py`; generic dtype, attention, and fused operators
-remain model-independent.
+isolated in `minimax_adapter.py`. Wan/Bernini integration is isolated in
+`wan_adapter.py`; it adds context-aware VRAM planning, shared QKV activation
+quantization, FP32-reduction LayerNorm+AdaLN, and GELU-to-ConvRot fusion.
+Generic dtype, attention, and fused operators remain model-independent.
 
 The bundled Sage backend accepts FP16/BF16 Q/K/V, GQA, causal attention,
 unequal sequence lengths, HND/NHD layouts, and head dimensions up to 128. FP32

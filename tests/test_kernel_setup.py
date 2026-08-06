@@ -72,7 +72,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn("arch=compute_75,code=compute_75", flags)
         self.assertNotIn("arch=compute_86,code=sm_86", flags)
         self.assertNotIn("-DCOMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS", flags)
-        self.assertEqual(setup.call_args.kwargs["version"], "0.7.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.8.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",

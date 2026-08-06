@@ -14,6 +14,7 @@ sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 import turing_fusions
+import turing_ops
 
 
 class SegmentValidationTest(unittest.TestCase):
@@ -30,6 +31,18 @@ class SegmentValidationTest(unittest.TestCase):
             turing_fusions._normalized_segments([(0, 2, 0), (3, 4, 0)], 4, 1)
         with self.assertRaisesRegex(ValueError, "outside"):
             turing_fusions._normalized_segments([(0, 4, 1)], 4, 1)
+
+    def test_large_w8_workspace_selects_fixed_workspace_path(self):
+        limit = turing_ops.TURING_INT8_GLOBAL_WORKSPACE_LIMIT
+        self.assertGreater(turing_ops.turing_int8_workspace_bytes(4, 8), 0)
+        self.assertEqual(
+            turing_ops.turing_int8_workspace_bytes(limit // (4 * 8), 8),
+            0,
+        )
+        self.assertEqual(
+            turing_ops.turing_int8_workspace_bytes(limit // 4, 1),
+            limit,
+        )
 
 
 class FusionDispatchTest(unittest.TestCase):
@@ -115,6 +128,153 @@ class FusionDispatchTest(unittest.TestCase):
                 self.assertEqual(kernel.call_args.kwargs["linear_dtype"], linear_dtype)
                 self.assertEqual(kernel.call_args.kwargs["input_act"], "swiglu")
                 uncast.assert_called_once_with(linear, weight, None, offload)
+
+    def test_direct_turing_input_act_forwards_fused_gelu(self):
+        weight = self._w8a8_weight(out_features=4, in_features=256)
+        linear = SimpleNamespace(weight=weight)
+        x = torch.zeros((2, 256), dtype=torch.bfloat16)
+        output = torch.empty((2, 4), dtype=torch.bfloat16)
+        offload = (None, None, None)
+        with (
+            mock.patch("turing_ops.is_supported_turing_device", return_value=True),
+            mock.patch(
+                "comfy.ops.cast_bias_weight", return_value=(weight, None, offload)
+            ),
+            mock.patch("comfy.ops.uncast_bias_weight"),
+            mock.patch("turing_ops.int8_linear", return_value=output) as kernel,
+        ):
+            result = turing_fusions.turing_linear_input_act(
+                linear, x, "gelu_tanh"
+            )
+
+        self.assertIs(result, output)
+        self.assertEqual(kernel.call_args.kwargs["input_act"], "gelu_tanh")
+
+    def test_large_w8_gemm_attempts_fixed_workspace_even_when_latency_heuristic_declines(self):
+        from comfy_kitchen.backends import cuda as kitchen_cuda
+
+        qactivation = torch.zeros((2, 16), dtype=torch.int8)
+        weight = torch.zeros((8, 16), dtype=torch.int8)
+        activation_scale = torch.ones(2, dtype=torch.float32)
+        weight_scale = torch.ones(8, dtype=torch.float32)
+        expected = torch.zeros((2, 8), dtype=torch.bfloat16)
+        with (
+            mock.patch.object(
+                turing_ops, "TURING_INT8_GLOBAL_WORKSPACE_LIMIT", 16
+            ),
+            mock.patch.object(
+                kitchen_cuda, "_prefer_turing_fused_int8", return_value=False
+            ),
+            mock.patch.object(
+                kitchen_cuda,
+                "_int8_linear_turing_quantized",
+                return_value=expected,
+            ) as fused,
+        ):
+            output = turing_ops._turing_int8_gemm(
+                qactivation,
+                weight,
+                activation_scale,
+                weight_scale,
+                None,
+                torch.bfloat16,
+            )
+
+        self.assertIs(output, expected)
+        fused.assert_called_once()
+
+    def test_qkv_group_quantizes_shared_w8_activation_once(self):
+        weights = [self._w8a8_weight(out_features=8, in_features=256) for _ in range(3)]
+        linears = [SimpleNamespace(weight=weight) for weight in weights]
+        x = torch.zeros((1, 2, 256), dtype=torch.bfloat16)
+        qactivation = torch.zeros((2, 256), dtype=torch.int8)
+        activation_scale = torch.ones((2, 1), dtype=torch.float32)
+        outputs = [torch.full((2, 8), value, dtype=torch.bfloat16) for value in range(3)]
+        offload = (None, None, None)
+
+        def cast(linear, *_args, **_kwargs):
+            return linear.weight, None, offload
+
+        with (
+            mock.patch("turing_ops.is_supported_turing_device", return_value=True),
+            mock.patch("comfy.ops.cast_bias_weight", side_effect=cast),
+            mock.patch("comfy.ops.uncast_bias_weight") as uncast,
+            mock.patch(
+                "turing_ops._quantize_turing_int8_activation",
+                return_value=(qactivation, activation_scale),
+            ) as quantize,
+            mock.patch(
+                "turing_ops._turing_int8_gemm", side_effect=outputs
+            ) as gemm,
+        ):
+            result = turing_fusions.turing_linear_group(linears, x)
+
+        self.assertEqual(len(result), 3)
+        self.assertEqual(quantize.call_count, 1)
+        self.assertEqual(gemm.call_count, 3)
+        self.assertEqual(uncast.call_count, 3)
+        for index, output in enumerate(result):
+            self.assertEqual(output.shape, (1, 2, 8))
+            self.assertTrue(torch.equal(output, outputs[index].reshape(1, 2, 8)))
+
+    def test_qkv_group_quantizes_shared_w4_activation_once(self):
+        from comfy_kitchen.backends import cuda as kitchen_cuda
+        import comfyui_turing_utils_kernel
+
+        for linear_dtype, quantizer_name, linear_target in (
+            ("int8", "_quantize_turing_int8_activation", "w4a8"),
+            ("int4", "_quantize_turing_int4_activation", "w4a4"),
+        ):
+            with self.subTest(linear_dtype=linear_dtype):
+                weights = [
+                    self._w4_weight(
+                        linear_dtype, out_features=8, in_features=256
+                    )
+                    for _ in range(3)
+                ]
+                linears = [SimpleNamespace(weight=weight) for weight in weights]
+                x = torch.zeros((1, 2, 256), dtype=torch.bfloat16)
+                qwidth = 256 if linear_dtype == "int8" else 128
+                qactivation = torch.zeros((2, qwidth), dtype=torch.int8)
+                activation_scale = torch.ones((2, 1), dtype=torch.float32)
+                outputs = [
+                    torch.full((2, 8), value, dtype=torch.bfloat16)
+                    for value in range(3)
+                ]
+
+                def cast(linear, *_args, **_kwargs):
+                    return linear.weight, None, (None, None, None)
+
+                target = (
+                    comfyui_turing_utils_kernel
+                    if linear_target == "w4a8"
+                    else kitchen_cuda
+                )
+                target_name = (
+                    "turing_w4a8_linear"
+                    if linear_target == "w4a8"
+                    else "int4_linear"
+                )
+                with (
+                    mock.patch(
+                        "turing_ops.is_supported_turing_device", return_value=True
+                    ),
+                    mock.patch("comfy.ops.cast_bias_weight", side_effect=cast),
+                    mock.patch("comfy.ops.uncast_bias_weight"),
+                    mock.patch.object(
+                        turing_ops,
+                        quantizer_name,
+                        return_value=(qactivation, activation_scale),
+                    ) as quantize,
+                    mock.patch.object(
+                        target, target_name, side_effect=outputs
+                    ) as linear,
+                ):
+                    result = turing_fusions.turing_linear_group(linears, x)
+
+                self.assertEqual(quantize.call_count, 1)
+                self.assertEqual(linear.call_count, 3)
+                self.assertEqual([item.shape for item in result], [(1, 2, 8)] * 3)
 
     def test_direct_turing_input_act_keeps_dense_fallback(self):
         linear = SimpleNamespace(weight=torch.zeros(4, 8, dtype=torch.bfloat16))

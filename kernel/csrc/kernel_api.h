@@ -28,6 +28,18 @@ void turing_swiglu_int4_convrot_quantize(Tensor input,
                                           Tensor output,
                                           Tensor scales);
 
+void turing_gelu_int8_convrot_quantize(Tensor input,
+                                        Tensor rotated,
+                                        Tensor partial_absmax,
+                                        Tensor output,
+                                        Tensor scales);
+
+void turing_gelu_int4_convrot_quantize(Tensor input,
+                                        Tensor rotated,
+                                        Tensor partial_absmax,
+                                        Tensor output,
+                                        Tensor scales);
+
 void turing_bf16_int8_convrot_quantize(Tensor input,
                                         Tensor output,
                                         Tensor scales,
@@ -40,6 +52,16 @@ void turing_bf16_int4_convrot_quantize(Tensor input,
                                         bool swiglu,
                                         int block_threads);
 
+void turing_bf16_gelu_int8_convrot_quantize(Tensor input,
+                                             Tensor output,
+                                             Tensor scales,
+                                             int block_threads);
+
+void turing_bf16_gelu_int4_convrot_quantize(Tensor input,
+                                             Tensor output,
+                                             Tensor scales,
+                                             int block_threads);
+
 void turing_segmented_rms_adaln(Tensor input,
                                  Tensor weight,
                                  Tensor scale,
@@ -47,5 +69,11 @@ void turing_segmented_rms_adaln(Tensor input,
                                  Tensor segments,
                                  Tensor output,
                                  float epsilon);
+
+void turing_layer_norm_adaln(Tensor input,
+                              Tensor scale,
+                              Tensor shift,
+                              Tensor output,
+                              float epsilon);
 
 }  // namespace comfyui_turing_utils::kernels

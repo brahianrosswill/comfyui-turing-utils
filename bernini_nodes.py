@@ -12,6 +12,84 @@ _BERNINI_ROPE_WRAPPER_KEY = "turing_utils_bernini_context_rope"
 _ABSOLUTE_INDEX_KEY = "turing_utils_bernini_absolute_latent_indices"
 
 
+def _slice_context_latents_for_estimate(value, full_length: int, estimate_length: int, dim: int):
+    if not isinstance(value, (list, tuple)):
+        return value
+    changed = False
+    sliced = []
+    for latent in value:
+        if torch.is_tensor(latent) and latent.ndim > dim and latent.shape[dim] == full_length:
+            latent = latent.narrow(dim, 0, min(estimate_length, full_length))
+            changed = True
+        sliced.append(latent)
+    if not changed:
+        return value
+    return tuple(sliced) if isinstance(value, tuple) else sliced
+
+
+def _estimate_conditioning(conds, full_length: int, estimate_length: int, dim: int):
+    changed = False
+    estimated = {}
+    for group, entries in conds.items():
+        new_entries = []
+        for entry in entries:
+            new_entry = entry
+            raw = entry.get("context_latents")
+            sliced = _slice_context_latents_for_estimate(raw, full_length, estimate_length, dim)
+            if sliced is not raw:
+                new_entry = dict(entry)
+                new_entry["context_latents"] = sliced
+                changed = True
+
+            model_conds = entry.get("model_conds")
+            if isinstance(model_conds, dict) and "context_latents" in model_conds:
+                cond = model_conds["context_latents"]
+                value = getattr(cond, "cond", None)
+                sliced = _slice_context_latents_for_estimate(value, full_length, estimate_length, dim)
+                if sliced is not value:
+                    if new_entry is entry:
+                        new_entry = dict(entry)
+                    new_model_conds = dict(model_conds)
+                    new_model_conds["context_latents"] = cond._copy_with(sliced)
+                    new_entry["model_conds"] = new_model_conds
+                    changed = True
+            new_entries.append(new_entry)
+        estimated[group] = new_entries
+    return estimated if changed else conds
+
+
+def _bernini_prepare_sampling_wrapper(executor, model, noise_shape, conds, *args, **kwargs):
+    model_options = kwargs.get("model_options")
+    if model_options is None:
+        raise RuntimeError("model_options not found in Bernini prepare-sampling wrapper")
+    handler = model_options.get("context_handler")
+    if handler is None or handler.dim >= len(noise_shape):
+        return executor(model, noise_shape, conds, *args, **kwargs)
+
+    # Match ComfyUI's conservative behavior for packed latents: latent_shapes
+    # is not attached yet, so a flat per-window size cannot be derived safely.
+    if len(noise_shape) == 3 and noise_shape[1] == 1:
+        return executor(model, noise_shape, conds, *args, **kwargs)
+
+    full_length = int(noise_shape[handler.dim])
+    if full_length <= handler.context_length:
+        return executor(model, noise_shape, conds, *args, **kwargs)
+
+    # Later causal windows prepend one source frame. Budget for the largest
+    # actual invocation, while leaving the real conditioning untouched.
+    anchor = 1 if getattr(handler, "causal_window_fix", False) else 0
+    estimate_length = min(full_length, int(handler.context_length) + anchor)
+    estimated_shape = list(noise_shape)
+    estimated_shape[handler.dim] = estimate_length
+    estimated_conds = _estimate_conditioning(
+        conds, full_length, estimate_length, handler.dim
+    )
+    result = executor(model, estimated_shape, estimated_conds, *args, **kwargs)
+    if isinstance(result, tuple) and len(result) >= 2:
+        return (result[0], conds, *result[2:])
+    return result
+
+
 def _validate_context_window_frames(context_length: int, context_overlap: int) -> tuple[int, int]:
     context_length = int(context_length)
     context_overlap = int(context_overlap)
@@ -422,7 +500,11 @@ class BerniniContextWindowsCore:
             _BERNINI_ROPE_WRAPPER_KEY,
         )
 
-        comfy.context_windows.create_prepare_sampling_wrapper(patched)
+        patched.add_wrapper_with_key(
+            comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING,
+            "ContextWindows_prepare_sampling",
+            _bernini_prepare_sampling_wrapper,
+        )
         if freenoise:
             comfy.context_windows.create_sampler_sample_wrapper(patched)
         _install_bernini_absolute_rope_patch()

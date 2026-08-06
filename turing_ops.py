@@ -9,6 +9,10 @@ import torch
 LOG = logging.getLogger("comfyui-turing-utils")
 BACKEND_NAME = "turing_utils_sm75"
 TURING_SHARED_MEMORY_LIMIT = 48 * 1024
+# Above this point a full MxN INT32 accumulator is more expensive than the
+# fixed-workspace fused Turing path. This is a dispatch threshold, never an
+# input-size limit.
+TURING_INT8_GLOBAL_WORKSPACE_LIMIT = 64 * 1024 * 1024
 _NVIDIA_TURING_WITHOUT_TENSOR_CORES = (
     "GTX 1630",
     "GTX 1650",
@@ -25,6 +29,20 @@ _NVIDIA_TURING_WITHOUT_TENSOR_CORES = (
 )
 _PREFLIGHTED_DEVICES: set[int] = set()
 _PREFLIGHTED_KITCHEN: set[tuple[int, bool, bool]] = set()
+
+
+def turing_int8_workspace_bytes(rows: int, output_channels: int) -> int:
+    """Return the global INT32 workspace used by the selected W8A8 path."""
+    if rows <= 0 or output_channels <= 0:
+        return 0
+    requested = int(rows) * int(output_channels) * 4
+    fixed_workspace_compatible = int(output_channels) % 8 == 0
+    return (
+        0
+        if fixed_workspace_compatible
+        and requested >= TURING_INT8_GLOBAL_WORKSPACE_LIMIT
+        else requested
+    )
 
 
 def is_supported_turing_device(device: torch.device) -> bool:
@@ -260,9 +278,25 @@ def _quantize_turing_int8_activation(
 ):
     from comfy_kitchen.backends import cuda as kitchen_cuda
 
-    if input_act not in (None, "none", "swiglu"):
+    if input_act not in (None, "none", "swiglu", "gelu_tanh"):
         raise ValueError(f"unsupported fused Turing INT8 activation: {input_act!r}")
     hidden_size = x2d.shape[1] // 2 if input_act == "swiglu" else x2d.shape[1]
+    if input_act == "gelu_tanh":
+        if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(hidden_size):
+            try:
+                from comfyui_turing_utils_kernel import turing_bf16_gelu_int8_convrot_quantize
+            except (ImportError, AttributeError):
+                pass
+            else:
+                return turing_bf16_gelu_int8_convrot_quantize(x2d, group_size)
+        try:
+            from comfyui_turing_utils_kernel import turing_gelu_int8_convrot_quantize
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "Turing W8A8 GELU requires an updated comfyui-turing-utils-kernel; "
+                "reinstall the kernel package"
+            ) from exc
+        return turing_gelu_int8_convrot_quantize(x2d, group_size)
     requested_shared = _convrot_int8_shared_memory_bytes(x2d.shape[0], hidden_size)
     if requested_shared < TURING_SHARED_MEMORY_LIMIT:
         if input_act == "swiglu":
@@ -306,8 +340,25 @@ def _quantize_turing_int4_activation(
 ):
     from comfy_kitchen.backends import cuda as kitchen_cuda
 
-    if input_act not in (None, "none", "swiglu"):
+    if input_act not in (None, "none", "swiglu", "gelu_tanh"):
         raise ValueError(f"unsupported fused Turing INT4 activation: {input_act!r}")
+    if input_act == "gelu_tanh":
+        hidden_size = x2d.shape[1]
+        if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(hidden_size):
+            try:
+                from comfyui_turing_utils_kernel import turing_bf16_gelu_int4_convrot_quantize
+            except (ImportError, AttributeError):
+                pass
+            else:
+                return turing_bf16_gelu_int4_convrot_quantize(x2d, group_size)
+        try:
+            from comfyui_turing_utils_kernel import turing_gelu_int4_convrot_quantize
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "Turing W4A4 GELU requires an updated comfyui-turing-utils-kernel; "
+                "reinstall the kernel package"
+            ) from exc
+        return turing_gelu_int4_convrot_quantize(x2d, group_size)
     if input_act == "swiglu":
         hidden_size = x2d.shape[1] // 2
         if x2d.shape[1] % 2 != 0:
@@ -450,10 +501,12 @@ def _turing_int8_gemm(
 
     prefer_fused = getattr(kitchen_cuda, "_prefer_turing_fused_int8", None)
     fused_linear = getattr(kitchen_cuda, "_int8_linear_turing_quantized", None)
-    if (
-        callable(prefer_fused)
-        and prefer_fused(m, n, k)
-        and callable(fused_linear)
+    avoid_global_workspace = (
+        m * n * 4 >= TURING_INT8_GLOBAL_WORKSPACE_LIMIT
+    )
+    if callable(fused_linear) and (
+        avoid_global_workspace
+        or (callable(prefer_fused) and prefer_fused(m, n, k))
     ):
         output = fused_linear(
             qactivation,
@@ -524,9 +577,9 @@ def int8_linear(
 
     original_shape = x.shape
     x2d = x.reshape(-1, original_shape[-1]).contiguous()
-    if input_act == "swiglu":
+    if input_act in ("swiglu", "gelu_tanh"):
         qactivation, activation_scale = _quantize_turing_int8_activation(
-            x2d, convrot_groupsize, input_act="swiglu"
+            x2d, convrot_groupsize, input_act=input_act
         )
     else:
         x2d = apply_input_act(x2d, input_act)
@@ -580,7 +633,7 @@ def convrot_w4a4_linear(
 
     original_shape = x.shape
     x2d = x.reshape(-1, original_shape[-1]).contiguous()
-    if input_act not in (None, "none", "swiglu"):
+    if input_act not in (None, "none", "swiglu", "gelu_tanh"):
         x2d = apply_input_act(x2d, input_act)
         input_act = None
     if linear_dtype == "int8":

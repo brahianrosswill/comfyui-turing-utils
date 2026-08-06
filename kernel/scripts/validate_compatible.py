@@ -178,6 +178,8 @@ def _validate_varlen_batches(
 
 def validate_sage(device: torch.device) -> None:
     from comfyui_turing_utils_kernel.turing_sage import sageattn, sageattn_varlen
+    from comfyui_turing_utils_kernel.turing_sage.core import sageattn_prequantized
+    from comfyui_turing_utils_kernel.turing_sage.quant import per_warp_int8
 
     for dtype in (torch.float16, torch.bfloat16):
         for head_dim, is_causal in ((32, False), (64, True), (96, False), (128, False)):
@@ -206,6 +208,17 @@ def validate_sage(device: torch.device) -> None:
             q.float(), k.float(), v.float(), enable_gqa=True
         ).transpose(1, 2)
         _assert_close(f"Sage NHD {dtype}", output_nhd, reference_nhd, rtol=0.08, atol=0.06)
+        q_nhd = q.transpose(1, 2).contiguous()
+        k_nhd = k.transpose(1, 2).contiguous()
+        v_nhd = v.transpose(1, 2).contiguous()
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8(
+            q_nhd, k_nhd, tensor_layout="NHD"
+        )
+        prequantized = sageattn_prequantized(
+            q_int8, q_scale, k_int8, k_scale, v_nhd, tensor_layout="NHD"
+        )
+        if not torch.equal(prequantized, output_nhd):
+            raise RuntimeError(f"prequantized Sage bridge mismatch for {dtype}")
 
     q = torch.randn((1, 4, 65, 64), device=device, dtype=torch.bfloat16)
     k = torch.randn((1, 1, 73, 64), device=device, dtype=torch.bfloat16)

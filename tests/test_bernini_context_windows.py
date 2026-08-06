@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -137,6 +138,56 @@ class BerniniContextWindowsTest(unittest.TestCase):
         patched_options = captured["args"][5]
         self.assertIsNot(patched_options, transformer_options)
         self.assertEqual(patched_options[bernini_nodes._ABSOLUTE_INDEX_KEY], (2, 3, 4, 5))
+
+    def test_prepare_sampling_budgets_context_and_anchor_without_mutating_conds(self):
+        handler = type(
+            "Handler",
+            (),
+            {"dim": 2, "context_length": 3, "causal_window_fix": True},
+        )()
+        context = torch.zeros(1, 16, 8, 4, 4)
+        conds = {"positive": [{"context_latents": [context]}]}
+        captured = {}
+
+        def executor(model, noise_shape, estimated_conds, *args, **kwargs):
+            captured["noise_shape"] = noise_shape
+            captured["conds"] = estimated_conds
+            return model, estimated_conds, ["loaded"]
+
+        result = bernini_nodes._bernini_prepare_sampling_wrapper(
+            executor,
+            "model",
+            (1, 16, 8, 4, 4),
+            conds,
+            model_options={"context_handler": handler},
+        )
+
+        self.assertEqual(captured["noise_shape"], [1, 16, 4, 4, 4])
+        estimated = captured["conds"]["positive"][0]["context_latents"][0]
+        self.assertEqual(estimated.shape, (1, 16, 4, 4, 4))
+        self.assertIs(result[1], conds)
+        self.assertIs(conds["positive"][0]["context_latents"][0], context)
+
+    def test_prepare_sampling_keeps_packed_latent_estimate_conservative(self):
+        handler = SimpleNamespace(dim=2, context_length=8, causal_window_fix=True)
+        conds = {"positive": []}
+        calls = []
+
+        def executor(_model, noise_shape, passed_conds, *args, **kwargs):
+            calls.append((noise_shape, passed_conds))
+            return "model", passed_conds, (), 0, 0
+
+        result = bernini_nodes._bernini_prepare_sampling_wrapper(
+            executor,
+            object(),
+            [1, 1, 64],
+            conds,
+            model_options={"context_handler": handler},
+        )
+
+        self.assertEqual(calls[0][0], [1, 1, 64])
+        self.assertIs(calls[0][1], conds)
+        self.assertIs(result[1], conds)
 
 
 if __name__ == "__main__":

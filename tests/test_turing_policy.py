@@ -118,7 +118,7 @@ class BF16PolicyTest(unittest.TestCase):
             mock.patch.dict(
                 sys.modules, {"comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.4.9")}
             ),
-            self.assertRaisesRegex(RuntimeError, "comfyui-turing-utils-kernel>=0.7.0"),
+            self.assertRaisesRegex(RuntimeError, "comfyui-turing-utils-kernel>=0.8.0"),
         ):
             bf16_policy._check_kernel_contract()
 
@@ -511,7 +511,7 @@ class BF16PolicyTest(unittest.TestCase):
         self.assertEqual(quantize.call_args.kwargs["input_act"], "swiglu")
         linear.assert_called_once()
 
-    def test_w4_paths_apply_non_swiglu_activation_before_quantization(self):
+    def test_w4_paths_fuse_gelu_into_quantization(self):
         x = torch.linspace(-1, 1, 512, dtype=torch.bfloat16).reshape(2, 256)
         qweight = torch.empty((8, 128), dtype=torch.int8)
         wscales = torch.ones(8, dtype=torch.float32)
@@ -538,9 +538,8 @@ class BF16PolicyTest(unittest.TestCase):
             )
 
         self.assertTrue(torch.equal(result, output))
-        expected = torch.nn.functional.gelu(x, approximate="tanh")
-        torch.testing.assert_close(quantize.call_args.args[0], expected)
-        self.assertIsNone(quantize.call_args.kwargs["input_act"])
+        self.assertEqual(quantize.call_args.args[0].data_ptr(), x.data_ptr())
+        self.assertEqual(quantize.call_args.kwargs["input_act"], "gelu_tanh")
 
     def test_w4a4_swiglu_uses_bf16_rowbuffer_when_it_fits(self):
         x = torch.empty((3, 28672), dtype=torch.bfloat16)

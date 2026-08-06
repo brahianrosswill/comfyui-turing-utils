@@ -1,7 +1,7 @@
 # Turing runtime flow
 
-The Turing path is a generic runtime capability. MiniMax H3 only supplies an
-adapter that connects its block structure to those capabilities.
+The Turing path is a generic runtime capability. Model adapters only connect
+MiniMax or Wan/Bernini block structure to those capabilities.
 
 ```text
 checkpoint metadata
@@ -28,15 +28,16 @@ not skip attention or quantized-kernel preflight.
 | `turing_ops.py` | exact-sm75 Kitchen backend and W8/W4 dispatch policy |
 | `turing_fusions.py` | model-independent fused Linear activation and segmented norm calls |
 | `minimax_adapter.py` | MiniMax block discovery and ModelPatcher object patches only |
+| `wan_adapter.py` | Wan/Bernini memory planning and model-specific object patches |
 | `kernel/csrc/turing` | separately installed Turing kernels, including bundled Sage |
 
 ## Linear matrix
 
-| Weight/activation | Plain input | SwiGLU input | Output |
+| Weight/activation | Plain input | Fused activation input | Output |
 |---|---|---|---|
-| W8A8 | fused Kitchen rotation when it fits; BF16 row-buffer or staged fallback | SwiGLU is folded into the same rotation/quantization decision | requested dtype, BF16 fast epilogue where eligible |
-| W4A4 | fused A4 rotation when it fits; BF16 row-buffer or grouped staged fallback | bundled staged/row-buffer SwiGLU produces packed A4 directly | original BF16 boundary |
-| W4A8 | shares the W8 activation quantizer and consumes packed W4 directly | shares fused W8 SwiGLU quantization | BF16 |
+| W8A8 | fused Kitchen rotation when it fits; BF16 row-buffer or staged fallback | SwiGLU and tanh-GELU are folded into the same rotation/quantization decision | requested dtype, BF16 fast epilogue where eligible |
+| W4A4 | fused A4 rotation when it fits; BF16 row-buffer or grouped staged fallback | bundled staged/row-buffer SwiGLU or tanh-GELU produces packed A4 directly | original BF16 boundary |
+| W4A8 | shares the W8 activation quantizer and consumes packed W4 directly | shares fused W8 SwiGLU/tanh-GELU quantization | BF16 |
 
 The BF16 row-buffer stores one completed rotated row as BF16 and keeps only
 active FHT groups in FP32. Launch selection is constrained to less than 48 KiB
@@ -55,9 +56,27 @@ kernel so the public API does not silently narrow its accepted shapes.
 
 For W8A8 GEMM, Kitchen's fused Turing kernel remains first choice. The no-bias
 contraction fallback uses cuBLAS INT8 plus the bundled vectorized BF16
-epilogue. Its INT32 workspace is intentionally retained because the measured
-H3 out-projection contribution was small and large-sequence shapes can lose
-occupancy when forced through the alternate fused GEMM.
+epilogue. Once a full MxN INT32 accumulator would reach 64 MiB, dispatch tries
+the fixed-workspace fused path even for contraction/square layers. If Kitchen
+cannot serve that shape, it falls back without narrowing the accepted input.
+
+Wan self-attention reuses one ConvRot activation quantization across Q/K/V when
+all three projections have the same W8A8, W4A8, or W4A4 format. Wan blocks fuse
+non-affine LayerNorm and repeated AdaLN mapping with FP32 mean/variance
+reduction, and feed fc1 directly into the tanh-GELU ConvRot quantizer for fc2.
+When bundled Sage is active and no attention patch needs Q/K afterward, the Wan
+adapter invokes the existing per-warp quantizer directly and releases BF16 Q/K
+before the score/value kernel. Unsupported heads and patched attention keep the
+normal generic path.
+Bernini context latents are included in ComfyUI's memory estimate; context
+windows budget both the context tokens and the possible causal anchor without
+changing the conditioning used at runtime.
+
+Wan patch embedding deliberately retains ComfyUI's FP32 convolution boundary.
+An A40 test with TF32 disabled found the prospective FP16 path slower and
+observed a non-zero BF16 output delta, so it is not installed as a speculative
+Turing optimization. The reproducible comparison is available through
+`validate_wan_fusions.py --patch-embedding`.
 
 ## Attention matrix
 
@@ -113,6 +132,7 @@ validation, build with:
 COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX" \
 python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
+python kernel/scripts/validate_wan_fusions.py --device cuda:0
 ```
 
 An A40 run validates numerical behavior, allocation shapes, and the absence of

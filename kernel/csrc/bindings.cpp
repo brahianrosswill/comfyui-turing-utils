@@ -6,6 +6,7 @@
 #include <cmath>
 #include <optional>
 #include <tuple>
+#include <utility>
 
 #include "kernel_api.h"
 
@@ -286,6 +287,59 @@ std::tuple<at::Tensor, at::Tensor> turing_swiglu_int4_convrot_quantize(
     return {output, scales};
 }
 
+std::tuple<at::Tensor, at::Tensor> turing_gelu_convrot_quantize(
+    at::Tensor input, int64_t group_size, bool int4) {
+    input = input.contiguous();
+    check_cuda_2d(input, "input");
+    check_half_like(input, "input");
+    TORCH_CHECK(group_size == 256,
+                "GELU staged ConvRot only supports group_size=256");
+
+    const int64_t rows = input.size(0);
+    const int64_t hidden = input.size(1);
+    TORCH_CHECK(rows > 0, "GELU staged ConvRot requires at least one row");
+    TORCH_CHECK(hidden > 0 && hidden % group_size == 0,
+                "activated GELU width must be positive and divisible by 256");
+    TORCH_CHECK(rows <= std::numeric_limits<int>::max() &&
+                    hidden <= std::numeric_limits<int>::max(),
+                "GELU staged ConvRot dimensions exceed the CUDA kernel range");
+
+    const at::cuda::CUDAGuard device_guard(input.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major > 7 ||
+                    (properties->major == 7 && properties->minor >= 5),
+                "GELU staged ConvRot requires sm75 or newer");
+
+    at::Tensor rotated = at::empty({rows, hidden}, input.options());
+    at::Tensor partial_absmax = at::empty(
+        {rows, hidden / group_size}, input.options().dtype(at::kFloat));
+    at::Tensor output = at::empty(
+        {rows, int4 ? hidden / 2 : hidden}, input.options().dtype(at::kChar));
+    at::Tensor scales = at::empty({rows, 1}, input.options().dtype(at::kFloat));
+
+    TorchOpContext ctx;
+    if (int4) {
+        comfyui_turing_utils::kernels::turing_gelu_int4_convrot_quantize(
+            from_torch(input), from_torch(rotated), from_torch(partial_absmax),
+            from_torch(output), from_torch(scales));
+    } else {
+        comfyui_turing_utils::kernels::turing_gelu_int8_convrot_quantize(
+            from_torch(input), from_torch(rotated), from_torch(partial_absmax),
+            from_torch(output), from_torch(scales));
+    }
+    return {output, scales};
+}
+
+std::tuple<at::Tensor, at::Tensor> turing_gelu_int8_convrot_quantize(
+    at::Tensor input, int64_t group_size) {
+    return turing_gelu_convrot_quantize(std::move(input), group_size, false);
+}
+
+std::tuple<at::Tensor, at::Tensor> turing_gelu_int4_convrot_quantize(
+    at::Tensor input, int64_t group_size) {
+    return turing_gelu_convrot_quantize(std::move(input), group_size, true);
+}
+
 std::tuple<at::Tensor, at::Tensor> turing_bf16_int8_convrot_quantize(
     at::Tensor input, int64_t group_size, bool swiglu) {
     input = input.contiguous();
@@ -405,6 +459,70 @@ std::tuple<at::Tensor, at::Tensor> turing_bf16_int4_convrot_quantize(
     return {output, scales};
 }
 
+std::tuple<at::Tensor, at::Tensor> turing_bf16_gelu_convrot_quantize(
+    at::Tensor input, int64_t group_size, bool int4) {
+    input = input.contiguous();
+    check_cuda_2d(input, "input");
+    TORCH_CHECK(input.scalar_type() == at::kBFloat16,
+                "BF16 GELU row-buffer ConvRot input must be bfloat16");
+    TORCH_CHECK(group_size == 256,
+                "BF16 GELU row-buffer ConvRot only supports group_size=256");
+
+    const int64_t rows = input.size(0);
+    const int64_t hidden = input.size(1);
+    TORCH_CHECK(rows > 0 && hidden > 0 && hidden % group_size == 0,
+                "BF16 GELU row-buffer width must be positive and divisible by 256");
+    TORCH_CHECK(rows <= std::numeric_limits<int>::max() &&
+                    hidden <= std::numeric_limits<int>::max(),
+                "BF16 GELU row-buffer dimensions exceed the CUDA kernel range");
+
+    constexpr int64_t shared_limit = 48 * 1024;
+    const auto shared_bytes = [hidden](int threads) {
+        const int64_t groups_in_flight = threads / 64;
+        return hidden * static_cast<int64_t>(sizeof(uint16_t)) +
+               groups_in_flight * 2 * 256 * static_cast<int64_t>(sizeof(float)) +
+               (threads / 32 + 4) * static_cast<int64_t>(sizeof(float));
+    };
+    int block_threads = 0;
+    for (const int candidate : {1024, 768, 512}) {
+        if (shared_bytes(candidate) < shared_limit) {
+            block_threads = candidate;
+            break;
+        }
+    }
+    TORCH_CHECK(block_threads != 0,
+                "BF16 GELU row-buffer ConvRot cannot fit under the 48 KiB shared-memory limit");
+
+    const at::cuda::CUDAGuard device_guard(input.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major > 7 ||
+                    (properties->major == 7 && properties->minor >= 5),
+                "BF16 GELU row-buffer ConvRot requires sm75 or newer");
+
+    at::Tensor output = at::empty(
+        {rows, int4 ? hidden / 2 : hidden}, input.options().dtype(at::kChar));
+    at::Tensor scales = at::empty({rows, 1}, input.options().dtype(at::kFloat));
+    TorchOpContext ctx;
+    if (int4) {
+        comfyui_turing_utils::kernels::turing_bf16_gelu_int4_convrot_quantize(
+            from_torch(input), from_torch(output), from_torch(scales), block_threads);
+    } else {
+        comfyui_turing_utils::kernels::turing_bf16_gelu_int8_convrot_quantize(
+            from_torch(input), from_torch(output), from_torch(scales), block_threads);
+    }
+    return {output, scales};
+}
+
+std::tuple<at::Tensor, at::Tensor> turing_bf16_gelu_int8_convrot_quantize(
+    at::Tensor input, int64_t group_size) {
+    return turing_bf16_gelu_convrot_quantize(std::move(input), group_size, false);
+}
+
+std::tuple<at::Tensor, at::Tensor> turing_bf16_gelu_int4_convrot_quantize(
+    at::Tensor input, int64_t group_size) {
+    return turing_bf16_gelu_convrot_quantize(std::move(input), group_size, true);
+}
+
 at::Tensor turing_segmented_rms_adaln(at::Tensor input,
                                        at::Tensor weight,
                                        at::Tensor scale,
@@ -474,6 +592,52 @@ at::Tensor turing_segmented_rms_adaln(at::Tensor input,
     return output;
 }
 
+at::Tensor turing_layer_norm_adaln(at::Tensor input,
+                                    at::Tensor scale,
+                                    at::Tensor shift,
+                                    double epsilon) {
+    input = input.contiguous();
+    scale = scale.contiguous();
+    shift = shift.contiguous();
+    TORCH_CHECK(input.is_cuda() && input.dim() == 3 && input.is_contiguous(),
+                "input must be contiguous CUDA [batch, sequence, hidden]");
+    check_float_like(input, "input");
+    TORCH_CHECK(scale.is_cuda() && scale.dim() == 3 && scale.is_contiguous(),
+                "scale must be contiguous CUDA [batch, modulation_steps, hidden]");
+    TORCH_CHECK(shift.is_cuda() && shift.dim() == 3 && shift.is_contiguous(),
+                "shift must be contiguous CUDA [batch, modulation_steps, hidden]");
+    TORCH_CHECK(input.device() == scale.device() && input.device() == shift.device(),
+                "LayerNorm+AdaLN tensors must use the same CUDA device");
+    TORCH_CHECK(input.scalar_type() == scale.scalar_type() &&
+                    input.scalar_type() == shift.scalar_type(),
+                "LayerNorm+AdaLN tensor dtypes must match");
+    TORCH_CHECK(scale.sizes() == shift.sizes(), "shift shape must match scale shape");
+    TORCH_CHECK(scale.size(0) == input.size(0) && scale.size(2) == input.size(2),
+                "scale must match input batch and hidden dimensions");
+    TORCH_CHECK(input.size(0) > 0 && input.size(1) > 0 && input.size(2) > 0 &&
+                    scale.size(1) > 0,
+                "LayerNorm+AdaLN dimensions must be positive");
+    TORCH_CHECK(input.size(0) * input.size(1) <= std::numeric_limits<int>::max() &&
+                    input.size(1) <= std::numeric_limits<int>::max() &&
+                    input.size(2) <= std::numeric_limits<int>::max() &&
+                    scale.size(1) <= std::numeric_limits<int>::max(),
+                "LayerNorm+AdaLN dimensions exceed the CUDA kernel range");
+    TORCH_CHECK(std::isfinite(epsilon) && epsilon > 0.0,
+                "LayerNorm epsilon must be finite and positive");
+
+    const at::cuda::CUDAGuard device_guard(input.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major > 7 ||
+                    (properties->major == 7 && properties->minor >= 5),
+                "LayerNorm+AdaLN requires sm75 or newer");
+    at::Tensor output = at::empty_like(input);
+    TorchOpContext ctx;
+    comfyui_turing_utils::kernels::turing_layer_norm_adaln(
+        from_torch(input), from_torch(scale), from_torch(shift),
+        from_torch(output), static_cast<float>(epsilon));
+    return output;
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -498,6 +662,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &turing_swiglu_int4_convrot_quantize,
           pybind11::arg("input"),
           pybind11::arg("group_size") = 256);
+    m.def("turing_gelu_int8_convrot_quantize",
+          &turing_gelu_int8_convrot_quantize,
+          pybind11::arg("input"),
+          pybind11::arg("group_size") = 256);
+    m.def("turing_gelu_int4_convrot_quantize",
+          &turing_gelu_int4_convrot_quantize,
+          pybind11::arg("input"),
+          pybind11::arg("group_size") = 256);
     m.def("turing_bf16_int8_convrot_quantize",
           &turing_bf16_int8_convrot_quantize,
           pybind11::arg("input"),
@@ -508,6 +680,14 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("input"),
           pybind11::arg("group_size") = 256,
           pybind11::arg("swiglu") = false);
+    m.def("turing_bf16_gelu_int8_convrot_quantize",
+          &turing_bf16_gelu_int8_convrot_quantize,
+          pybind11::arg("input"),
+          pybind11::arg("group_size") = 256);
+    m.def("turing_bf16_gelu_int4_convrot_quantize",
+          &turing_bf16_gelu_int4_convrot_quantize,
+          pybind11::arg("input"),
+          pybind11::arg("group_size") = 256);
     m.def("turing_segmented_rms_adaln",
           &turing_segmented_rms_adaln,
           pybind11::arg("input"),
@@ -515,5 +695,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("scale"),
           pybind11::arg("shift"),
           pybind11::arg("segments"),
+          pybind11::arg("epsilon") = 1.0e-5);
+    m.def("turing_layer_norm_adaln",
+          &turing_layer_norm_adaln,
+          pybind11::arg("input"),
+          pybind11::arg("scale"),
+          pybind11::arg("shift"),
           pybind11::arg("epsilon") = 1.0e-5);
 }

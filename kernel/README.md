@@ -1,9 +1,10 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's exact-sm75
-runtime. Version 0.7.0 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
-activation quantizers, BF16 epilogues, fused normalization, and bundled Sage
-attention. It contains no model-weight format or model loader.
+runtime. Version 0.8.0 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
+activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
+and LayerNorm modulation, and bundled Sage attention. It contains no
+model-weight format or model loader.
 
 ## Install
 
@@ -23,7 +24,7 @@ csrc/
   tensor_bridge.h                        tensor/stream bridge used by CUDA entry points
   turing/
     convrot_quant.cu                      staged/row-buffer W8 and W4 ConvRot quantizers
-    segmented_rms_adaln.cu                affine segmented RMSNorm + AdaLN
+    segmented_rms_adaln.cu                RMSNorm/LayerNorm + AdaLN kernels
     w4a8.cu                               packed W4-to-S8 SM75 Tensor Core GEMM
     sage/                                 bundled production SM75 Sage kernel
 comfyui_turing_utils_kernel/
@@ -48,6 +49,7 @@ Ampere-only instructions.
 COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX" \
 python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
+python kernel/scripts/validate_wan_fusions.py --device cuda:0
 ```
 
 On Windows, use an x64 Visual Studio Developer shell. CUDA 12.8 Conda users

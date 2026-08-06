@@ -47,6 +47,11 @@ try:
 except ImportError:
     from minimax_adapter import apply_minimax_adapter
 
+try:
+    from .wan_adapter import apply_wan_adapter
+except ImportError:
+    from wan_adapter import apply_wan_adapter
+
 
 LOG = logging.getLogger("comfyui-turing-utils")
 DIFFUSION_FOLDER_NAME = "diffusion_models"
@@ -483,6 +488,7 @@ def load_convrot_model(
         loaded.w8a8,
     )
     apply_minimax_adapter(model, load_device)
+    apply_wan_adapter(model, load_device)
     apply_attention_backend(model, attention_backend, device=load_device)
     model.cached_patcher_init = (
         load_convrot_model,

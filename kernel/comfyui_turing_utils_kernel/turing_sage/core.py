@@ -153,6 +153,80 @@ def sageattn(
 
 
 @_on_input_device
+def sageattn_prequantized(
+    q_int8: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_int8: torch.Tensor,
+    k_scale: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    tensor_layout: str = "NHD",
+    is_causal: bool = False,
+    sm_scale: Optional[float] = None,
+    return_lse: bool = False,
+):
+    """Internal bridge for adapters that can release BF16 Q/K before attention."""
+    if tensor_layout not in {"HND", "NHD"}:
+        raise ValueError(f"Unsupported tensor_layout: {tensor_layout}")
+    if q_int8.dtype != torch.int8 or k_int8.dtype != torch.int8:
+        raise TypeError("prequantized Sage Q/K must be int8")
+    if v.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("prequantized Sage V must be float16 or bfloat16")
+    if q_int8.ndim != 4 or k_int8.ndim != 4 or v.ndim != 4:
+        raise ValueError("prequantized Sage Q/K/V must be four-dimensional")
+    if q_int8.device != k_int8.device or q_int8.device != v.device:
+        raise ValueError("prequantized Sage Q/K/V must share one CUDA device")
+    if q_scale.dtype != torch.float32 or k_scale.dtype != torch.float32:
+        raise TypeError("prequantized Sage scales must be float32")
+    if q_scale.device != q_int8.device or k_scale.device != q_int8.device:
+        raise ValueError("prequantized Sage scales must be on the Q/K device")
+
+    head_axis = 1 if tensor_layout == "HND" else 2
+    sequence_axis = 2 if tensor_layout == "HND" else 1
+    if (
+        q_int8.size(0) != k_int8.size(0)
+        or q_int8.size(0) != v.size(0)
+        or k_int8.size(head_axis) != v.size(head_axis)
+        or k_int8.size(sequence_axis) != v.size(sequence_axis)
+        or q_int8.size(-1) != k_int8.size(-1)
+        or q_int8.size(-1) != v.size(-1)
+    ):
+        raise ValueError("prequantized Sage Q/K/V shapes are incompatible")
+    q_heads = q_int8.size(head_axis)
+    kv_heads = k_int8.size(head_axis)
+    if kv_heads <= 0 or q_heads % kv_heads != 0:
+        raise ValueError("prequantized Sage Q heads must be divisible by KV heads")
+
+    head_dim = q_int8.size(-1)
+    if head_dim not in (64, 128):
+        raise ValueError("prequantized Sage currently requires head_dim 64 or 128")
+    expected_q_tiles = ((q_int8.size(sequence_axis) + 63) // 64) * 4
+    expected_k_tiles = (k_int8.size(sequence_axis) + 63) // 64
+    if q_scale.shape != (q_int8.size(0), q_heads, expected_q_tiles):
+        raise ValueError("prequantized Sage Q scale shape is incompatible")
+    if k_scale.shape != (k_int8.size(0), kv_heads, expected_k_tiles):
+        raise ValueError("prequantized Sage K scale shape is incompatible")
+
+    tensor_layout_id = 0 if tensor_layout == "NHD" else 1
+    scale = float(sm_scale) if sm_scale is not None else head_dim**-0.5
+    output = torch.empty(q_int8.shape, dtype=v.dtype, device=v.device)
+    lse = sm75_compile.qk_int8_sv_f16_accum_f32_attn(
+        q_int8.contiguous(),
+        k_int8.contiguous(),
+        v.contiguous(),
+        output,
+        q_scale.contiguous(),
+        k_scale.contiguous(),
+        tensor_layout_id,
+        int(is_causal),
+        2,
+        scale,
+        int(return_lse),
+    )
+    return (output, lse / 1.44269504) if return_lse else output
+
+
+@_on_input_device
 def sageattn_varlen(
     q: torch.Tensor,
     k: torch.Tensor,

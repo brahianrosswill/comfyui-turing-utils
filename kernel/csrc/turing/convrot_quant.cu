@@ -143,6 +143,19 @@ __device__ __forceinline__ float load_swiglu(
 }
 
 template <typename InputType>
+__device__ __forceinline__ float load_gelu_tanh(
+    const InputType *__restrict__ input, int64_t row_offset, int col) {
+    const float x = to_float(input[row_offset + col]);
+    constexpr float kAlpha = 0.7978845608028654f;
+    constexpr float kBeta = 0.044715f;
+    const float activated =
+        0.5f * x * (1.0f + tanhf(kAlpha * (x + kBeta * x * x * x)));
+    // Match nn.GELU's output tensor boundary before ConvRot. Keeping this
+    // explicit makes the fused path numerically equivalent to eager BF16/FP16.
+    return to_float(from_float<InputType>(activated));
+}
+
+template <typename InputType, bool Gelu = false>
 __global__ void swiglu_rotate_amax_kernel(
     const InputType *__restrict__ input,
     InputType *__restrict__ rotated,
@@ -158,16 +171,17 @@ __global__ void swiglu_rotate_amax_kernel(
     const int group_col = group * kConvRotGroup;
     const int base = lane * 4;
     const int col = group_col + base;
-    const int64_t input_row = static_cast<int64_t>(row) * (2 * k);
+    constexpr int kInputWidth = Gelu ? 1 : 2;
+    const int64_t input_row = static_cast<int64_t>(row) * (kInputWidth * k);
     const int64_t output_row = static_cast<int64_t>(row) * k;
 
     float *buf0 = smem + sub * (2 * kConvRotGroup);
     float *buf1 = buf0 + kConvRotGroup;
 
-    const float x0 = active ? load_swiglu(input, input_row, col, k) : 0.0f;
-    const float x1 = active ? load_swiglu(input, input_row, col + 1, k) : 0.0f;
-    const float x2 = active ? load_swiglu(input, input_row, col + 2, k) : 0.0f;
-    const float x3 = active ? load_swiglu(input, input_row, col + 3, k) : 0.0f;
+    const float x0 = active ? (Gelu ? load_gelu_tanh(input, input_row, col) : load_swiglu(input, input_row, col, k)) : 0.0f;
+    const float x1 = active ? (Gelu ? load_gelu_tanh(input, input_row, col + 1) : load_swiglu(input, input_row, col + 1, k)) : 0.0f;
+    const float x2 = active ? (Gelu ? load_gelu_tanh(input, input_row, col + 2) : load_swiglu(input, input_row, col + 2, k)) : 0.0f;
+    const float x3 = active ? (Gelu ? load_gelu_tanh(input, input_row, col + 3) : load_swiglu(input, input_row, col + 3, k)) : 0.0f;
     buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
     buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
     buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
@@ -315,7 +329,7 @@ __device__ __forceinline__ float fht_store_bf16_absmax(
     return fmaxf(fmaxf(fabsf(y0), fabsf(y1)), fmaxf(fabsf(y2), fabsf(y3)));
 }
 
-template <bool SwiGLU>
+template <bool SwiGLU, bool Gelu = false>
 __device__ __forceinline__ float load_bf16_input(
     const nv_bfloat16 *__restrict__ input,
     int64_t row_offset,
@@ -323,6 +337,8 @@ __device__ __forceinline__ float load_bf16_input(
     int k) {
     if constexpr (SwiGLU) {
         return load_swiglu(input, row_offset, column, k);
+    } else if constexpr (Gelu) {
+        return load_gelu_tanh(input, row_offset, column);
     }
     return __bfloat162float(input[row_offset + column]);
 }
@@ -331,7 +347,7 @@ __device__ __forceinline__ float load_bf16_input(
 // inactive row is stored as BF16 while each active group retains FP32 scratch.
 // This preserves the staged path's BF16 rounding but removes its global-memory
 // intermediate and second kernel launch.
-template <int BlockThreads, bool SwiGLU, bool Int4>
+template <int BlockThreads, bool SwiGLU, bool Int4, bool Gelu = false>
 __global__ void bf16_rowbuffer_convrot_quantize_kernel(
     const nv_bfloat16 *__restrict__ input,
     int8_t *__restrict__ output,
@@ -365,10 +381,10 @@ __global__ void bf16_rowbuffer_convrot_quantize_kernel(
         const int base = lane * 4;
         const int group_column = group * kConvRotGroup;
         const int column = group_column + base;
-        const float x0 = active ? load_bf16_input<SwiGLU>(input, input_row, column, k) : 0.0f;
-        const float x1 = active ? load_bf16_input<SwiGLU>(input, input_row, column + 1, k) : 0.0f;
-        const float x2 = active ? load_bf16_input<SwiGLU>(input, input_row, column + 2, k) : 0.0f;
-        const float x3 = active ? load_bf16_input<SwiGLU>(input, input_row, column + 3, k) : 0.0f;
+        const float x0 = active ? load_bf16_input<SwiGLU, Gelu>(input, input_row, column, k) : 0.0f;
+        const float x1 = active ? load_bf16_input<SwiGLU, Gelu>(input, input_row, column + 1, k) : 0.0f;
+        const float x2 = active ? load_bf16_input<SwiGLU, Gelu>(input, input_row, column + 2, k) : 0.0f;
+        const float x3 = active ? load_bf16_input<SwiGLU, Gelu>(input, input_row, column + 3, k) : 0.0f;
         buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
         buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
         buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
@@ -427,7 +443,7 @@ __global__ void bf16_rowbuffer_convrot_quantize_kernel(
     }
 }
 
-template <int BlockThreads, bool SwiGLU, bool Int4 = false>
+template <int BlockThreads, bool SwiGLU, bool Int4 = false, bool Gelu = false>
 void launch_bf16_rowbuffer(Tensor input, Tensor output, Tensor scales) {
     const int rows = input.size(0);
     const int k = Int4 ? output.size(1) * 2 : output.size(1);
@@ -435,7 +451,7 @@ void launch_bf16_rowbuffer(Tensor input, Tensor output, Tensor scales) {
     const size_t shared_bytes =
         static_cast<size_t>(k) * sizeof(uint16_t) +
         kGroupsInFlight * 2 * kConvRotGroup * sizeof(float);
-    bf16_rowbuffer_convrot_quantize_kernel<BlockThreads, SwiGLU, Int4>
+    bf16_rowbuffer_convrot_quantize_kernel<BlockThreads, SwiGLU, Int4, Gelu>
         <<<rows, BlockThreads, shared_bytes, getCurrentCUDAStream()>>>(
             static_cast<const nv_bfloat16 *>(input.ptr),
             static_cast<int8_t *>(output.ptr),
@@ -444,7 +460,7 @@ void launch_bf16_rowbuffer(Tensor input, Tensor output, Tensor scales) {
     checkCUDA(cudaGetLastError());
 }
 
-template <typename InputType, bool Int4 = false>
+template <typename InputType, bool Int4 = false, bool Gelu = false>
 void launch_swiglu_quantize(Tensor input,
                             Tensor rotated,
                             Tensor partial_absmax,
@@ -456,7 +472,7 @@ void launch_swiglu_quantize(Tensor input,
     const dim3 grid(static_cast<unsigned int>(rows), static_cast<unsigned int>(group_blocks));
     constexpr size_t smem_bytes =
         kGroupsPerBlock * 2 * kConvRotGroup * sizeof(float);
-    swiglu_rotate_amax_kernel<InputType><<<grid, kRotateThreads, smem_bytes, getCurrentCUDAStream()>>>(
+    swiglu_rotate_amax_kernel<InputType, Gelu><<<grid, kRotateThreads, smem_bytes, getCurrentCUDAStream()>>>(
         static_cast<const InputType *>(input.ptr),
         static_cast<InputType *>(rotated.ptr),
         static_cast<float *>(partial_absmax.ptr),
@@ -513,6 +529,34 @@ void turing_swiglu_int4_convrot_quantize(Tensor input,
     }
 }
 
+void turing_gelu_int8_convrot_quantize(Tensor input,
+                                        Tensor rotated,
+                                        Tensor partial_absmax,
+                                        Tensor output,
+                                        Tensor scales) {
+    if (input.scalar_type() == Tensor::BF16) {
+        launch_swiglu_quantize<nv_bfloat16, false, true>(input, rotated, partial_absmax, output, scales);
+    } else if (input.scalar_type() == Tensor::FP16) {
+        launch_swiglu_quantize<half, false, true>(input, rotated, partial_absmax, output, scales);
+    } else {
+        throw std::runtime_error("GELU staged ConvRot requires float16 or bfloat16 input");
+    }
+}
+
+void turing_gelu_int4_convrot_quantize(Tensor input,
+                                        Tensor rotated,
+                                        Tensor partial_absmax,
+                                        Tensor output,
+                                        Tensor scales) {
+    if (input.scalar_type() == Tensor::BF16) {
+        launch_swiglu_quantize<nv_bfloat16, true, true>(input, rotated, partial_absmax, output, scales);
+    } else if (input.scalar_type() == Tensor::FP16) {
+        launch_swiglu_quantize<half, true, true>(input, rotated, partial_absmax, output, scales);
+    } else {
+        throw std::runtime_error("GELU staged INT4 ConvRot requires float16 or bfloat16 input");
+    }
+}
+
 void turing_bf16_int8_convrot_quantize(Tensor input,
                                         Tensor output,
                                         Tensor scales,
@@ -560,6 +604,38 @@ void turing_bf16_int4_convrot_quantize(Tensor input,
         launch_bf16_rowbuffer<768, false, true>(input, output, scales);
     } else {
         launch_bf16_rowbuffer<512, false, true>(input, output, scales);
+    }
+}
+
+void turing_bf16_gelu_int8_convrot_quantize(Tensor input,
+                                             Tensor output,
+                                             Tensor scales,
+                                             int block_threads) {
+    if (input.scalar_type() != Tensor::BF16) {
+        throw std::runtime_error("BF16 GELU row-buffer ConvRot requires bfloat16 input");
+    }
+    if (block_threads == 1024) {
+        launch_bf16_rowbuffer<1024, false, false, true>(input, output, scales);
+    } else if (block_threads == 768) {
+        launch_bf16_rowbuffer<768, false, false, true>(input, output, scales);
+    } else {
+        launch_bf16_rowbuffer<512, false, false, true>(input, output, scales);
+    }
+}
+
+void turing_bf16_gelu_int4_convrot_quantize(Tensor input,
+                                             Tensor output,
+                                             Tensor scales,
+                                             int block_threads) {
+    if (input.scalar_type() != Tensor::BF16) {
+        throw std::runtime_error("BF16 GELU row-buffer INT4 ConvRot requires bfloat16 input");
+    }
+    if (block_threads == 1024) {
+        launch_bf16_rowbuffer<1024, false, true, true>(input, output, scales);
+    } else if (block_threads == 768) {
+        launch_bf16_rowbuffer<768, false, true, true>(input, output, scales);
+    } else {
+        launch_bf16_rowbuffer<512, false, true, true>(input, output, scales);
     }
 }
 

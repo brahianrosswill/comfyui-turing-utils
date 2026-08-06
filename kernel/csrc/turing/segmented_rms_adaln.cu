@@ -78,6 +78,41 @@ __device__ __forceinline__ float warp_reduce_sum(float value) {
     return value;
 }
 
+struct WelfordData {
+    float mean;
+    float m2;
+    int count;
+};
+
+__device__ __forceinline__ WelfordData welford_combine(
+    WelfordData left, WelfordData right) {
+    if (right.count == 0) return left;
+    if (left.count == 0) return right;
+    const int count = left.count + right.count;
+    const float delta = right.mean - left.mean;
+    left.mean += delta * static_cast<float>(right.count) /
+                 static_cast<float>(count);
+    left.m2 += right.m2 + delta * delta *
+                               static_cast<float>(left.count) *
+                               static_cast<float>(right.count) /
+                               static_cast<float>(count);
+    left.count = count;
+    return left;
+}
+
+__device__ __forceinline__ WelfordData warp_reduce_welford(WelfordData value) {
+#pragma unroll
+    for (int offset = kWarpThreads / 2; offset > 0; offset >>= 1) {
+        WelfordData other{
+            __shfl_down_sync(0xffffffff, value.mean, offset),
+            __shfl_down_sync(0xffffffff, value.m2, offset),
+            __shfl_down_sync(0xffffffff, value.count, offset),
+        };
+        value = welford_combine(value, other);
+    }
+    return value;
+}
+
 __device__ __forceinline__ int find_modulation_row(
     const int *__restrict__ segments, int segment_count, int token_row) {
     int low = 0;
@@ -199,6 +234,77 @@ __global__ void segmented_rms_adaln_kernel(
 }
 
 template <typename T>
+__global__ void layer_norm_adaln_kernel(
+    const T *__restrict__ input,
+    const T *__restrict__ scale,
+    const T *__restrict__ shift,
+    T *__restrict__ output,
+    int sequence,
+    int hidden,
+    int modulation_steps,
+    float epsilon) {
+    __shared__ float warp_means[kNormWarps];
+    __shared__ float warp_m2[kNormWarps];
+    __shared__ int warp_counts[kNormWarps];
+
+    const int row = static_cast<int>(blockIdx.x);
+    const int tid = threadIdx.x;
+    const int lane = tid & (kWarpThreads - 1);
+    const int warp = tid / kWarpThreads;
+    const int batch = row / sequence;
+    const int token = row - batch * sequence;
+    int modulation_token = 0;
+    if (modulation_steps > 1) {
+        const int repeats = sequence / modulation_steps;
+        const int group = repeats * modulation_steps == sequence ? repeats : repeats + 1;
+        modulation_token = min(token / max(group, 1), modulation_steps - 1);
+    }
+
+    const int64_t row_offset = static_cast<int64_t>(row) * hidden;
+    const int64_t modulation_offset =
+        (static_cast<int64_t>(batch) * modulation_steps + modulation_token) * hidden;
+    WelfordData statistics{0.0f, 0.0f, 0};
+    for (int col = tid; col < hidden; col += kNormThreads) {
+        const float value = to_float(input[row_offset + col]);
+        ++statistics.count;
+        const float delta = value - statistics.mean;
+        statistics.mean += delta / static_cast<float>(statistics.count);
+        statistics.m2 += delta * (value - statistics.mean);
+    }
+    statistics = warp_reduce_welford(statistics);
+    if (lane == 0) {
+        warp_means[warp] = statistics.mean;
+        warp_m2[warp] = statistics.m2;
+        warp_counts[warp] = statistics.count;
+    }
+    __syncthreads();
+
+    statistics = {0.0f, 0.0f, 0};
+#pragma unroll
+    for (int item = 0; item < kNormWarps; ++item) {
+        statistics = welford_combine(
+            statistics,
+            {warp_means[item], warp_m2[item], warp_counts[item]});
+    }
+    // Welford avoids cancellation for offset inputs while retaining a single
+    // FP32 statistics pass over global memory.
+    const float mean = statistics.mean;
+    const float variance = statistics.m2 / static_cast<float>(statistics.count);
+    const float inverse_std = rsqrtf(variance + epsilon);
+    for (int col = tid; col < hidden; col += kNormThreads) {
+        const float normalized = (to_float(input[row_offset + col]) - mean) * inverse_std;
+        // Preserve the public LayerNorm output boundary and addcmul operand
+        // dtype while keeping the sensitive reduction itself in FP32.
+        const T normalized_value = from_float<T>(normalized);
+        const T multiplier = from_float<T>(
+            1.0f + to_float(scale[modulation_offset + col]));
+        const float result = to_float(normalized_value) * to_float(multiplier) +
+                             to_float(shift[modulation_offset + col]);
+        output[row_offset + col] = from_float<T>(result);
+    }
+}
+
+template <typename T>
 void launch_segmented_rms_adaln(Tensor input,
                                  Tensor weight,
                                  Tensor scale,
@@ -258,6 +364,45 @@ void turing_segmented_rms_adaln(Tensor input,
             input, weight, scale, shift, segments, output, epsilon);
     } else {
         throw std::runtime_error("segmented RMSNorm+AdaLN requires float16, bfloat16, or float32 input");
+    }
+}
+
+template <typename T>
+void launch_layer_norm_adaln(Tensor input,
+                             Tensor scale,
+                             Tensor shift,
+                             Tensor output,
+                             float epsilon) {
+    const int batch = input.size(0);
+    const int sequence = input.size(1);
+    const int hidden = input.size(2);
+    const int modulation_steps = scale.size(1);
+    const int rows = batch * sequence;
+    layer_norm_adaln_kernel<T><<<rows, kNormThreads, 0, getCurrentCUDAStream()>>>(
+        static_cast<const T *>(input.ptr),
+        static_cast<const T *>(scale.ptr),
+        static_cast<const T *>(shift.ptr),
+        static_cast<T *>(output.ptr),
+        sequence,
+        hidden,
+        modulation_steps,
+        epsilon);
+    checkCUDA(cudaGetLastError());
+}
+
+void turing_layer_norm_adaln(Tensor input,
+                              Tensor scale,
+                              Tensor shift,
+                              Tensor output,
+                              float epsilon) {
+    if (input.scalar_type() == Tensor::BF16) {
+        launch_layer_norm_adaln<nv_bfloat16>(input, scale, shift, output, epsilon);
+    } else if (input.scalar_type() == Tensor::FP16) {
+        launch_layer_norm_adaln<half>(input, scale, shift, output, epsilon);
+    } else if (input.scalar_type() == Tensor::FP32) {
+        launch_layer_norm_adaln<float>(input, scale, shift, output, epsilon);
+    } else {
+        throw std::runtime_error("LayerNorm+AdaLN requires float16, bfloat16, or float32 input");
     }
 }
 

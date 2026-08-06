@@ -28,7 +28,7 @@ except ImportError:
 
 LOG = logging.getLogger("comfyui-turing-utils")
 MIN_KITCHEN_VERSION = (0, 2, 26)
-MIN_KERNEL_VERSION = (0, 7, 0)
+MIN_KERNEL_VERSION = (0, 8, 0)
 _CONVROT_W4_LAYOUT = "TensorCoreConvRotW4A4Layout"
 _TENSORWISE_INT8_LAYOUT = "TensorWiseINT8Layout"
 
