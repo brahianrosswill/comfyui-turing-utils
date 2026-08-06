@@ -138,6 +138,7 @@ class BF16PolicyTest(unittest.TestCase):
         with (
             mock.patch.object(kitchen_cuda, "quantize_int8_rowwise_convrot64") as fused,
             mock.patch.object(kitchen_cuda, "quantize_int8_convrot_staged", return_value=("q", "s")) as staged,
+            mock.patch.dict(sys.modules, {"svdint4": SimpleNamespace()}),
         ):
             result = turing_ops._quantize_turing_int8_activation(x, 256)
         self.assertEqual(result, ("q", "s"))
@@ -159,6 +160,48 @@ class BF16PolicyTest(unittest.TestCase):
         fused.assert_called_once_with(x, 256)
         staged.assert_not_called()
 
+    def test_bf16_rowbuffer_convrot_replaces_staged_h3_shapes_under_48k(self):
+        rowbuffer = mock.Mock(return_value=("q", "s"))
+        for hidden_size in (5376, 7168, 14336):
+            x = torch.empty((3, hidden_size), dtype=torch.bfloat16)
+            with (
+                self.subTest(hidden_size=hidden_size),
+                mock.patch.object(kitchen_cuda, "quantize_int8_rowwise_convrot64") as fused,
+                mock.patch.object(kitchen_cuda, "quantize_int8_convrot_staged") as staged,
+                mock.patch.dict(
+                    sys.modules,
+                    {"svdint4": SimpleNamespace(
+                        turing_bf16_int8_convrot_quantize=rowbuffer
+                    )},
+                ),
+            ):
+                result = turing_ops._quantize_turing_int8_activation(x, 256)
+            self.assertEqual(result, ("q", "s"))
+            rowbuffer.assert_called_with(x, 256, swiglu=False)
+            fused.assert_not_called()
+            staged.assert_not_called()
+            rowbuffer.reset_mock()
+
+    def test_bf16_rowbuffer_convrot_absorbs_h3_swiglu(self):
+        x = torch.empty((3, 28672), dtype=torch.bfloat16)
+        rowbuffer = mock.Mock(return_value=("q", "s"))
+        staged_swiglu = mock.Mock()
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {"svdint4": SimpleNamespace(
+                    turing_bf16_int8_convrot_quantize=rowbuffer,
+                    turing_swiglu_int8_convrot_quantize=staged_swiglu,
+                )},
+            ),
+        ):
+            result = turing_ops._quantize_turing_int8_activation(
+                x, 256, input_act="swiglu"
+            )
+        self.assertEqual(result, ("q", "s"))
+        rowbuffer.assert_called_once_with(x, 256, swiglu=True)
+        staged_swiglu.assert_not_called()
+
     def test_w8a8_uses_shared_staged_quantizer(self):
         x = torch.ones((2, 10752), dtype=torch.bfloat16)
         weight = torch.zeros((8, 5376), dtype=torch.int8)
@@ -169,6 +212,8 @@ class BF16PolicyTest(unittest.TestCase):
         fused_swiglu = mock.Mock(return_value=(qactivation, activation_scale))
         with (
             mock.patch.object(turing_ops, "is_supported_turing_device", return_value=True),
+            mock.patch.object(kitchen_cuda, "_prefer_turing_fused_int8", return_value=False),
+            mock.patch.object(turing_ops, "_turing_cublas_int8_bf16", return_value=None),
             mock.patch.object(
                 kitchen_cuda,
                 "_int4_linear_via_int8_values",
@@ -196,6 +241,60 @@ class BF16PolicyTest(unittest.TestCase):
         self.assertEqual(fused_swiglu.call_args.args[1], 256)
         linear.assert_called_once()
         self.assertEqual(linear.call_args.args[3].shape, (8,))
+
+    def test_w8a8_fused_turing_gemm_keeps_scalar_weight_scale(self):
+        qactivation = torch.zeros((4, 256), dtype=torch.int8)
+        weight = torch.zeros((1024, 256), dtype=torch.int8)
+        activation_scale = torch.ones((4, 1), dtype=torch.float32)
+        weight_scale = torch.ones((), dtype=torch.float32)
+        expected = torch.zeros((4, 1024), dtype=torch.bfloat16)
+        with (
+            mock.patch.object(kitchen_cuda, "_prefer_turing_fused_int8", return_value=True),
+            mock.patch.object(
+                kitchen_cuda,
+                "_int8_linear_turing_quantized",
+                return_value=expected,
+            ) as fused,
+            mock.patch.object(kitchen_cuda, "_int4_linear_via_int8_values") as fallback,
+        ):
+            output = turing_ops._turing_int8_gemm(
+                qactivation,
+                weight,
+                activation_scale,
+                weight_scale,
+                None,
+                torch.bfloat16,
+            )
+        self.assertIs(output, expected)
+        self.assertEqual(fused.call_args.args[3].numel(), 1)
+        fallback.assert_not_called()
+
+    def test_w8a8_contraction_uses_bundled_bf16_epilogue_path(self):
+        qactivation = torch.zeros((4, 256), dtype=torch.int8)
+        weight = torch.zeros((64, 256), dtype=torch.int8)
+        activation_scale = torch.ones((4, 1), dtype=torch.float32)
+        weight_scale = torch.ones((), dtype=torch.float32)
+        expected = torch.zeros((4, 64), dtype=torch.bfloat16)
+        with (
+            mock.patch.object(kitchen_cuda, "_prefer_turing_fused_int8", return_value=False),
+            mock.patch.object(
+                turing_ops,
+                "_turing_cublas_int8_bf16",
+                return_value=expected,
+            ) as fast_epilogue,
+            mock.patch.object(kitchen_cuda, "_int4_linear_via_int8_values") as fallback,
+        ):
+            output = turing_ops._turing_int8_gemm(
+                qactivation,
+                weight,
+                activation_scale,
+                weight_scale,
+                None,
+                torch.bfloat16,
+            )
+        self.assertIs(output, expected)
+        self.assertEqual(fast_epilogue.call_args.args[3].numel(), 1)
+        fallback.assert_not_called()
 
     def test_w4a8_linear_uses_shared_staged_quantizer(self):
         x = torch.empty((2, 5376), dtype=torch.bfloat16)

@@ -217,7 +217,9 @@ __global__ void quantize_from_partials_kernel(
         abs_max = fmaxf(abs_max, row_partials[group]);
     }
     abs_max = block_reduce_max<kWarps>(abs_max, warp_values, &block_value);
-    const float scale = fmaxf(fminf(abs_max, finite_max<InputType>()) / 127.0f, 1.0e-30f);
+    const float scale = fmaxf(
+        fminf(abs_max, finite_max<InputType>()) * (1.0f / 127.0f),
+        1.0e-30f);
     if (tid == 0) {
         scales[row] = scale;
     }
@@ -228,6 +230,155 @@ __global__ void quantize_from_partials_kernel(
         quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
         output[index] = static_cast<int8_t>(quantized);
     }
+}
+
+__device__ __forceinline__ uint16_t float_to_bf16_rn_bits(float value) {
+    const uint32_t bits = __float_as_uint(value);
+    if ((bits & 0x7fffffffU) > 0x7f800000U) {
+        return 0x7fffU;
+    }
+    uint16_t upper = static_cast<uint16_t>(bits >> 16U);
+    const uint32_t remainder = bits << 16U;
+    if (remainder > 0x80000000U ||
+        (remainder == 0x80000000U && (upper & 1U) != 0U)) {
+        ++upper;
+    }
+    return upper;
+}
+
+__device__ __forceinline__ float bf16_bits_to_float(uint16_t value) {
+    return __uint_as_float(static_cast<uint32_t>(value) << 16U);
+}
+
+template <int S>
+__device__ __forceinline__ float fht_store_bf16_absmax(
+    const float *__restrict__ src,
+    uint16_t *__restrict__ output,
+    int lane) {
+    const int base = (lane % S) + (lane / S) * (4 * S);
+    const float x0 = src[base];
+    const float x1 = src[base + S];
+    const float x2 = src[base + 2 * S];
+    const float x3 = src[base + 3 * S];
+    const float y0 = 0.5f * (x0 + x1 + x2 - x3);
+    const float y1 = 0.5f * (x0 + x1 - x2 + x3);
+    const float y2 = 0.5f * (x0 - x1 + x2 + x3);
+    const float y3 = 0.5f * (-x0 + x1 + x2 + x3);
+    output[base] = float_to_bf16_rn_bits(y0);
+    output[base + S] = float_to_bf16_rn_bits(y1);
+    output[base + 2 * S] = float_to_bf16_rn_bits(y2);
+    output[base + 3 * S] = float_to_bf16_rn_bits(y3);
+    return fmaxf(fmaxf(fabsf(y0), fabsf(y1)), fmaxf(fabsf(y2), fabsf(y3)));
+}
+
+template <bool SwiGLU>
+__device__ __forceinline__ float load_bf16_input(
+    const nv_bfloat16 *__restrict__ input,
+    int64_t row_offset,
+    int column,
+    int k) {
+    if constexpr (SwiGLU) {
+        return load_swiglu(input, row_offset, column, k);
+    }
+    return __bfloat162float(input[row_offset + column]);
+}
+
+// Whole-row ConvRot under the default 48 KiB SM75 shared-memory limit.  The
+// inactive row is stored as BF16 while each active group retains FP32 scratch.
+// This preserves the staged path's BF16 rounding but removes its global-memory
+// intermediate and second kernel launch.
+template <int BlockThreads, bool SwiGLU>
+__global__ void bf16_rowbuffer_convrot_quantize_kernel(
+    const nv_bfloat16 *__restrict__ input,
+    int8_t *__restrict__ output,
+    float *__restrict__ scales,
+    int k) {
+    constexpr int kGroupsInFlight = BlockThreads / kGroupThreads;
+    constexpr int kWarps = BlockThreads / kWarpThreads;
+
+    extern __shared__ unsigned char shared_bytes[];
+    uint16_t *row_buffer = reinterpret_cast<uint16_t *>(shared_bytes);
+    float *scratch = reinterpret_cast<float *>(row_buffer + k);
+    __shared__ float warp_values[kWarps];
+    __shared__ float block_value;
+
+    const int row = static_cast<int>(blockIdx.x);
+    const int tid = threadIdx.x;
+    const int sub = tid / kGroupThreads;
+    const int lane = tid % kGroupThreads;
+    const int groups = k / kConvRotGroup;
+    constexpr int kInputWidth = SwiGLU ? 2 : 1;
+    const int64_t input_row = static_cast<int64_t>(row) * k * kInputWidth;
+    const int64_t output_row = static_cast<int64_t>(row) * k;
+    float *buf0 = scratch + sub * (2 * kConvRotGroup);
+    float *buf1 = buf0 + kConvRotGroup;
+    float abs_max = 0.0f;
+
+    const int iterations = (groups + kGroupsInFlight - 1) / kGroupsInFlight;
+    for (int iteration = 0; iteration < iterations; ++iteration) {
+        const int group = iteration * kGroupsInFlight + sub;
+        const bool active = group < groups;
+        const int base = lane * 4;
+        const int group_column = group * kConvRotGroup;
+        const int column = group_column + base;
+        const float x0 = active ? load_bf16_input<SwiGLU>(input, input_row, column, k) : 0.0f;
+        const float x1 = active ? load_bf16_input<SwiGLU>(input, input_row, column + 1, k) : 0.0f;
+        const float x2 = active ? load_bf16_input<SwiGLU>(input, input_row, column + 2, k) : 0.0f;
+        const float x3 = active ? load_bf16_input<SwiGLU>(input, input_row, column + 3, k) : 0.0f;
+        buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
+        buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
+        buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
+        buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+        __syncthreads();
+
+        fht_stage<4>(buf1, buf0, lane);
+        __syncthreads();
+        fht_stage<16>(buf0, buf1, lane);
+        __syncthreads();
+
+        if (active) {
+            abs_max = fmaxf(
+                abs_max,
+                fht_store_bf16_absmax<64>(
+                    buf1, row_buffer + group_column, lane));
+        }
+        __syncthreads();
+    }
+
+    abs_max = block_reduce_max<kWarps>(abs_max, warp_values, &block_value);
+    const float scale = fmaxf(
+        fminf(abs_max, finite_max<nv_bfloat16>()) * (1.0f / 127.0f),
+        1.0e-30f);
+    if (tid == 0) {
+        scales[row] = scale;
+    }
+
+    const float rounded_scale = bf16_bits_to_float(float_to_bf16_rn_bits(scale));
+    for (int column = tid; column < k; column += BlockThreads) {
+        const float value = bf16_bits_to_float(row_buffer[column]);
+        const float divided = bf16_bits_to_float(
+            float_to_bf16_rn_bits(value / rounded_scale));
+        float quantized = nearbyintf(divided);
+        quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
+        output[output_row + column] = static_cast<int8_t>(quantized);
+    }
+}
+
+template <int BlockThreads, bool SwiGLU>
+void launch_bf16_rowbuffer(Tensor input, Tensor output, Tensor scales) {
+    const int rows = input.size(0);
+    const int k = output.size(1);
+    constexpr int kGroupsInFlight = BlockThreads / kGroupThreads;
+    const size_t shared_bytes =
+        static_cast<size_t>(k) * sizeof(uint16_t) +
+        kGroupsInFlight * 2 * kConvRotGroup * sizeof(float);
+    bf16_rowbuffer_convrot_quantize_kernel<BlockThreads, SwiGLU>
+        <<<rows, BlockThreads, shared_bytes, getCurrentCUDAStream()>>>(
+            static_cast<const nv_bfloat16 *>(input.ptr),
+            static_cast<int8_t *>(output.ptr),
+            static_cast<float *>(scales.ptr),
+            k);
+    checkCUDA(cudaGetLastError());
 }
 
 template <typename InputType>
@@ -271,6 +422,31 @@ void turing_swiglu_int8_convrot_quantize(Tensor input,
         launch_swiglu_quantize<half>(input, rotated, partial_absmax, output, scales);
     } else {
         throw std::runtime_error("SwiGLU staged ConvRot requires float16 or bfloat16 input");
+    }
+}
+
+void turing_bf16_int8_convrot_quantize(Tensor input,
+                                        Tensor output,
+                                        Tensor scales,
+                                        bool swiglu,
+                                        int block_threads) {
+    if (input.scalar_type() != Tensor::BF16) {
+        throw std::runtime_error("BF16 row-buffer ConvRot requires bfloat16 input");
+    }
+    if (swiglu) {
+        if (block_threads == 1024) {
+            launch_bf16_rowbuffer<1024, true>(input, output, scales);
+        } else if (block_threads == 768) {
+            launch_bf16_rowbuffer<768, true>(input, output, scales);
+        } else {
+            launch_bf16_rowbuffer<512, true>(input, output, scales);
+        }
+    } else if (block_threads == 1024) {
+        launch_bf16_rowbuffer<1024, false>(input, output, scales);
+    } else if (block_threads == 768) {
+        launch_bf16_rowbuffer<768, false>(input, output, scales);
+    } else {
+        launch_bf16_rowbuffer<512, false>(input, output, scales);
     }
 }
 

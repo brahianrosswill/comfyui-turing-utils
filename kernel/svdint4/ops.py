@@ -40,6 +40,28 @@ def turing_w4a8_linear(
     )
 
 
+def turing_dequantize_int8_bf16(
+    accumulator: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output_columns: int = -1,
+) -> torch.Tensor:
+    """Dequantize an INT32 GEMM workspace directly into packed BF16 stores."""
+    if accumulator.device.type != "cuda":
+        raise RuntimeError("SVDInt4 Turing BF16 epilogue requires CUDA tensors")
+    major, minor = torch.cuda.get_device_capability(accumulator.device)
+    if (major, minor) < (7, 5):
+        raise RuntimeError("SVDInt4 Turing BF16 epilogue requires sm75 or newer")
+    if accumulator.dtype != torch.int32 or accumulator.ndim != 2:
+        raise TypeError("accumulator must be a 2D int32 tensor")
+    return _C.turing_dequantize_int8_bf16(
+        accumulator.contiguous(),
+        activation_scale.contiguous(),
+        weight_scale.contiguous(),
+        output_columns,
+    )
+
+
 def turing_swiglu_int8_convrot_quantize(
     x: torch.Tensor,
     group_size: int = 256,
@@ -55,6 +77,27 @@ def turing_swiglu_int8_convrot_quantize(
     if x.ndim != 2:
         raise ValueError("SwiGLU ConvRot input must be 2D [M, 2K]")
     return _C.turing_swiglu_int8_convrot_quantize(x.contiguous(), group_size)
+
+
+def turing_bf16_int8_convrot_quantize(
+    x: torch.Tensor,
+    group_size: int = 256,
+    *,
+    swiglu: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Whole-row BF16 ConvRot quantization under the SM75 48 KiB limit."""
+    if x.device.type != "cuda":
+        raise RuntimeError("SVDInt4 BF16 row-buffer ConvRot requires CUDA tensors")
+    major, minor = torch.cuda.get_device_capability(x.device)
+    if (major, minor) < (7, 5):
+        raise RuntimeError("SVDInt4 BF16 row-buffer ConvRot requires sm75 or newer")
+    if x.dtype != torch.bfloat16:
+        raise TypeError("BF16 row-buffer ConvRot input must be bfloat16")
+    if x.ndim != 2:
+        raise ValueError("BF16 row-buffer ConvRot input must be 2D")
+    return _C.turing_bf16_int8_convrot_quantize(
+        x.contiguous(), group_size, swiglu
+    )
 
 
 def turing_segmented_rms_adaln(

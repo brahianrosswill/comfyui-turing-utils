@@ -188,6 +188,18 @@ def _convrot_int8_shared_memory_bytes(rows: int, hidden_size: int) -> int:
     return (hidden_size + groups_in_flight * 2 * 256) * 4
 
 
+def _convrot_int8_bf16_rowbuffer_fits(hidden_size: int) -> bool:
+    for block_threads in (1024, 768, 512):
+        groups_in_flight = block_threads // 64
+        dynamic_bytes = hidden_size * 2 + groups_in_flight * 2 * 256 * 4
+        # ptxas reserves three additional aligned words around the static
+        # warp-reduction arrays (80/112/144 bytes for 512/768/1024 threads).
+        static_bytes = (block_threads // 32 + 4) * 4
+        if dynamic_bytes + static_bytes < TURING_SHARED_MEMORY_LIMIT:
+            return True
+    return False
+
+
 def _convrot_int4_shared_memory_bytes(rows: int, hidden_size: int, element_size: int) -> int:
     if rows != 1 and hidden_size <= 4096:
         block_threads = 256
@@ -222,6 +234,17 @@ def _quantize_turing_int8_activation(
                 x2d, group_size, input_act="swiglu"
             )
         return kitchen_cuda.quantize_int8_rowwise_convrot64(x2d, group_size)
+    if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(hidden_size):
+        try:
+            from svdint4 import turing_bf16_int8_convrot_quantize
+        except (ImportError, AttributeError):
+            pass
+        else:
+            return turing_bf16_int8_convrot_quantize(
+                x2d,
+                group_size,
+                swiglu=input_act == "swiglu",
+            )
     if input_act == "swiglu":
         try:
             from svdint4 import turing_swiglu_int8_convrot_quantize
@@ -256,6 +279,141 @@ def _quantize_turing_int4_activation(x2d: torch.Tensor, group_size: int):
         )
     rotated = rotate(x2d, group_size)
     return kitchen_cuda.quantize_int4_rowwise(rotated)
+
+
+def _turing_cublas_int8_bf16(
+    qactivation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor | None:
+    """Run Kitchen's Turing cuBLAS fallback with the bundled BF16 epilogue."""
+    from comfy_kitchen.backends import cuda as kitchen_cuda
+
+    try:
+        from svdint4 import turing_dequantize_int8_bf16
+    except (ImportError, AttributeError):
+        return None
+
+    required = (
+        "_C",
+        "_cublas_int8_n_alignment",
+        "_pad_2d_cols",
+        "_pad_2d_rows",
+        "_round_up",
+        "_wrap_for_dlpack",
+        "get_cublas_workspace",
+    )
+    if not all(hasattr(kitchen_cuda, name) for name in required):
+        return None
+    if not hasattr(kitchen_cuda._C, "cublas_gemm_int8"):
+        return None
+
+    m, k = qactivation.shape
+    n = weight.shape[0]
+    padded_k = kitchen_cuda._round_up(k, 16)
+    padded_n = kitchen_cuda._round_up(
+        n, kitchen_cuda._cublas_int8_n_alignment(qactivation)
+    )
+    cublas_x = kitchen_cuda._pad_2d_cols(qactivation, padded_k)
+    cublas_weight = kitchen_cuda._pad_2d_rows(
+        kitchen_cuda._pad_2d_cols(weight, padded_k), padded_n
+    )
+    accumulator = torch.empty(
+        (m, padded_n), dtype=torch.int32, device=qactivation.device
+    )
+    stream_ptr = torch.cuda.current_stream(qactivation.device).cuda_stream
+    kitchen_cuda._C.cublas_gemm_int8(
+        kitchen_cuda._wrap_for_dlpack(cublas_x),
+        kitchen_cuda._wrap_for_dlpack(cublas_weight),
+        kitchen_cuda._wrap_for_dlpack(accumulator),
+        kitchen_cuda._wrap_for_dlpack(kitchen_cuda.get_cublas_workspace()),
+        stream_ptr,
+    )
+    return turing_dequantize_int8_bf16(
+        accumulator,
+        activation_scale,
+        weight_scale,
+        output_columns=n,
+    )
+
+
+def _turing_int8_gemm(
+    qactivation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Keep scalar scales in fused GEMMs and use the fast no-bias BF16 epilogue."""
+    from comfy_kitchen.backends import cuda as kitchen_cuda
+
+    m, k = qactivation.shape
+    n = weight.shape[0]
+    activation_scale = (
+        activation_scale.to(device=qactivation.device, dtype=torch.float32)
+        .reshape(-1)
+        .contiguous()
+    )
+    weight_scale = (
+        weight_scale.to(device=qactivation.device, dtype=torch.float32)
+        .reshape(-1)
+        .contiguous()
+    )
+    if activation_scale.numel() != m:
+        raise ValueError(
+            f"Turing W8A8 activation scale must have {m} values, "
+            f"got {activation_scale.numel()}"
+        )
+    if weight_scale.numel() not in (1, n):
+        raise ValueError(
+            f"Turing W8A8 weight scale must be scalar or have {n} values, "
+            f"got {weight_scale.numel()}"
+        )
+
+    prefer_fused = getattr(kitchen_cuda, "_prefer_turing_fused_int8", None)
+    fused_linear = getattr(kitchen_cuda, "_int8_linear_turing_quantized", None)
+    if (
+        callable(prefer_fused)
+        and prefer_fused(m, n, k)
+        and callable(fused_linear)
+    ):
+        output = fused_linear(
+            qactivation,
+            weight,
+            activation_scale,
+            weight_scale,
+            bias,
+            output_dtype,
+        )
+        if output is not None:
+            return output
+
+    if bias is None and output_dtype == torch.bfloat16:
+        output = _turing_cublas_int8_bf16(
+            qactivation,
+            weight,
+            activation_scale,
+            weight_scale,
+        )
+        if output is not None:
+            return output
+
+    quantized_linear = getattr(kitchen_cuda, "_int4_linear_via_int8_values", None)
+    if quantized_linear is None:
+        raise RuntimeError("SVDInt4 Turing W8A8 requires Kitchen quantized INT8 linear support")
+    expanded_weight_scale = weight_scale
+    if expanded_weight_scale.numel() == 1:
+        expanded_weight_scale = expanded_weight_scale.expand(n).contiguous()
+    return quantized_linear(
+        qactivation,
+        weight,
+        activation_scale,
+        expanded_weight_scale,
+        bias,
+        output_dtype,
+    )
 
 
 def int8_linear(
@@ -300,20 +458,13 @@ def int8_linear(
             x2d, convrot_groupsize
         )
 
-    # This Kitchen fallback is a generic INT8 GEMM once both operands are INT8.
-    quantized_linear = getattr(kitchen_cuda, "_int4_linear_via_int8_values", None)
-    if quantized_linear is None:
-        raise RuntimeError("SVDInt4 Turing W8A8 requires Kitchen quantized INT8 linear support")
     output_dtype = out_dtype or x.dtype
     output_channels = weight.shape[0]
-    expanded_weight_scale = weight_scale.reshape(-1)
-    if expanded_weight_scale.numel() == 1:
-        expanded_weight_scale = expanded_weight_scale.expand(output_channels).contiguous()
-    output = quantized_linear(
+    output = _turing_int8_gemm(
         qactivation,
         weight.contiguous(),
         activation_scale,
-        expanded_weight_scale,
+        weight_scale,
         bias,
         output_dtype,
     )

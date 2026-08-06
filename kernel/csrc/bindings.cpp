@@ -331,6 +331,57 @@ at::Tensor turing_w4a8_linear(at::Tensor activation,
     return output;
 }
 
+at::Tensor turing_dequantize_int8_bf16(at::Tensor accumulator,
+                                        at::Tensor activation_scale,
+                                        at::Tensor weight_scale,
+                                        int64_t output_columns) {
+    accumulator = accumulator.contiguous();
+    activation_scale = activation_scale.reshape({-1}).to(at::kFloat).contiguous();
+    weight_scale = weight_scale.reshape({-1}).to(at::kFloat).contiguous();
+    check_cuda_2d(accumulator, "accumulator");
+    TORCH_CHECK(accumulator.scalar_type() == at::kInt,
+                "accumulator must be int32");
+    TORCH_CHECK(activation_scale.is_cuda() && weight_scale.is_cuda(),
+                "scales must be CUDA tensors");
+    TORCH_CHECK(accumulator.device() == activation_scale.device() &&
+                    accumulator.device() == weight_scale.device(),
+                "accumulator and scales must use the same CUDA device");
+
+    const int64_t rows = accumulator.size(0);
+    const int64_t accumulator_columns = accumulator.size(1);
+    if (output_columns < 0) {
+        output_columns = accumulator_columns;
+    }
+    TORCH_CHECK(rows > 0 && accumulator_columns > 0,
+                "INT8 BF16 epilogue dimensions must be positive");
+    TORCH_CHECK(output_columns > 0 && output_columns <= accumulator_columns,
+                "output_columns must be positive and no larger than the accumulator width");
+    TORCH_CHECK(activation_scale.numel() == rows,
+                "activation_scale must contain one value per accumulator row");
+    TORCH_CHECK(weight_scale.numel() == 1 || weight_scale.numel() == output_columns,
+                "weight_scale must be scalar or contain one value per output column");
+    TORCH_CHECK(rows <= std::numeric_limits<int>::max() &&
+                    accumulator_columns <= std::numeric_limits<int>::max() &&
+                    output_columns <= std::numeric_limits<int>::max(),
+                "INT8 BF16 epilogue dimensions exceed the CUDA kernel range");
+
+    const at::cuda::CUDAGuard device_guard(accumulator.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major > 7 ||
+                    (properties->major == 7 && properties->minor >= 5),
+                "INT8 BF16 epilogue requires sm75 or newer");
+
+    at::Tensor output = at::empty(
+        {rows, output_columns}, accumulator.options().dtype(at::kBFloat16));
+    TorchOpContext ctx;
+    svdint4::kernels::turing_dequantize_int8_bf16(
+        from_torch(accumulator),
+        from_torch(activation_scale),
+        from_torch(weight_scale),
+        from_torch(output));
+    return output;
+}
+
 std::tuple<at::Tensor, at::Tensor> turing_swiglu_int8_convrot_quantize(
     at::Tensor input, int64_t group_size) {
     input = input.contiguous();
@@ -366,6 +417,68 @@ std::tuple<at::Tensor, at::Tensor> turing_swiglu_int8_convrot_quantize(
         from_torch(partial_absmax),
         from_torch(output),
         from_torch(scales));
+    return {output, scales};
+}
+
+std::tuple<at::Tensor, at::Tensor> turing_bf16_int8_convrot_quantize(
+    at::Tensor input, int64_t group_size, bool swiglu) {
+    input = input.contiguous();
+    check_cuda_2d(input, "input");
+    TORCH_CHECK(input.scalar_type() == at::kBFloat16,
+                "BF16 row-buffer ConvRot input must be bfloat16");
+    TORCH_CHECK(group_size == 256,
+                "BF16 row-buffer ConvRot only supports group_size=256");
+
+    const int64_t rows = input.size(0);
+    const int64_t input_columns = input.size(1);
+    TORCH_CHECK(!swiglu || input_columns % 2 == 0,
+                "SwiGLU BF16 row-buffer ConvRot input width must be even");
+    const int64_t hidden = swiglu ? input_columns / 2 : input_columns;
+    TORCH_CHECK(rows > 0 && hidden > 0 && hidden % group_size == 0,
+                "BF16 row-buffer ConvRot width must be positive and divisible by 256");
+    TORCH_CHECK(rows <= std::numeric_limits<int>::max() &&
+                    hidden <= std::numeric_limits<int>::max(),
+                "BF16 row-buffer ConvRot dimensions exceed the CUDA kernel range");
+
+    constexpr int64_t shared_limit = 48 * 1024;
+    const auto shared_bytes = [hidden](int threads) {
+        const int64_t groups_in_flight = threads / 64;
+        const int64_t dynamic_bytes =
+            hidden * static_cast<int64_t>(sizeof(uint16_t)) +
+            groups_in_flight * 2 * 256 * static_cast<int64_t>(sizeof(float));
+        // ptxas reports three additional alignment words around the static
+        // warp-reduction arrays.
+        const int64_t static_bytes =
+            (threads / 32 + 4) * static_cast<int64_t>(sizeof(float));
+        return dynamic_bytes + static_bytes;
+    };
+    int block_threads = 0;
+    for (const int candidate : {1024, 768, 512}) {
+        if (shared_bytes(candidate) < shared_limit) {
+            block_threads = candidate;
+            break;
+        }
+    }
+    TORCH_CHECK(block_threads != 0,
+                "BF16 row-buffer ConvRot cannot fit under the 48 KiB shared-memory limit");
+
+    const at::cuda::CUDAGuard device_guard(input.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major > 7 ||
+                    (properties->major == 7 && properties->minor >= 5),
+                "BF16 row-buffer ConvRot requires sm75 or newer");
+
+    at::Tensor output = at::empty(
+        {rows, hidden}, input.options().dtype(at::kChar));
+    at::Tensor scales = at::empty(
+        {rows, 1}, input.options().dtype(at::kFloat));
+    TorchOpContext ctx;
+    svdint4::kernels::turing_bf16_int8_convrot_quantize(
+        from_torch(input),
+        from_torch(output),
+        from_torch(scales),
+        swiglu,
+        block_threads);
     return {output, scales};
 }
 
@@ -480,10 +593,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("activation_scale"),
           pybind11::arg("weight_scale"),
           pybind11::arg("bias") = std::nullopt);
+    m.def("turing_dequantize_int8_bf16",
+          &turing_dequantize_int8_bf16,
+          pybind11::arg("accumulator"),
+          pybind11::arg("activation_scale"),
+          pybind11::arg("weight_scale"),
+          pybind11::arg("output_columns") = -1);
     m.def("turing_swiglu_int8_convrot_quantize",
           &turing_swiglu_int8_convrot_quantize,
           pybind11::arg("input"),
           pybind11::arg("group_size") = 256);
+    m.def("turing_bf16_int8_convrot_quantize",
+          &turing_bf16_int8_convrot_quantize,
+          pybind11::arg("input"),
+          pybind11::arg("group_size") = 256,
+          pybind11::arg("swiglu") = false);
     m.def("turing_segmented_rms_adaln",
           &turing_segmented_rms_adaln,
           pybind11::arg("input"),

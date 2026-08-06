@@ -255,16 +255,21 @@ The Turing linear dispatch reuses comfy-kitchen's official sm75 W4A4 and W8A8
 GEMM kernels. W4A8 is supplied by the local backend: it consumes the original
 packed W4 weight directly, fuses nibble unpacking, INT8 dot products, scaling,
 bias, and BF16 storage, and never materializes a full W8 copy of the weight. Its
-static shared-memory footprint is 2 KiB. W8A8 and W4A8 activation rotations use
-Kitchen's staged BF16 INT8 quantizer whenever the fused row would reach the
-48 KiB limit. For a staged SwiGLU input, the bundled quantizer folds SwiGLU into
-its first ConvRot pass, uses 16 KiB of dynamic shared memory, and avoids the
-activated BF16 intermediate. Its scale and INT8 rounding order match Kitchen's
-fused ConvRot path. W4A4 keeps fused A4 quantization while it fits and otherwise
-uses Kitchen's grouped FHT rotation followed by row-wise INT4 quantization. None
-of the three paths falls back to a dense Hadamard matmul on supported sm75
-devices. On a non-sm75 tensor the local backend constraint does not match, so
-comfy-kitchen selects its official backend.
+static shared-memory footprint is 2 KiB. For BF16 W8A8 activation rotations
+that would overflow Kitchen's FP32 whole-row buffer, the bundled quantizer keeps
+the completed row as BF16 and only the active FHT groups as FP32 scratch. It
+selects a 1024-, 768-, or 512-thread launch that remains below the default
+48 KiB limit, folds SwiGLU into the same kernel when requested, and avoids both
+the activated and rotated full-size BF16 global intermediates. Its scale and
+INT8 outputs are bit-identical to Kitchen's staged path. Wider unsupported rows
+retain the staged fallback. Scalar W8 weight scales stay scalar in the fused
+Turing GEMM, while contraction shapes use a vectorized round-to-nearest-even
+BF16 writeback after the INT32 GEMM workspace. W4A4 keeps fused A4 quantization
+while it fits and otherwise uses Kitchen's grouped FHT rotation followed by
+row-wise INT4 quantization. None of the three paths falls back to a dense
+Hadamard matmul on supported sm75 devices. On a non-sm75 tensor the local
+backend constraint does not match, so comfy-kitchen selects its official
+backend.
 
 Compatible DiT blocks on exact-sm75 GPUs also use the bundled affine
 RMSNorm+AdaLN operator. It keeps the RMS reduction and modulation arithmetic in
