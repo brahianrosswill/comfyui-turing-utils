@@ -91,16 +91,6 @@ class TuringAttentionContractTest(unittest.TestCase):
         self.assertFalse(sage.call_args.kwargs["smooth_k"])
         self.assertNotIn("variant", sage.call_args.kwargs)
 
-    def test_experimental_variant_is_rejected(self):
-        q = torch.zeros((1, 4, 32, 64), dtype=torch.bfloat16)
-        with (
-            mock.patch("attention.is_supported_turing_device", return_value=True),
-            self.assertRaisesRegex(ValueError, "Unsupported bundled Turing Sage backend"),
-        ):
-            turing_attention.turing_sage_attention(
-                mock.Mock(), q, q, q, 4, skip_reshape=True, variant="sage2"
-            )
-
     def test_bf16_unreshaped_gqa_keeps_compact_kv_heads(self):
         q = torch.zeros((1, 32, 4 * 64), dtype=torch.bfloat16)
         k = torch.zeros((1, 16, 2 * 64), dtype=torch.bfloat16)

@@ -7,7 +7,7 @@ from importlib.metadata import PackageNotFoundError, version
 import torch
 
 try:
-    from .attention import bundled_available, preflight_bundled
+    from .attention import bundled_available, normalize_attention_backend, preflight_bundled
     from .turing_ops import (
         backend_available,
         is_supported_turing_device,
@@ -16,7 +16,7 @@ try:
         register_backend,
     )
 except ImportError:
-    from attention import bundled_available, preflight_bundled
+    from attention import bundled_available, normalize_attention_backend, preflight_bundled
     from turing_ops import (
         backend_available,
         is_supported_turing_device,
@@ -111,7 +111,9 @@ def prepare_turing_runtime(
     if not is_supported_turing_device(device):
         return
 
-    bundled_attention = attention_backend in {"auto", "sage_attn", "sage", "sage_"}
+    if attention_backend is not None:
+        attention_backend = normalize_attention_backend(attention_backend)
+    bundled_attention = attention_backend in {"auto", "sage_attn"}
     needs_kernel = bool(summary.w4a4 or summary.w4a8 or summary.w8a8) or bundled_attention
     if needs_kernel:
         _check_kernel_contract()

@@ -58,14 +58,15 @@ occupancy when forced through the alternate fused GEMM.
 
 ## Attention matrix
 
-On exact sm75, `auto` and `sage_attn` select bundled `sage`; the standalone
-package is not required. The explicit loader option is also named `sage`.
-Legacy serialized `sage_` values normalize invisibly to `sage` but are no
-longer displayed.
+On exact sm75, both `auto` and the explicit `sage_attn` option select the
+bundled Sage implementation; the standalone package is not required. On other
+GPUs, `sage_attn` means the independently installed SageAttention package.
+Legacy serialized `sage`, `sage_`, `sage_hybrid`, and `turing_sage` values
+normalize invisibly to `sage_attn` and are not displayed by either loader.
 
 | Option | Q/K path | Smoothing | PV path |
 |---|---|---|---|
-| `sage` | INT8, per-16-token Q-warp scales | disabled | FP16 V tiles with direct FP32 accumulation |
+| `sage_attn` on Turing | INT8, per-16-token Q-warp scales | disabled | FP16 V tiles with direct FP32 accumulation |
 
 Integer Q/K MMA accumulates into INT32. The stable facade supports FP16 and
 BF16 Q/K/V, HND/NHD, GQA, causal mode, unequal Q/KV lengths, head dimensions
@@ -87,6 +88,13 @@ are documented in
 On non-Turing GPUs, installed standalone Sage has priority, followed by Flash
 Attention and PyTorch SDPA. An all-FP32 call that cannot enter external Sage
 uses ComfyUI's PyTorch attention implementation deterministically.
+
+The loader log reports `sage_attn via bundled_turing_sage` when `auto` or
+`sage_attn` is bound to the local sm75 implementation. The first real bundled
+call also reports dtype, layout, and Q/K/V shapes. Any unsupported call reports
+its fallback reason once, so a masked, disabled-low-precision, or incompatible
+shape can no longer turn a performance regression into an invisible backend
+change.
 
 ## Validation boundary
 

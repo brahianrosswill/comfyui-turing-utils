@@ -101,6 +101,18 @@ class BF16PolicyTest(unittest.TestCase):
                 NO_CONVROT, torch.device("cuda", 0), "auto"
             )
 
+    def test_legacy_sage_alias_preflights_the_canonical_bundled_backend(self):
+        with (
+            mock.patch("precision.is_supported_turing_device", return_value=True),
+            mock.patch("precision._check_kernel_contract"),
+            mock.patch("precision.bundled_available", return_value=True),
+            mock.patch("precision.preflight_bundled") as preflight,
+        ):
+            bf16_policy.prepare_turing_runtime(
+                NO_CONVROT, torch.device("cuda", 0), "sage_"
+            )
+        preflight.assert_called_once_with(torch.device("cuda", 0))
+
     def test_turing_runtime_rejects_stale_independent_kernel(self):
         with (
             mock.patch.dict(

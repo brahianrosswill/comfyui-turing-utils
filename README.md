@@ -212,8 +212,10 @@ The script writes original metadata and basic provenance to
   follows each layer's activation format, while `true` forces INT8 GEMM
   activations. W4A8 requires an enabled comfy-kitchen CUDA backend because its
   eager fallback always computes W4A4. On Turing, `patch_attention=auto`
-  selects the stable bundled `sage`; elsewhere it selects installed
+  selects the stable bundled Sage implementation; elsewhere it selects installed
   SageAttention first, Flash Attention second, and PyTorch SDPA as the fallback.
+  The explicit `sage_attn` option follows the same device-dependent rule. Old
+  serialized `sage` and `sage_` values remain accepted as hidden aliases.
   BF16 activation storage is selected automatically when the detected model
   declares BF16 inference support; there is no loader-only dtype switch.
   Legacy per-row W8 ConvRot descriptors with a missing format or
@@ -231,7 +233,7 @@ The script writes original metadata and basic provenance to
   Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
   returns a ComfyUI `MODEL`. `patch_attention=auto` uses the same SageAttention,
   Flash Attention, then PyTorch SDPA priority on non-Turing GPUs. On a supported
-  Turing GPU, `auto` selects the bundled `sage` implementation. On non-Turing
+  Turing GPU, `auto` selects the bundled Sage implementation. On non-Turing
   GPUs, `auto` prefers the independently installed SageAttention package and
   falls back through Flash Attention to PyTorch SDPA.
 
@@ -291,7 +293,7 @@ intermediate. It is enabled automatically after model load and has no loader
 control. Other architectures and unmatched block layouts retain their normal
 ComfyUI implementation.
 
-The bundled `sage` backend is derived from wjie98's full SM75 path and does not
+The bundled Sage backend is derived from wjie98's full SM75 path and does not
 import or require the standalone `sageattention` package. It uses per-warp
 INT8 Q/K and direct FP32 probability/value accumulation. It accepts FP16 or
 BF16 input/output, HND or NHD layout, causal attention, GQA, different Q/KV
@@ -307,7 +309,10 @@ from [`kernel/experiments/turing_sage_variants`](kernel/experiments/turing_sage_
 
 ComfyUI attention masks, disabled low-precision attention, and head dimensions
 outside that contract use the original ComfyUI attention function without a
-dtype conversion. The standalone Sage backend on non-Turing GPUs uses
+dtype conversion and emit a one-time fallback reason. Startup records whether
+`sage_attn` resolved to `bundled_turing_sage` or the ComfyUI-provided external
+implementation, and the first bundled call records its dtype, layout, and Q/K/V
+shape. The standalone Sage backend on non-Turing GPUs uses
 ComfyUI's PyTorch attention for an all-FP32 boundary. Failure of a required
 SM75 kernel is reported before model allocation instead of silently reverting
 the whole model to FP32. The bundled-vs-official INT8 and INT4 precision

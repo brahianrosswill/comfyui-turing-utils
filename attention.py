@@ -17,8 +17,10 @@ except ImportError:
 LOG = logging.getLogger("comfyui-svdint4")
 SUPPORTED_KERNEL_DTYPES = (torch.float16, torch.bfloat16)
 SUPPORTED_INPUT_DTYPES = (*SUPPORTED_KERNEL_DTYPES, torch.float32)
-_PREFLIGHTED_DEVICES: set[tuple[int, str]] = set()
+_PREFLIGHTED_DEVICES: set[int] = set()
 _LOGGED_FP32_COMPAT = False
+_LOGGED_TURING_KERNELS: set[tuple[int, torch.dtype, int]] = set()
+_LOGGED_TURING_FALLBACKS: set[str] = set()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -41,19 +43,23 @@ def _normalize_key(value: str) -> str:
 def register_attention_backend(backend: AttentionBackend) -> None:
     if backend.option in _BACKENDS:
         raise ValueError(f"duplicate attention backend option: {backend.option}")
+    normalized_aliases = {
+        _normalize_key(alias) for alias in (backend.option, backend.label, *backend.aliases)
+    }
+    collisions = {
+        alias: _ALIASES[alias] for alias in normalized_aliases if alias in _ALIASES
+    }
+    if collisions:
+        details = ", ".join(
+            f"{alias!r} is already owned by {option!r}"
+            for alias, option in sorted(collisions.items())
+        )
+        raise ValueError(f"attention backend alias collision: {details}")
     _BACKENDS[backend.option] = backend
-    for alias in (backend.option, backend.label, *backend.aliases):
-        _ALIASES[_normalize_key(alias)] = backend.option
+    for alias in normalized_aliases:
+        _ALIASES[alias] = backend.option
 
 
-register_attention_backend(
-    AttentionBackend(
-        option="sage",
-        attention_function=None,
-        label="sage",
-        aliases=("sage_", "sage_hybrid", "turing_sage", "turing_sage_hybrid"),
-    )
-)
 register_attention_backend(
     AttentionBackend(
         option="auto",
@@ -68,7 +74,15 @@ register_attention_backend(
         attention_function="sage",
         label="sage attn",
         install_hint="Install sageattention in the ComfyUI Python environment.",
-        aliases=("sageattention", "sage_attention"),
+        aliases=(
+            "sage",
+            "sage_",
+            "sageattention",
+            "sage_attention",
+            "sage_hybrid",
+            "turing_sage",
+            "turing_sage_hybrid",
+        ),
     )
 )
 register_attention_backend(
@@ -93,7 +107,7 @@ AUTO_BACKEND_PRIORITY = ("sage_attn", "flash_attn", "sdpa")
 
 
 def attention_backend_choices() -> tuple[str, ...]:
-    return ("auto", "sage", "sage_attn", "flash_attn", "sdpa")
+    return tuple(_BACKENDS)
 
 
 def normalize_attention_backend(value: str | None) -> str:
@@ -157,19 +171,16 @@ def _sageattn(*args, **kwargs):
     return turing_sage.sageattn(*args, **kwargs)
 
 
-def preflight_bundled(device: torch.device, variant: str = "sage") -> None:
+def preflight_bundled(device: torch.device) -> None:
     if not is_supported_turing_device(device):
         raise RuntimeError(f"unsupported Turing device {device}")
     index = device.index if device.index is not None else torch.cuda.current_device()
-    if variant not in {"sage", "sage_"}:
-        raise ValueError(f"unknown bundled Turing Sage backend: {variant}")
-    key = (index, "sage")
-    if key in _PREFLIGHTED_DEVICES:
+    if index in _PREFLIGHTED_DEVICES:
         return
     from svdint4.turing_sage import preflight
 
     preflight(device)
-    _PREFLIGHTED_DEVICES.add(key)
+    _PREFLIGHTED_DEVICES.add(index)
 
 
 def _reshape_qkv(q, k, v, heads: int, enable_gqa: bool):
@@ -188,6 +199,22 @@ def _reshape_qkv(q, k, v, heads: int, enable_gqa: bool):
     return q, k, v, batch, head_dim
 
 
+def _bundled_fallback(
+    fallback: Callable,
+    reason: str,
+    fallback_args: tuple,
+    fallback_kwargs: dict,
+):
+    if reason not in _LOGGED_TURING_FALLBACKS:
+        LOG.warning(
+            "Bundled Turing Sage is falling back to ComfyUI attention (%s); "
+            "this message is emitted once per reason",
+            reason,
+        )
+        _LOGGED_TURING_FALLBACKS.add(reason)
+    return fallback(*fallback_args, **fallback_kwargs)
+
+
 def turing_sage_attention(
     fallback: Callable,
     q: torch.Tensor,
@@ -198,7 +225,6 @@ def turing_sage_attention(
     attn_precision=None,
     skip_reshape: bool = False,
     skip_output_reshape: bool = False,
-    variant: str = "sage",
     **kwargs,
 ) -> torch.Tensor:
     global _LOGGED_FP32_COMPAT
@@ -211,37 +237,83 @@ def turing_sage_attention(
         "skip_output_reshape": skip_output_reshape,
         **kwargs,
     }
-    if (
-        not is_supported_turing_device(q.device)
-        or mask is not None
-        or kwargs.get("low_precision_attention", True) is False
-    ):
-        return fallback(*fallback_args, **fallback_kwargs)
+    if not is_supported_turing_device(q.device):
+        return _bundled_fallback(
+            fallback,
+            "Q/K/V are not on a supported sm75 GPU",
+            fallback_args,
+            fallback_kwargs,
+        )
+    if mask is not None:
+        return _bundled_fallback(
+            fallback,
+            "an attention mask was supplied",
+            fallback_args,
+            fallback_kwargs,
+        )
+    if kwargs.get("low_precision_attention", True) is False:
+        return _bundled_fallback(
+            fallback,
+            "low_precision_attention=False",
+            fallback_args,
+            fallback_kwargs,
+        )
     if q.dtype != k.dtype or q.dtype != v.dtype:
         raise RuntimeError(
-            f"Turing {variant} requires matching Q/K/V dtypes, got {q.dtype}, {k.dtype}, {v.dtype}"
+            f"Turing Sage requires matching Q/K/V dtypes, got {q.dtype}, {k.dtype}, {v.dtype}"
         )
     if q.dtype not in SUPPORTED_INPUT_DTYPES:
-        raise RuntimeError(f"Turing {variant} supports FP16, BF16, or FP32 Q/K/V, got {q.dtype}")
+        raise RuntimeError(f"Turing Sage supports FP16, BF16, or FP32 Q/K/V, got {q.dtype}")
     if q.device != k.device or q.device != v.device:
-        raise RuntimeError(f"Turing {variant} requires Q/K/V on the same CUDA device")
+        raise RuntimeError("Turing Sage requires Q/K/V on the same CUDA device")
 
     input_dtype = q.dtype
     enable_gqa = bool(kwargs.get("enable_gqa", False))
     if skip_reshape:
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or q.shape[1] != heads:
-            return fallback(*fallback_args, **fallback_kwargs)
+            return _bundled_fallback(
+                fallback,
+                "skip_reshape Q/K/V layout is incompatible",
+                fallback_args,
+                fallback_kwargs,
+            )
         batch, _, _, head_dim = q.shape
         tensor_layout = "HND"
     else:
         try:
             q, k, v, batch, head_dim = _reshape_qkv(q, k, v, heads, enable_gqa)
         except ValueError:
-            return fallback(*fallback_args, **fallback_kwargs)
+            return _bundled_fallback(
+                fallback,
+                "unreshaped Q/K/V layout is incompatible",
+                fallback_args,
+                fallback_kwargs,
+            )
         tensor_layout = "NHD"
 
     if head_dim <= 0 or head_dim > 128:
-        return fallback(*fallback_args, **fallback_kwargs)
+        return _bundled_fallback(
+            fallback,
+            f"head_dim={head_dim} is outside the supported range",
+            fallback_args,
+            fallback_kwargs,
+        )
+
+    index = q.device.index if q.device.index is not None else torch.cuda.current_device()
+    kernel_key = (index, input_dtype, head_dim)
+    if kernel_key not in _LOGGED_TURING_KERNELS:
+        LOG.info(
+            "Bundled Turing Sage active: device=%s dtype=%s layout=%s "
+            "Q=%s K=%s V=%s heads=%d",
+            q.device,
+            input_dtype,
+            tensor_layout,
+            tuple(q.shape),
+            tuple(k.shape),
+            tuple(v.shape),
+            heads,
+        )
+        _LOGGED_TURING_KERNELS.add(kernel_key)
 
     if input_dtype == torch.float32:
         if not _LOGGED_FP32_COMPAT:
@@ -253,8 +325,6 @@ def turing_sage_attention(
         k = k.to(torch.bfloat16)
         v = v.to(torch.bfloat16)
 
-    if variant not in {"sage", "sage_"}:
-        raise ValueError(f"Unsupported bundled Turing Sage backend: {variant}")
     output = _sageattn(
         q,
         k,
@@ -273,15 +343,13 @@ def turing_sage_attention(
     return result.to(input_dtype) if input_dtype == torch.float32 else result
 
 
-def _bundled_turing_variant(option: str, device: torch.device | None) -> str | None:
+def _uses_bundled_turing_sage(option: str, device: torch.device | None) -> bool:
     option = normalize_attention_backend(option)
-    if device is None or not is_supported_turing_device(device):
-        if option == "sage":
-            raise RuntimeError(f"Attention backend {option!r} requires an NVIDIA sm75 Turing GPU")
-        return None
-    if option in {"auto", "sage_attn"}:
-        return "sage"
-    return option if option == "sage" else None
+    return bool(
+        device is not None
+        and is_supported_turing_device(device)
+        and option in {"auto", "sage_attn"}
+    )
 
 
 def _dtype_compatible_fallback(original: Callable, *args, **kwargs):
@@ -300,25 +368,27 @@ def _dtype_compatible_fallback(original: Callable, *args, **kwargs):
 
 def make_attention_override(option: str, device: torch.device | None = None) -> Callable:
     option = normalize_attention_backend(option)
-    bundled_variant = _bundled_turing_variant(option, device)
-    if bundled_variant is not None:
+    bundled_turing = _uses_bundled_turing_sage(option, device)
+    if bundled_turing:
         if not bundled_available():
             raise RuntimeError(
                 "The bundled Turing Sage extensions are unavailable. "
                 "Rebuild svdint4-kernel with SVDINT4_ARCH_LIST including 7.5."
             )
-        preflight_bundled(device, bundled_variant)
-        backend = AttentionBackend(bundled_variant, None, f"bundled Turing {bundled_variant}")
+        preflight_bundled(device)
+        backend = _BACKENDS["sage_attn"]
         target = turing_sage_attention
+        implementation = "bundled_turing_sage"
     else:
         backend, target = _select_attention_backend(option)
+        implementation = f"comfy:{backend.attention_function}"
 
     def attention_override(original: Callable, *args, **kwargs):
         fallback = lambda *fallback_args, **fallback_kwargs: _dtype_compatible_fallback(
             original, *fallback_args, **fallback_kwargs
         )
-        if bundled_variant is not None:
-            return target(fallback, *args, variant=bundled_variant, **kwargs)
+        if bundled_turing:
+            return target(fallback, *args, **kwargs)
         if (
             backend.option == "sage_attn"
             and len(args) >= 3
@@ -329,6 +399,7 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
         return target(*args, **kwargs)
 
     attention_override.svdint4_attention_backend = backend.option
+    attention_override.svdint4_attention_implementation = implementation
     return attention_override
 
 
@@ -337,7 +408,14 @@ def apply_attention_backend(model, option: str, device: torch.device | None = No
     transformer_options = model.model_options.setdefault("transformer_options", {})
     override = make_attention_override(option, device=device)
     selected = override.svdint4_attention_backend
+    implementation = override.svdint4_attention_implementation
     transformer_options["optimized_attention_override"] = override
     transformer_options["svdint4_attention_backend"] = selected
-    LOG.info("SVDInt4 attention backend override: %s (requested %s)", selected, option)
+    transformer_options["svdint4_attention_implementation"] = implementation
+    LOG.info(
+        "SVDInt4 attention backend override: %s via %s (requested %s)",
+        selected,
+        implementation,
+        option,
+    )
     return model
