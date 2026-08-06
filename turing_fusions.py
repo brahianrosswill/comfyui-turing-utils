@@ -9,11 +9,6 @@ from collections.abc import Sequence
 
 import torch
 
-try:
-    from .turing_profile import cuda_region, profile_block
-except ImportError:
-    from turing_profile import cuda_region, profile_block
-
 
 LOG = logging.getLogger("comfyui-svdint4")
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -133,42 +128,17 @@ def _fused_block_forward(
             transformer_options=transformer_options,
         )
 
-    with profile_block(x):
-        with cuda_region("phase.adaln_proj", x):
-            (
-                shift_msa,
-                scale_msa,
-                gate_msa,
-                shift_mlp,
-                scale_mlp,
-                gate_mlp,
-            ) = self.adaln_proj(t_emb)
-        with cuda_region("phase.norm1_adaln", x):
-            h = segmented_rms_adaln(
-                self.norm1, x, shift_msa, scale_msa, mod_segments
-            )
-        model_module = sys.modules[type(self).__module__]
-        with cuda_region("phase.attention", x):
-            attention_output = self.attn(
-                h,
-                rope_freqs=rope_freqs,
-                transformer_options=transformer_options,
-            )
-        with cuda_region("phase.gate1", x):
-            x = model_module._mod_gate(
-                x,
-                gate_msa,
-                attention_output,
-                mod_segments,
-            )
-        with cuda_region("phase.norm2_adaln", x):
-            h = segmented_rms_adaln(
-                self.norm2, x, shift_mlp, scale_mlp, mod_segments
-            )
-        with cuda_region("phase.mlp", x):
-            mlp_output = self.mlp(h)
-        with cuda_region("phase.gate2", x):
-            return model_module._mod_gate(x, gate_mlp, mlp_output, mod_segments)
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
+    h = segmented_rms_adaln(self.norm1, x, shift_msa, scale_msa, mod_segments)
+    model_module = sys.modules[type(self).__module__]
+    x = model_module._mod_gate(
+        x,
+        gate_msa,
+        self.attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options),
+        mod_segments,
+    )
+    h = segmented_rms_adaln(self.norm2, x, shift_mlp, scale_mlp, mod_segments)
+    return model_module._mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
 
 
 def _compatible_block(block: torch.nn.Module) -> bool:

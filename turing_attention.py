@@ -9,10 +9,8 @@ import torch
 
 try:
     from .turing_ops import is_supported_turing_device
-    from .turing_profile import cuda_region
 except ImportError:
     from turing_ops import is_supported_turing_device
-    from turing_profile import cuda_region
 
 
 LOG = logging.getLogger("comfyui-svdint4")
@@ -93,8 +91,7 @@ def attention(
         or mask is not None
         or kwargs.get("low_precision_attention", True) is False
     ):
-        with cuda_region("detail.attention.original_fallback", q):
-            return original(*fallback_args, **fallback_kwargs)
+        return original(*fallback_args, **fallback_kwargs)
     if q.dtype != k.dtype or q.dtype != v.dtype:
         raise RuntimeError(f"Turing SageAttention2 requires matching Q/K/V dtypes, got {q.dtype}, {k.dtype}, {v.dtype}")
     if q.dtype not in SUPPORTED_INPUT_DTYPES:
@@ -107,21 +104,18 @@ def attention(
     enable_gqa = bool(kwargs.get("enable_gqa", False))
     if skip_reshape:
         if q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or q.shape[1] != heads:
-            with cuda_region("detail.attention.layout_fallback", q):
-                return original(*fallback_args, **fallback_kwargs)
+            return original(*fallback_args, **fallback_kwargs)
         batch, _, _, head_dim = q.shape
         tensor_layout = "HND"
     else:
         try:
             q, k, v, batch, head_dim = _reshape_qkv(q, k, v, heads, enable_gqa)
         except ValueError:
-            with cuda_region("detail.attention.reshape_fallback", q):
-                return original(*fallback_args, **fallback_kwargs)
+            return original(*fallback_args, **fallback_kwargs)
         tensor_layout = "NHD"
 
     if head_dim <= 0 or head_dim > 128:
-        with cuda_region("detail.attention.head_dim_fallback", q):
-            return original(*fallback_args, **fallback_kwargs)
+        return original(*fallback_args, **fallback_kwargs)
 
     if input_dtype == torch.float32:
         if not _LOGGED_FP32_COMPAT:
@@ -130,34 +124,28 @@ def attention(
                 "to BF16 for the attention kernel and restoring FP32 output"
             )
             _LOGGED_FP32_COMPAT = True
-        with cuda_region("detail.attention.fp32_to_bf16", q):
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
-            v = v.to(torch.bfloat16)
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
 
-    with cuda_region("detail.attention.sage2", q):
-        output = _sageattn(
-            q,
-            k,
-            v,
-            tensor_layout=tensor_layout,
-            is_causal=bool(kwargs.get("is_causal", False)),
-            sm_scale=kwargs.get("scale"),
-            smooth_k=False,
-        )
-    with cuda_region("detail.attention.output_layout", output):
-        if tensor_layout == "HND":
-            if skip_output_reshape:
-                result = output
-            else:
-                result = output.transpose(1, 2).reshape(
-                    batch, -1, heads * head_dim
-                )
-        elif skip_output_reshape:
-            result = output.transpose(1, 2)
+    output = _sageattn(
+        q,
+        k,
+        v,
+        tensor_layout=tensor_layout,
+        is_causal=bool(kwargs.get("is_causal", False)),
+        sm_scale=kwargs.get("scale"),
+        smooth_k=False,
+    )
+    if tensor_layout == "HND":
+        if skip_output_reshape:
+            result = output
         else:
-            result = output.reshape(batch, -1, heads * head_dim)
+            result = output.transpose(1, 2).reshape(batch, -1, heads * head_dim)
+    elif skip_output_reshape:
+        result = output.transpose(1, 2)
+    else:
+        result = output.reshape(batch, -1, heads * head_dim)
     if result.dtype != input_dtype:
-        with cuda_region("detail.attention.restore_input_dtype", result):
-            result = result.to(input_dtype)
+        result = result.to(input_dtype)
     return result

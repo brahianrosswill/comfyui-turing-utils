@@ -5,11 +5,6 @@ import sys
 
 import torch
 
-try:
-    from .turing_profile import cuda_region
-except ImportError:
-    from turing_profile import cuda_region
-
 
 LOG = logging.getLogger("comfyui-svdint4")
 BACKEND_NAME = "svdint4_turing"
@@ -30,19 +25,6 @@ _NVIDIA_TURING_WITHOUT_TENSOR_CORES = (
 )
 _PREFLIGHTED_DEVICES: set[int] = set()
 _PREFLIGHTED_KITCHEN: set[tuple[int, bool, bool]] = set()
-
-
-_H3_LINEAR_ROLES = {
-    (5376, 21504): "qkv",
-    (7168, 5376): "out_proj",
-    (5376, 28672): "fc1",
-    (14336, 5376): "fc2",
-}
-
-
-def _linear_profile_label(k: int, n: int) -> str:
-    role = _H3_LINEAR_ROLES.get((k, n), "other")
-    return f"detail.linear.{role}.k{k}.n{n}"
 
 
 def is_supported_turing_device(device: torch.device) -> bool:
@@ -329,35 +311,31 @@ def _turing_cublas_int8_bf16(
 
     m, k = qactivation.shape
     n = weight.shape[0]
-    label = _linear_profile_label(k, n)
-    with cuda_region(f"{label}.cublas_prepare", qactivation):
-        padded_k = kitchen_cuda._round_up(k, 16)
-        padded_n = kitchen_cuda._round_up(
-            n, kitchen_cuda._cublas_int8_n_alignment(qactivation)
-        )
-        cublas_x = kitchen_cuda._pad_2d_cols(qactivation, padded_k)
-        cublas_weight = kitchen_cuda._pad_2d_rows(
-            kitchen_cuda._pad_2d_cols(weight, padded_k), padded_n
-        )
-        accumulator = torch.empty(
-            (m, padded_n), dtype=torch.int32, device=qactivation.device
-        )
+    padded_k = kitchen_cuda._round_up(k, 16)
+    padded_n = kitchen_cuda._round_up(
+        n, kitchen_cuda._cublas_int8_n_alignment(qactivation)
+    )
+    cublas_x = kitchen_cuda._pad_2d_cols(qactivation, padded_k)
+    cublas_weight = kitchen_cuda._pad_2d_rows(
+        kitchen_cuda._pad_2d_cols(weight, padded_k), padded_n
+    )
+    accumulator = torch.empty(
+        (m, padded_n), dtype=torch.int32, device=qactivation.device
+    )
     stream_ptr = torch.cuda.current_stream(qactivation.device).cuda_stream
-    with cuda_region(f"{label}.cublas_int32", qactivation):
-        kitchen_cuda._C.cublas_gemm_int8(
-            kitchen_cuda._wrap_for_dlpack(cublas_x),
-            kitchen_cuda._wrap_for_dlpack(cublas_weight),
-            kitchen_cuda._wrap_for_dlpack(accumulator),
-            kitchen_cuda._wrap_for_dlpack(kitchen_cuda.get_cublas_workspace()),
-            stream_ptr,
-        )
-    with cuda_region(f"{label}.bf16_epilogue", qactivation):
-        return turing_dequantize_int8_bf16(
-            accumulator,
-            activation_scale,
-            weight_scale,
-            output_columns=n,
-        )
+    kitchen_cuda._C.cublas_gemm_int8(
+        kitchen_cuda._wrap_for_dlpack(cublas_x),
+        kitchen_cuda._wrap_for_dlpack(cublas_weight),
+        kitchen_cuda._wrap_for_dlpack(accumulator),
+        kitchen_cuda._wrap_for_dlpack(kitchen_cuda.get_cublas_workspace()),
+        stream_ptr,
+    )
+    return turing_dequantize_int8_bf16(
+        accumulator,
+        activation_scale,
+        weight_scale,
+        output_columns=n,
+    )
 
 
 def _turing_int8_gemm(
@@ -373,7 +351,6 @@ def _turing_int8_gemm(
 
     m, k = qactivation.shape
     n = weight.shape[0]
-    label = _linear_profile_label(k, n)
     activation_scale = (
         activation_scale.to(device=qactivation.device, dtype=torch.float32)
         .reshape(-1)
@@ -402,15 +379,14 @@ def _turing_int8_gemm(
         and prefer_fused(m, n, k)
         and callable(fused_linear)
     ):
-        with cuda_region(f"{label}.fused_int8_gemm", qactivation):
-            output = fused_linear(
-                qactivation,
-                weight,
-                activation_scale,
-                weight_scale,
-                bias,
-                output_dtype,
-            )
+        output = fused_linear(
+            qactivation,
+            weight,
+            activation_scale,
+            weight_scale,
+            bias,
+            output_dtype,
+        )
         if output is not None:
             return output
 
@@ -430,15 +406,14 @@ def _turing_int8_gemm(
     expanded_weight_scale = weight_scale
     if expanded_weight_scale.numel() == 1:
         expanded_weight_scale = expanded_weight_scale.expand(n).contiguous()
-    with cuda_region(f"{label}.generic_int8_gemm", qactivation):
-        return quantized_linear(
-            qactivation,
-            weight,
-            activation_scale,
-            expanded_weight_scale,
-            bias,
-            output_dtype,
-        )
+    return quantized_linear(
+        qactivation,
+        weight,
+        activation_scale,
+        expanded_weight_scale,
+        bias,
+        output_dtype,
+    )
 
 
 def int8_linear(
@@ -454,39 +429,34 @@ def int8_linear(
     from comfy_kitchen.backends import cuda as kitchen_cuda
     from comfy_kitchen.backends._activations import apply_input_act
 
-    k = weight.shape[1]
-    n = weight.shape[0]
-    label = _linear_profile_label(k, n)
     if (
         x.dtype != torch.bfloat16
         or not is_supported_turing_device(x.device)
         or not convrot
         or convrot_groupsize != 256
     ):
-        with cuda_region(f"{label}.kitchen_delegate.{x.dtype}", x):
-            return kitchen_cuda.int8_linear(
-                x,
-                weight,
-                weight_scale,
-                bias=bias,
-                out_dtype=out_dtype,
-                convrot=convrot,
-                convrot_groupsize=convrot_groupsize,
-                input_act=input_act,
-            )
+        return kitchen_cuda.int8_linear(
+            x,
+            weight,
+            weight_scale,
+            bias=bias,
+            out_dtype=out_dtype,
+            convrot=convrot,
+            convrot_groupsize=convrot_groupsize,
+            input_act=input_act,
+        )
 
     original_shape = x.shape
     x2d = x.reshape(-1, original_shape[-1]).contiguous()
-    with cuda_region(f"{label}.convrot_quant", x2d):
-        if input_act == "swiglu":
-            qactivation, activation_scale = _quantize_turing_int8_activation(
-                x2d, convrot_groupsize, input_act="swiglu"
-            )
-        else:
-            x2d = apply_input_act(x2d, input_act)
-            qactivation, activation_scale = _quantize_turing_int8_activation(
-                x2d, convrot_groupsize
-            )
+    if input_act == "swiglu":
+        qactivation, activation_scale = _quantize_turing_int8_activation(
+            x2d, convrot_groupsize, input_act="swiglu"
+        )
+    else:
+        x2d = apply_input_act(x2d, input_act)
+        qactivation, activation_scale = _quantize_turing_int8_activation(
+            x2d, convrot_groupsize
+        )
 
     output_dtype = out_dtype or x.dtype
     output_channels = weight.shape[0]
