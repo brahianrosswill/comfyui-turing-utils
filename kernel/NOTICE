@@ -1,11 +1,3 @@
-svdint4 includes an Apache-2.0 derived minimal binding around the Nunchaku
-W4A4/SVDQuant CUDA kernel path.
-
-The package exposes INT4 GEMM, activation quantization, SVD correction, packed
-Turing W4A8, and the bundled production Turing Sage attention path. Model
-wrappers, RoPE fusion, W8A8, AWQ, NVFP4, cache logic, and pipeline integrations
-are intentionally omitted.
-
 The Turing ConvRot quantizers, segmented RMSNorm+AdaLN kernel, and W4A8 SM75
 GEMM tile/epilogue policy under `csrc/turing/` are derived from comfy-kitchen's
 Apache-2.0 CUDA implementation:
@@ -19,17 +11,6 @@ The packed Turing W4A8 Tensor Core path uses NVIDIA CUTLASS headers:
 CUTLASS is licensed under the BSD 3-Clause License. Its license text is kept
 in `LICENSES/cutlass-LICENSE.txt`.
 
-The CUDA kernel subset under csrc/svdint4 is derived from Nunchaku:
-
-  https://github.com/nunchaku-ai/nunchaku
-
-Nunchaku is licensed under the Apache License, Version 2.0. A copy of the
-original license text is kept in LICENSES/nunchaku-LICENCE.txt.
-
-The derived subset has been reduced to the files required for INT4 GEMM,
-activation quantization, and SVD correction dispatch. The package build no
-longer depends on a sibling nunchaku checkout.
-
 The SM75 attention sources are derived from wjie98's Apache-2.0 SageAttention
 branch `feature/turing-sm75-backend`, commit
 `abc695cb9ed9572deb83fd9bb85f0fb815347ebd`, itself derived from SageAttention:
@@ -41,4 +22,4 @@ The vendored CUDA and Python support is kept under `csrc/turing/sage` and
 `svdint4/turing_sage`. Unstable Sage1/Sage2 research is excluded from the
 default bindings and documented under `experiments/turing_sage_variants`.
 SageAttention is licensed under the Apache License, Version 2.0; its license
-text is in LICENSES/sageattention-LICENSE.txt.
+text is in `LICENSES/sageattention-LICENSE.txt`.

@@ -14,7 +14,6 @@ sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 import attention as attention_backends  # noqa: E402
-import svdint4_nodes  # noqa: E402
 from comfy.ldm.modules import attention as comfy_attention  # noqa: E402
 
 
@@ -50,16 +49,6 @@ class AttentionBackendsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "alias collision"):
             attention_backends.register_attention_backend(backend)
         self.assertNotIn("test_collision", attention_backends.attention_backend_choices())
-
-    def test_svdint4_node_defaults_to_auto(self):
-        with mock.patch("svdint4_nodes._model_names", return_value=[]):
-            patch_attention = svdint4_nodes.SVDInt4DiffusionModelLoader.INPUT_TYPES()["optional"]["patch_attention"]
-
-        self.assertEqual(
-            patch_attention[0],
-            ("auto", "sage_attn", "flash_attn", "sdpa"),
-        )
-        self.assertEqual(patch_attention[1]["default"], "auto")
 
     def test_auto_prefers_sage(self):
         model = FakeModel()

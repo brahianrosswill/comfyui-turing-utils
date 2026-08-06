@@ -72,7 +72,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn("arch=compute_75,code=compute_75", flags)
         self.assertNotIn("arch=compute_86,code=sm_86", flags)
         self.assertNotIn("-DSVDINT4_EXPERIMENTAL_SAGE_VARIANTS", flags)
-        self.assertEqual(setup.call_args.kwargs["version"], "0.6.2")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.7.0")
         self.assertNotIn(
             "svdint4.turing_sage2", setup.call_args.kwargs["packages"]
         )

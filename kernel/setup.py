@@ -343,8 +343,6 @@ core_ext = CUDAExtension(
     name="svdint4._C",
     sources=[
         "csrc/bindings.cpp",
-        "csrc/svdint4/dispatcher.cu",
-        "csrc/svdint4/gemm_instantiations.cu",
         "csrc/turing/bf16_epilogue.cu",
         "csrc/turing/convrot_quant.cu",
         "csrc/turing/segmented_rms_adaln.cu",
@@ -416,7 +414,7 @@ if _includes_sm75():
 
 setup(
     name="svdint4-kernel",
-    version="0.6.2",
+    version="0.7.0",
     packages=find_packages(exclude=("svdint4.turing_sage2", "svdint4.turing_sage2.*")),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

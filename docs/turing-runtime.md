@@ -14,7 +14,7 @@ checkpoint metadata
   -> install attention override
 ```
 
-Diffusion, packed SVDInt4, and CLIP loaders prepare their own runtime. Loading a
+Diffusion and CLIP loaders prepare their own runtime. Loading a
 text encoder therefore does not depend on a diffusion loader having run first.
 An explicit ComfyUI dtype flag wins over automatic BF16 selection, but it does
 not skip attention or quantized-kernel preflight.
@@ -28,7 +28,6 @@ not skip attention or quantized-kernel preflight.
 | `turing_ops.py` | exact-sm75 Kitchen backend and W8/W4 dispatch policy |
 | `turing_fusions.py` | model-independent fused Linear activation and segmented norm calls |
 | `minimax_adapter.py` | MiniMax block discovery and ModelPatcher object patches only |
-| `kernel/csrc/svdint4` | architecture-independent SVDInt4 kernels |
 | `kernel/csrc/turing` | separately installed Turing kernels, including bundled Sage |
 
 ## Linear matrix
