@@ -110,7 +110,7 @@ symbol boundary, and exclusion of experimental packages. For compatible A40
 validation, build with:
 
 ```bash
-SVDINT4_ARCH_LIST="7.5+PTX" \
+COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX" \
 python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
 ```

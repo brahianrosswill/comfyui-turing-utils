@@ -48,7 +48,7 @@ except ImportError:
     from minimax_adapter import apply_minimax_adapter
 
 
-LOG = logging.getLogger("comfyui-svdint4")
+LOG = logging.getLogger("comfyui-turing-utils")
 DIFFUSION_FOLDER_NAME = "diffusion_models"
 CLIP_FOLDER_NAME = "text_encoders"
 MODEL_EXTENSIONS = {".safetensors", ".sft"}
@@ -612,7 +612,7 @@ class ConvRotDiffusionModelLoader:
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "load_diffusion_model"
-    CATEGORY = "SVDInt4/loaders"
+    CATEGORY = "Turing Utils/loaders"
     TITLE = "Load ConvRot DiT"
 
     def load_diffusion_model(
@@ -666,7 +666,7 @@ class ConvRotCLIPLoader:
     RETURN_TYPES = ("CLIP",)
     RETURN_NAMES = ("clip",)
     FUNCTION = "load_clip"
-    CATEGORY = "SVDInt4/loaders"
+    CATEGORY = "Turing Utils/loaders"
     TITLE = "Load ConvRot CLIP"
 
     def load_clip(

@@ -2,7 +2,7 @@
 
 #include "tensor_bridge.h"
 
-namespace svdint4::kernels {
+namespace comfyui_turing_utils::kernels {
 
 void turing_w4a8_linear(Tensor activation,
                         Tensor weight,
@@ -48,4 +48,4 @@ void turing_segmented_rms_adaln(Tensor input,
                                  Tensor output,
                                  float epsilon);
 
-}  // namespace svdint4::kernels
+}  // namespace comfyui_turing_utils::kernels

@@ -1119,7 +1119,7 @@ at::Tensor qk_int8_sv_f16_accum_f32_attn(at::Tensor query,
   return lse;
 }
 
-#ifdef SVDINT4_EXPERIMENTAL_SAGE_VARIANTS
+#ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
 at::Tensor qk_int8_sv_f16_accum_f16_attn(at::Tensor query,
                     at::Tensor key,
                     at::Tensor value,

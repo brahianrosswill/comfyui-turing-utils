@@ -16,7 +16,7 @@
 
 #include "kernel_api.h"
 
-namespace svdint4::kernels {
+namespace comfyui_turing_utils::kernels {
 namespace {
 
 constexpr int kThreads = 256;
@@ -217,4 +217,4 @@ void turing_dequantize_int8_bf16(Tensor accumulator,
     checkCUDA(cudaGetLastError());
 }
 
-}  // namespace svdint4::kernels
+}  // namespace comfyui_turing_utils::kernels

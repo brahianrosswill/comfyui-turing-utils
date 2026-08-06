@@ -19,14 +19,14 @@ def run(cmd: list[str], env: dict[str, str]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a svdint4-kernel wheel.")
-    parser.add_argument("--arch-list", default=os.environ.get("SVDINT4_ARCH_LIST", DEFAULT_ARCH_LIST))
+    parser = argparse.ArgumentParser(description="Build a comfyui-turing-utils-kernel wheel.")
+    parser.add_argument("--arch-list", default=os.environ.get("COMFYUI_TURING_UTILS_ARCH_LIST", DEFAULT_ARCH_LIST))
     parser.add_argument("--with-isolation", action="store_true", help="Use PEP 517 build isolation.")
     parser.add_argument("--skip-build-deps", action="store_true", help="Do not install pip/build/wheel/ninja.")
     args = parser.parse_args()
 
     env = os.environ.copy()
-    env["SVDINT4_ARCH_LIST"] = args.arch_list
+    env["COMFYUI_TURING_UTILS_ARCH_LIST"] = args.arch_list
 
     if platform.system() == "Windows":
         if shutil.which("cl") is None:
@@ -41,8 +41,7 @@ def main() -> None:
         run([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "build", "wheel", "ninja"], env)
 
     shutil.rmtree(ROOT / "build", ignore_errors=True)
-    shutil.rmtree(ROOT / "svdint4.egg-info", ignore_errors=True)
-    shutil.rmtree(ROOT / "svdint4_kernel.egg-info", ignore_errors=True)
+    shutil.rmtree(ROOT / "comfyui_turing_utils_kernel.egg-info", ignore_errors=True)
 
     cmd = [sys.executable, "-m", "build", "--wheel"]
     if not args.with_isolation:

@@ -49,7 +49,7 @@ class WanVideoFramesPadding:
     RETURN_TYPES = ("IMAGE", "MASK", "INT", "INT", "INT", "INT")
     RETURN_NAMES = ("image", "mask", "width", "height", "length", "input_length")
     FUNCTION = "pad"
-    CATEGORY = "SVDInt4/video"
+    CATEGORY = "Turing Utils/video"
     TITLE = "Wan Video Frames Padding"
 
     def pad(self, image, target_frame_count: int, mask=None):

@@ -4,7 +4,7 @@ __pycache__/
 kernel/build/
 kernel/dist/
 kernel/*.egg-info/
-kernel/svdint4/_C*.so
-kernel/svdint4/_C*.pyd
+kernel/comfyui_turing_utils_kernel/_C*.so
+kernel/comfyui_turing_utils_kernel/_C*.pyd
 kernel/.ninja_deps
 kernel/.ninja_log

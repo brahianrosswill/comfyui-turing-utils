@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Modified for svdint4: add affine RMSNorm weights and an explicit segmented
+ * Modified for ComfyUI Turing Utils: add affine RMSNorm weights and an explicit segmented
  * token-to-modulation mapping while preserving the comfy-kitchen FP32
  * reduction and fused AdaLN epilogue.
  */
@@ -16,7 +16,7 @@
 
 #include "kernel_api.h"
 
-namespace svdint4::kernels {
+namespace comfyui_turing_utils::kernels {
 namespace {
 
 constexpr int kWarpThreads = 32;
@@ -261,4 +261,4 @@ void turing_segmented_rms_adaln(Tensor input,
     }
 }
 
-}  // namespace svdint4::kernels
+}  // namespace comfyui_turing_utils::kernels

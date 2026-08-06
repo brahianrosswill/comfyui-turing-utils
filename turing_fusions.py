@@ -156,10 +156,10 @@ def segmented_rms_adaln(
         shift = shift.to(device=x.device, dtype=x.dtype)
         table = _segment_table(segments, x.shape[0], scale.shape[0], x.device)
         try:
-            from svdint4 import turing_segmented_rms_adaln
+            from comfyui_turing_utils_kernel import turing_segmented_rms_adaln
         except (ImportError, AttributeError) as exc:
             raise RuntimeError(
-                "Turing RMSNorm+AdaLN fusion requires an updated svdint4-kernel; reinstall the kernel package"
+                "Turing RMSNorm+AdaLN fusion requires an updated comfyui-turing-utils-kernel; reinstall the kernel package"
             ) from exc
         return turing_segmented_rms_adaln(x, weight, scale, shift, table, float(norm.eps))
     finally:

@@ -64,11 +64,11 @@ class AttentionBackendsTest(unittest.TestCase):
             attention_backends.apply_attention_backend(model, "auto")
 
         self.assertEqual(
-            model.model_options["transformer_options"]["svdint4_attention_backend"],
+            model.model_options["transformer_options"]["turing_utils_attention_backend"],
             "sage_attn",
         )
         self.assertEqual(
-            model.model_options["transformer_options"]["svdint4_attention_implementation"],
+            model.model_options["transformer_options"]["turing_utils_attention_implementation"],
             "comfy:sage",
         )
 
@@ -86,7 +86,7 @@ class AttentionBackendsTest(unittest.TestCase):
             attention_backends.apply_attention_backend(model, "auto")
 
         transformer_options = model.model_options["transformer_options"]
-        self.assertEqual(transformer_options["svdint4_attention_backend"], "flash_attn")
+        self.assertEqual(transformer_options["turing_utils_attention_backend"], "flash_attn")
         self.assertIn("optimized_attention_override", transformer_options)
 
     def test_auto_falls_back_to_sdpa(self):
@@ -103,7 +103,7 @@ class AttentionBackendsTest(unittest.TestCase):
             attention_backends.apply_attention_backend(model, "auto")
 
         self.assertEqual(
-            model.model_options["transformer_options"]["svdint4_attention_backend"],
+            model.model_options["transformer_options"]["turing_utils_attention_backend"],
             "sdpa",
         )
 
@@ -207,7 +207,7 @@ class AttentionBackendsTest(unittest.TestCase):
         model = FakeModel()
         attention_backends.apply_attention_backend(model, "sdpa")
         transformer_options = model.model_options["transformer_options"]
-        self.assertEqual(transformer_options["svdint4_attention_backend"], "sdpa")
+        self.assertEqual(transformer_options["turing_utils_attention_backend"], "sdpa")
         self.assertIn("optimized_attention_override", transformer_options)
 
         q = torch.randn(1, 8, 16)
@@ -233,11 +233,11 @@ class AttentionBackendsTest(unittest.TestCase):
         kernel.assert_called_once()
         preflight.assert_called_once_with(torch.device("cuda", 0))
         self.assertEqual(
-            model.model_options["transformer_options"]["svdint4_attention_backend"],
+            model.model_options["transformer_options"]["turing_utils_attention_backend"],
             "sage_attn",
         )
         self.assertEqual(
-            model.model_options["transformer_options"]["svdint4_attention_implementation"],
+            model.model_options["transformer_options"]["turing_utils_attention_implementation"],
             "bundled_turing_sage",
         )
 
@@ -271,8 +271,8 @@ class AttentionBackendsTest(unittest.TestCase):
             override = attention_backends.make_attention_override(
                 "sage", device=torch.device("cuda", 0)
             )
-        self.assertEqual(override.svdint4_attention_backend, "sage_attn")
-        self.assertEqual(override.svdint4_attention_implementation, "comfy:sage")
+        self.assertEqual(override.turing_utils_attention_backend, "sage_attn")
+        self.assertEqual(override.turing_utils_attention_implementation, "comfy:sage")
 
     def test_turing_explicit_non_sage_backend_is_honored(self):
         flash = lambda *args, **kwargs: None
@@ -284,7 +284,7 @@ class AttentionBackendsTest(unittest.TestCase):
             ),
         ):
             override = attention_backends.make_attention_override("flash_attn", device=torch.device("cuda", 0))
-        self.assertEqual(override.svdint4_attention_backend, "flash_attn")
+        self.assertEqual(override.turing_utils_attention_backend, "flash_attn")
 
 
 if __name__ == "__main__":

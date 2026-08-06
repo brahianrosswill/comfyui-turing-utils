@@ -19,7 +19,7 @@ branch `feature/turing-sm75-backend`, commit
   https://github.com/thu-ml/SageAttention
 
 The vendored CUDA and Python support is kept under `csrc/turing/sage` and
-`svdint4/turing_sage`. Unstable Sage1/Sage2 research is excluded from the
+`comfyui_turing_utils_kernel/turing_sage`. Unstable Sage1/Sage2 research is excluded from the
 default bindings and documented under `experiments/turing_sage_variants`.
 SageAttention is licensed under the Apache License, Version 2.0; its license
 text is in `LICENSES/sageattention-LICENSE.txt`.

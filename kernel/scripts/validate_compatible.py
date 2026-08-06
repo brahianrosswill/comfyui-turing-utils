@@ -15,7 +15,7 @@ sys.path.insert(0, kernel_root)
 
 import torch
 
-import svdint4
+import comfyui_turing_utils_kernel
 
 
 def _assert_close(name: str, actual: torch.Tensor, expected: torch.Tensor, **kwargs) -> None:
@@ -45,8 +45,8 @@ def validate_convrot(device: torch.device) -> None:
         generator = torch.Generator(device=device).manual_seed(4100 + hidden)
         x = torch.randn((3, hidden * 2), generator=generator, device=device, dtype=torch.bfloat16)
         for bits in (8, 4):
-            staged = getattr(svdint4, f"turing_swiglu_int{bits}_convrot_quantize")
-            rowbuffer = getattr(svdint4, f"turing_bf16_int{bits}_convrot_quantize")
+            staged = getattr(comfyui_turing_utils_kernel, f"turing_swiglu_int{bits}_convrot_quantize")
+            rowbuffer = getattr(comfyui_turing_utils_kernel, f"turing_bf16_int{bits}_convrot_quantize")
             staged_q, staged_scale = staged(x, 256)
             row_q, row_scale = rowbuffer(x, 256, swiglu=True)
             if not torch.equal(staged_q, row_q):
@@ -65,8 +65,8 @@ def validate_convrot(device: torch.device) -> None:
 
     zero = torch.zeros((2, 512), device=device, dtype=torch.bfloat16)
     for implementation in (
-        lambda: svdint4.turing_swiglu_int4_convrot_quantize(zero, 256),
-        lambda: svdint4.turing_bf16_int4_convrot_quantize(zero, 256, swiglu=True),
+        lambda: comfyui_turing_utils_kernel.turing_swiglu_int4_convrot_quantize(zero, 256),
+        lambda: comfyui_turing_utils_kernel.turing_bf16_int4_convrot_quantize(zero, 256, swiglu=True),
     ):
         packed, scale = implementation()
         if torch.count_nonzero(_unpack_int4(packed)):
@@ -103,7 +103,7 @@ def validate_w4a8(device: torch.device) -> None:
             bias = torch.randn(
                 (n,), generator=generator, device=device, dtype=torch.bfloat16
             ) * 0.1
-        output = svdint4.turing_w4a8_linear(
+        output = comfyui_turing_utils_kernel.turing_w4a8_linear(
             activation, _pack_int4(weight), activation_scale, weight_scale, bias
         )
         reference = (
@@ -137,7 +137,7 @@ def validate_segmented_norm(device: torch.device) -> None:
         weight = torch.randn((hidden,), device=device, dtype=dtype)
         scale = torch.randn((3, hidden), device=device, dtype=dtype) * 0.1
         shift = torch.randn((3, hidden), device=device, dtype=dtype) * 0.1
-        output = svdint4.turing_segmented_rms_adaln(
+        output = comfyui_turing_utils_kernel.turing_segmented_rms_adaln(
             x, weight, scale, shift, segments, 1.0e-5
         )
         norm = x.float() * torch.rsqrt(
@@ -177,7 +177,7 @@ def _validate_varlen_batches(
 
 
 def validate_sage(device: torch.device) -> None:
-    from svdint4.turing_sage import sageattn, sageattn_varlen
+    from comfyui_turing_utils_kernel.turing_sage import sageattn, sageattn_varlen
 
     for dtype in (torch.float16, torch.bfloat16):
         for head_dim, is_causal in ((32, False), (64, True), (96, False), (128, False)):
@@ -249,7 +249,7 @@ def _elapsed_ms(function, iterations: int) -> float:
 
 
 def benchmark_sage(device: torch.device, iterations: int) -> None:
-    from svdint4.turing_sage import sageattn
+    from comfyui_turing_utils_kernel.turing_sage import sageattn
 
     for dtype in (torch.float16, torch.bfloat16):
         q = torch.randn((1, 8, 2048, 128), device=device, dtype=dtype)
@@ -271,7 +271,7 @@ def main() -> None:
     capability = torch.cuda.get_device_capability(device)
     if capability < (7, 5):
         raise RuntimeError(f"validation requires sm75 or newer, got sm{capability[0]}{capability[1]}")
-    print(f"kernel={Path(svdint4.__file__).resolve()} version={svdint4.__version__}")
+    print(f"kernel={Path(comfyui_turing_utils_kernel.__file__).resolve()} version={comfyui_turing_utils_kernel.__version__}")
     print(f"device={torch.cuda.get_device_name(device)} capability=sm{capability[0]}{capability[1]}")
     torch.manual_seed(20260806)
     with torch.inference_mode(), torch.cuda.device(device):

@@ -7,9 +7,9 @@ import comfy.patcher_extension
 import torch
 
 
-LOG = logging.getLogger("comfyui-svdint4")
-_BERNINI_ROPE_WRAPPER_KEY = "svdint4_bernini_context_rope"
-_ABSOLUTE_INDEX_KEY = "svdint4_bernini_absolute_latent_indices"
+LOG = logging.getLogger("comfyui-turing-utils")
+_BERNINI_ROPE_WRAPPER_KEY = "turing_utils_bernini_context_rope"
+_ABSOLUTE_INDEX_KEY = "turing_utils_bernini_absolute_latent_indices"
 
 
 def _validate_context_window_frames(context_length: int, context_overlap: int) -> tuple[int, int]:
@@ -59,10 +59,10 @@ def _with_transformer_options(args, kwargs, transformer_options):
 def _install_bernini_absolute_rope_patch() -> None:
     from comfy.ldm.wan import model as wan_model
 
-    if hasattr(wan_model.WanModel, "_svdint4_original_forward"):
+    if hasattr(wan_model.WanModel, "_turing_utils_original_forward"):
         return
 
-    wan_model.WanModel._svdint4_original_forward = wan_model.WanModel._forward
+    wan_model.WanModel._turing_utils_original_forward = wan_model.WanModel._forward
     wan_model.WanModel._forward = _wan_forward_with_optional_absolute_indices
 
 
@@ -80,7 +80,7 @@ def _wan_forward_with_optional_absolute_indices(
 
     target_indices = transformer_options.get(_ABSOLUTE_INDEX_KEY, None)
     if target_indices is None:
-        return self._svdint4_original_forward(
+        return self._turing_utils_original_forward(
             x,
             timestep,
             context,
@@ -95,7 +95,7 @@ def _wan_forward_with_optional_absolute_indices(
             "Bernini absolute context RoPE indices were ignored for a Wan path with "
             "time_dim_concat/reference_latent; falling back to ComfyUI RoPE."
         )
-        return self._svdint4_original_forward(
+        return self._turing_utils_original_forward(
             x,
             timestep,
             context,
@@ -248,7 +248,7 @@ def _bernini_context_rope_wrapper(executor, *args, **kwargs):
     if window is None or not getattr(window, "index_list", None):
         return executor(*args, **kwargs)
 
-    if getattr(window, "svdint4_use_absolute_indices", False):
+    if getattr(window, "turing_utils_use_absolute_indices", False):
         indices = list(window.index_list)
         anchor_idx = getattr(window, "causal_anchor_index", None)
         if anchor_idx is not None and anchor_idx >= 0:
@@ -277,7 +277,7 @@ class BerniniScheduledContextHandler(comfy.context_windows.IndexListContextHandl
     def get_context_windows(self, model, x_in: torch.Tensor, model_options: dict[str]):
         windows = super().get_context_windows(model, x_in, model_options)
         for window in windows:
-            window.svdint4_use_absolute_indices = True
+            window.turing_utils_use_absolute_indices = True
         return windows
 
 
@@ -369,7 +369,7 @@ class BerniniContextWindowsCore:
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "apply"
-    CATEGORY = "SVDInt4/patches"
+    CATEGORY = "Turing Utils/patches"
     TITLE = "Bernini Context Windows"
 
     def apply(

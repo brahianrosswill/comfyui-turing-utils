@@ -14,7 +14,7 @@ except ImportError:
     from turing_ops import is_supported_turing_device
 
 
-LOG = logging.getLogger("comfyui-svdint4")
+LOG = logging.getLogger("comfyui-turing-utils")
 SUPPORTED_KERNEL_DTYPES = (torch.float16, torch.bfloat16)
 SUPPORTED_INPUT_DTYPES = (*SUPPORTED_KERNEL_DTYPES, torch.float32)
 _PREFLIGHTED_DEVICES: set[int] = set()
@@ -116,7 +116,7 @@ def normalize_attention_backend(value: str | None) -> str:
     option = _ALIASES.get(_normalize_key(value))
     if option is None:
         raise ValueError(
-            f"Unsupported SVDInt4 attention backend {value!r}. "
+            f"Unsupported Turing Utils attention backend {value!r}. "
             f"Supported options: {', '.join(attention_backend_choices())}"
         )
     return option
@@ -135,7 +135,7 @@ def _resolve_attention_function(backend: AttentionBackend) -> Callable | None:
     if function is not None:
         return function
     message = (
-        f"SVDInt4 attention backend {backend.option!r} requires ComfyUI attention "
+        f"Turing Utils attention backend {backend.option!r} requires ComfyUI attention "
         f"function {backend.attention_function!r}, but it is not available."
     )
     if backend.install_hint:
@@ -159,14 +159,14 @@ def _select_attention_backend(option: str) -> tuple[AttentionBackend, Callable]:
 
 def bundled_available() -> bool:
     try:
-        from svdint4.turing_sage import available
+        from comfyui_turing_utils_kernel.turing_sage import available
     except (ImportError, OSError):
         return False
     return available()
 
 
 def _sageattn(*args, **kwargs):
-    from svdint4 import turing_sage
+    from comfyui_turing_utils_kernel import turing_sage
 
     return turing_sage.sageattn(*args, **kwargs)
 
@@ -177,7 +177,7 @@ def preflight_bundled(device: torch.device) -> None:
     index = device.index if device.index is not None else torch.cuda.current_device()
     if index in _PREFLIGHTED_DEVICES:
         return
-    from svdint4.turing_sage import preflight
+    from comfyui_turing_utils_kernel.turing_sage import preflight
 
     preflight(device)
     _PREFLIGHTED_DEVICES.add(index)
@@ -329,7 +329,7 @@ def turing_sage_attention(
     if input_dtype == torch.float32:
         if not _LOGGED_FP32_COMPAT:
             LOG.info(
-                "SVDInt4 Turing Sage FP32 compatibility uses BF16 Q/K/V storage and restores FP32 output"
+                "Turing Sage FP32 compatibility uses BF16 Q/K/V storage and restores FP32 output"
             )
             _LOGGED_FP32_COMPAT = True
         q = q.to(torch.bfloat16)
@@ -384,7 +384,7 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
         if not bundled_available():
             raise RuntimeError(
                 "The bundled Turing Sage extensions are unavailable. "
-                "Rebuild svdint4-kernel with SVDINT4_ARCH_LIST including 7.5."
+                "Rebuild comfyui-turing-utils-kernel with COMFYUI_TURING_UTILS_ARCH_LIST including 7.5."
             )
         preflight_bundled(device)
         backend = _BACKENDS["sage_attn"]
@@ -409,8 +409,8 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
             return fallback(*args, **kwargs)
         return target(*args, **kwargs)
 
-    attention_override.svdint4_attention_backend = backend.option
-    attention_override.svdint4_attention_implementation = implementation
+    attention_override.turing_utils_attention_backend = backend.option
+    attention_override.turing_utils_attention_implementation = implementation
     return attention_override
 
 
@@ -418,13 +418,13 @@ def apply_attention_backend(model, option: str, device: torch.device | None = No
     option = normalize_attention_backend(option)
     transformer_options = model.model_options.setdefault("transformer_options", {})
     override = make_attention_override(option, device=device)
-    selected = override.svdint4_attention_backend
-    implementation = override.svdint4_attention_implementation
+    selected = override.turing_utils_attention_backend
+    implementation = override.turing_utils_attention_implementation
     transformer_options["optimized_attention_override"] = override
-    transformer_options["svdint4_attention_backend"] = selected
-    transformer_options["svdint4_attention_implementation"] = implementation
+    transformer_options["turing_utils_attention_backend"] = selected
+    transformer_options["turing_utils_attention_implementation"] = implementation
     LOG.info(
-        "SVDInt4 attention backend override: %s via %s (requested %s)",
+        "Turing Utils attention backend override: %s via %s (requested %s)",
         selected,
         implementation,
         option,

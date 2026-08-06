@@ -116,9 +116,9 @@ class BF16PolicyTest(unittest.TestCase):
     def test_turing_runtime_rejects_stale_independent_kernel(self):
         with (
             mock.patch.dict(
-                sys.modules, {"svdint4": SimpleNamespace(__version__="0.4.9")}
+                sys.modules, {"comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.4.9")}
             ),
-            self.assertRaisesRegex(RuntimeError, "svdint4-kernel>=0.6.2"),
+            self.assertRaisesRegex(RuntimeError, "comfyui-turing-utils-kernel>=0.7.0"),
         ):
             bf16_policy._check_kernel_contract()
 
@@ -256,7 +256,7 @@ class BF16PolicyTest(unittest.TestCase):
         with (
             mock.patch.object(kitchen_cuda, "quantize_int8_rowwise_convrot64") as fused,
             mock.patch.object(kitchen_cuda, "quantize_int8_convrot_staged", return_value=("q", "s")) as staged,
-            mock.patch.dict(sys.modules, {"svdint4": SimpleNamespace()}),
+            mock.patch.dict(sys.modules, {"comfyui_turing_utils_kernel": SimpleNamespace()}),
         ):
             result = turing_ops._quantize_turing_int8_activation(x, 256)
         self.assertEqual(result, ("q", "s"))
@@ -288,7 +288,7 @@ class BF16PolicyTest(unittest.TestCase):
                 mock.patch.object(kitchen_cuda, "quantize_int8_convrot_staged") as staged,
                 mock.patch.dict(
                     sys.modules,
-                    {"svdint4": SimpleNamespace(
+                    {"comfyui_turing_utils_kernel": SimpleNamespace(
                         turing_bf16_int8_convrot_quantize=rowbuffer
                     )},
                 ),
@@ -307,7 +307,7 @@ class BF16PolicyTest(unittest.TestCase):
         with (
             mock.patch.dict(
                 sys.modules,
-                {"svdint4": SimpleNamespace(
+                {"comfyui_turing_utils_kernel": SimpleNamespace(
                     turing_bf16_int8_convrot_quantize=rowbuffer,
                     turing_swiglu_int8_convrot_quantize=staged_swiglu,
                 )},
@@ -339,7 +339,7 @@ class BF16PolicyTest(unittest.TestCase):
             ) as linear,
             mock.patch.dict(
                 sys.modules,
-                {"svdint4": SimpleNamespace(
+                {"comfyui_turing_utils_kernel": SimpleNamespace(
                     turing_swiglu_int8_convrot_quantize=fused_swiglu
                 )},
             ),
@@ -429,7 +429,7 @@ class BF16PolicyTest(unittest.TestCase):
                 "_quantize_turing_int8_activation",
                 return_value=(qactivation, activation_scale),
             ) as quantize,
-            mock.patch.dict(sys.modules, {"svdint4": SimpleNamespace(turing_w4a8_linear=linear)}),
+            mock.patch.dict(sys.modules, {"comfyui_turing_utils_kernel": SimpleNamespace(turing_w4a8_linear=linear)}),
         ):
             result = turing_ops.convrot_w4a4_linear(
                 x,
@@ -548,7 +548,7 @@ class BF16PolicyTest(unittest.TestCase):
         staged = mock.Mock()
         with mock.patch.dict(
             sys.modules,
-            {"svdint4": SimpleNamespace(
+            {"comfyui_turing_utils_kernel": SimpleNamespace(
                 turing_bf16_int4_convrot_quantize=rowbuffer,
                 turing_swiglu_int4_convrot_quantize=staged,
             )},

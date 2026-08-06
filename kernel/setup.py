@@ -32,7 +32,7 @@ def _is_cutlass_include_dir(candidate: Path) -> bool:
 
 def _download_cutlass_include_dir() -> Path | None:
     """Fetch the pinned, platform-independent NVIDIA wheel without its Python deps."""
-    enabled = os.environ.get("SVDINT4_CUTLASS_AUTO_DOWNLOAD", "1").strip().lower()
+    enabled = os.environ.get("COMFYUI_TURING_UTILS_CUTLASS_AUTO_DOWNLOAD", "1").strip().lower()
     if enabled in {"0", "false", "no", "off"}:
         return None
 
@@ -44,7 +44,7 @@ def _download_cutlass_include_dir() -> Path | None:
         + filename
     )
     expected_sha256 = "f9599ada45c7bcb6bf53f7d3f0a7d154183e53451c01bfa59eecd37dd4a693f6"
-    cache_root = Path(tempfile.gettempdir()) / f"svdint4-cutlass-{version}"
+    cache_root = Path(tempfile.gettempdir()) / f"comfyui-turing-utils-cutlass-{version}"
     include_dir = cache_root / "include"
     if _is_cutlass_include_dir(include_dir):
         return include_dir.resolve()
@@ -91,14 +91,14 @@ def _download_cutlass_include_dir() -> Path | None:
 
 def _cutlass_include_dir() -> Path:
     """Find portable CUTLASS C++ headers on Linux and Windows."""
-    override = os.environ.get("SVDINT4_CUTLASS_INCLUDE_DIR")
+    override = os.environ.get("COMFYUI_TURING_UTILS_CUTLASS_INCLUDE_DIR")
     if override:
         root = Path(override)
         for candidate in (root, root / "include"):
             if _is_cutlass_include_dir(candidate):
                 return candidate.resolve()
         raise RuntimeError(
-            "SVDINT4_CUTLASS_INCLUDE_DIR must name CUTLASS's include directory "
+            "COMFYUI_TURING_UTILS_CUTLASS_INCLUDE_DIR must name CUTLASS's include directory "
             "or its parent (the resolved directory must contain cutlass/cutlass.h)."
         )
 
@@ -169,9 +169,9 @@ def _cutlass_include_dir() -> Path:
     raise RuntimeError(
         "CUTLASS C++ headers are missing or undiscoverable. Install the official "
         "portable package with `python -m pip install nvidia-cutlass==4.2.0.0`, "
-        "install a Conda CUTLASS package, or set SVDINT4_CUTLASS_INCLUDE_DIR "
+        "install a Conda CUTLASS package, or set COMFYUI_TURING_UTILS_CUTLASS_INCLUDE_DIR "
         "to the directory containing "
-        "cutlass/cutlass.h. Set SVDINT4_CUTLASS_AUTO_DOWNLOAD=1 to allow the "
+        "cutlass/cutlass.h. Set COMFYUI_TURING_UTILS_CUTLASS_AUTO_DOWNLOAD=1 to allow the "
         "default pinned-header download."
     )
 
@@ -182,7 +182,7 @@ def _windows_cccl_include_dirs() -> list[str]:
         return []
 
     candidates: list[Path] = []
-    override = os.environ.get("SVDINT4_CCCL_INCLUDE_DIR")
+    override = os.environ.get("COMFYUI_TURING_UTILS_CCCL_INCLUDE_DIR")
     if override:
         candidates.append(Path(override))
 
@@ -238,12 +238,12 @@ def _windows_cccl_include_dirs() -> list[str]:
         "CUDA CCCL headers are missing or undiscoverable: nv/target was not found. "
         "For a CUDA 12.8 Conda environment on Windows, install them with "
         "`conda install -c nvidia cuda-cccl=12.8.90`, or set "
-        "SVDINT4_CCCL_INCLUDE_DIR to the directory containing nv/target."
+        "COMFYUI_TURING_UTILS_CCCL_INCLUDE_DIR to the directory containing nv/target."
     )
 
 
 def _arch_list() -> str:
-    value = os.environ.get("SVDINT4_ARCH_LIST", "7.5;8.0;8.6;8.9")
+    value = os.environ.get("COMFYUI_TURING_UTILS_ARCH_LIST", "7.5;8.0;8.6;8.9")
     arches = []
     for raw in value.replace(",", ";").split(";"):
         arch = raw.strip()
@@ -262,14 +262,13 @@ CCCL_INCLUDE_DIRS = _windows_cccl_include_dirs()
 
 COMMON_DEFINES = [
     "-DENABLE_BF16=1",
-    "-DSVDINT4_MINIMAL=1",
 ]
 
 HOST_CXX_STANDARD = os.environ.get(
-    "SVDINT4_HOST_CXX_STANDARD",
-    os.environ.get("SVDINT4_CXX_STANDARD", "c++20" if IS_WINDOWS else "c++2a"),
+    "COMFYUI_TURING_UTILS_HOST_CXX_STANDARD",
+    os.environ.get("COMFYUI_TURING_UTILS_CXX_STANDARD", "c++17"),
 )
-NVCC_CXX_STANDARD = os.environ.get("SVDINT4_NVCC_CXX_STANDARD", "c++20")
+NVCC_CXX_STANDARD = os.environ.get("COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD", "c++17")
 
 NVCC_FLAGS = [
     *COMMON_DEFINES,
@@ -309,7 +308,7 @@ if IS_WINDOWS:
         ]
     )
 
-CUDAHOSTCXX = os.environ.get("SVDINT4_CUDAHOSTCXX") or os.environ.get("CUDAHOSTCXX")
+CUDAHOSTCXX = os.environ.get("COMFYUI_TURING_UTILS_CUDAHOSTCXX") or os.environ.get("CUDAHOSTCXX")
 if CUDAHOSTCXX:
     NVCC_FLAGS.extend(["-ccbin", CUDAHOSTCXX])
 
@@ -317,7 +316,6 @@ if IS_WINDOWS:
     std_flag = HOST_CXX_STANDARD if HOST_CXX_STANDARD.startswith("/std:") else f"/std:{HOST_CXX_STANDARD}"
     CXX_FLAGS = [
         "/DENABLE_BF16=1",
-        "/DSVDINT4_MINIMAL=1",
         std_flag,
         "/O2",
         "/EHsc",
@@ -340,7 +338,7 @@ else:
 
 
 core_ext = CUDAExtension(
-    name="svdint4._C",
+    name="comfyui_turing_utils_kernel._C",
     sources=[
         "csrc/bindings.cpp",
         "csrc/turing/bf16_epilogue.cu",
@@ -390,7 +388,7 @@ if _includes_sm75():
     ext_modules.extend(
         [
             CUDAExtension(
-                name="svdint4._sage_qattn_sm75",
+                name="comfyui_turing_utils_kernel._sage_qattn_sm75",
                 sources=[
                     "csrc/turing/sage/pybind_sm75.cpp",
                     "csrc/turing/sage/qk_int_sv_f16_cuda_sm75.cu",
@@ -400,7 +398,7 @@ if _includes_sm75():
                 extra_compile_args={"cxx": CXX_FLAGS, "nvcc": sm75_nvcc_flags},
             ),
             CUDAExtension(
-                name="svdint4._sage_fused_sm75",
+                name="comfyui_turing_utils_kernel._sage_fused_sm75",
                 sources=[
                     "csrc/turing/sage/pybind_fused.cpp",
                     "csrc/turing/sage/fused.cu",
@@ -413,9 +411,9 @@ if _includes_sm75():
 
 
 setup(
-    name="svdint4-kernel",
+    name="comfyui-turing-utils-kernel",
     version="0.7.0",
-    packages=find_packages(exclude=("svdint4.turing_sage2", "svdint4.turing_sage2.*")),
+    packages=find_packages(where=str(ROOT)),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
 )

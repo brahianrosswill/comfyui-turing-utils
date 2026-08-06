@@ -99,7 +99,7 @@ class TuringAttentionContractTest(unittest.TestCase):
             mock.patch("attention.is_supported_turing_device", return_value=True),
             mock.patch("torch.cuda.current_device", return_value=0),
             mock.patch("attention._sageattn", side_effect=lambda q, *args, **kwargs: q),
-            self.assertLogs("comfyui-svdint4", level="INFO") as captured,
+            self.assertLogs("comfyui-turing-utils", level="INFO") as captured,
         ):
             turing_attention.turing_sage_attention(
                 mock.Mock(), q_short, q_short, q_short, 4,

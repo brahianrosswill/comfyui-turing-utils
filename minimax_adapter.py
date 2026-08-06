@@ -28,7 +28,7 @@ except ImportError:
     from turing_ops import is_supported_turing_device
 
 
-LOG = logging.getLogger("comfyui-svdint4")
+LOG = logging.getLogger("comfyui-turing-utils")
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _BLOCK_FORWARD_PARAMETERS = (
     "x",
@@ -220,7 +220,7 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
     block_fusions = 0
     mlp_fusions = 0
     try:
-        from svdint4 import turing_segmented_rms_adaln
+        from comfyui_turing_utils_kernel import turing_segmented_rms_adaln
     except (ImportError, AttributeError):
         turing_segmented_rms_adaln = None
 

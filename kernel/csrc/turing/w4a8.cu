@@ -18,7 +18,7 @@
 
 #include "kernel_api.h"
 
-namespace svdint4::kernels {
+namespace comfyui_turing_utils::kernels {
 namespace {
 
 using cute::_0;
@@ -494,4 +494,4 @@ void turing_w4a8_linear(Tensor activation,
     checkCUDA(cudaGetLastError());
 }
 
-}  // namespace svdint4::kernels
+}  // namespace comfyui_turing_utils::kernels

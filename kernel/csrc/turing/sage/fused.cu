@@ -705,7 +705,7 @@ __global__ void MeanScaleKernel(T *__restrict__ input, int8_t *__restrict__ outp
   }
 }
 
-#ifdef SVDINT4_EXPERIMENTAL_SAGE_VARIANTS
+#ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
 template <uint32_t head_dim, typename T>
 __global__ void TokenBlockMeanKernel(
     const T *__restrict__ input,
@@ -1689,7 +1689,7 @@ void quant_per_block_int8_cuda(
   });
 }
 
-#ifdef SVDINT4_EXPERIMENTAL_SAGE_VARIANTS
+#ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
 void quant_per_block_int8_fuse_sub_mean_cuda(
                 at::Tensor input,
                 at::Tensor mean,
@@ -2080,7 +2080,7 @@ void quant_per_warp_int8_varlen_cuda(
   (void)total_tokens;
 }
 
-#ifdef SVDINT4_EXPERIMENTAL_SAGE_VARIANTS
+#ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
 void sub_mean_cuda(
                 at::Tensor input,
                 at::Tensor mean,

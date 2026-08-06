@@ -105,7 +105,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
                     mock.patch.object(minimax_model, "DiTBlock", FakeBlock),
                     mock.patch.dict(
                         sys.modules,
-                        {"svdint4": SimpleNamespace(turing_segmented_rms_adaln=mock.Mock())},
+                        {"comfyui_turing_utils_kernel": SimpleNamespace(turing_segmented_rms_adaln=mock.Mock())},
                     ),
                 ):
                     count = minimax_adapter.apply_minimax_adapter(
@@ -133,7 +133,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
         with (
             mock.patch("minimax_adapter.is_supported_turing_device", return_value=True),
             mock.patch.object(minimax_model, "DiTBlock", ChangedBlock),
-            self.assertLogs("comfyui-svdint4", level="WARNING"),
+            self.assertLogs("comfyui-turing-utils", level="WARNING"),
         ):
             count = minimax_adapter.apply_minimax_adapter(
                 patcher, torch.device("cuda", 0)
@@ -145,7 +145,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
     def test_runtime_audit_reports_a_complete_fused_window_once(self):
         audit = minimax_adapter._RuntimeDispatchAudit(expected_blocks=2, expected_mlps=2)
         x = torch.zeros((3, 256), dtype=torch.bfloat16)
-        with self.assertLogs("comfyui-svdint4", level="INFO") as captured:
+        with self.assertLogs("comfyui-turing-utils", level="INFO") as captured:
             audit.record("block", True, x)
             audit.record("mlp", True, x)
             audit.record("block", True, x)
@@ -164,7 +164,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
         patched = minimax_adapter._make_mlp_forward(mlp, audit)
         x = torch.zeros((3, 256), dtype=torch.float32)
 
-        with self.assertLogs("comfyui-svdint4", level="WARNING") as captured:
+        with self.assertLogs("comfyui-turing-utils", level="WARNING") as captured:
             output = patched(x)
 
         self.assertIs(output, x)
@@ -184,7 +184,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
                 "minimax_adapter.turing_linear_input_act",
                 return_value=sentinel,
             ) as fused,
-            self.assertLogs("comfyui-svdint4", level="INFO") as captured,
+            self.assertLogs("comfyui-turing-utils", level="INFO") as captured,
         ):
             output = patched(x)
 

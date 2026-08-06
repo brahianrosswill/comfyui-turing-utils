@@ -6,8 +6,8 @@ import sys
 import torch
 
 
-LOG = logging.getLogger("comfyui-svdint4")
-BACKEND_NAME = "svdint4_turing"
+LOG = logging.getLogger("comfyui-turing-utils")
+BACKEND_NAME = "turing_utils_sm75"
 TURING_SHARED_MEMORY_LIMIT = 48 * 1024
 _NVIDIA_TURING_WITHOUT_TENSOR_CORES = (
     "GTX 1630",
@@ -39,7 +39,7 @@ def is_supported_turing_device(device: torch.device) -> bool:
 
 def _kernel_available() -> bool:
     try:
-        from svdint4 import _C
+        from comfyui_turing_utils_kernel import _C
     except (ImportError, OSError):
         return False
     return hasattr(_C, "turing_w4a8_linear")
@@ -58,12 +58,12 @@ def preflight_w4a8(device: torch.device) -> None:
     if not is_supported_turing_device(device):
         raise RuntimeError(f"unsupported device {device}")
     if not _kernel_available():
-        raise RuntimeError("the installed svdint4-kernel does not provide Turing W4A8")
+        raise RuntimeError("the installed comfyui-turing-utils-kernel does not provide Turing W4A8")
     index = device.index if device.index is not None else torch.cuda.current_device()
     if index in _PREFLIGHTED_DEVICES:
         return
 
-    from svdint4 import turing_w4a8_linear
+    from comfyui_turing_utils_kernel import turing_w4a8_linear
 
     activation = ((torch.arange(3 * 64, device=device) % 23) - 11).to(torch.int8).reshape(3, 64)
     weight_values = ((torch.arange(5 * 64, device=device) % 15) - 7).to(torch.int8).reshape(5, 64)
@@ -272,7 +272,7 @@ def _quantize_turing_int8_activation(
         return kitchen_cuda.quantize_int8_rowwise_convrot64(x2d, group_size)
     if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(hidden_size):
         try:
-            from svdint4 import turing_bf16_int8_convrot_quantize
+            from comfyui_turing_utils_kernel import turing_bf16_int8_convrot_quantize
         except (ImportError, AttributeError):
             pass
         else:
@@ -283,17 +283,17 @@ def _quantize_turing_int8_activation(
             )
     if input_act == "swiglu":
         try:
-            from svdint4 import turing_swiglu_int8_convrot_quantize
+            from comfyui_turing_utils_kernel import turing_swiglu_int8_convrot_quantize
         except (ImportError, AttributeError) as exc:
             raise RuntimeError(
-                "SVDInt4 Turing W8A8 SwiGLU requires an updated svdint4-kernel; "
+                "Turing W8A8 SwiGLU requires an updated comfyui-turing-utils-kernel; "
                 "reinstall the kernel package"
             ) from exc
         return turing_swiglu_int8_convrot_quantize(x2d, group_size)
     staged = getattr(kitchen_cuda, "quantize_int8_convrot_staged", None)
     if staged is None:
         raise RuntimeError(
-            "SVDInt4 Turing INT8 activation requires Kitchen staged ConvRot quantization "
+            "Turing INT8 activation requires Kitchen staged ConvRot quantization "
             "when the 48 KiB shared-memory limit is exceeded"
         )
     return staged(x2d, group_size)
@@ -314,7 +314,7 @@ def _quantize_turing_int4_activation(
             raise ValueError("SwiGLU input width must be even")
         if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(hidden_size):
             try:
-                from svdint4 import turing_bf16_int4_convrot_quantize
+                from comfyui_turing_utils_kernel import turing_bf16_int4_convrot_quantize
             except (ImportError, AttributeError):
                 pass
             else:
@@ -324,10 +324,10 @@ def _quantize_turing_int4_activation(
                     swiglu=True,
                 )
         try:
-            from svdint4 import turing_swiglu_int4_convrot_quantize
+            from comfyui_turing_utils_kernel import turing_swiglu_int4_convrot_quantize
         except (ImportError, AttributeError) as exc:
             raise RuntimeError(
-                "SVDInt4 Turing W4A4 SwiGLU requires an updated svdint4-kernel; reinstall the kernel package"
+                "Turing W4A4 SwiGLU requires an updated comfyui-turing-utils-kernel; reinstall the kernel package"
             ) from exc
         return turing_swiglu_int4_convrot_quantize(x2d, group_size)
 
@@ -338,7 +338,7 @@ def _quantize_turing_int4_activation(
         return kitchen_cuda.quantize_int4_rowwise_convrot64(x2d, group_size)
     if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(x2d.shape[1]):
         try:
-            from svdint4 import turing_bf16_int4_convrot_quantize
+            from comfyui_turing_utils_kernel import turing_bf16_int4_convrot_quantize
         except (ImportError, AttributeError):
             pass
         else:
@@ -350,7 +350,7 @@ def _quantize_turing_int4_activation(
     rotate = getattr(kitchen_cuda, "rotate_int8_convrot_weight", None)
     if rotate is None:
         raise RuntimeError(
-            "SVDInt4 Turing INT4 activation requires Kitchen grouped ConvRot rotation "
+            "Turing INT4 activation requires Kitchen grouped ConvRot rotation "
             "when the 48 KiB shared-memory limit is exceeded"
         )
     rotated = rotate(x2d, group_size)
@@ -367,7 +367,7 @@ def _turing_cublas_int8_bf16(
     from comfy_kitchen.backends import cuda as kitchen_cuda
 
     try:
-        from svdint4 import turing_dequantize_int8_bf16
+        from comfyui_turing_utils_kernel import turing_dequantize_int8_bf16
     except (ImportError, AttributeError):
         return None
 
@@ -478,7 +478,7 @@ def _turing_int8_gemm(
 
     quantized_linear = getattr(kitchen_cuda, "_int4_linear_via_int8_values", None)
     if quantized_linear is None:
-        raise RuntimeError("SVDInt4 Turing W8A8 requires Kitchen quantized INT8 linear support")
+        raise RuntimeError("Turing W8A8 requires Kitchen quantized INT8 linear support")
     expanded_weight_scale = weight_scale
     if expanded_weight_scale.numel() == 1:
         expanded_weight_scale = expanded_weight_scale.expand(n).contiguous()
@@ -584,7 +584,7 @@ def convrot_w4a4_linear(
         x2d = apply_input_act(x2d, input_act)
         input_act = None
     if linear_dtype == "int8":
-        from svdint4 import turing_w4a8_linear
+        from comfyui_turing_utils_kernel import turing_w4a8_linear
 
         qactivation, activation_scale = _quantize_turing_int8_activation(
             x2d,
@@ -703,5 +703,5 @@ def register_backend() -> bool:
     )
     existing_priority = list(getattr(registry, "_priority", ("cuda", "triton", "eager")))
     registry.set_priority([BACKEND_NAME, *(name for name in existing_priority if name != BACKEND_NAME)])
-    LOG.info("Registered SVDInt4 Turing ConvRot backend")
+    LOG.info("Registered Turing Utils ConvRot backend")
     return True

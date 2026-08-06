@@ -3,7 +3,7 @@ requires = ["setuptools>=69", "wheel", "torch>=2.6", "ninja"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "svdint4-kernel"
+name = "comfyui-turing-utils-kernel"
 version = "0.7.0"
 description = "Bundled Turing ConvRot operators and Sage attention"
 readme = "README.md"
@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE", "LICENSES/*", "NOTICE"]
 authors = [
-  { name = "svdint4 contributors" },
+  { name = "ComfyUI Turing Utils contributors" },
 ]
 classifiers = [
   "Development Status :: 3 - Alpha",
@@ -29,4 +29,4 @@ dependencies = ["torch>=2.6"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["svdint4*"]
+include = ["comfyui_turing_utils_kernel*"]

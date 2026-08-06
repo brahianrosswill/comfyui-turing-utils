@@ -2,7 +2,7 @@
  * SPDX-FileCopyrightText: Copyright (c) 2025 Comfy Org. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
- * Modified for svdint4: fold SwiGLU into the first pass of the staged
+ * Modified for ComfyUI Turing Utils: fold SwiGLU into the first pass of the staged
  * ConvRot INT8 activation quantizer.  The FHT, scale, and rounding order
  * intentionally match comfy-kitchen's CUDA implementation.
  */
@@ -17,7 +17,7 @@
 
 #include "kernel_api.h"
 
-namespace svdint4::kernels {
+namespace comfyui_turing_utils::kernels {
 namespace {
 
 constexpr int kWarpThreads = 32;
@@ -563,4 +563,4 @@ void turing_bf16_int4_convrot_quantize(Tensor input,
     }
 }
 
-}  // namespace svdint4::kernels
+}  // namespace comfyui_turing_utils::kernels

@@ -1,9 +1,9 @@
-# ComfyUI SVDInt4
+# ComfyUI Turing Utils
 
-ComfyUI custom nodes for ConvRot W8A8/W4A8/W4A4 models, exact-sm75 BF16
-activation storage, bundled Turing Sage attention, and Wan/Bernini context
-windows. The deprecated SVDInt4 model-weight format and loader are not part of
-the current release.
+Compatibility and performance extensions that fill gaps in ComfyUI on older
+NVIDIA Turing GPUs. The plugin currently provides ConvRot W8A8/W4A8/W4A4
+support, exact-sm75 BF16 activation storage, bundled Turing Sage attention, and
+Wan/Bernini context-window utilities.
 
 ## Requirements
 
@@ -12,14 +12,14 @@ the current release.
 - Python 3.10 or newer
 - PyTorch with CUDA and ComfyUI
 - `comfy-kitchen>=0.2.26` for ConvRot model integration
-- the independently installed `svdint4-kernel>=0.6.2` on exact sm75
+- the independently installed `comfyui-turing-utils-kernel>=0.7.0` on exact sm75
 
 ## Installation
 
 ```bash
 cd ComfyUI/custom_nodes
-git clone https://github.com/wjie98/comfyui-svdint4.git
-cd comfyui-svdint4
+git clone https://github.com/wjie98/comfyui-turing-utils.git
+cd comfyui-turing-utils
 python -m pip install -v --no-build-isolation -e ./kernel
 ```
 
@@ -63,7 +63,7 @@ exposed by loader nodes.
 ## Kernel validation
 
 ```bash
-SVDINT4_ARCH_LIST="7.5+PTX" \
+COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX" \
 python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
 ```

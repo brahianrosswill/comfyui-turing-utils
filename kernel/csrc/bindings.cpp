@@ -74,7 +74,7 @@ Tensor from_torch(at::Tensor input) {
         result.scalarType = Tensor::FP8_E5M2;
         break;
     default:
-        TORCH_CHECK(false, "unsupported tensor dtype for svdint4");
+        TORCH_CHECK(false, "unsupported tensor dtype for Turing Utils kernel");
     }
 
     result.ptr = input.data_ptr();
@@ -150,7 +150,7 @@ at::Tensor turing_w4a8_linear(at::Tensor activation,
     at::Tensor output = at::empty(
         {activation.size(0), weight.size(0)}, activation.options().dtype(at::kBFloat16));
     TorchOpContext ctx;
-    svdint4::kernels::turing_w4a8_linear(from_torch(activation),
+    comfyui_turing_utils::kernels::turing_w4a8_linear(from_torch(activation),
                                           from_torch(weight),
                                           from_torch(activation_scale),
                                           from_torch(weight_scale),
@@ -202,7 +202,7 @@ at::Tensor turing_dequantize_int8_bf16(at::Tensor accumulator,
     at::Tensor output = at::empty(
         {rows, output_columns}, accumulator.options().dtype(at::kBFloat16));
     TorchOpContext ctx;
-    svdint4::kernels::turing_dequantize_int8_bf16(
+    comfyui_turing_utils::kernels::turing_dequantize_int8_bf16(
         from_torch(accumulator),
         from_torch(activation_scale),
         from_torch(weight_scale),
@@ -239,7 +239,7 @@ std::tuple<at::Tensor, at::Tensor> turing_swiglu_int8_convrot_quantize(
     at::Tensor scales = at::empty({rows, 1}, input.options().dtype(at::kFloat));
 
     TorchOpContext ctx;
-    svdint4::kernels::turing_swiglu_int8_convrot_quantize(
+    comfyui_turing_utils::kernels::turing_swiglu_int8_convrot_quantize(
         from_torch(input),
         from_torch(rotated),
         from_torch(partial_absmax),
@@ -277,7 +277,7 @@ std::tuple<at::Tensor, at::Tensor> turing_swiglu_int4_convrot_quantize(
     at::Tensor scales = at::empty({rows, 1}, input.options().dtype(at::kFloat));
 
     TorchOpContext ctx;
-    svdint4::kernels::turing_swiglu_int4_convrot_quantize(
+    comfyui_turing_utils::kernels::turing_swiglu_int4_convrot_quantize(
         from_torch(input),
         from_torch(rotated),
         from_torch(partial_absmax),
@@ -339,7 +339,7 @@ std::tuple<at::Tensor, at::Tensor> turing_bf16_int8_convrot_quantize(
     at::Tensor scales = at::empty(
         {rows, 1}, input.options().dtype(at::kFloat));
     TorchOpContext ctx;
-    svdint4::kernels::turing_bf16_int8_convrot_quantize(
+    comfyui_turing_utils::kernels::turing_bf16_int8_convrot_quantize(
         from_torch(input),
         from_torch(output),
         from_torch(scales),
@@ -396,7 +396,7 @@ std::tuple<at::Tensor, at::Tensor> turing_bf16_int4_convrot_quantize(
     at::Tensor output = at::empty({rows, hidden / 2}, input.options().dtype(at::kChar));
     at::Tensor scales = at::empty({rows, 1}, input.options().dtype(at::kFloat));
     TorchOpContext ctx;
-    svdint4::kernels::turing_bf16_int4_convrot_quantize(
+    comfyui_turing_utils::kernels::turing_bf16_int4_convrot_quantize(
         from_torch(input),
         from_torch(output),
         from_torch(scales),
@@ -463,7 +463,7 @@ at::Tensor turing_segmented_rms_adaln(at::Tensor input,
 
     at::Tensor output = at::empty_like(input);
     TorchOpContext ctx;
-    svdint4::kernels::turing_segmented_rms_adaln(
+    comfyui_turing_utils::kernels::turing_segmented_rms_adaln(
         from_torch(input),
         from_torch(weight),
         from_torch(scale),

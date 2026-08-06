@@ -26,9 +26,9 @@ except ImportError:
     )
 
 
-LOG = logging.getLogger("comfyui-svdint4")
+LOG = logging.getLogger("comfyui-turing-utils")
 MIN_KITCHEN_VERSION = (0, 2, 26)
-MIN_KERNEL_VERSION = (0, 6, 2)
+MIN_KERNEL_VERSION = (0, 7, 0)
 _CONVROT_W4_LAYOUT = "TensorCoreConvRotW4A4Layout"
 _TENSORWISE_INT8_LAYOUT = "TensorWiseINT8Layout"
 
@@ -66,7 +66,7 @@ def _check_kitchen_contract() -> None:
     if _version_tuple(kitchen_version) < MIN_KITCHEN_VERSION:
         required = ".".join(str(value) for value in MIN_KITCHEN_VERSION)
         raise RuntimeError(
-            f"SVDInt4 Turing kernels require comfy-kitchen>={required}, got {kitchen_version}. Update ComfyUI."
+            f"Turing Utils requires comfy-kitchen>={required}, got {kitchen_version}. Update ComfyUI."
         )
 
     from comfy_kitchen.backends import cuda as kitchen_cuda
@@ -81,23 +81,23 @@ def _check_kitchen_contract() -> None:
     missing = [name for name in required_cuda_api if not hasattr(kitchen_cuda, name)]
     if missing:
         raise RuntimeError(
-            "The installed comfy-kitchen does not provide the Turing ConvRot API required by SVDInt4: "
+            "The installed comfy-kitchen does not provide the Turing ConvRot API required by Turing Utils: "
             + ", ".join(missing)
         )
 
 
 def _check_kernel_contract() -> None:
     try:
-        import svdint4
+        import comfyui_turing_utils_kernel
     except (ImportError, OSError) as exc:
         raise RuntimeError(
-            "The independently installed svdint4-kernel is unavailable; reinstall ./kernel"
+            "The independently installed comfyui-turing-utils-kernel is unavailable; reinstall ./kernel"
         ) from exc
-    kernel_version = getattr(svdint4, "__version__", "0.0.0")
+    kernel_version = getattr(comfyui_turing_utils_kernel, "__version__", "0.0.0")
     if _version_tuple(kernel_version) < MIN_KERNEL_VERSION:
         required = ".".join(str(value) for value in MIN_KERNEL_VERSION)
         raise RuntimeError(
-            f"SVDInt4 Turing runtime requires svdint4-kernel>={required}, "
+            f"Turing Utils requires comfyui-turing-utils-kernel>={required}, "
             f"got {kernel_version}; reinstall the independent kernel package"
         )
 

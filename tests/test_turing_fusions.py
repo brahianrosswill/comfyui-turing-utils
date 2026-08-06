@@ -168,7 +168,7 @@ class FusionDispatchTest(unittest.TestCase):
             mock.patch.object(turing_fusions, "_segment_table", return_value=table),
             mock.patch.dict(
                 sys.modules,
-                {"svdint4": SimpleNamespace(turing_segmented_rms_adaln=kernel)},
+                {"comfyui_turing_utils_kernel": SimpleNamespace(turing_segmented_rms_adaln=kernel)},
             ),
         ):
             result = turing_fusions.segmented_rms_adaln(

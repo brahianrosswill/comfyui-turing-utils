@@ -4,7 +4,7 @@ include README.md
 recursive-include LICENSES *
 recursive-include csrc *.cpp *.cu *.cuh *.h
 recursive-include scripts *.py *.sh *.ps1
-recursive-include svdint4 *.py
-exclude svdint4/_C*.so
+recursive-include comfyui_turing_utils_kernel *.py
+exclude comfyui_turing_utils_kernel/_C*.so
 recursive-exclude * __pycache__
 recursive-exclude * *.py[cod]

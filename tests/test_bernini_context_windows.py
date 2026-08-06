@@ -109,11 +109,11 @@ class BerniniContextWindowsTest(unittest.TestCase):
 
         windows = handler.get_context_windows(None, torch.zeros(1, 4, 8), {})
         self.assertTrue(windows)
-        self.assertTrue(all(getattr(window, "svdint4_use_absolute_indices", False) for window in windows))
+        self.assertTrue(all(getattr(window, "turing_utils_use_absolute_indices", False) for window in windows))
 
     def test_rope_wrapper_includes_causal_anchor_index(self):
         window = comfy.context_windows.IndexListContextWindow([3, 4, 5], dim=2, total_frames=8)
-        window.svdint4_use_absolute_indices = True
+        window.turing_utils_use_absolute_indices = True
         window.causal_anchor_index = 2
         transformer_options = {"context_window": window}
         captured = {}

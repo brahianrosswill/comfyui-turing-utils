@@ -7,8 +7,8 @@ import torch
 
 def available() -> bool:
     try:
-        importlib.import_module("svdint4._sage_qattn_sm75")
-        importlib.import_module("svdint4._sage_fused_sm75")
+        importlib.import_module("comfyui_turing_utils_kernel._sage_qattn_sm75")
+        importlib.import_module("comfyui_turing_utils_kernel._sage_fused_sm75")
     except (ImportError, OSError):
         return False
     return True

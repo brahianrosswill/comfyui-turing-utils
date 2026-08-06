@@ -28,7 +28,7 @@ at::Tensor qk_int8_sv_f16_accum_f32_attn(at::Tensor query,
                     float sm_scale,
                     int return_lse);
 
-#ifdef SVDINT4_EXPERIMENTAL_SAGE_VARIANTS
+#ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
 at::Tensor qk_int8_sv_f16_accum_f16_attn(at::Tensor query,
                     at::Tensor key,
                     at::Tensor value,
@@ -80,7 +80,7 @@ at::Tensor qk_int8_sv_f16_varlen_accum_f32_attn(at::Tensor query,
                     int is_causal,
                     float sm_scale);
 
-#ifdef SVDINT4_EXPERIMENTAL_SAGE_VARIANTS
+#ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
 at::Tensor qk_int4_sv_f16_accum_f16_f32_attn(
                     at::Tensor query,
                     at::Tensor key,

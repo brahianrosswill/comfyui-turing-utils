@@ -11,8 +11,8 @@ import torch
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT / "kernel"))
 
-from svdint4 import turing_sage  # noqa: E402
-from svdint4.turing_sage import quant  # noqa: E402
+from comfyui_turing_utils_kernel import turing_sage  # noqa: E402
+from comfyui_turing_utils_kernel.turing_sage import quant  # noqa: E402
 
 
 class TuringSageQuantContractTest(unittest.TestCase):
