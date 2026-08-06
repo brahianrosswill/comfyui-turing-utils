@@ -30,9 +30,9 @@ except ImportError:
     )
 
 try:
-    from .bf16_policy import select_compute_dtype
+    from .bf16_policy import normalize_turing_convrot_weight_dtypes, select_compute_dtype
 except ImportError:
-    from bf16_policy import select_compute_dtype
+    from bf16_policy import normalize_turing_convrot_weight_dtypes, select_compute_dtype
 
 try:
     from .turing_fusions import apply_turing_fusions
@@ -457,6 +457,10 @@ def load_convrot_model(
     if model is None:
         raise RuntimeError(f"ComfyUI could not detect a supported model config from {model_path}")
 
+    if compute_dtype is not None:
+        model.set_model_compute_dtype(compute_dtype)
+        normalize_turing_convrot_weight_dtypes(model, load_device, compute_dtype)
+
     loaded = _loaded_convrot_summary(model)
     if loaded != expected:
         raise RuntimeError(
@@ -471,8 +475,6 @@ def load_convrot_model(
         loaded.w4a8,
         loaded.w8a8,
     )
-    if compute_dtype is not None:
-        model.set_model_compute_dtype(compute_dtype)
     apply_turing_fusions(model, load_device)
     apply_attention_backend(model, attention_backend, device=load_device)
     model.cached_patcher_init = (

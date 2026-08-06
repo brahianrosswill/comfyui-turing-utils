@@ -10,6 +10,8 @@ import torch
 
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+COMFY_ROOT = PLUGIN_ROOT.parents[1]
+sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 import bf16_policy  # noqa: E402
@@ -23,6 +25,41 @@ BF16_CONFIG = SimpleNamespace(supported_inference_dtypes=[torch.bfloat16, torch.
 
 
 class BF16PolicyTest(unittest.TestCase):
+    @staticmethod
+    def _w8_weight(dtype=torch.float32, *, convrot=True):
+        from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
+
+        qdata = torch.zeros((4, 8), dtype=torch.int8)
+        params = TensorWiseINT8Layout.Params(
+            scale=torch.ones(1, dtype=torch.float32),
+            orig_dtype=dtype,
+            orig_shape=(4, 8),
+            convrot=convrot,
+            convrot_groupsize=256,
+        )
+        return QuantizedTensor(qdata, "TensorWiseINT8Layout", params)
+
+    @staticmethod
+    def _w4_weight(dtype=torch.float32, *, linear_dtype="int4"):
+        from comfy.quant_ops import QuantizedTensor, TensorCoreConvRotW4A4Layout
+
+        qdata = torch.zeros((4, 4), dtype=torch.uint8)
+        params = TensorCoreConvRotW4A4Layout.Params(
+            scale=torch.ones((4, 1), dtype=torch.float32),
+            orig_dtype=dtype,
+            orig_shape=(4, 8),
+            convrot_groupsize=256,
+            quant_group_size=64,
+            linear_dtype=linear_dtype,
+        )
+        return QuantizedTensor(qdata, "TensorCoreConvRotW4A4Layout", params)
+
+    @staticmethod
+    def _module_with_weight(weight):
+        module = torch.nn.Module()
+        module.register_parameter("weight", torch.nn.Parameter(weight, requires_grad=False))
+        return module
+
     def test_any_model_declaring_bf16_uses_it_on_non_turing_cuda(self):
         with (
             mock.patch("bf16_policy._explicit_dtype_override", return_value=False),
@@ -107,6 +144,76 @@ class BF16PolicyTest(unittest.TestCase):
                 BF16_CONFIG, torch.device("cuda", 0), NO_CONVROT
             )
         self.assertIsNone(dtype)
+
+    def test_turing_convrot_logical_dtype_is_normalized_without_copying_qdata(self):
+        weight = self._w8_weight(torch.float32, convrot=True)
+        module = self._module_with_weight(weight)
+        root = torch.nn.Module()
+        root.fc = module
+        old_qdata_ptr = module.weight._qdata.data_ptr()
+        old_scale_ptr = module.weight._params.scale.data_ptr()
+
+        with mock.patch("bf16_policy.is_supported_turing_device", return_value=True):
+            count = bf16_policy.normalize_turing_convrot_weight_dtypes(
+                root, torch.device("cuda", 0), torch.bfloat16
+            )
+
+        self.assertEqual(count, 1)
+        self.assertIs(module.weight.dtype, torch.bfloat16)
+        self.assertIs(module.weight._params.orig_dtype, torch.bfloat16)
+        self.assertEqual(module.weight._qdata.data_ptr(), old_qdata_ptr)
+        self.assertEqual(module.weight._params.scale.data_ptr(), old_scale_ptr)
+        self.assertIs(module.weight_comfy_model_dtype, torch.bfloat16)
+
+    def test_turing_dtype_normalization_does_not_touch_dense_or_nonconvrot_weights(self):
+        dense = torch.nn.Linear(8, 4, bias=False, dtype=torch.float32)
+        plain_int8 = self._module_with_weight(self._w8_weight(torch.float32, convrot=False))
+        root = torch.nn.Module()
+        root.dense = dense
+        root.plain_int8 = plain_int8
+        dense_weight = dense.weight
+        plain_weight = plain_int8.weight
+
+        with mock.patch("bf16_policy.is_supported_turing_device", return_value=True):
+            count = bf16_policy.normalize_turing_convrot_weight_dtypes(
+                root, torch.device("cuda", 0), torch.bfloat16
+            )
+
+        self.assertEqual(count, 0)
+        self.assertIs(dense.weight, dense_weight)
+        self.assertIs(dense.weight.dtype, torch.float32)
+        self.assertIs(plain_int8.weight, plain_weight)
+        self.assertIs(plain_int8.weight.dtype, torch.float32)
+        self.assertFalse(hasattr(plain_int8, "weight_comfy_model_dtype"))
+
+    def test_turing_w4a4_and_w4a8_logical_dtypes_are_normalized(self):
+        root = torch.nn.Module()
+        root.w4a4 = self._module_with_weight(self._w4_weight(linear_dtype="int4"))
+        root.w4a8 = self._module_with_weight(self._w4_weight(linear_dtype="int8"))
+
+        with mock.patch("bf16_policy.is_supported_turing_device", return_value=True):
+            count = bf16_policy.normalize_turing_convrot_weight_dtypes(
+                root, torch.device("cuda", 0), torch.bfloat16
+            )
+
+        self.assertEqual(count, 2)
+        self.assertIs(root.w4a4.weight.dtype, torch.bfloat16)
+        self.assertEqual(root.w4a4.weight._params.linear_dtype, "int4")
+        self.assertIs(root.w4a8.weight.dtype, torch.bfloat16)
+        self.assertEqual(root.w4a8.weight._params.linear_dtype, "int8")
+
+    def test_convrot_dtype_normalization_is_disabled_off_turing_or_without_bf16(self):
+        for supported, dtype in ((False, torch.bfloat16), (True, None), (True, torch.float32)):
+            with self.subTest(supported=supported, dtype=dtype):
+                module = self._module_with_weight(self._w8_weight(torch.float32, convrot=True))
+                with mock.patch(
+                    "bf16_policy.is_supported_turing_device", return_value=supported
+                ):
+                    count = bf16_policy.normalize_turing_convrot_weight_dtypes(
+                        module, torch.device("cuda", 0), dtype
+                    )
+                self.assertEqual(count, 0)
+                self.assertIs(module.weight.dtype, torch.float32)
 
     def test_device_check_uses_requested_tensor_device(self):
         with (
