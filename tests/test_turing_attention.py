@@ -91,6 +91,34 @@ class TuringAttentionContractTest(unittest.TestCase):
         self.assertFalse(sage.call_args.kwargs["smooth_k"])
         self.assertNotIn("variant", sage.call_args.kwargs)
 
+    def test_distinct_sequence_shapes_each_report_bundled_dispatch_once(self):
+        q_short = torch.zeros((1, 4, 32, 64), dtype=torch.bfloat16)
+        q_long = torch.zeros((1, 4, 96, 64), dtype=torch.bfloat16)
+        turing_attention._LOGGED_TURING_KERNELS.clear()
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("torch.cuda.current_device", return_value=0),
+            mock.patch("attention._sageattn", side_effect=lambda q, *args, **kwargs: q),
+            self.assertLogs("comfyui-svdint4", level="INFO") as captured,
+        ):
+            turing_attention.turing_sage_attention(
+                mock.Mock(), q_short, q_short, q_short, 4,
+                skip_reshape=True, skip_output_reshape=True
+            )
+            turing_attention.turing_sage_attention(
+                mock.Mock(), q_long, q_long, q_long, 4,
+                skip_reshape=True, skip_output_reshape=True
+            )
+            turing_attention.turing_sage_attention(
+                mock.Mock(), q_long, q_long, q_long, 4,
+                skip_reshape=True, skip_output_reshape=True
+            )
+
+        dispatch_logs = [line for line in captured.output if "Bundled Turing Sage active" in line]
+        self.assertEqual(len(dispatch_logs), 2)
+        self.assertTrue(any("32" in line for line in dispatch_logs))
+        self.assertTrue(any("96" in line for line in dispatch_logs))
+
     def test_bf16_unreshaped_gqa_keeps_compact_kv_heads(self):
         q = torch.zeros((1, 32, 4 * 64), dtype=torch.bfloat16)
         k = torch.zeros((1, 16, 2 * 64), dtype=torch.bfloat16)

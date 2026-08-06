@@ -76,19 +76,48 @@ def validate_convrot(device: torch.device) -> None:
 
 
 def validate_w4a8(device: torch.device) -> None:
-    m, n, k = 7, 13, 64
-    activation = ((torch.arange(m * k, device=device) % 23) - 11).to(torch.int8).reshape(m, k)
-    weight = ((torch.arange(n * k, device=device) % 15) - 7).to(torch.int8).reshape(n, k)
-    activation_scale = torch.linspace(0.01, 0.03, m, device=device)
-    weight_scale = torch.linspace(0.02, 0.06, n, device=device)
-    bias = torch.linspace(-0.2, 0.2, n, dtype=torch.bfloat16, device=device)
-    output = svdint4.turing_w4a8_linear(
-        activation, _pack_int4(weight), activation_scale, weight_scale, bias
+    # The first two cases exercise the compatibility path. The remaining
+    # cases cover every production Tensor Core tile and predicated edge tiles.
+    cases = (
+        (7, 13, 64),
+        (3, 16, 12),
+        (1, 8, 16),
+        (17, 72, 80),
+        (33, 128, 128),
+        (129, 264, 256),
+        (513, 520, 64),
+        (8193, 8, 16),
     )
-    reference = (
-        activation.float() @ weight.float().t()
-    ) * activation_scale[:, None] * weight_scale[None, :] + bias.float()
-    _assert_close("packed W4A8", output, reference, rtol=0.01, atol=0.01)
+    for index, (m, n, k) in enumerate(cases):
+        generator = torch.Generator(device=device).manual_seed(4300 + index)
+        activation = torch.randint(
+            -128, 128, (m, k), generator=generator, device=device, dtype=torch.int8
+        )
+        weight = torch.randint(
+            -8, 8, (n, k), generator=generator, device=device, dtype=torch.int8
+        )
+        activation_scale = torch.rand((m,), generator=generator, device=device) * 0.02 + 0.001
+        weight_scale = torch.rand((n,), generator=generator, device=device) * 0.03 + 0.001
+        bias = None
+        if index % 2 == 0:
+            bias = torch.randn(
+                (n,), generator=generator, device=device, dtype=torch.bfloat16
+            ) * 0.1
+        output = svdint4.turing_w4a8_linear(
+            activation, _pack_int4(weight), activation_scale, weight_scale, bias
+        )
+        reference = (
+            activation.float() @ weight.float().t()
+        ) * activation_scale[:, None] * weight_scale[None, :]
+        if bias is not None:
+            reference = reference + bias.float()
+        _assert_close(
+            f"packed W4A8 M={m} N={n} K={k}",
+            output,
+            reference,
+            rtol=0.01,
+            atol=0.01,
+        )
 
 
 def validate_segmented_norm(device: torch.device) -> None:

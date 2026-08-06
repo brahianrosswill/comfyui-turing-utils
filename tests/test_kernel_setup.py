@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import platform
 import runpy
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -35,6 +36,18 @@ class KernelSetupTest(unittest.TestCase):
         ):
             runpy.run_path(str(SETUP_PATH), run_name="__svdint4_windows_setup_test__")
         return setup.call_args.kwargs["ext_modules"]
+
+    @staticmethod
+    def _make_cutlass_headers(include_dir: Path) -> None:
+        for relative in (
+            "cutlass/cutlass.h",
+            "cutlass/gemm/device/gemm_universal_adapter.h",
+            "cutlass/epilogue/threadblock/fusion/visitors.hpp",
+            "cute/tensor.hpp",
+        ):
+            header = include_dir / relative
+            header.parent.mkdir(parents=True, exist_ok=True)
+            header.touch()
 
     def test_sage_compute75_ptx_is_opt_in_and_keeps_sm75(self):
         environment = {
@@ -70,11 +83,55 @@ class KernelSetupTest(unittest.TestCase):
             cccl = prefix / "Library" / "include" / "targets" / "x64"
             (cccl / "nv").mkdir(parents=True)
             (cccl / "nv" / "target").touch()
+            conda_include = prefix / "Library" / "include"
+            self._make_cutlass_headers(conda_include)
 
             extensions = self._run_windows_setup(prefix)
 
         self.assertEqual([extension.name for extension in extensions], ["svdint4._C"])
+        self.assertEqual(extensions[0].kwargs["include_dirs"][1], str(conda_include.resolve()))
         self.assertIn(str(cccl.resolve()), extensions[0].kwargs["include_dirs"])
+
+    def test_nvidia_cutlass_python_package_is_auto_detected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            site_root = Path(temp_dir)
+            cutlass_include = site_root / "cutlass_library" / "source" / "include"
+            self._make_cutlass_headers(cutlass_include)
+            environment = {"SVDINT4_ARCH_LIST": "8.6"}
+            with (
+                mock.patch.object(platform, "system", return_value="Linux"),
+                mock.patch.dict(os.environ, environment, clear=False),
+                mock.patch.object(sys, "path", [str(site_root), *sys.path]),
+                mock.patch("torch.utils.cpp_extension.CUDAExtension", side_effect=self._extension),
+                mock.patch("torch.utils.cpp_extension.BuildExtension", object()),
+                mock.patch("setuptools.setup") as setup,
+            ):
+                runpy.run_path(str(SETUP_PATH), run_name="__svdint4_cutlass_package_test__")
+
+        core = setup.call_args.kwargs["ext_modules"][0]
+        self.assertEqual(core.kwargs["include_dirs"][1], str(cutlass_include.resolve()))
+
+    def test_windows_uses_cached_portable_cutlass_headers(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            prefix = temp_root / "conda"
+            cccl = prefix / "Library" / "include" / "targets" / "x64"
+            (cccl / "nv").mkdir(parents=True)
+            (cccl / "nv" / "target").touch()
+            cutlass_include = (
+                temp_root / "svdint4-cutlass-4.2.0.0" / "include"
+            )
+            self._make_cutlass_headers(cutlass_include)
+
+            with (
+                mock.patch.object(sys, "path", [str(temp_root / "empty-site")]),
+                mock.patch("tempfile.gettempdir", return_value=temp_dir),
+            ):
+                extensions = self._run_windows_setup(prefix)
+
+        core = extensions[0]
+        self.assertEqual(core.kwargs["include_dirs"][1], str(cutlass_include.resolve()))
+        self.assertIn(str(cccl.resolve()), core.kwargs["include_dirs"])
 
     def test_windows_missing_cccl_has_actionable_error(self):
         with tempfile.TemporaryDirectory() as temp_dir, self.assertRaisesRegex(

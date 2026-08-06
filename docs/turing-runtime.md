@@ -46,9 +46,13 @@ intermediate. A40 compatibility validation shows identical packed INT8/INT4
 values versus the staged operators across K=256, 5376, 7168, and 14336; INT4
 scale differences are at most normal FP32 reduction-order roundoff.
 
-W4A8 unpacks packed W4 tiles into INT8 shared memory and uses the sm75 DP4A
-compatibility kernel. It never creates a persistent W8 weight copy. A
-tensor-core replacement still requires an exact-sm75 occupancy profile.
+W4A8 reads packed W4 tiles directly, expands each vector once while filling
+CUTLASS's SM75 crosswise INT8 shared-memory layout, and executes the contraction
+with `m8n8k16` INT8 Tensor Core instructions. Scaling, optional bias, and BF16
+storage stay in the epilogue. It never creates a persistent W8 weight copy and
+keeps every production tile within the default 48 KiB shared-memory limit.
+Non-Tensor-Core-compatible edge dimensions retain a small DP4A compatibility
+kernel so the public API does not silently narrow its accepted shapes.
 
 For W8A8 GEMM, Kitchen's fused Turing kernel remains first choice. The no-bias
 contraction fallback uses cuBLAS INT8 plus the bundled vectorized BF16
@@ -91,10 +95,13 @@ uses ComfyUI's PyTorch attention implementation deterministically.
 
 The loader log reports `sage_attn via bundled_turing_sage` when `auto` or
 `sage_attn` is bound to the local sm75 implementation. The first real bundled
-call also reports dtype, layout, and Q/K/V shapes. Any unsupported call reports
-its fallback reason once, so a masked, disabled-low-precision, or incompatible
-shape can no longer turn a performance regression into an invisible backend
-change.
+call for each distinct sequence shape also reports dtype, layout, and Q/K/V
+shapes. Any unsupported call reports its fallback reason once, so a masked,
+disabled-low-precision, or incompatible shape can no longer turn a performance
+regression into an invisible backend change. MiniMax additionally emits one
+`phase=block` and one `phase=mlp` runtime-dispatch line after the first complete
+pass. A healthy H3 W8A8 run reports 50 fused and zero fallback calls for both
+phases; these counters use no CUDA events or device synchronization.
 
 ## Validation boundary
 

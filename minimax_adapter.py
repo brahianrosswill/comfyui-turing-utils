@@ -39,6 +39,50 @@ _BLOCK_FORWARD_PARAMETERS = (
 )
 
 
+class _RuntimeDispatchAudit:
+    """Report the first full MiniMax block pass without CUDA timing events."""
+
+    def __init__(self, expected_blocks: int, expected_mlps: int):
+        self.expected = {"block": expected_blocks, "mlp": expected_mlps}
+        self.counts = {"block": Counter(), "mlp": Counter()}
+        self.dtypes = {"block": Counter(), "mlp": Counter()}
+        self.shapes = {"block": Counter(), "mlp": Counter()}
+        self.reasons = {"block": Counter(), "mlp": Counter()}
+        self.logged_phases: set[str] = set()
+
+    def record(
+        self,
+        phase: str,
+        fused: bool,
+        x: torch.Tensor,
+        reason: str | None = None,
+    ) -> None:
+        if phase in self.logged_phases or self.expected[phase] == 0:
+            return
+        self.counts[phase]["fused" if fused else "fallback"] += 1
+        self.dtypes[phase][str(x.dtype)] += 1
+        self.shapes[phase][str(tuple(x.shape))] += 1
+        if reason is not None:
+            self.reasons[phase][reason] += 1
+
+        calls = self.counts[phase]["fused"] + self.counts[phase]["fallback"]
+        if calls < self.expected[phase]:
+            return
+
+        log = LOG.warning if self.counts[phase]["fallback"] else LOG.info
+        log(
+            "MiniMax Turing runtime dispatch: phase=%s fused=%d fallback=%d "
+            "dtypes=[%s] shapes=[%s] reasons=[%s]",
+            phase,
+            self.counts[phase]["fused"],
+            self.counts[phase]["fallback"],
+            _format_counts(self.dtypes[phase].elements()),
+            _format_counts(self.shapes[phase].elements()),
+            _format_counts(self.reasons[phase].elements()) or "none",
+        )
+        self.logged_phases.add(phase)
+
+
 def _format_counts(values) -> str:
     counts = Counter(values)
     return ",".join(
@@ -74,27 +118,44 @@ def _compatible_block_forward(block_type: type[torch.nn.Module]) -> bool:
     return parameters == ("self", *_BLOCK_FORWARD_PARAMETERS)
 
 
-def _can_fuse(x: torch.Tensor, t_emb: torch.Tensor, device_index: int) -> bool:
+def _block_fusion_blocker(
+    x: torch.Tensor,
+    t_emb: torch.Tensor,
+    device_index: int,
+) -> str | None:
     if x.device.type != "cuda" or x.dtype not in _SUPPORTED_DTYPES or x.ndim != 2:
-        return False
+        return f"input={x.device.type}/{x.dtype}/ndim{x.ndim}"
     index = x.device.index if x.device.index is not None else torch.cuda.current_device()
     if index != device_index:
-        return False
-    return not (torch.is_grad_enabled() and (x.requires_grad or t_emb.requires_grad))
+        return f"device_index={index},expected={device_index}"
+    if torch.is_grad_enabled() and (x.requires_grad or t_emb.requires_grad):
+        return "grad_enabled"
+    return None
 
 
-def _make_mlp_forward(mlp: torch.nn.Module):
+def _make_mlp_forward(mlp: torch.nn.Module, audit: _RuntimeDispatchAudit):
     original = mlp.forward
 
     def forward(self, x: torch.Tensor):
-        if x.dtype != torch.bfloat16 or not is_turing_convrot_linear(self.fc2):
+        blocker = None
+        if x.dtype != torch.bfloat16:
+            blocker = f"dtype={x.dtype}"
+        elif not is_turing_convrot_linear(self.fc2):
+            blocker = "fc2_not_turing_convrot"
+        audit.record("mlp", blocker is None, x, blocker)
+        if blocker is not None:
             return original(x)
         return turing_linear_input_act(self.fc2, self.fc1(x), "swiglu")
 
     return types.MethodType(forward, mlp)
 
 
-def _make_block_forward(block: torch.nn.Module, device_index: int, mod_gate):
+def _make_block_forward(
+    block: torch.nn.Module,
+    device_index: int,
+    mod_gate,
+    audit: _RuntimeDispatchAudit,
+):
     original = block.forward
 
     def forward(
@@ -105,7 +166,9 @@ def _make_block_forward(block: torch.nn.Module, device_index: int, mod_gate):
         rope_freqs,
         transformer_options={},
     ):
-        if not _can_fuse(x, t_emb, device_index):
+        blocker = _block_fusion_blocker(x, t_emb, device_index)
+        audit.record("block", blocker is None, x, blocker)
+        if blocker is not None:
             return original(
                 x,
                 t_emb,
@@ -161,12 +224,21 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
     except (ImportError, AttributeError):
         turing_segmented_rms_adaln = None
 
+    expected_blocks = len(candidates) if callable(turing_segmented_rms_adaln) else 0
+    audit = _RuntimeDispatchAudit(expected_blocks, eligible_fc2)
+
     for name, block in candidates:
         if hasattr(block.mlp, "fc2") and is_turing_convrot_linear(block.mlp.fc2):
-            model.add_object_patch(f"{name}.mlp.forward", _make_mlp_forward(block.mlp))
+            model.add_object_patch(
+                f"{name}.mlp.forward",
+                _make_mlp_forward(block.mlp, audit),
+            )
             mlp_fusions += 1
         if callable(turing_segmented_rms_adaln):
-            model.add_object_patch(f"{name}.forward", _make_block_forward(block, index, _mod_gate))
+            model.add_object_patch(
+                f"{name}.forward",
+                _make_block_forward(block, index, _mod_gate, audit),
+            )
             block_fusions += 1
 
     if block_fusions:

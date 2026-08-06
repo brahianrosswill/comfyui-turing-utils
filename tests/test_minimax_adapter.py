@@ -142,6 +142,56 @@ class MiniMaxAdapterTest(unittest.TestCase):
         self.assertEqual(count, 0)
         self.assertFalse(patcher.object_patches)
 
+    def test_runtime_audit_reports_a_complete_fused_window_once(self):
+        audit = minimax_adapter._RuntimeDispatchAudit(expected_blocks=2, expected_mlps=2)
+        x = torch.zeros((3, 256), dtype=torch.bfloat16)
+        with self.assertLogs("comfyui-svdint4", level="INFO") as captured:
+            audit.record("block", True, x)
+            audit.record("mlp", True, x)
+            audit.record("block", True, x)
+            audit.record("mlp", True, x)
+            audit.record("mlp", False, x, "should_not_be_recorded")
+
+        messages = "\n".join(captured.output)
+        self.assertIn("phase=block fused=2 fallback=0", messages)
+        self.assertIn("phase=mlp fused=2 fallback=0", messages)
+        self.assertNotIn("should_not_be_recorded", messages)
+
+    def test_runtime_audit_exposes_mlp_dtype_fallback(self):
+        FakeBlock, _ = self._types("w8a8")
+        mlp = FakeBlock().mlp
+        audit = minimax_adapter._RuntimeDispatchAudit(expected_blocks=0, expected_mlps=1)
+        patched = minimax_adapter._make_mlp_forward(mlp, audit)
+        x = torch.zeros((3, 256), dtype=torch.float32)
+
+        with self.assertLogs("comfyui-svdint4", level="WARNING") as captured:
+            output = patched(x)
+
+        self.assertIs(output, x)
+        self.assertIn("phase=mlp fused=0 fallback=1", "\n".join(captured.output))
+        self.assertIn("dtype=torch.float32", "\n".join(captured.output))
+
+    def test_runtime_audit_keeps_fused_w8a8_mlp_dispatch(self):
+        FakeBlock, _ = self._types("w8a8")
+        mlp = FakeBlock().mlp
+        audit = minimax_adapter._RuntimeDispatchAudit(expected_blocks=0, expected_mlps=1)
+        patched = minimax_adapter._make_mlp_forward(mlp, audit)
+        x = torch.zeros((3, 256), dtype=torch.bfloat16)
+        sentinel = object()
+
+        with (
+            mock.patch(
+                "minimax_adapter.turing_linear_input_act",
+                return_value=sentinel,
+            ) as fused,
+            self.assertLogs("comfyui-svdint4", level="INFO") as captured,
+        ):
+            output = patched(x)
+
+        self.assertIs(output, sentinel)
+        fused.assert_called_once_with(mlp.fc2, x, "swiglu")
+        self.assertIn("phase=mlp fused=1 fallback=0", "\n".join(captured.output))
+
 
 if __name__ == "__main__":
     unittest.main()

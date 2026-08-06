@@ -2,7 +2,8 @@
 
 CUDA/PyTorch extension used by ComfyUI SVDInt4.
 
-In addition to the SVDQuant path, version 0.6.2 provides exact-sm75 packed W4A8,
+In addition to the SVDQuant path, version 0.6.2 provides exact-sm75 packed W4A8
+Tensor Core GEMM,
 W8/W4 staged and BF16 row-buffer activation fusions, and a self-contained
 Sage attention backend. Bundled `sage` uses per-warp INT8 Q/K and direct FP32
 probability/value accumulation without the standalone `sageattention` package.
@@ -28,7 +29,7 @@ csrc/
   turing/
     convrot_quant.cu                      staged/row-buffer W8 and W4 ConvRot quantizers
     segmented_rms_adaln.cu                affine segmented RMSNorm + AdaLN
-    w4a8.cu                               packed Turing W4A8 kernel
+    w4a8.cu                               packed W4-to-S8 SM75 Tensor Core GEMM
     sage/                                 bundled production SM75 Sage kernel
 svdint4/
   ops.py                                  stable SVDInt4/W4A8 Python API
@@ -57,11 +58,28 @@ extensions are never JIT-compiled by the plugin.
 
 ## Build
 
-From this `kernel/` directory:
+CUTLASS headers are discovered automatically from Conda on Linux or Windows,
+the CUDA toolkit, NVIDIA's platform-independent `nvidia-cutlass` Python package,
+or an explicitly configured checkout. If none is present, the build downloads
+the pinned official NVIDIA wheel, verifies its SHA256, and extracts only the C++
+headers without installing its Python dependencies. For a manual VCS checkout
+that uses `--no-build-isolation`, an optional offline setup is:
+
+```bash
+python -m pip install --no-deps nvidia-cutlass==4.2.0.0
+python -m pip install -v --no-build-isolation -e .
+```
+
+For the normal online one-command installation, simply run:
 
 ```bash
 python -m pip install -v --no-build-isolation -e .
 ```
+
+Set `SVDINT4_CUTLASS_INCLUDE_DIR` only for a custom CUTLASS checkout. It may
+point either to the directory containing `cutlass/cutlass.h` or its parent.
+Set `SVDINT4_CUTLASS_AUTO_DOWNLOAD=0` for a strictly offline build; a local,
+Conda, Python-package, CUDA-toolkit, or custom checkout must then be available.
 
 By default the extension builds for `sm_75`, `sm_80`, `sm_86`, and `sm_89`.
 Override this with:

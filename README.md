@@ -34,7 +34,7 @@ The CUDA package remains a separate installation: Python-only plugin updates
 never invoke a compiler or JIT. Reinstall `svdint4-kernel` only when its CUDA
 sources or published kernel version change.
 The Turing runtime in this revision requires the independently installed
-`svdint4-kernel>=0.6.1` and reports a stale package before allocating the model.
+`svdint4-kernel>=0.6.2` and reports a stale package before allocating the model.
 
 Install the CUDA kernel in the same Python environment that runs ComfyUI:
 
@@ -262,9 +262,11 @@ BF16 but continues to use the normal installed backends.
 
 The Turing linear dispatch reuses comfy-kitchen's official sm75 W4A4 and W8A8
 GEMM kernels. W4A8 is supplied by the local backend: it consumes the original
-packed W4 weight directly, fuses nibble unpacking, INT8 dot products, scaling,
-bias, and BF16 storage, and never materializes a full W8 copy of the weight. Its
-static shared-memory footprint is 2 KiB. For BF16 W8A8 activation rotations
+packed W4 weight directly, expands each vector once into CUTLASS's bank-aware
+crosswise shared layout, executes the contraction with SM75 INT8 Tensor Cores,
+and fuses scaling, bias, and BF16 storage. It never materializes a full W8 copy
+of the weight, and every production tile stays within the default 48 KiB shared
+memory limit. For BF16 W8A8 activation rotations
 that would overflow Kitchen's FP32 whole-row buffer, the bundled quantizer keeps
 the completed row as BF16 and only the active FHT groups as FP32 scratch. It
 selects a 1024-, 768-, or 512-thread launch that remains below the default
@@ -311,8 +313,10 @@ ComfyUI attention masks, disabled low-precision attention, and head dimensions
 outside that contract use the original ComfyUI attention function without a
 dtype conversion and emit a one-time fallback reason. Startup records whether
 `sage_attn` resolved to `bundled_turing_sage` or the ComfyUI-provided external
-implementation, and the first bundled call records its dtype, layout, and Q/K/V
-shape. The standalone Sage backend on non-Turing GPUs uses
+implementation, and each distinct bundled sequence shape is recorded once with
+its dtype and layout. The MiniMax adapter also reports fused and fallback counts
+separately for the first complete DiT-block and MLP pass, without CUDA timing
+events or synchronization. The standalone Sage backend on non-Turing GPUs uses
 ComfyUI's PyTorch attention for an all-FP32 boundary. Failure of a required
 SM75 kernel is reported before model allocation instead of silently reverting
 the whole model to FP32. The bundled-vs-official INT8 and INT4 precision
@@ -415,6 +419,19 @@ The build automatically discovers Conda's
 `Library\include\targets\x64` layout. For a custom CCCL installation, set
 `SVDINT4_CCCL_INCLUDE_DIR` to the directory that directly contains
 `nv\target`.
+
+The W4A8 Tensor Core source also needs CUTLASS headers. The installer searches
+the active Windows Conda environment, CUDA toolkit, and the portable
+`nvidia-cutlass` Python package. If none contains the required headers, the
+normal online install downloads a pinned NVIDIA wheel, verifies its SHA256,
+and extracts only its C++ headers. For an offline build, preinstall the header
+package without its optional Python dependencies:
+
+```bat
+python -m pip install --no-deps nvidia-cutlass==4.2.0.0
+```
+
+No Git submodule or separate CUTLASS checkout is required.
 
 `fatal error C1083: ... cusparse.h: No such file or directory`
 

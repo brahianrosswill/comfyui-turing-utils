@@ -19,7 +19,7 @@ SUPPORTED_KERNEL_DTYPES = (torch.float16, torch.bfloat16)
 SUPPORTED_INPUT_DTYPES = (*SUPPORTED_KERNEL_DTYPES, torch.float32)
 _PREFLIGHTED_DEVICES: set[int] = set()
 _LOGGED_FP32_COMPAT = False
-_LOGGED_TURING_KERNELS: set[tuple[int, torch.dtype, int]] = set()
+_LOGGED_TURING_KERNELS: set[tuple] = set()
 _LOGGED_TURING_FALLBACKS: set[str] = set()
 
 
@@ -300,7 +300,18 @@ def turing_sage_attention(
         )
 
     index = q.device.index if q.device.index is not None else torch.cuda.current_device()
-    kernel_key = (index, input_dtype, head_dim)
+    sequence_axis = 2 if tensor_layout == "HND" else 1
+    head_axis = 1 if tensor_layout == "HND" else 2
+    kernel_key = (
+        index,
+        input_dtype,
+        tensor_layout,
+        head_dim,
+        q.shape[sequence_axis],
+        k.shape[sequence_axis],
+        q.shape[head_axis],
+        k.shape[head_axis],
+    )
     if kernel_key not in _LOGGED_TURING_KERNELS:
         LOG.info(
             "Bundled Turing Sage active: device=%s dtype=%s layout=%s "

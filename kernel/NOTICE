@@ -6,10 +6,18 @@ Turing W4A8, and the bundled production Turing Sage attention path. Model
 wrappers, RoPE fusion, W8A8, AWQ, NVFP4, cache logic, and pipeline integrations
 are intentionally omitted.
 
-The staged Turing ConvRot quantizer and segmented RMSNorm+AdaLN kernel under
-`csrc/turing/` are derived from comfy-kitchen's Apache-2.0 CUDA implementation:
+The Turing ConvRot quantizers, segmented RMSNorm+AdaLN kernel, and W4A8 SM75
+GEMM tile/epilogue policy under `csrc/turing/` are derived from comfy-kitchen's
+Apache-2.0 CUDA implementation:
 
   https://github.com/Comfy-Org/comfy-kitchen
+
+The packed Turing W4A8 Tensor Core path uses NVIDIA CUTLASS headers:
+
+  https://github.com/NVIDIA/cutlass
+
+CUTLASS is licensed under the BSD 3-Clause License. Its license text is kept
+in `LICENSES/cutlass-LICENSE.txt`.
 
 The CUDA kernel subset under csrc/svdint4 is derived from Nunchaku:
 

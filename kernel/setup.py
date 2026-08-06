@@ -1,7 +1,11 @@
+import hashlib
 import os
 import platform
 import shutil
 import sys
+import tempfile
+import urllib.request
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -14,6 +18,162 @@ if IS_WINDOWS:
 
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
+
+
+def _is_cutlass_include_dir(candidate: Path) -> bool:
+    required = (
+        "cutlass/cutlass.h",
+        "cutlass/gemm/device/gemm_universal_adapter.h",
+        "cutlass/epilogue/threadblock/fusion/visitors.hpp",
+        "cute/tensor.hpp",
+    )
+    return all((candidate / relative).is_file() for relative in required)
+
+
+def _download_cutlass_include_dir() -> Path | None:
+    """Fetch the pinned, platform-independent NVIDIA wheel without its Python deps."""
+    enabled = os.environ.get("SVDINT4_CUTLASS_AUTO_DOWNLOAD", "1").strip().lower()
+    if enabled in {"0", "false", "no", "off"}:
+        return None
+
+    version = "4.2.0.0"
+    filename = f"nvidia_cutlass-{version}-py3-none-any.whl"
+    url = (
+        "https://files.pythonhosted.org/packages/21/6b/"
+        "e86fc2fd536dd4b8bd2209aa31d7002610c501b0802337787eac9c9b328c/"
+        + filename
+    )
+    expected_sha256 = "f9599ada45c7bcb6bf53f7d3f0a7d154183e53451c01bfa59eecd37dd4a693f6"
+    cache_root = Path(tempfile.gettempdir()) / f"svdint4-cutlass-{version}"
+    include_dir = cache_root / "include"
+    if _is_cutlass_include_dir(include_dir):
+        return include_dir.resolve()
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    wheel = cache_root / filename
+    if not wheel.is_file() or hashlib.sha256(wheel.read_bytes()).hexdigest() != expected_sha256:
+        partial = cache_root / f"{filename}.{os.getpid()}.part"
+        try:
+            with urllib.request.urlopen(url, timeout=60) as response, partial.open("wb") as output:
+                shutil.copyfileobj(response, output)
+            digest = hashlib.sha256(partial.read_bytes()).hexdigest()
+            if digest != expected_sha256:
+                raise RuntimeError(
+                    f"downloaded NVIDIA CUTLASS wheel has SHA256 {digest}, expected {expected_sha256}"
+                )
+            partial.replace(wheel)
+        finally:
+            if partial.exists():
+                partial.unlink()
+
+    staging = cache_root / f"include.{os.getpid()}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    prefix = "cutlass_library/source/include/"
+    with zipfile.ZipFile(wheel) as archive:
+        for member in archive.infolist():
+            if member.is_dir() or not member.filename.startswith(prefix):
+                continue
+            relative = Path(member.filename[len(prefix):])
+            if not relative.parts or ".." in relative.parts:
+                continue
+            target = staging / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member) as source, target.open("wb") as output:
+                shutil.copyfileobj(source, output)
+    if not _is_cutlass_include_dir(staging):
+        raise RuntimeError("the pinned NVIDIA CUTLASS wheel did not contain the required C++ headers")
+    if include_dir.exists():
+        shutil.rmtree(include_dir)
+    staging.replace(include_dir)
+    return include_dir.resolve()
+
+
+def _cutlass_include_dir() -> Path:
+    """Find portable CUTLASS C++ headers on Linux and Windows."""
+    override = os.environ.get("SVDINT4_CUTLASS_INCLUDE_DIR")
+    if override:
+        root = Path(override)
+        for candidate in (root, root / "include"):
+            if _is_cutlass_include_dir(candidate):
+                return candidate.resolve()
+        raise RuntimeError(
+            "SVDINT4_CUTLASS_INCLUDE_DIR must name CUTLASS's include directory "
+            "or its parent (the resolved directory must contain cutlass/cutlass.h)."
+        )
+
+    candidates: list[Path] = []
+    prefixes = [Path(sys.prefix)]
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        prefixes.insert(0, Path(conda_prefix))
+    for prefix in prefixes:
+        candidates.extend(
+            [
+                prefix / "Library" / "include",  # Conda on Windows
+                prefix / "include",              # Conda on Linux
+            ]
+        )
+
+    cuda_roots: list[Path] = []
+    for value in (CUDA_HOME, os.environ.get("CUDA_PATH")):
+        if value:
+            cuda_roots.append(Path(value))
+    nvcc = shutil.which("nvcc")
+    if nvcc:
+        cuda_roots.append(Path(nvcc).resolve().parent.parent)
+    for cuda_root in cuda_roots:
+        candidates.extend(
+            [
+                cuda_root / "include",
+                cuda_root / "targets" / "x86_64-linux" / "include",
+                cuda_root / "targets" / "x64" / "include",
+            ]
+        )
+
+    # NVIDIA's platform-independent nvidia-cutlass wheel installs the C++
+    # sources below cutlass_library/source. Keep additional conventional paths
+    # for future NVIDIA packages without importing their Python runtime.
+    for entry in sys.path:
+        if not entry:
+            continue
+        site_root = Path(entry)
+        candidates.extend(
+            [
+                site_root / "cutlass_library" / "source" / "include",
+                site_root / "nvidia" / "cutlass" / "include",
+                site_root / "nvidia_cutlass" / "include",
+                site_root / "cutlass" / "include",
+            ]
+        )
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = os.path.normcase(os.path.abspath(candidate))
+        if key in seen:
+            continue
+        seen.add(key)
+        if _is_cutlass_include_dir(candidate):
+            return candidate.resolve()
+
+    try:
+        downloaded = _download_cutlass_include_dir()
+    except Exception as error:
+        raise RuntimeError(
+            "CUTLASS C++ headers were not found locally and the pinned NVIDIA "
+            f"header download failed: {error}"
+        ) from error
+    if downloaded is not None:
+        return downloaded
+
+    raise RuntimeError(
+        "CUTLASS C++ headers are missing or undiscoverable. Install the official "
+        "portable package with `python -m pip install nvidia-cutlass==4.2.0.0`, "
+        "install a Conda CUTLASS package, or set SVDINT4_CUTLASS_INCLUDE_DIR "
+        "to the directory containing "
+        "cutlass/cutlass.h. Set SVDINT4_CUTLASS_AUTO_DOWNLOAD=1 to allow the "
+        "default pinned-header download."
+    )
 
 
 def _windows_cccl_include_dirs() -> list[str]:
@@ -97,6 +257,7 @@ def _arch_list() -> str:
 
 ARCH_LIST = _arch_list()
 os.environ.setdefault("TORCH_CUDA_ARCH_LIST", ARCH_LIST)
+CUTLASS_INCLUDE_DIR = _cutlass_include_dir()
 CCCL_INCLUDE_DIRS = _windows_cccl_include_dirs()
 
 COMMON_DEFINES = [
@@ -191,6 +352,7 @@ core_ext = CUDAExtension(
     ],
     include_dirs=[
         str((ROOT / "csrc").resolve()),
+        str(CUTLASS_INCLUDE_DIR.resolve()),
         *CCCL_INCLUDE_DIRS,
     ],
     extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS},
