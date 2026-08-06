@@ -36,7 +36,7 @@ class KernelSetupTest(unittest.TestCase):
             runpy.run_path(str(SETUP_PATH), run_name="__svdint4_windows_setup_test__")
         return setup.call_args.kwargs["ext_modules"]
 
-    def test_sage_compatibility_ptx_is_opt_in_and_keeps_sm75(self):
+    def test_sage_compute75_ptx_is_opt_in_and_keeps_sm75(self):
         environment = {
             "SVDINT4_ARCH_LIST": "7.5+PTX",
         }
@@ -58,6 +58,11 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn("arch=compute_75,code=sm_75", flags)
         self.assertIn("arch=compute_75,code=compute_75", flags)
         self.assertNotIn("arch=compute_86,code=sm_86", flags)
+        self.assertNotIn("-DSVDINT4_EXPERIMENTAL_SAGE_VARIANTS", flags)
+        self.assertEqual(setup.call_args.kwargs["version"], "0.6.2")
+        self.assertNotIn(
+            "svdint4.turing_sage2", setup.call_args.kwargs["packages"]
+        )
 
     def test_windows_conda_target_specific_cccl_path_is_added(self):
         with tempfile.TemporaryDirectory() as temp_dir:

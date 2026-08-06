@@ -2,16 +2,12 @@
 
 CUDA/PyTorch extension used by ComfyUI SVDInt4.
 
-In addition to the SVDQuant path, version 0.6.1 provides exact-sm75 packed W4A8,
+In addition to the SVDQuant path, version 0.6.2 provides exact-sm75 packed W4A8,
 W8/W4 staged and BF16 row-buffer activation fusions, and a self-contained
-Sage attention family. Bundled `sage1` uses per-block INT8 Q/K and stable
-FP16-tile/FP32-running PV accumulation; the Turing `sage2` adaptation uses
-packed per-thread INT4 Q/K, official-style Q/K smoothing, and the same stable
-PV policy. Sage2 fuses block-local smoothing with quantization and computes its
-bounded, chunked score correction with FP16 Tensor Core MMA plus FP32
-accumulation. The per-warp INT8-QK/direct-FP32-PV `sage_` path is the default
-because it remains the fastest and most stable current choice. All variants
-run without the standalone `sageattention` package.
+Sage attention backend. Bundled `sage` uses per-warp INT8 Q/K and direct FP32
+probability/value accumulation without the standalone `sageattention` package.
+Unstable Sage1/Sage2 adaptations are excluded from the production package and
+default CUDA build.
 
 Most users should install it from the parent `comfyui-svdint4` directory:
 
@@ -33,11 +29,12 @@ csrc/
     convrot_quant.cu                      staged/row-buffer W8 and W4 ConvRot quantizers
     segmented_rms_adaln.cu                affine segmented RMSNorm + AdaLN
     w4a8.cu                               packed Turing W4A8 kernel
-    sage/                                 bundled SM75 Sage1/Sage2/hybrid kernels
+    sage/                                 bundled production SM75 Sage kernel
 svdint4/
   ops.py                                  stable SVDInt4/W4A8 Python API
-  turing_sage/                            lazy Sage family Python facade
-  turing_sage2/                           compatibility import for pre-0.6 callers
+  turing_sage/                            lazy production Sage Python facade
+experiments/
+  turing_sage_variants/                   source-only research checkpoint guide
 ```
 
 `tensor_bridge.h` is the small tensor/stream ABI bridge shared by the CUDA
@@ -88,23 +85,10 @@ Then run the numerical matrix, optionally with ConvRot timings:
 python scripts/validate_compatible.py --device cuda:0 --benchmark
 ```
 
-To compare the installed official SageAttention INT8 implementation with the
-bundled Sage1 INT8 path, invoke the official package's shipped INT4 Triton
-quantizer source, and separate paper-style INT4 quantization error from the
-bundled Sage2 kernel error on identical inputs:
-
-```bash
-python scripts/compare_sage_precision.py --device cuda:0
-python scripts/compare_sage_precision.py --device cuda:0 --profile biased
-```
-
-The Gaussian profile measures the ordinary zero-mean case. The biased profile
-adds the per-channel K bias and per-64-token Q-block bias that the official
-smoothing identities target, and reports no-smoothing, K-only, Q-only, and
-Q+K rows. The public package attention API currently uses INT8 QK; its INT4
-Triton quantizers are source-level comparison references, not a public INT4
-attention API. If the package is absent, the script still separates local
-INT4 quantization error from the SM75 online-softmax/FP16-PV error.
+The removed Sage1/Sage2 experiments, precision comparator and benchmark
+breakdowns are reproducible from the checkpoint documented in
+`experiments/turing_sage_variants/README.md`; they are intentionally not
+installed by this package.
 
 If `nvcc` selects the wrong host compiler:
 

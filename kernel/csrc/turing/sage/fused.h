@@ -31,6 +31,7 @@ void quant_per_block_int8_cuda(
                 int block_size,
                 int tensor_layout);
 
+#ifdef SVDINT4_EXPERIMENTAL_SAGE_VARIANTS
 void quant_per_block_int8_fuse_sub_mean_cuda(
                 at::Tensor input,
                 at::Tensor mean,
@@ -38,6 +39,7 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
                 at::Tensor scale,
                 int block_size,
                 int tensor_layout);
+#endif
 
 void quant_per_warp_int8_cuda(
                 at::Tensor input,
@@ -68,6 +70,7 @@ void quant_per_warp_int8_varlen_cuda(
                 int block_size,
                 int warp_block_size);
 
+#ifdef SVDINT4_EXPERIMENTAL_SAGE_VARIANTS
 void token_block_mean_cuda(
                 at::Tensor input,
                 at::Tensor output,
@@ -111,12 +114,15 @@ void sage2_score_correction_cuda(
                 at::Tensor output,
                 int tensor_layout,
                 bool subtract_key_mean);
+#endif
 
+#ifdef SVDINT4_EXPERIMENTAL_SAGE_VARIANTS
 void sub_mean_cuda(
                 at::Tensor input,
                 at::Tensor mean,
                 at::Tensor output,
                 int tensor_layout);
+#endif
 
 void transpose_pad_permute_cuda(
                 at::Tensor input,

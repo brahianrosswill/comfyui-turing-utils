@@ -1018,6 +1018,8 @@ at::Tensor qk_int8_sv_f16_accum_f32_attn(at::Tensor query,
   CHECK_DIMS(output, 4);
   CHECK_DIMS(query_scale, 3);
   CHECK_DIMS(key_scale, 3);
+  TORCH_CHECK(qk_quant_gran == 2,
+              "production Turing Sage requires per-warp Q/K quantization");
 
   const int head_dim = query.size(3);
   const int batch_size = query.size(0);
@@ -1093,32 +1095,31 @@ at::Tensor qk_int8_sv_f16_accum_f32_attn(at::Tensor query,
 
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
-      DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, {
-        DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
-          DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
-           DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(value_dtype, DTypeV, {
-            constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
+      DISPATCH_RETURN_LSE(return_lse, RETURN_LSE, {
+        DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
+         DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(value_dtype, DTypeV, {
+          constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
 
-            launch_qk_int_sv_f16_attn<64, 64, 16, 64, HEAD_DIM, QK_QUANT_GRAN,
-                                       float, false, DTypeOut, DTypeV, mask_mode,
-                                       RETURN_LSE, false>(
-                query, key, value, output, query_scale, key_scale, at::Tensor(), lse,
-                batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads, num_kv_groups,
-                stride_bz_q, stride_seq_q, stride_h_q,
-                stride_bz_k, stride_seq_k, stride_h_k,
-                stride_bz_v, stride_seq_v, stride_h_v,
-                stride_bz_o, stride_seq_o, stride_h_o,
-                sm_scale);
-           });
+          launch_qk_int_sv_f16_attn<64, 64, 16, 64, HEAD_DIM, 2,
+                                     float, false, DTypeOut, DTypeV, mask_mode,
+                                     RETURN_LSE, false>(
+              query, key, value, output, query_scale, key_scale, at::Tensor(), lse,
+              batch_size, qo_len, kv_len, num_qo_heads, num_kv_heads, num_kv_groups,
+              stride_bz_q, stride_seq_q, stride_h_q,
+              stride_bz_k, stride_seq_k, stride_h_k,
+              stride_bz_v, stride_seq_v, stride_h_v,
+              stride_bz_o, stride_seq_o, stride_h_o,
+              sm_scale);
+         });
           });
         });
       });
-    });
   });
 
   return lse;
 }
 
+#ifdef SVDINT4_EXPERIMENTAL_SAGE_VARIANTS
 at::Tensor qk_int8_sv_f16_accum_f16_attn(at::Tensor query,
                     at::Tensor key,
                     at::Tensor value,
@@ -1812,3 +1813,4 @@ at::Tensor qk_int4_sv_f16_accum_f16_f32_precomputed_attn(
       at::Tensor(), at::Tensor(), tensor_layout, is_causal, sm_scale,
       return_lse, 0, 0, score_correction, true, q_block_start, q_block_count);
 }
+#endif

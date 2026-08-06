@@ -1,4 +1,4 @@
-"""Attention backend selection and the self-contained Turing Sage family."""
+"""Attention backend selection and the self-contained Turing Sage backend."""
 
 from __future__ import annotations
 
@@ -48,26 +48,10 @@ def register_attention_backend(backend: AttentionBackend) -> None:
 
 register_attention_backend(
     AttentionBackend(
-        option="sage2",
+        option="sage",
         attention_function=None,
-        label="sage2",
-        aliases=("turing_sage2", "bundled_sage2"),
-    )
-)
-register_attention_backend(
-    AttentionBackend(
-        option="sage1",
-        attention_function=None,
-        label="sage1",
-        aliases=("turing_sage1", "bundled_sage1"),
-    )
-)
-register_attention_backend(
-    AttentionBackend(
-        option="sage_",
-        attention_function=None,
-        label="sage_",
-        aliases=("sage_hybrid", "turing_sage_hybrid", "accuracy_baseline"),
+        label="sage",
+        aliases=("sage_", "sage_hybrid", "turing_sage", "turing_sage_hybrid"),
     )
 )
 register_attention_backend(
@@ -84,7 +68,7 @@ register_attention_backend(
         attention_function="sage",
         label="sage attn",
         install_hint="Install sageattention in the ComfyUI Python environment.",
-        aliases=("sage", "sageattention", "sage_attention"),
+        aliases=("sageattention", "sage_attention"),
     )
 )
 register_attention_backend(
@@ -109,7 +93,7 @@ AUTO_BACKEND_PRIORITY = ("sage_attn", "flash_attn", "sdpa")
 
 
 def attention_backend_choices() -> tuple[str, ...]:
-    return ("auto", "sage_", "sage1", "sage2", "sage_attn", "flash_attn", "sdpa")
+    return ("auto", "sage", "sage_attn", "flash_attn", "sdpa")
 
 
 def normalize_attention_backend(value: str | None) -> str:
@@ -167,27 +151,24 @@ def bundled_available() -> bool:
     return available()
 
 
-def _sageattn(*args, variant: str = "sage_", **kwargs):
+def _sageattn(*args, **kwargs):
     from svdint4 import turing_sage
 
-    implementations = {
-        "sage2": turing_sage.sageattn_sage2,
-        "sage1": turing_sage.sageattn_sage1,
-        "sage_": turing_sage.sageattn_hybrid,
-    }
-    return implementations[variant](*args, **kwargs)
+    return turing_sage.sageattn(*args, **kwargs)
 
 
-def preflight_bundled(device: torch.device, variant: str = "sage_") -> None:
+def preflight_bundled(device: torch.device, variant: str = "sage") -> None:
     if not is_supported_turing_device(device):
         raise RuntimeError(f"unsupported Turing device {device}")
     index = device.index if device.index is not None else torch.cuda.current_device()
-    key = (index, variant)
+    if variant not in {"sage", "sage_"}:
+        raise ValueError(f"unknown bundled Turing Sage backend: {variant}")
+    key = (index, "sage")
     if key in _PREFLIGHTED_DEVICES:
         return
     from svdint4.turing_sage import preflight
 
-    preflight(device, variant=variant)
+    preflight(device)
     _PREFLIGHTED_DEVICES.add(key)
 
 
@@ -217,7 +198,7 @@ def turing_sage_attention(
     attn_precision=None,
     skip_reshape: bool = False,
     skip_output_reshape: bool = False,
-    variant: str = "sage_",
+    variant: str = "sage",
     **kwargs,
 ) -> torch.Tensor:
     global _LOGGED_FP32_COMPAT
@@ -272,23 +253,16 @@ def turing_sage_attention(
         k = k.to(torch.bfloat16)
         v = v.to(torch.bfloat16)
 
-    variant_options = {
-        "sage2": {"smooth_q": True, "smooth_k": True},
-        "sage1": {"smooth_k": True},
-        # Preserve the original bundled hybrid exactly as an accuracy baseline.
-        "sage_": {"smooth_k": False},
-    }
-    if variant not in variant_options:
-        raise ValueError(f"Unsupported bundled Turing Sage variant: {variant}")
+    if variant not in {"sage", "sage_"}:
+        raise ValueError(f"Unsupported bundled Turing Sage backend: {variant}")
     output = _sageattn(
         q,
         k,
         v,
-        variant=variant,
         tensor_layout=tensor_layout,
         is_causal=bool(kwargs.get("is_causal", False)),
         sm_scale=kwargs.get("scale"),
-        **variant_options[variant],
+        smooth_k=False,
     )
     if tensor_layout == "HND":
         result = output if skip_output_reshape else output.transpose(1, 2).reshape(batch, -1, heads * head_dim)
@@ -302,12 +276,12 @@ def turing_sage_attention(
 def _bundled_turing_variant(option: str, device: torch.device | None) -> str | None:
     option = normalize_attention_backend(option)
     if device is None or not is_supported_turing_device(device):
-        if option in {"sage1", "sage2", "sage_"}:
+        if option == "sage":
             raise RuntimeError(f"Attention backend {option!r} requires an NVIDIA sm75 Turing GPU")
         return None
     if option in {"auto", "sage_attn"}:
-        return "sage_"
-    return option if option in {"sage1", "sage2", "sage_"} else None
+        return "sage"
+    return option if option == "sage" else None
 
 
 def _dtype_compatible_fallback(original: Callable, *args, **kwargs):

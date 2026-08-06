@@ -22,9 +22,9 @@ from .packing import (
     unpack_svd_down,
     unpack_svd_up,
 )
-from . import turing_sage, turing_sage2
+from . import turing_sage
 
-__version__ = "0.6.1"
+__version__ = "0.6.2"
 
 __all__ = [
     "PackedInt4Weight",
@@ -45,7 +45,6 @@ __all__ = [
     "turing_swiglu_int8_convrot_quantize",
     "turing_swiglu_int4_convrot_quantize",
     "turing_w4a8_linear",
-    "turing_sage2",
     "turing_sage",
     "unpack_svd_down",
     "unpack_svd_up",

@@ -70,7 +70,7 @@ class TuringAttentionContractTest(unittest.TestCase):
         self.assertIs(output, q)
         self.assertEqual(sage.call_args.kwargs["tensor_layout"], "HND")
 
-    def test_causal_and_scale_options_are_forwarded(self):
+    def test_causal_and_scale_options_are_forwarded_to_stable_sage(self):
         q = torch.zeros((1, 4, 32, 64), dtype=torch.bfloat16)
         with (
             mock.patch("attention.is_supported_turing_device", return_value=True),
@@ -85,13 +85,21 @@ class TuringAttentionContractTest(unittest.TestCase):
                 skip_reshape=True,
                 is_causal=True,
                 scale=0.125,
-                variant="sage2",
             )
         self.assertTrue(sage.call_args.kwargs["is_causal"])
         self.assertEqual(sage.call_args.kwargs["sm_scale"], 0.125)
-        self.assertTrue(sage.call_args.kwargs["smooth_q"])
-        self.assertTrue(sage.call_args.kwargs["smooth_k"])
-        self.assertEqual(sage.call_args.kwargs["variant"], "sage2")
+        self.assertFalse(sage.call_args.kwargs["smooth_k"])
+        self.assertNotIn("variant", sage.call_args.kwargs)
+
+    def test_experimental_variant_is_rejected(self):
+        q = torch.zeros((1, 4, 32, 64), dtype=torch.bfloat16)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            self.assertRaisesRegex(ValueError, "Unsupported bundled Turing Sage backend"),
+        ):
+            turing_attention.turing_sage_attention(
+                mock.Mock(), q, q, q, 4, skip_reshape=True, variant="sage2"
+            )
 
     def test_bf16_unreshaped_gqa_keeps_compact_kv_heads(self):
         q = torch.zeros((1, 32, 4 * 64), dtype=torch.bfloat16)

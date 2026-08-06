@@ -2,7 +2,7 @@ svdint4 includes an Apache-2.0 derived minimal binding around the Nunchaku
 W4A4/SVDQuant CUDA kernel path.
 
 The package exposes INT4 GEMM, activation quantization, SVD correction, packed
-Turing W4A8, and bundled Turing Sage1/Sage2/hybrid attention paths. Model
+Turing W4A8, and the bundled production Turing Sage attention path. Model
 wrappers, RoPE fusion, W8A8, AWQ, NVFP4, cache logic, and pipeline integrations
 are intentionally omitted.
 
@@ -30,6 +30,7 @@ branch `feature/turing-sm75-backend`, commit
   https://github.com/thu-ml/SageAttention
 
 The vendored CUDA and Python support is kept under `csrc/turing/sage` and
-`svdint4/turing_sage` (`turing_sage2` is a compatibility import).
+`svdint4/turing_sage`. Unstable Sage1/Sage2 research is excluded from the
+default bindings and documented under `experiments/turing_sage_variants`.
 SageAttention is licensed under the Apache License, Version 2.0; its license
 text is in LICENSES/sageattention-LICENSE.txt.

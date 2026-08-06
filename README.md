@@ -212,7 +212,7 @@ The script writes original metadata and basic provenance to
   follows each layer's activation format, while `true` forces INT8 GEMM
   activations. W4A8 requires an enabled comfy-kitchen CUDA backend because its
   eager fallback always computes W4A4. On Turing, `patch_attention=auto`
-  selects the stable bundled `sage_`; elsewhere it selects installed
+  selects the stable bundled `sage`; elsewhere it selects installed
   SageAttention first, Flash Attention second, and PyTorch SDPA as the fallback.
   BF16 activation storage is selected automatically when the detected model
   declares BF16 inference support; there is no loader-only dtype switch.
@@ -231,13 +231,9 @@ The script writes original metadata and basic provenance to
   Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
   returns a ComfyUI `MODEL`. `patch_attention=auto` uses the same SageAttention,
   Flash Attention, then PyTorch SDPA priority on non-Turing GPUs. On a supported
-  Turing GPU, `auto` selects the bundled `sage_` implementation. This is the
-  previous INT8-QK/FP32-PV path and remains the default because it is the most
-  stable and fastest of the current SM75 variants. The explicit `sage1` and
-  `sage2` choices select the experimental bundled alternatives. On non-Turing
-  GPUs, `auto` still prefers the independently installed SageAttention package
-  and falls back through Flash Attention to
-  PyTorch SDPA.
+  Turing GPU, `auto` selects the bundled `sage` implementation. On non-Turing
+  GPUs, `auto` prefers the independently installed SageAttention package and
+  falls back through Flash Attention to PyTorch SDPA.
 
 - `Bernini Context Windows`
   Uses the same controls and defaults as ComfyUI's Wan Context Windows node,
@@ -295,28 +291,19 @@ intermediate. It is enabled automatically after model load and has no loader
 control. Other architectures and unmatched block layouts retain their normal
 ComfyUI implementation.
 
-The bundled attention family is derived from wjie98's full SM75 path and does
-not import or require the standalone `sageattention` package. The default
-`sage_` uses per-warp INT8 Q/K and direct FP32 probability/value accumulation.
-Experimental `sage1` uses per-block INT8 Q/K, global K smoothing, and FP16 MMA
-for one 64-token PV tile before folding it into an FP32 running accumulator.
-Experimental `sage2` uses packed per-thread INT4 Q/K, blockwise Q and global K
-smoothing, an FP16-Tensor-Core/FP32-accumulated Q-mean score correction, and
-the same stable mixed PV policy. Q/K preprocessing preserves the official
-packed-code layout exactly. Correction uses a bounded 128 MiB chunked
-workspace rather than an unbounded sequence-squared allocation. This is a
-Turing adaptation: SM75 has neither
-the FP8 PV path nor the newer tensor-core instructions used by upstream
-SageAttention2.
+The bundled `sage` backend is derived from wjie98's full SM75 path and does not
+import or require the standalone `sageattention` package. It uses per-warp
+INT8 Q/K and direct FP32 probability/value accumulation. It accepts FP16 or
+BF16 input/output, HND or NHD layout, causal attention, GQA, different Q/KV
+lengths, variable-length batches, and head dimensions up to 128. BF16 V is
+converted tile-by-tile as it enters FP16 shared memory, so no full-size FP16 V
+copy is allocated. If the calling model supplies FP32 Q/K/V, only the attention
+boundary is narrowed to BF16 and the result is restored to FP32.
 
-All three variants accept FP16 or BF16 input/output, HND or NHD layout, causal
-attention, GQA, different Q/KV lengths, variable-length batches, and head
-dimensions up to 128 (smaller dimensions are padded internally). FP16 V is
-read directly; BF16 V is converted tile-by-tile as it enters FP16 shared
-memory, so no full-size FP16 V copy is allocated. Sage2 keeps its attention
-dynamic shared-memory use below the 48 KiB target. If the calling model supplies FP32 Q/K/V, only the attention boundary
-is narrowed to BF16 and the result is restored to FP32; the rest of the model
-remains under its existing dtype policy.
+The earlier Sage1 and Sage2 adaptations are unstable research code. They are
+not loader options, public Python APIs, or part of the default kernel build.
+Their source and comparison procedure are preserved at the checkpoint linked
+from [`kernel/experiments/turing_sage_variants`](kernel/experiments/turing_sage_variants/README.md).
 
 ComfyUI attention masks, disabled low-precision attention, and head dimensions
 outside that contract use the original ComfyUI attention function without a

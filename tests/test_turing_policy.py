@@ -106,7 +106,7 @@ class BF16PolicyTest(unittest.TestCase):
             mock.patch.dict(
                 sys.modules, {"svdint4": SimpleNamespace(__version__="0.4.9")}
             ),
-            self.assertRaisesRegex(RuntimeError, "svdint4-kernel>=0.6.1"),
+            self.assertRaisesRegex(RuntimeError, "svdint4-kernel>=0.6.2"),
         ):
             bf16_policy._check_kernel_contract()
 

@@ -100,8 +100,7 @@ class SVDInt4DiffusionModelLoader:
                         "default": "auto",
                         "tooltip": (
                             "Select this SVDInt4 model's attention backend. "
-                            "On Turing, auto uses the stable bundled sage_; sage1 and sage2 "
-                            "select the experimental alternatives. Elsewhere auto tries installed "
+                            "On Turing, auto uses the stable bundled sage backend. Elsewhere auto tries installed "
                             "sage_attn, then flash_attn, then PyTorch SDPA."
                         ),
                     },

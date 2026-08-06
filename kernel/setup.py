@@ -254,8 +254,8 @@ if _includes_sm75():
 
 setup(
     name="svdint4-kernel",
-    version="0.6.1",
-    packages=find_packages(),
+    version="0.6.2",
+    packages=find_packages(exclude=("svdint4.turing_sage2", "svdint4.turing_sage2.*")),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},
 )
