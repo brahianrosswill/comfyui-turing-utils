@@ -103,6 +103,18 @@ def preflight_w4a8(device: torch.device) -> None:
         )
         if full_output.dtype != torch.bfloat16 or not torch.isfinite(full_output).all():
             raise RuntimeError(f"BF16 ConvRot W4A8 self-test failed for K={hidden_size}")
+    swiglu_input = torch.zeros((3, 512), dtype=torch.bfloat16, device=device)
+    swiglu_output = convrot_w4a4_linear(
+        swiglu_input,
+        torch.zeros((5, 128), dtype=torch.int8, device=device),
+        torch.ones((5,), dtype=torch.float32, device=device),
+        convrot_groupsize=256,
+        quant_group_size=64,
+        linear_dtype="int8",
+        input_act="swiglu",
+    )
+    if swiglu_output.dtype != torch.bfloat16 or not torch.isfinite(swiglu_output).all():
+        raise RuntimeError("SwiGLU W4A8 BF16 self-test failed")
     torch.cuda.synchronize(device)
     _PREFLIGHTED_DEVICES.add(index)
 
@@ -137,6 +149,19 @@ def preflight_kitchen(device: torch.device, w4a4: bool, w8a8: bool) -> None:
             )
             if output.dtype != torch.bfloat16 or not torch.isfinite(output).all():
                 raise RuntimeError(f"Kitchen W4A4 BF16 self-test failed for K={hidden_size}")
+        swiglu_input = torch.zeros((16, 512), dtype=torch.bfloat16, device=device)
+        swiglu_weight = torch.zeros((64, 128), dtype=torch.int8, device=device)
+        swiglu_output = convrot_w4a4_linear(
+            swiglu_input,
+            swiglu_weight,
+            torch.ones((64,), dtype=torch.float32, device=device),
+            convrot_groupsize=256,
+            quant_group_size=64,
+            linear_dtype="int4",
+            input_act="swiglu",
+        )
+        if swiglu_output.dtype != torch.bfloat16 or not torch.isfinite(swiglu_output).all():
+            raise RuntimeError("SwiGLU W4A4 BF16 self-test failed")
     if w8a8:
         for hidden_size in (256, 5376):
             x = (
@@ -169,6 +194,17 @@ def preflight_kitchen(device: torch.device, w4a4: bool, w8a8: bool) -> None:
         )
         if swiglu_output.dtype != torch.bfloat16 or not torch.isfinite(swiglu_output).all():
             raise RuntimeError("Kitchen SwiGLU W8A8 BF16 self-test failed")
+        contraction_input = torch.zeros((129, 256), dtype=torch.bfloat16, device=device)
+        contraction_output = comfy_kitchen.int8_linear(
+            contraction_input,
+            torch.zeros((64, 256), dtype=torch.int8, device=device),
+            torch.ones((), dtype=torch.float32, device=device),
+            out_dtype=torch.bfloat16,
+            convrot=True,
+            convrot_groupsize=256,
+        )
+        if contraction_output.dtype != torch.bfloat16 or not torch.isfinite(contraction_output).all():
+            raise RuntimeError("Turing W8A8 BF16 contraction self-test failed")
     torch.cuda.synchronize(device)
     _PREFLIGHTED_KITCHEN.add(key)
 
@@ -263,14 +299,54 @@ def _quantize_turing_int8_activation(
     return staged(x2d, group_size)
 
 
-def _quantize_turing_int4_activation(x2d: torch.Tensor, group_size: int):
+def _quantize_turing_int4_activation(
+    x2d: torch.Tensor,
+    group_size: int,
+    input_act: str | None = None,
+):
     from comfy_kitchen.backends import cuda as kitchen_cuda
+
+    if input_act not in (None, "none", "swiglu"):
+        raise ValueError(f"unsupported fused Turing INT4 activation: {input_act!r}")
+    if input_act == "swiglu":
+        hidden_size = x2d.shape[1] // 2
+        if x2d.shape[1] % 2 != 0:
+            raise ValueError("SwiGLU input width must be even")
+        if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(hidden_size):
+            try:
+                from svdint4 import turing_bf16_int4_convrot_quantize
+            except (ImportError, AttributeError):
+                pass
+            else:
+                return turing_bf16_int4_convrot_quantize(
+                    x2d,
+                    group_size,
+                    swiglu=True,
+                )
+        try:
+            from svdint4 import turing_swiglu_int4_convrot_quantize
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                "SVDInt4 Turing W4A4 SwiGLU requires an updated svdint4-kernel; reinstall the kernel package"
+            ) from exc
+        return turing_swiglu_int4_convrot_quantize(x2d, group_size)
 
     requested_shared = _convrot_int4_shared_memory_bytes(
         x2d.shape[0], x2d.shape[1], x2d.element_size()
     )
     if requested_shared < TURING_SHARED_MEMORY_LIMIT:
         return kitchen_cuda.quantize_int4_rowwise_convrot64(x2d, group_size)
+    if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(x2d.shape[1]):
+        try:
+            from svdint4 import turing_bf16_int4_convrot_quantize
+        except (ImportError, AttributeError):
+            pass
+        else:
+            return turing_bf16_int4_convrot_quantize(
+                x2d,
+                group_size,
+                swiglu=False,
+            )
     rotate = getattr(kitchen_cuda, "rotate_int8_convrot_weight", None)
     if rotate is None:
         raise RuntimeError(
@@ -479,8 +555,10 @@ def convrot_w4a4_linear(
     convrot_groupsize: int = 256,
     quant_group_size: int = 64,
     linear_dtype: str = "int4",
+    input_act: str | None = None,
 ) -> torch.Tensor:
     from comfy_kitchen.backends import cuda as kitchen_cuda
+    from comfy_kitchen.backends._activations import apply_input_act
 
     if (
         linear_dtype not in {"int4", "int8"}
@@ -489,6 +567,7 @@ def convrot_w4a4_linear(
         or x.dtype != torch.bfloat16
         or not is_supported_turing_device(x.device)
     ):
+        x = apply_input_act(x, input_act)
         return kitchen_cuda.convrot_w4a4_linear(
             x,
             qweight,
@@ -501,13 +580,24 @@ def convrot_w4a4_linear(
 
     original_shape = x.shape
     x2d = x.reshape(-1, original_shape[-1]).contiguous()
+    if input_act not in (None, "none", "swiglu"):
+        x2d = apply_input_act(x2d, input_act)
+        input_act = None
     if linear_dtype == "int8":
         from svdint4 import turing_w4a8_linear
 
-        qactivation, activation_scale = _quantize_turing_int8_activation(x2d, convrot_groupsize)
+        qactivation, activation_scale = _quantize_turing_int8_activation(
+            x2d,
+            convrot_groupsize,
+            input_act=input_act,
+        )
         output = turing_w4a8_linear(qactivation, qweight, activation_scale, wscales, bias)
     else:
-        qactivation, activation_scale = _quantize_turing_int4_activation(x2d, convrot_groupsize)
+        qactivation, activation_scale = _quantize_turing_int4_activation(
+            x2d,
+            convrot_groupsize,
+            input_act=input_act,
+        )
         output = kitchen_cuda.int4_linear(
             qactivation,
             qweight.contiguous(),
@@ -516,7 +606,8 @@ def convrot_w4a4_linear(
             bias=bias,
             out_dtype=x.dtype,
         )
-    return output.reshape(*original_shape[:-1], qweight.shape[0])
+    output_shape = original_shape[:-1]
+    return output.reshape(*output_shape, qweight.shape[0])
 
 
 def register_backend() -> bool:
@@ -603,6 +694,7 @@ def register_backend() -> bool:
                     "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
                     "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
                     "linear_dtype": ParamConstraint(dtypes=frozenset({str})),
+                    "input_act": ParamConstraint(dtypes=frozenset({str, type(None)})),
                 },
                 default_devices=cuda_devices,
                 call_rules=(require_w4_convrot_256,),

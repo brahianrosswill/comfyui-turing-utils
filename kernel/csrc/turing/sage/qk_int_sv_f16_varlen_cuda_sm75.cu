@@ -41,22 +41,13 @@
 
 #define MMA_SV_N 16
 
-static bool is_sm75_varlen_device()
-{
-  int dev_id = 0;
-  cudaGetDevice(&dev_id);
-  cudaDeviceProp prop;
-  cudaGetDeviceProperties(&prop, dev_id);
-  return prop.major == 7 && prop.minor == 5;
-}
-
 template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K,
-          uint32_t head_dim, typename IndexT, typename DTypeOut,
+          uint32_t head_dim, typename IndexT, typename DTypeV, typename DTypeOut,
           MaskMode mask_mode = MaskMode::kNone>
 __global__ void qk_int_sv_f16_varlen_attn_kernel(
     int8_t *__restrict__ Q,
     int8_t *__restrict__ K,
-    half *__restrict__ V,
+    DTypeV *__restrict__ V,
     DTypeOut *__restrict__ O,
     float *__restrict__ Q_scale,
     float *__restrict__ K_scale,
@@ -170,7 +161,7 @@ __global__ void qk_int_sv_f16_varlen_attn_kernel(
 
   int8_t *Q_lane_base_ptr = Q + (q_start + bx * CTA_Q + CTA_Q / num_warps * warp_id + lane_id / global_to_shared_line_lanes_QK) * stride_seq_q + head_id * stride_h_q + (lane_id % global_to_shared_line_lanes_QK) * PACK_SIZE_QK;
   int8_t *K_lane_base_ptr = K + (k_start + CTA_K / num_warps * warp_id + lane_id / global_to_shared_line_lanes_QK) * stride_seq_k + kv_head * stride_h_k + (lane_id % global_to_shared_line_lanes_QK) * PACK_SIZE_QK;
-  half *V_lane_base_ptr = V + (k_start + CTA_K / num_warps * warp_id + lane_id / global_to_shared_line_lanes_V) * stride_seq_v + kv_head * stride_h_v + (lane_id % global_to_shared_line_lanes_V) * PACK_SIZE_V;
+  DTypeV *V_lane_base_ptr = V + (k_start + CTA_K / num_warps * warp_id + lane_id / global_to_shared_line_lanes_V) * stride_seq_v + kv_head * stride_h_v + (lane_id % global_to_shared_line_lanes_V) * PACK_SIZE_V;
 
   uint32_t Q_smem_offset_load = smem_Q.get_permuted_offset(warp_id * global_to_shared_copy_lines_per_warp_QK * Q_smem_iters_col + lane_id / global_to_shared_line_lanes_QK, lane_id % global_to_shared_line_lanes_QK);
   uint32_t K_smem_offset_load = smem_K.get_permuted_offset(warp_id * global_to_shared_copy_lines_per_warp_QK * K_smem_iters_col + lane_id / global_to_shared_line_lanes_QK, lane_id % global_to_shared_line_lanes_QK);
@@ -226,7 +217,7 @@ __global__ void qk_int_sv_f16_varlen_attn_kernel(
   float dequant_scale = q_scale * K_scale[k_scale_idx];
   sm_scale = original_sm_scale * dequant_scale;
 
-  load_global_to_share<global_to_shared_line_lanes_V, global_to_shared_copy_lines_per_warp_V, V_smem_iters_row, V_smem_iters_col, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, CTA_K>(
+  load_v_global_to_share<global_to_shared_line_lanes_V, global_to_shared_copy_lines_per_warp_V, V_smem_iters_row, V_smem_iters_col, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, CTA_K>(
       &V_lane_base_ptr, V_smem_offset_load, stride_seq_v, smem_V, V_load_idx_lane_base, kv_len);
   cp_async::commit_group();
 
@@ -286,7 +277,7 @@ __global__ void qk_int_sv_f16_varlen_attn_kernel(
         smem_V, RS_f16, RO, d, V_smem_offset_mma);
 
     __syncthreads();
-    load_global_to_share<global_to_shared_line_lanes_V, global_to_shared_copy_lines_per_warp_V, V_smem_iters_row, V_smem_iters_col, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, CTA_K>(
+    load_v_global_to_share<global_to_shared_line_lanes_V, global_to_shared_copy_lines_per_warp_V, V_smem_iters_row, V_smem_iters_col, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, CTA_K>(
         &V_lane_base_ptr, V_smem_offset_load, stride_seq_v, smem_V);
     cp_async::commit_group();
     K_load_idx_lane_base += CTA_K;
@@ -350,7 +341,7 @@ __global__ void qk_int_sv_f16_varlen_attn_kernel(
         smem_V, RS_f16, RO, d, V_smem_offset_mma);
 
     __syncthreads();
-    load_global_to_share<global_to_shared_line_lanes_V, global_to_shared_copy_lines_per_warp_V, V_smem_iters_row, V_smem_iters_col, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, CTA_K>(
+    load_v_global_to_share<global_to_shared_line_lanes_V, global_to_shared_copy_lines_per_warp_V, V_smem_iters_row, V_smem_iters_col, swizzle_mode_V, V_SMEM_STRIDE / PACK_SIZE_V, CTA_K>(
         &V_lane_base_ptr, V_smem_offset_load, stride_seq_v, smem_V, V_load_idx_lane_base, kv_len);
     cp_async::commit_group();
     K_load_idx_lane_base += CTA_K;
@@ -482,7 +473,7 @@ __global__ void qk_int_sv_f16_varlen_attn_kernel(
 }
 
 template <uint32_t CTA_Q, uint32_t CTA_K, uint32_t WARP_Q, uint32_t WARP_K,
-          uint32_t HEAD_DIM, typename IndexT, typename DTypeOut,
+          uint32_t HEAD_DIM, typename IndexT, typename DTypeV, typename DTypeOut,
           MaskMode mask_mode>
 static void launch_qk_int_sv_f16_varlen_attn(
     at::Tensor query,
@@ -518,7 +509,7 @@ static void launch_qk_int_sv_f16_varlen_attn(
                                        CTA_Q * HEAD_DIM * sizeof(half));
   static_assert(smem_max <= 48 * 1024, "SM75 attention must stay within 48 KiB shared memory");
 
-  auto kernel_func = qk_int_sv_f16_varlen_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, IndexT, DTypeOut, mask_mode>;
+  auto kernel_func = qk_int_sv_f16_varlen_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, IndexT, DTypeV, DTypeOut, mask_mode>;
   cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
 
   dim3 grid(div_ceil(max_seqlen_q, CTA_Q), num_qo_heads, batch_size);
@@ -527,7 +518,7 @@ static void launch_qk_int_sv_f16_varlen_attn(
   kernel_func<<<grid, block, smem_max>>>(
       query.data_ptr<int8_t>(),
       key.data_ptr<int8_t>(),
-      reinterpret_cast<half *>(value.data_ptr()),
+      reinterpret_cast<DTypeV *>(value.data_ptr()),
       reinterpret_cast<DTypeOut *>(output.data_ptr()),
       reinterpret_cast<float *>(query_scale.data_ptr()),
       reinterpret_cast<float *>(key_scale.data_ptr()),
@@ -578,7 +569,9 @@ at::Tensor qk_int8_sv_f16_varlen_accum_f32_attn(
 
   CHECK_DTYPE(query, at::ScalarType::Char);
   CHECK_DTYPE(key, at::ScalarType::Char);
-  CHECK_DTYPE(value, at::ScalarType::Half);
+  TORCH_CHECK(
+      value.scalar_type() == at::ScalarType::Half || value.scalar_type() == at::ScalarType::BFloat16,
+      "value must be float16 or bfloat16");
   CHECK_DTYPE(query_scale, at::ScalarType::Float);
   CHECK_DTYPE(key_scale, at::ScalarType::Float);
 
@@ -613,67 +606,42 @@ at::Tensor qk_int8_sv_f16_varlen_accum_f32_attn(
 
   const int num_kv_groups = num_qo_heads / num_kv_heads;
   auto output_dtype = output.scalar_type();
+  auto value_dtype = value.scalar_type();
   auto index_dtype = cu_seqlens_q.scalar_type();
   at::Tensor lse = at::empty({0});
 
   DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
     DISPATCH_CAUSAL(is_causal, IS_CAUSAL, {
+      DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(value_dtype, DTypeV, {
       DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(output_dtype, DTypeOut, {
         constexpr MaskMode mask_mode = IS_CAUSAL ? MaskMode::kCausal : MaskMode::kNone;
         if (index_dtype == at::ScalarType::Int)
         {
-          if (is_sm75_varlen_device())
-          {
-            launch_qk_int_sv_f16_varlen_attn<64, 64, 16, 64, HEAD_DIM, int32_t, DTypeOut, mask_mode>(
-                query, key, value, output, query_scale, key_scale, cu_seqlens_q, cu_seqlens_k,
-                batch_size, max_seqlen_q, max_seqlen_k, num_qo_heads, num_kv_heads, num_kv_groups,
-                query.stride(0), query.stride(1),
-                key.stride(0), key.stride(1),
-                value.stride(0), value.stride(1),
-                output.stride(0), output.stride(1),
-                sm_scale);
-          }
-          else
-          {
-            launch_qk_int_sv_f16_varlen_attn<128, 64, 32, 64, HEAD_DIM, int32_t, DTypeOut, mask_mode>(
-                query, key, value, output, query_scale, key_scale, cu_seqlens_q, cu_seqlens_k,
-                batch_size, max_seqlen_q, max_seqlen_k, num_qo_heads, num_kv_heads, num_kv_groups,
-                query.stride(0), query.stride(1),
-                key.stride(0), key.stride(1),
-                value.stride(0), value.stride(1),
-                output.stride(0), output.stride(1),
-                sm_scale);
-          }
+          launch_qk_int_sv_f16_varlen_attn<64, 64, 16, 64, HEAD_DIM, int32_t, DTypeV, DTypeOut, mask_mode>(
+              query, key, value, output, query_scale, key_scale, cu_seqlens_q, cu_seqlens_k,
+              batch_size, max_seqlen_q, max_seqlen_k, num_qo_heads, num_kv_heads, num_kv_groups,
+              query.stride(0), query.stride(1),
+              key.stride(0), key.stride(1),
+              value.stride(0), value.stride(1),
+              output.stride(0), output.stride(1),
+              sm_scale);
         }
         else if (index_dtype == at::ScalarType::Long)
         {
-          if (is_sm75_varlen_device())
-          {
-            launch_qk_int_sv_f16_varlen_attn<64, 64, 16, 64, HEAD_DIM, int64_t, DTypeOut, mask_mode>(
-                query, key, value, output, query_scale, key_scale, cu_seqlens_q, cu_seqlens_k,
-                batch_size, max_seqlen_q, max_seqlen_k, num_qo_heads, num_kv_heads, num_kv_groups,
-                query.stride(0), query.stride(1),
-                key.stride(0), key.stride(1),
-                value.stride(0), value.stride(1),
-                output.stride(0), output.stride(1),
-                sm_scale);
-          }
-          else
-          {
-            launch_qk_int_sv_f16_varlen_attn<128, 64, 32, 64, HEAD_DIM, int64_t, DTypeOut, mask_mode>(
-                query, key, value, output, query_scale, key_scale, cu_seqlens_q, cu_seqlens_k,
-                batch_size, max_seqlen_q, max_seqlen_k, num_qo_heads, num_kv_heads, num_kv_groups,
-                query.stride(0), query.stride(1),
-                key.stride(0), key.stride(1),
-                value.stride(0), value.stride(1),
-                output.stride(0), output.stride(1),
-                sm_scale);
-          }
+          launch_qk_int_sv_f16_varlen_attn<64, 64, 16, 64, HEAD_DIM, int64_t, DTypeV, DTypeOut, mask_mode>(
+              query, key, value, output, query_scale, key_scale, cu_seqlens_q, cu_seqlens_k,
+              batch_size, max_seqlen_q, max_seqlen_k, num_qo_heads, num_kv_heads, num_kv_groups,
+              query.stride(0), query.stride(1),
+              key.stride(0), key.stride(1),
+              value.stride(0), value.stride(1),
+              output.stride(0), output.stride(1),
+              sm_scale);
         }
         else
         {
           TORCH_CHECK(false, "cu_seqlens must be int32 or int64");
         }
+      });
       });
     });
   });

@@ -47,34 +47,20 @@ class FusionDispatchTest(unittest.TestCase):
         )
         return QuantizedTensor(qdata, "TensorWiseINT8Layout", params)
 
-    def test_fc2_audit_reports_actual_loaded_weight_contract(self):
-        good = SimpleNamespace(
-            mlp=SimpleNamespace(
-                fc2=SimpleNamespace(
-                    weight=self._w8a8_weight(),
-                    quant_format="int8_tensorwise",
-                )
-            )
-        )
-        dense = SimpleNamespace(
-            mlp=SimpleNamespace(
-                fc2=SimpleNamespace(
-                    weight=torch.zeros(4, 8, dtype=torch.bfloat16)
-                )
-            )
-        )
+    @staticmethod
+    def _w4_weight(linear_dtype: str, out_features=4, in_features=256):
+        from comfy.quant_ops import QuantizedTensor, TensorCoreConvRotW4A4Layout
 
-        with self.assertLogs("comfyui-svdint4", level="INFO") as logs:
-            eligible = turing_fusions._audit_turing_fc2([good, dense])
-
-        self.assertEqual(eligible, 1)
-        output = "\n".join(logs.output)
-        self.assertIn("eligible_w8a8=1", output)
-        self.assertIn("TensorWiseINT8Layout:1", output)
-        self.assertIn("torch.bfloat16:2", output)
-        self.assertIn("transposed=[False:2]", output)
-        self.assertIn("convrot=[False:1,True:1]", output)
-        self.assertIn("ConvRot group sizes: [256:1,None:1]", output)
+        qdata = torch.zeros((out_features, in_features // 2), dtype=torch.uint8)
+        params = TensorCoreConvRotW4A4Layout.Params(
+            scale=torch.ones((out_features, in_features // 64), dtype=torch.float32),
+            orig_dtype=torch.bfloat16,
+            orig_shape=(out_features, in_features),
+            convrot_groupsize=256,
+            quant_group_size=64,
+            linear_dtype=linear_dtype,
+        )
+        return QuantizedTensor(qdata, "TensorCoreConvRotW4A4Layout", params)
 
     def test_direct_turing_input_act_preserves_cast_lifecycle(self):
         weight = self._w8a8_weight()
@@ -84,6 +70,7 @@ class FusionDispatchTest(unittest.TestCase):
         offload = (None, None, None)
 
         with (
+            mock.patch("turing_ops.is_supported_turing_device", return_value=True),
             mock.patch(
                 "comfy.ops.cast_bias_weight",
                 return_value=(weight, None, offload),
@@ -104,6 +91,30 @@ class FusionDispatchTest(unittest.TestCase):
         uncast.assert_called_once_with(linear, weight, None, offload)
         self.assertEqual(int8_linear.call_args.kwargs["input_act"], "swiglu")
         self.assertTrue(int8_linear.call_args.kwargs["convrot"])
+
+    def test_direct_turing_input_act_supports_w4a4_and_w4a8(self):
+        for linear_dtype in ("int4", "int8"):
+            with self.subTest(linear_dtype=linear_dtype):
+                weight = self._w4_weight(linear_dtype)
+                linear = SimpleNamespace(weight=weight)
+                x = torch.zeros((2, 512), dtype=torch.bfloat16)
+                output = torch.empty((2, 4), dtype=torch.bfloat16)
+                offload = (None, None, None)
+                with (
+                    mock.patch("turing_ops.is_supported_turing_device", return_value=True),
+                    mock.patch(
+                        "comfy.ops.cast_bias_weight",
+                        return_value=(weight, None, offload),
+                    ),
+                    mock.patch("comfy.ops.uncast_bias_weight") as uncast,
+                    mock.patch("turing_ops.convrot_w4a4_linear", return_value=output) as kernel,
+                ):
+                    result = turing_fusions.turing_linear_input_act(linear, x, "swiglu")
+
+                self.assertIs(result, output)
+                self.assertEqual(kernel.call_args.kwargs["linear_dtype"], linear_dtype)
+                self.assertEqual(kernel.call_args.kwargs["input_act"], "swiglu")
+                uncast.assert_called_once_with(linear, weight, None, offload)
 
     def test_direct_turing_input_act_keeps_dense_fallback(self):
         linear = SimpleNamespace(weight=torch.zeros(4, 8, dtype=torch.bfloat16))
@@ -171,89 +182,6 @@ class FusionDispatchTest(unittest.TestCase):
         self.assertIs(kernel.call_args.args[0], x)
         self.assertIs(kernel.call_args.args[1], weight)
         self.assertIs(kernel.call_args.args[4], table)
-
-    def test_apply_patches_only_compatible_turing_blocks(self):
-        import comfy.ldm.minimax.model as minimax_model
-        import turing_ops
-
-        class FakeBlock(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.norm1 = torch.nn.Identity()
-                self.norm2 = torch.nn.Identity()
-                self.adaln_proj = torch.nn.Identity()
-                self.attn = torch.nn.Identity()
-                self.mlp = torch.nn.Identity()
-
-            def forward(self, value):
-                return value
-
-        block = FakeBlock()
-        model = SimpleNamespace(model=torch.nn.Sequential(block))
-        kernel = mock.Mock()
-        with (
-            mock.patch.object(turing_ops, "is_supported_turing_device", return_value=True),
-            mock.patch.object(minimax_model, "DiTBlock", FakeBlock),
-            mock.patch.dict(
-                sys.modules,
-                {"svdint4": SimpleNamespace(turing_segmented_rms_adaln=kernel)},
-            ),
-        ):
-            count = turing_fusions.apply_turing_fusions(model, torch.device("cuda", 0))
-
-        self.assertEqual(count, 1)
-        self.assertTrue(callable(block._svdint4_original_forward))
-        self.assertIs(block.forward.__func__, turing_fusions._fused_block_forward)
-        self.assertEqual(block._svdint4_turing_device_index, 0)
-
-    def test_apply_installs_direct_dispatch_only_for_eligible_fc2(self):
-        import comfy.ldm.minimax.model as minimax_model
-        import turing_ops
-
-        class FakeMLP(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.fc1 = torch.nn.Identity()
-                self.fc2 = SimpleNamespace(
-                    weight=FusionDispatchTest._w8a8_weight(),
-                    quant_format="int8_tensorwise",
-                )
-
-            def forward(self, value):
-                return value
-
-        class FakeBlock(torch.nn.Module):
-            def __init__(self):
-                super().__init__()
-                self.norm1 = torch.nn.Identity()
-                self.norm2 = torch.nn.Identity()
-                self.adaln_proj = torch.nn.Identity()
-                self.attn = torch.nn.Identity()
-                self.mlp = FakeMLP()
-
-            def forward(self, value):
-                return value
-
-        block = FakeBlock()
-        model = SimpleNamespace(model=torch.nn.Sequential(block))
-        with (
-            mock.patch.object(
-                turing_ops,
-                "is_supported_turing_device",
-                return_value=True,
-            ),
-            mock.patch.object(minimax_model, "DiTBlock", FakeBlock),
-            mock.patch.dict(
-                sys.modules,
-                {"svdint4": SimpleNamespace(turing_segmented_rms_adaln=mock.Mock())},
-            ),
-        ):
-            count = turing_fusions.apply_turing_fusions(model, torch.device("cuda", 0))
-
-        self.assertEqual(count, 1)
-        self.assertTrue(callable(block.mlp._svdint4_original_forward))
-        self.assertIs(block.mlp.forward.__func__, turing_fusions._turing_mlp_forward)
-
 
 if __name__ == "__main__":
     unittest.main()

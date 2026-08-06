@@ -8,10 +8,10 @@ import folder_paths
 from safetensors import safe_open
 
 try:
-    from .attention_backends import attention_backend_choices
+    from .attention import attention_backend_choices
     from .model_format import validate_svdint4_metadata
 except ImportError:
-    from attention_backends import attention_backend_choices
+    from attention import attention_backend_choices
     from model_format import validate_svdint4_metadata
 
 
@@ -100,7 +100,9 @@ class SVDInt4DiffusionModelLoader:
                         "default": "auto",
                         "tooltip": (
                             "Select this SVDInt4 model's attention backend. "
-                            "auto tries sage_attn, then flash_attn, then PyTorch SDPA."
+                            "On Turing, auto uses bundled sage2; sage1 and sage_ select "
+                            "the bundled alternatives. Elsewhere auto tries installed "
+                            "sage_attn, then flash_attn, then PyTorch SDPA."
                         ),
                     },
                 ),

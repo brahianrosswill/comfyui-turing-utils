@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime.h"
+#include "tensor_bridge.h"
 
 namespace svdint4::kernels {
 
@@ -40,7 +40,19 @@ void turing_swiglu_int8_convrot_quantize(Tensor input,
                                           Tensor output,
                                           Tensor scales);
 
+void turing_swiglu_int4_convrot_quantize(Tensor input,
+                                          Tensor rotated,
+                                          Tensor partial_absmax,
+                                          Tensor output,
+                                          Tensor scales);
+
 void turing_bf16_int8_convrot_quantize(Tensor input,
+                                        Tensor output,
+                                        Tensor scales,
+                                        bool swiglu,
+                                        int block_threads);
+
+void turing_bf16_int4_convrot_quantize(Tensor input,
                                         Tensor output,
                                         Tensor scales,
                                         bool swiglu,

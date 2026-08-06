@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime.h"
+#include "tensor_bridge.h"
 #include <cuda_fp16.h>
 
 template<typename F>

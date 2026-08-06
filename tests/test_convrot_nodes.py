@@ -556,15 +556,19 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
                 return_value=SimpleNamespace(unet_config={"image_model": "wan"}),
             ),
             mock.patch("convrot_nodes._validate_runtime_support"),
+            mock.patch("convrot_nodes.prepare_turing_runtime") as prepare_runtime,
             mock.patch("convrot_nodes.select_compute_dtype", return_value=None),
             mock.patch("convrot_nodes.normalize_turing_convrot_weight_dtypes") as normalize_dtypes,
             mock.patch("comfy.sd.load_diffusion_model_state_dict", return_value=fake_model) as load_state,
-            mock.patch("convrot_nodes.apply_turing_fusions") as apply_fusions,
+            mock.patch("convrot_nodes.apply_minimax_adapter") as apply_fusions,
             mock.patch("convrot_nodes.apply_attention_backend") as apply_backend,
         ):
             loaded = load_convrot_model("model.safetensors")
 
         self.assertIs(loaded, fake_model)
+        prepare_runtime.assert_called_once_with(
+            ConvRotSummary(w4a4=1), torch.device("cuda", 0), "auto"
+        )
         self.assertEqual(load_state.call_args.kwargs["model_options"], {})
         self.assertIsNone(fake_model.compute_dtype)
         normalize_dtypes.assert_not_called()
@@ -593,15 +597,19 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
             mock.patch("comfy.model_detection.model_config_from_unet", return_value=model_config),
             mock.patch("comfy.model_management.get_torch_device", return_value=torch.device("cuda", 0)),
             mock.patch("convrot_nodes._validate_runtime_support"),
+            mock.patch("convrot_nodes.prepare_turing_runtime") as prepare_runtime,
             mock.patch("convrot_nodes.select_compute_dtype", return_value=torch.bfloat16),
             mock.patch("convrot_nodes.normalize_turing_convrot_weight_dtypes") as normalize_dtypes,
             mock.patch("comfy.sd.load_diffusion_model_state_dict", return_value=fake_model) as load_state,
-            mock.patch("convrot_nodes.apply_turing_fusions") as apply_fusions,
+            mock.patch("convrot_nodes.apply_minimax_adapter") as apply_fusions,
             mock.patch("convrot_nodes.apply_attention_backend") as apply_backend,
         ):
             loaded = load_convrot_model("model.safetensors")
 
         self.assertIs(loaded, fake_model)
+        prepare_runtime.assert_called_once_with(
+            ConvRotSummary(w4a4=1), torch.device("cuda", 0), "auto"
+        )
         self.assertEqual(load_state.call_args.kwargs["model_options"], {"dtype": torch.bfloat16})
         self.assertEqual(fake_model.compute_dtype, torch.bfloat16)
         normalize_dtypes.assert_called_once_with(
@@ -628,6 +636,7 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
             mock.patch("comfy.utils.load_torch_file", return_value=(state_dict, {})),
             mock.patch("comfy.model_management.text_encoder_device", return_value=torch.device("cuda", 0)),
             mock.patch("convrot_nodes._validate_runtime_support") as validate,
+            mock.patch("convrot_nodes.prepare_turing_runtime") as prepare_runtime,
             mock.patch("comfy.sd.load_text_encoder_state_dicts", side_effect=fake_load_text_encoder),
         ):
             loaded = load_convrot_clip(
@@ -638,6 +647,9 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
 
         self.assertIs(loaded, fake_clip)
         validate.assert_called_once_with(ConvRotSummary(w4a8=1), torch.device("cuda", 0))
+        prepare_runtime.assert_called_once_with(
+            ConvRotSummary(w4a8=1), torch.device("cuda", 0)
+        )
         config = quant_config(
             captured["state_dicts"][0][
                 "text_model.encoder.layers.0.mlp.fc1.comfy_quant"
@@ -779,7 +791,7 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
         self.assertNotIn("activation_dtype", inputs["required"])
         self.assertEqual(
             inputs["optional"]["patch_attention"][0],
-            ("auto", "sage_attn", "flash_attn", "sdpa"),
+            ("auto", "sage2", "sage1", "sage_", "sage_attn", "flash_attn", "sdpa"),
         )
         self.assertEqual(inputs["optional"]["patch_attention"][1]["default"], "auto")
         self.assertNotIn("turing_bf16_mode", inputs["optional"])

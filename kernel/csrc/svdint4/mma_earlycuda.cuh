@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstdint>
-#include "runtime.h"
+#include "tensor_bridge.h"
 
 // cuda 12.4- does not support "C" constraint in inline assembly :(
 // use explicit specialization for now

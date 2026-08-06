@@ -35,6 +35,7 @@ namespace mma{
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 750)
 #define MMA_F16F16F32_M16N8K8_ENABLED
 #define MMA_F16F16F16_M16N8K8_ENABLED
+#define MMA_S4S4S32_M8N8K32_ENABLED
 #define LDMATRIX_M8N8X2_ENABLED
 #define LDMATRIX_M8N8X4_ENABLED
 #endif
@@ -567,7 +568,26 @@ __device__ __forceinline__ void mma_sync_m16n8k64_row_col_s4s4s32(int32_t* C, ui
           "r"(0), "r"(0));
   }
 #else
+#ifdef MMA_S4S4S32_M8N8K32_ENABLED
+  if constexpr (mma_mode == MMAMode::kInit) {
+    C[0] = 0;
+    C[1] = 0;
+    C[2] = 0;
+    C[3] = 0;
+  }
+  asm volatile(
+      "{\n"
+      "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%0, %1}, {%4}, {%8},  {%0, %1};\n"
+      "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%2, %3}, {%5}, {%8},  {%2, %3};\n"
+      "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%0, %1}, {%6}, {%9},  {%0, %1};\n"
+      "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%2, %3}, {%7}, {%9},  {%2, %3};\n"
+      "}\n"
+      : "+r"(C[0]), "+r"(C[1]), "+r"(C[2]), "+r"(C[3])
+      : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+        "r"(B[0]), "r"(B[1]));
+#else
   RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+#endif
 #endif
 }
 
@@ -626,7 +646,35 @@ __device__ __forceinline__ void mma_sync_m16n16k64_row_col_s4s4s32(int32_t* C, u
           "r"(0), "r"(0));
   }
 #else
+#ifdef MMA_S4S4S32_M8N8K32_ENABLED
+  if constexpr (mma_mode == MMAMode::kInit) {
+    C[0] = 0;
+    C[1] = 0;
+    C[2] = 0;
+    C[3] = 0;
+    C[4] = 0;
+    C[5] = 0;
+    C[6] = 0;
+    C[7] = 0;
+  }
+  asm volatile(
+      "{\n"
+      "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%0, %1}, {%8},  {%12}, {%0, %1};\n"
+      "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%4, %5}, {%8},  {%14}, {%4, %5};\n"
+      "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%2, %3}, {%9},  {%12}, {%2, %3};\n"
+      "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%6, %7}, {%9},  {%14}, {%6, %7};\n"
+      "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%0, %1}, {%10}, {%13}, {%0, %1};\n"
+      "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%4, %5}, {%10}, {%15}, {%4, %5};\n"
+      "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%2, %3}, {%11}, {%13}, {%2, %3};\n"
+      "mma.sync.aligned.m8n8k32.row.col.s32.s4.s4.s32 {%6, %7}, {%11}, {%15}, {%6, %7};\n"
+      "}\n"
+      : "+r"(C[0]), "+r"(C[1]), "+r"(C[2]), "+r"(C[3]),
+        "+r"(C[4]), "+r"(C[5]), "+r"(C[6]), "+r"(C[7])
+      : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+        "r"(B[0]), "r"(B[1]), "r"(B[2]), "r"(B[3]));
+#else
   RUNTIME_ASSERT("Unsupported CUDA architecture for mma instruction");
+#endif
 #endif
 }
 

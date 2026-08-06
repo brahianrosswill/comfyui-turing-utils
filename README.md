@@ -15,7 +15,7 @@ adapter overlays; to make a LoRA part of the quantized base, repack the model.
 - PyTorch with CUDA
 - CUDA toolkit with `nvcc` if installing from source
 - ComfyUI
-- The comfy-kitchen version pinned by ComfyUI
+- `comfy-kitchen>=0.2.26` for Turing ConvRot models (normally provided by ComfyUI)
 
 The default source build targets `sm_75`, `sm_80`, `sm_86`, and `sm_89`.
 
@@ -33,6 +33,8 @@ Manager install or update the custom node without compiling CUDA code.
 The CUDA package remains a separate installation: Python-only plugin updates
 never invoke a compiler or JIT. Reinstall `svdint4-kernel` only when its CUDA
 sources or published kernel version change.
+The Turing runtime in this revision requires the independently installed
+`svdint4-kernel>=0.6.0` and reports a stale package before allocating the model.
 
 Install the CUDA kernel in the same Python environment that runs ComfyUI:
 
@@ -83,17 +85,19 @@ from svdint4.ops import svd_int4_linear
 print("torch:", torch.__version__, "cuda:", torch.version.cuda)
 print("svdint4:", svdint4.__file__)
 print("kernel api:", callable(svd_int4_linear))
-print("Turing SageAttention2:", svdint4.turing_sage2.available())
+print("Turing Sage family:", svdint4.turing_sage.available())
 PY
 ```
 
 The installed pip distribution is named `svdint4-kernel`; the Python package is
 imported as `svdint4`.
 
-The plugin-side split is intentionally small: `bf16_policy.py` owns generic
-dtype selection, `attention_backends.py` owns backend choice,
-`turing_attention.py` adapts bundled SageAttention2 to ComfyUI, and
-`turing_ops.py` is the exact-sm75 comfy-kitchen bridge. None is H3-specific.
+The plugin-side split is intentionally small: `precision.py` owns generic
+dtype/runtime preparation, `attention.py` owns backend choice and the bundled
+Turing Sage adapter, `turing_ops.py` is the exact-sm75 comfy-kitchen bridge,
+and `turing_fusions.py` contains model-independent fused operations. The only
+MiniMax-specific installation logic lives in `minimax_adapter.py` and is
+applied through ComfyUI's ModelPatcher rather than by mutating model classes.
 
 ## Model Files
 
@@ -207,8 +211,9 @@ The script writes original metadata and basic provenance to
   Loads an official ComfyUI ConvRot diffusion model. `force_int8_gemm=false`
   follows each layer's activation format, while `true` forces INT8 GEMM
   activations. W4A8 requires an enabled comfy-kitchen CUDA backend because its
-  eager fallback always computes W4A4. `patch_attention=auto` selects
-  SageAttention first, Flash Attention second, and PyTorch SDPA as the fallback.
+  eager fallback always computes W4A4. On Turing, `patch_attention=auto`
+  selects the bundled `sage2`; elsewhere it selects installed SageAttention
+  first, Flash Attention second, and PyTorch SDPA as the fallback.
   BF16 activation storage is selected automatically when the detected model
   declares BF16 inference support; there is no loader-only dtype switch.
   Legacy per-row W8 ConvRot descriptors with a missing format or
@@ -226,7 +231,12 @@ The script writes original metadata and basic provenance to
   Selects one SVDInt4 DiT `.safetensors` file from `diffusion_models` and
   returns a ComfyUI `MODEL`. `patch_attention=auto` uses the same SageAttention,
   Flash Attention, then PyTorch SDPA priority on non-Turing GPUs. On a supported
-  Turing GPU, `auto` selects the bundled SageAttention2 implementation.
+  Turing GPU, `auto` selects the bundled `sage2` implementation. The explicit
+  `sage1` and `sage2` choices select the bundled SM75 variants, while `sage_`
+  temporarily retains the previous INT8-QK/FP32-PV hybrid for accuracy
+  comparisons. On non-Turing GPUs, `auto` still prefers the independently
+  installed SageAttention package and falls back through Flash Attention to
+  PyTorch SDPA.
 
 - `Bernini Context Windows`
   Uses the same controls and defaults as ComfyUI's Wan Context Windows node,
@@ -260,42 +270,61 @@ that would overflow Kitchen's FP32 whole-row buffer, the bundled quantizer keeps
 the completed row as BF16 and only the active FHT groups as FP32 scratch. It
 selects a 1024-, 768-, or 512-thread launch that remains below the default
 48 KiB limit, folds SwiGLU into the same kernel when requested, and avoids both
-the activated and rotated full-size BF16 global intermediates. Its scale and
-INT8 outputs are bit-identical to Kitchen's staged path. Wider unsupported rows
-retain the staged fallback. Scalar W8 weight scales stay scalar in the fused
+the activated and rotated full-size BF16 global intermediates. The same
+row-buffer and staged choices are available to W4A4 activation quantization;
+W4A8 shares the INT8 activation path. Their packed values match the staged
+paths exactly, with only FP32-roundoff-level scale differences for INT4. Wider
+unsupported rows retain the staged fallback. Scalar W8 weight scales stay scalar in the fused
 Turing GEMM, while contraction shapes use a vectorized round-to-nearest-even
 BF16 writeback after the INT32 GEMM workspace. W4A4 keeps fused A4 quantization
-while it fits and otherwise uses Kitchen's grouped FHT rotation followed by
-row-wise INT4 quantization. None of the three paths falls back to a dense
+while it fits and otherwise uses the BF16 row-buffer or Kitchen's grouped FHT
+rotation followed by row-wise INT4 quantization. None of the three paths falls back to a dense
 Hadamard matmul on supported sm75 devices. On a non-sm75 tensor the local
 backend constraint does not match, so comfy-kitchen selects its official
 backend.
 
-Compatible DiT blocks on exact-sm75 GPUs also use the bundled affine
-RMSNorm+AdaLN operator. It keeps the RMS reduction and modulation arithmetic in
+MiniMax DiT blocks on exact-sm75 GPUs are connected by the isolated MiniMax
+adapter to the bundled affine RMSNorm+AdaLN and fused ConvRot SwiGLU operators.
+The norm kernel keeps the RMS reduction and modulation arithmetic in
 FP32, writes the original FP16/BF16/FP32 activation dtype, reads nonuniform
 contiguous token segments without expanding scale/shift across the sequence,
-and uses less than 1 KiB of static shared memory. The optimization is enabled
-automatically after model load and has no loader control. Other architectures
-and unmatched block layouts retain their normal ComfyUI implementation.
+and uses less than 1 KiB of static shared memory. The adapter accepts W8A8,
+W4A4, and W4A8 `fc2` weights and eliminates the activated BF16 MLP
+intermediate. It is enabled automatically after model load and has no loader
+control. Other architectures and unmatched block layouts retain their normal
+ComfyUI implementation.
 
-The bundled attention backend is derived from wjie98's full SM75
-SageAttention2 path and does not import or require the standalone
-`sageattention` package. It accepts FP16 or BF16 input/output, HND or NHD
-layout, causal attention, GQA, different Q/KV lengths, variable-length batches,
-and head dimensions up to 128 (smaller dimensions are padded internally). Q/K
-are quantized to INT8 per warp; V is staged as FP16 for SM75 tensor cores;
-online softmax and PV accumulation use FP32; the result is written in the
-original FP16/BF16 dtype. Dynamic shared memory tops out at 32 KiB, below the
-48 KiB default target. If the calling model supplies FP32 Q/K/V, only the
-attention boundary is narrowed to BF16 and the result is restored to FP32;
-the rest of the model remains under its existing dtype policy.
+The bundled attention family is derived from wjie98's full SM75 path and does
+not import or require the standalone `sageattention` package. `sage1` uses
+per-block INT8 Q/K, global K smoothing, and FP16 probability/value
+accumulation. The default `sage2` uses packed per-thread INT4 Q/K, blockwise Q
+and global K smoothing, the exact Q-mean score correction, and FP16
+probability/value accumulation. This is a Turing adaptation: SM75 has neither
+the FP8 PV path nor the newer tensor-core instructions used by upstream
+SageAttention2. The previous per-warp INT8-QK/FP32-PV implementation remains
+temporarily available as `sage_` for controlled accuracy comparisons.
+
+All three variants accept FP16 or BF16 input/output, HND or NHD layout, causal
+attention, GQA, different Q/KV lengths, variable-length batches, and head
+dimensions up to 128 (smaller dimensions are padded internally). FP16 V is
+read directly; BF16 V is converted tile-by-tile as it enters FP16 shared
+memory, so no full-size FP16 V copy is allocated. The Sage2 Q/K means and
+score-correction scratch keep its dynamic shared-memory use below the 48 KiB
+target. If the calling model supplies FP32 Q/K/V, only the attention boundary
+is narrowed to BF16 and the result is restored to FP32; the rest of the model
+remains under its existing dtype policy.
 
 ComfyUI attention masks, disabled low-precision attention, and head dimensions
 outside that contract use the original ComfyUI attention function without a
-dtype conversion. The standalone Sage backend on non-Turing GPUs likewise
-hands FP32 back to ComfyUI. Failure of a required SM75 kernel is reported before
-model allocation instead of silently reverting the whole model to FP32.
+dtype conversion. The standalone Sage backend on non-Turing GPUs uses
+ComfyUI's PyTorch attention for an all-FP32 boundary. Failure of a required
+SM75 kernel is reported before model allocation instead of silently reverting
+the whole model to FP32. The bundled-vs-official INT8 and INT4 precision
+comparison procedure is documented in
+[`docs/turing-runtime.md`](docs/turing-runtime.md#validation-boundary).
+
+The complete dispatch matrix and the deliberately retained large-sequence GEMM
+workspace policy are documented in [`docs/turing-runtime.md`](docs/turing-runtime.md).
 
 Packed SVDInt4 weights are represented as ComfyUI QuantizedTensor weights so
 ComfyUI can account for and move their qweight, scales, smooth factors, and SVD

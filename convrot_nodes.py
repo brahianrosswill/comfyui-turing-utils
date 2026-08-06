@@ -17,27 +17,35 @@ import comfy.sd
 import comfy.utils
 
 try:
-    from .attention_backends import (
+    from .attention import (
         apply_attention_backend,
         attention_backend_choices,
         normalize_attention_backend,
     )
 except ImportError:
-    from attention_backends import (
+    from attention import (
         apply_attention_backend,
         attention_backend_choices,
         normalize_attention_backend,
     )
 
 try:
-    from .bf16_policy import normalize_turing_convrot_weight_dtypes, select_compute_dtype
+    from .precision import (
+        normalize_turing_convrot_weight_dtypes,
+        prepare_turing_runtime,
+        select_compute_dtype,
+    )
 except ImportError:
-    from bf16_policy import normalize_turing_convrot_weight_dtypes, select_compute_dtype
+    from precision import (
+        normalize_turing_convrot_weight_dtypes,
+        prepare_turing_runtime,
+        select_compute_dtype,
+    )
 
 try:
-    from .turing_fusions import apply_turing_fusions
+    from .minimax_adapter import apply_minimax_adapter
 except ImportError:
-    from turing_fusions import apply_turing_fusions
+    from minimax_adapter import apply_minimax_adapter
 
 
 LOG = logging.getLogger("comfyui-svdint4")
@@ -437,6 +445,7 @@ def load_convrot_model(
     )
     load_device = comfy.model_management.get_torch_device()
     _validate_runtime_support(expected, load_device)
+    prepare_turing_runtime(expected, load_device, attention_backend)
     model_config = comfy.model_detection.model_config_from_unet(
         state_dict,
         diffusion_model_prefix,
@@ -445,8 +454,6 @@ def load_convrot_model(
     compute_dtype = select_compute_dtype(
         model_config,
         load_device,
-        expected,
-        attention_backend,
     )
     model = comfy.sd.load_diffusion_model_state_dict(
         state_dict,
@@ -475,7 +482,7 @@ def load_convrot_model(
         loaded.w4a8,
         loaded.w8a8,
     )
-    apply_turing_fusions(model, load_device)
+    apply_minimax_adapter(model, load_device)
     apply_attention_backend(model, attention_backend, device=load_device)
     model.cached_patcher_init = (
         load_convrot_model,
@@ -522,6 +529,7 @@ def load_convrot_clip(
     model_options = dict(model_options or {})
     load_device = model_options.get("load_device", comfy.model_management.text_encoder_device())
     _validate_runtime_support(expected, load_device)
+    prepare_turing_runtime(expected, load_device)
 
     state_dict, metadata = comfy.utils.convert_old_quants(state_dict, model_prefix="", metadata=metadata)
     model_options["quantization_metadata"] = {"mixed_ops": True}
@@ -592,7 +600,9 @@ class ConvRotDiffusionModelLoader:
                         "default": "auto",
                         "tooltip": (
                             "Select this ConvRot model's attention backend. "
-                            "auto tries sage_attn, then flash_attn, then PyTorch SDPA."
+                            "On Turing, auto uses bundled sage2; sage1 and sage_ select "
+                            "the bundled alternatives. Elsewhere auto tries installed "
+                            "sage_attn, then flash_attn, then PyTorch SDPA."
                         ),
                     },
                 ),

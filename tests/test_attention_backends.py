@@ -13,9 +13,9 @@ COMFY_ROOT = PLUGIN_ROOT.parents[1]
 sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
-import attention_backends  # noqa: E402
+import attention as attention_backends  # noqa: E402
 import svdint4_nodes  # noqa: E402
-from comfy.ldm.modules import attention  # noqa: E402
+from comfy.ldm.modules import attention as comfy_attention  # noqa: E402
 
 
 class FakeModel:
@@ -27,7 +27,7 @@ class AttentionBackendsTest(unittest.TestCase):
     def test_backend_choices_are_stable(self):
         self.assertEqual(
             attention_backends.attention_backend_choices(),
-            ("auto", "sage_attn", "flash_attn", "sdpa"),
+            ("auto", "sage2", "sage1", "sage_", "sage_attn", "flash_attn", "sdpa"),
         )
 
     def test_aliases_normalize_to_node_options(self):
@@ -42,7 +42,7 @@ class AttentionBackendsTest(unittest.TestCase):
 
         self.assertEqual(
             patch_attention[0],
-            ("auto", "sage_attn", "flash_attn", "sdpa"),
+            ("auto", "sage2", "sage1", "sage_", "sage_attn", "flash_attn", "sdpa"),
         )
         self.assertEqual(patch_attention[1]["default"], "auto")
 
@@ -99,18 +99,21 @@ class AttentionBackendsTest(unittest.TestCase):
             "sdpa",
         )
 
-    def test_external_sage_sends_fp32_qkv_to_original_attention(self):
+    def test_external_sage_sends_fp32_qkv_to_pytorch_attention(self):
         sage = mock.Mock()
+        pytorch = mock.Mock(return_value="pytorch")
         original = mock.Mock(return_value="original")
         with mock.patch(
             "comfy.ldm.modules.attention.get_attention_function",
-            side_effect=lambda name, default: sage if name == "sage" else default,
+            side_effect=lambda name, default: (
+                sage if name == "sage" else pytorch if name == "pytorch" else default
+            ),
         ):
             override = attention_backends.make_attention_override("sage_attn")
-
-        q = torch.randn(1, 2, 4, 8, dtype=torch.float32)
-        self.assertEqual(override(original, q, q, q, 2, skip_reshape=True), "original")
-        original.assert_called_once()
+            q = torch.randn(1, 2, 4, 8, dtype=torch.float32)
+            self.assertEqual(override(original, q, q, q, 2, skip_reshape=True), "pytorch")
+        pytorch.assert_called_once()
+        original.assert_not_called()
         sage.assert_not_called()
 
     def test_external_sage_sends_mixed_qkv_to_original_attention(self):
@@ -153,7 +156,8 @@ class AttentionBackendsTest(unittest.TestCase):
             mock.patch(
                 "comfy.ldm.modules.attention.get_attention_function",
                 side_effect=lambda name, default: (
-                    attention.attention_sage if name == "sage" else default
+                    comfy_attention.attention_sage if name == "sage" else
+                    comfy_attention.attention_pytorch if name == "pytorch" else default
                 ),
             ),
             mock.patch("comfy.ldm.modules.attention.sageattn") as sage,
@@ -161,7 +165,7 @@ class AttentionBackendsTest(unittest.TestCase):
             attention_backends.apply_attention_backend(model, "sage_attn")
             transformer_options = model.model_options["transformer_options"]
             q = torch.randn(1, 2, 4, 8, dtype=torch.float32)
-            output = attention.optimized_attention(
+            output = comfy_attention.optimized_attention(
                 q,
                 q,
                 q,
@@ -201,17 +205,17 @@ class AttentionBackendsTest(unittest.TestCase):
         q = torch.randn(1, 8, 16)
         k = torch.randn(1, 8, 16)
         v = torch.randn(1, 8, 16)
-        out = attention.optimized_attention(q, k, v, heads=2, transformer_options=transformer_options)
+        out = comfy_attention.optimized_attention(q, k, v, heads=2, transformer_options=transformer_options)
         self.assertEqual(tuple(out.shape), (1, 8, 16))
 
     def test_turing_auto_uses_bundled_sageattention2(self):
         model = FakeModel()
         q = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
         with (
-            mock.patch("turing_ops.is_supported_turing_device", return_value=True),
-            mock.patch("turing_attention.available", return_value=True),
-            mock.patch("turing_attention.preflight") as preflight,
-            mock.patch("turing_attention.attention", return_value=q) as kernel,
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention.bundled_available", return_value=True),
+            mock.patch("attention.preflight_bundled") as preflight,
+            mock.patch("attention.turing_sage_attention", return_value=q) as kernel,
         ):
             attention_backends.apply_attention_backend(model, "auto", device=torch.device("cuda", 0))
             override = model.model_options["transformer_options"]["optimized_attention_override"]
@@ -219,16 +223,41 @@ class AttentionBackendsTest(unittest.TestCase):
 
         self.assertIs(out, q)
         kernel.assert_called_once()
-        preflight.assert_called_once_with(torch.device("cuda", 0))
+        preflight.assert_called_once_with(torch.device("cuda", 0), "sage2")
         self.assertEqual(
             model.model_options["transformer_options"]["svdint4_attention_backend"],
-            "turing_sage2",
+            "sage2",
         )
+
+    def test_turing_explicit_sage1_selects_bundled_variant(self):
+        model = FakeModel()
+        q = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention.bundled_available", return_value=True),
+            mock.patch("attention.preflight_bundled") as preflight,
+            mock.patch("attention.turing_sage_attention", return_value=q) as kernel,
+        ):
+            attention_backends.apply_attention_backend(
+                model, "sage1", device=torch.device("cuda", 0)
+            )
+            override = model.model_options["transformer_options"]["optimized_attention_override"]
+            override(lambda *args, **kwargs: None, q, q, q, 2, skip_reshape=True)
+
+        preflight.assert_called_once_with(torch.device("cuda", 0), "sage1")
+        self.assertEqual(kernel.call_args.kwargs["variant"], "sage1")
+
+    def test_bundled_variant_rejects_non_turing_device(self):
+        with mock.patch("attention.is_supported_turing_device", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "requires an NVIDIA sm75"):
+                attention_backends.make_attention_override(
+                    "sage2", device=torch.device("cuda", 0)
+                )
 
     def test_turing_explicit_non_sage_backend_is_honored(self):
         flash = lambda *args, **kwargs: None
         with (
-            mock.patch("turing_ops.is_supported_turing_device", return_value=True),
+            mock.patch("attention.is_supported_turing_device", return_value=True),
             mock.patch(
                 "comfy.ldm.modules.attention.get_attention_function",
                 side_effect=lambda name, default: flash if name == "flash" else default,

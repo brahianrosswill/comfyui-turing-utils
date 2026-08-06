@@ -26,6 +26,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("quant_per_warp_int8_cuda", py::overload_cast<at::Tensor, at::Tensor, at::Tensor, int, int, int>(&quant_per_warp_int8_cuda), "quant_per_warp_int8_cuda");
   m.def("quant_qk_per_warp_int8_cuda", &quant_qk_per_warp_int8_cuda, "quant_qk_per_warp_int8_cuda");
   m.def("quant_per_warp_int8_varlen_cuda", &quant_per_warp_int8_varlen_cuda, "quant_per_warp_int8_varlen_cuda");
+  m.def("token_block_mean_cuda", &token_block_mean_cuda, "token_block_mean_cuda");
+  m.def("quant_query_per_thread_int4_cuda", &quant_query_per_thread_int4_cuda, "quant_query_per_thread_int4_cuda");
+  m.def("quant_key_per_thread_int4_cuda", &quant_key_per_thread_int4_cuda, "quant_key_per_thread_int4_cuda");
 
   m.def("sub_mean_cuda", py::overload_cast<at::Tensor, at::Tensor, at::Tensor, int>(&sub_mean_cuda), "sub_mean_cuda");
 

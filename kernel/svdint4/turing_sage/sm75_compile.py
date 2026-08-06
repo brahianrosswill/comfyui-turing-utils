@@ -97,3 +97,27 @@ def qk_int8_sv_f16_varlen_accum_f32_attn(
         cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
         is_causal, sm_scale
     )
+
+
+def qk_int4_sv_f16_accum_f16_attn(
+    query,
+    key,
+    value,
+    output,
+    query_scale,
+    key_scale,
+    key_original,
+    query_mean,
+    key_mean,
+    tensor_layout,
+    is_causal,
+    sm_scale,
+    return_lse,
+    smooth_q,
+    smooth_k,
+):
+    return _qattn_sm75.qk_int4_sv_f16_accum_f16_attn(
+        query, key, value, output, query_scale, key_scale,
+        key_original, query_mean, key_mean, tensor_layout, is_causal,
+        sm_scale, return_lse, smooth_q, smooth_k
+    )

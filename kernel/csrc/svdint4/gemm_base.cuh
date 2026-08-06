@@ -1,6 +1,6 @@
 #pragma once
 
-#include "runtime.h"
+#include "tensor_bridge.h"
 
 #include "utils.cuh"
 #include "dispatch_utils.h"

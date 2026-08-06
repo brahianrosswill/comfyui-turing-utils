@@ -316,8 +316,9 @@ at::Tensor turing_w4a8_linear(at::Tensor activation,
 
     const at::cuda::CUDAGuard device_guard(activation.device());
     const cudaDeviceProp *properties = getCurrentDeviceProperties();
-    TORCH_CHECK(properties->major == 7 && properties->minor == 5,
-                "turing_w4a8_linear requires NVIDIA Turing/sm75");
+    TORCH_CHECK(properties->major > 7 ||
+                    (properties->major == 7 && properties->minor >= 5),
+                "turing_w4a8_linear requires sm75 or newer");
 
     at::Tensor output = at::empty(
         {activation.size(0), weight.size(0)}, activation.options().dtype(at::kBFloat16));
@@ -420,6 +421,44 @@ std::tuple<at::Tensor, at::Tensor> turing_swiglu_int8_convrot_quantize(
     return {output, scales};
 }
 
+std::tuple<at::Tensor, at::Tensor> turing_swiglu_int4_convrot_quantize(
+    at::Tensor input, int64_t group_size) {
+    input = input.contiguous();
+    check_cuda_2d(input, "input");
+    check_half_like(input, "input");
+    TORCH_CHECK(group_size == 256, "SwiGLU staged INT4 ConvRot only supports group_size=256");
+    TORCH_CHECK(input.size(1) % 2 == 0, "SwiGLU input width must be even");
+
+    const int64_t rows = input.size(0);
+    const int64_t hidden = input.size(1) / 2;
+    TORCH_CHECK(rows > 0, "SwiGLU staged INT4 ConvRot requires at least one row");
+    TORCH_CHECK(hidden > 0 && hidden % group_size == 0,
+                "activated SwiGLU width must be positive and divisible by 256");
+    TORCH_CHECK(rows <= std::numeric_limits<int>::max() &&
+                    hidden <= std::numeric_limits<int>::max(),
+                "SwiGLU staged INT4 ConvRot dimensions exceed the CUDA kernel range");
+
+    const at::cuda::CUDAGuard device_guard(input.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major > 7 || (properties->major == 7 && properties->minor >= 5),
+                "SwiGLU staged INT4 ConvRot requires sm75 or newer");
+
+    at::Tensor rotated = at::empty({rows, hidden}, input.options());
+    at::Tensor partial_absmax = at::empty(
+        {rows, hidden / group_size}, input.options().dtype(at::kFloat));
+    at::Tensor output = at::empty({rows, hidden / 2}, input.options().dtype(at::kChar));
+    at::Tensor scales = at::empty({rows, 1}, input.options().dtype(at::kFloat));
+
+    TorchOpContext ctx;
+    svdint4::kernels::turing_swiglu_int4_convrot_quantize(
+        from_torch(input),
+        from_torch(rotated),
+        from_torch(partial_absmax),
+        from_torch(output),
+        from_torch(scales));
+    return {output, scales};
+}
+
 std::tuple<at::Tensor, at::Tensor> turing_bf16_int8_convrot_quantize(
     at::Tensor input, int64_t group_size, bool swiglu) {
     input = input.contiguous();
@@ -474,6 +513,63 @@ std::tuple<at::Tensor, at::Tensor> turing_bf16_int8_convrot_quantize(
         {rows, 1}, input.options().dtype(at::kFloat));
     TorchOpContext ctx;
     svdint4::kernels::turing_bf16_int8_convrot_quantize(
+        from_torch(input),
+        from_torch(output),
+        from_torch(scales),
+        swiglu,
+        block_threads);
+    return {output, scales};
+}
+
+std::tuple<at::Tensor, at::Tensor> turing_bf16_int4_convrot_quantize(
+    at::Tensor input, int64_t group_size, bool swiglu) {
+    input = input.contiguous();
+    check_cuda_2d(input, "input");
+    TORCH_CHECK(input.scalar_type() == at::kBFloat16,
+                "BF16 row-buffer INT4 ConvRot input must be bfloat16");
+    TORCH_CHECK(group_size == 256,
+                "BF16 row-buffer INT4 ConvRot only supports group_size=256");
+
+    const int64_t rows = input.size(0);
+    const int64_t input_columns = input.size(1);
+    TORCH_CHECK(!swiglu || input_columns % 2 == 0,
+                "SwiGLU BF16 row-buffer INT4 ConvRot input width must be even");
+    const int64_t hidden = swiglu ? input_columns / 2 : input_columns;
+    TORCH_CHECK(rows > 0 && hidden > 0 && hidden % group_size == 0,
+                "BF16 row-buffer INT4 ConvRot width must be positive and divisible by 256");
+    TORCH_CHECK(rows <= std::numeric_limits<int>::max() &&
+                    hidden <= std::numeric_limits<int>::max(),
+                "BF16 row-buffer INT4 ConvRot dimensions exceed the CUDA kernel range");
+
+    constexpr int64_t shared_limit = 48 * 1024;
+    const auto shared_bytes = [hidden](int threads) {
+        const int64_t groups_in_flight = threads / 64;
+        const int64_t dynamic_bytes =
+            hidden * static_cast<int64_t>(sizeof(uint16_t)) +
+            groups_in_flight * 2 * 256 * static_cast<int64_t>(sizeof(float));
+        const int64_t static_bytes =
+            (threads / 32 + 4) * static_cast<int64_t>(sizeof(float));
+        return dynamic_bytes + static_bytes;
+    };
+    int block_threads = 0;
+    for (const int candidate : {1024, 768, 512}) {
+        if (shared_bytes(candidate) < shared_limit) {
+            block_threads = candidate;
+            break;
+        }
+    }
+    TORCH_CHECK(block_threads != 0,
+                "BF16 row-buffer INT4 ConvRot cannot fit under the 48 KiB shared-memory limit");
+
+    const at::cuda::CUDAGuard device_guard(input.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major > 7 || (properties->major == 7 && properties->minor >= 5),
+                "BF16 row-buffer INT4 ConvRot requires sm75 or newer");
+
+    at::Tensor output = at::empty({rows, hidden / 2}, input.options().dtype(at::kChar));
+    at::Tensor scales = at::empty({rows, 1}, input.options().dtype(at::kFloat));
+    TorchOpContext ctx;
+    svdint4::kernels::turing_bf16_int4_convrot_quantize(
         from_torch(input),
         from_torch(output),
         from_torch(scales),
@@ -603,8 +699,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &turing_swiglu_int8_convrot_quantize,
           pybind11::arg("input"),
           pybind11::arg("group_size") = 256);
+    m.def("turing_swiglu_int4_convrot_quantize",
+          &turing_swiglu_int4_convrot_quantize,
+          pybind11::arg("input"),
+          pybind11::arg("group_size") = 256);
     m.def("turing_bf16_int8_convrot_quantize",
           &turing_bf16_int8_convrot_quantize,
+          pybind11::arg("input"),
+          pybind11::arg("group_size") = 256,
+          pybind11::arg("swiglu") = false);
+    m.def("turing_bf16_int4_convrot_quantize",
+          &turing_bf16_int4_convrot_quantize,
           pybind11::arg("input"),
           pybind11::arg("group_size") = 256,
           pybind11::arg("swiglu") = false);

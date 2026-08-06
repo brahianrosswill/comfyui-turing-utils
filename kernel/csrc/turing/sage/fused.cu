@@ -704,6 +704,308 @@ __global__ void MeanScaleKernel(T *__restrict__ input, int8_t *__restrict__ outp
   }
 }
 
+template <uint32_t head_dim, typename T>
+__global__ void TokenBlockMeanKernel(
+    const T *__restrict__ input,
+    float *__restrict__ output,
+    const uint32_t num_tokens,
+    const uint32_t block_size,
+    const uint32_t stride_bz_input,
+    const uint32_t stride_seq_input,
+    const uint32_t stride_h_input,
+    const uint32_t stride_bz_output,
+    const uint32_t stride_h_output,
+    const uint32_t stride_block_output)
+{
+  const uint32_t token_block = blockIdx.x;
+  const uint32_t head_id = blockIdx.y;
+  const uint32_t batch_id = blockIdx.z;
+  const uint32_t dim = threadIdx.x;
+  const uint32_t token_start = token_block * block_size;
+  const uint32_t token_end = min(token_start + block_size, num_tokens);
+
+  float sum = 0.0f;
+  for (uint32_t token = token_start; token < token_end; ++token)
+  {
+    const T value = input[batch_id * stride_bz_input + head_id * stride_h_input +
+                          token * stride_seq_input + dim];
+    sum += convert_to_float(value);
+  }
+  const uint32_t count = max(1U, token_end - token_start);
+  output[batch_id * stride_bz_output + head_id * stride_h_output +
+         token_block * stride_block_output + dim] = sum / static_cast<float>(count);
+}
+
+template <uint32_t head_dim, bool is_query, bool subtract_mean, typename T>
+__global__ void QuantPerThreadInt4Kernel(
+    const T *__restrict__ input,
+    const float *__restrict__ mean,
+    int8_t *__restrict__ output,
+    float *__restrict__ scale,
+    const uint32_t num_tokens,
+    const uint32_t stride_bz_input,
+    const uint32_t stride_seq_input,
+    const uint32_t stride_h_input,
+    const uint32_t stride_bz_output,
+    const uint32_t stride_seq_output,
+    const uint32_t stride_h_output,
+    const uint32_t stride_bz_mean,
+    const uint32_t stride_h_mean,
+    const uint32_t stride_block_mean,
+    const uint32_t stride_bz_scale,
+    const uint32_t stride_h_scale)
+{
+  constexpr uint32_t token_block_size = 64;
+  // The SM75 attention CTA contains four 16-token Q warps. Each Q warp
+  // has eight scale groups shared by token pairs {g, g + 8}. K spans one
+  // 64-token warp tile and uses the four official 16-token scale groups.
+  constexpr uint32_t groups_per_block = is_query ? 32 : 4;
+  constexpr uint32_t tokens_per_group = is_query ? 2 : 16;
+
+  const uint32_t scale_group = blockIdx.x;
+  const uint32_t token_block = scale_group / groups_per_block;
+  const uint32_t group_in_block = scale_group % groups_per_block;
+  const uint32_t head_id = blockIdx.y;
+  const uint32_t batch_id = blockIdx.z;
+
+  auto token_for_group_index = [=] __device__ (uint32_t group_token) {
+    if constexpr (is_query)
+    {
+      const uint32_t query_warp = group_in_block / 8;
+      const uint32_t group_in_warp = group_in_block % 8;
+      return token_block * token_block_size + query_warp * 16 +
+             group_in_warp + group_token * 8;
+    }
+    else
+    {
+      const uint32_t pair = group_token / 8;
+      const uint32_t row = group_token % 8;
+      return token_block * token_block_size + row * 8 + group_in_block * 2 + pair;
+    }
+  };
+
+  float thread_amax = 0.0f;
+  constexpr uint32_t values_per_group = tokens_per_group * head_dim;
+  for (uint32_t linear = threadIdx.x; linear < values_per_group; linear += blockDim.x)
+  {
+    const uint32_t group_token = linear / head_dim;
+    const uint32_t dim = linear % head_dim;
+    const uint32_t token = token_for_group_index(group_token);
+    if (token < num_tokens)
+    {
+      float value = convert_to_float(input[batch_id * stride_bz_input +
+                                           head_id * stride_h_input +
+                                           token * stride_seq_input + dim]);
+      if constexpr (subtract_mean)
+      {
+        const uint32_t mean_block = is_query ? token_block : 0;
+        value -= mean[batch_id * stride_bz_mean + head_id * stride_h_mean +
+                      mean_block * stride_block_mean + dim];
+      }
+      thread_amax = fmaxf(thread_amax, fabsf(value));
+    }
+  }
+
+  __shared__ float shared_scale;
+  const float group_amax = vllm::blockReduceMax(thread_amax);
+  if (threadIdx.x == 0)
+  {
+    shared_scale = group_amax / 7.0f + 1.0e-7f;
+    scale[batch_id * stride_bz_scale + head_id * stride_h_scale + scale_group] = shared_scale;
+  }
+  __syncthreads();
+
+  constexpr uint32_t packed_values_per_group = tokens_per_group * (head_dim / 2);
+  for (uint32_t linear = threadIdx.x; linear < packed_values_per_group; linear += blockDim.x)
+  {
+    const uint32_t group_token = linear / (head_dim / 2);
+    const uint32_t packed_dim = linear % (head_dim / 2);
+    const uint32_t token = token_for_group_index(group_token);
+    if (token < num_tokens)
+    {
+      const uint32_t dim0 = packed_dim * 2;
+      float value0 = convert_to_float(input[batch_id * stride_bz_input +
+                                            head_id * stride_h_input +
+                                            token * stride_seq_input + dim0]);
+      float value1 = convert_to_float(input[batch_id * stride_bz_input +
+                                            head_id * stride_h_input +
+                                            token * stride_seq_input + dim0 + 1]);
+      if constexpr (subtract_mean)
+      {
+        const uint32_t mean_block = is_query ? token_block : 0;
+        const float *mean_ptr = mean + batch_id * stride_bz_mean +
+                                head_id * stride_h_mean + mean_block * stride_block_mean;
+        value0 -= mean_ptr[dim0];
+        value1 -= mean_ptr[dim0 + 1];
+      }
+      int quant0 = max(-7, min(7, __float2int_rn(value0 / shared_scale)));
+      int quant1 = max(-7, min(7, __float2int_rn(value1 / shared_scale)));
+      const uint8_t packed = static_cast<uint8_t>((quant0 & 0x0f) | ((quant1 & 0x0f) << 4));
+      reinterpret_cast<uint8_t *>(output)[batch_id * stride_bz_output +
+                                           head_id * stride_h_output +
+                                           token * stride_seq_output + packed_dim] = packed;
+    }
+  }
+}
+
+void token_block_mean_cuda(
+                at::Tensor input,
+                at::Tensor output,
+                int block_size,
+                int tensor_layout)
+{
+  CHECK_CUDA(input);
+  CHECK_CUDA(output);
+  CHECK_LASTDIM_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(output);
+  CHECK_DTYPE(output, at::ScalarType::Float);
+  CHECK_DIMS(input, 4);
+  CHECK_DIMS(output, 4);
+  TORCH_CHECK(block_size > 0, "block_size must be positive");
+
+  const int batch_size = input.size(0);
+  const int head_dim = input.size(3);
+  int num_tokens, num_heads, stride_seq_input, stride_h_input;
+  if (tensor_layout == 0)
+  {
+    num_tokens = input.size(1);
+    num_heads = input.size(2);
+    stride_seq_input = input.stride(1);
+    stride_h_input = input.stride(2);
+  }
+  else if (tensor_layout == 1)
+  {
+    num_tokens = input.size(2);
+    num_heads = input.size(1);
+    stride_seq_input = input.stride(2);
+    stride_h_input = input.stride(1);
+  }
+  else
+  {
+    throw std::invalid_argument("tensor_layout must be 0 or 1");
+  }
+
+  const int num_blocks = (num_tokens + block_size - 1) / block_size;
+  CHECK_SHAPE(output, batch_size, num_heads, num_blocks, head_dim);
+  auto input_dtype = input.scalar_type();
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
+    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+      dim3 grid(num_blocks, num_heads, batch_size);
+      TokenBlockMeanKernel<HEAD_DIM, c_type><<<grid, HEAD_DIM>>>(
+          reinterpret_cast<c_type *>(input.data_ptr()), output.data_ptr<float>(),
+          num_tokens, block_size, input.stride(0), stride_seq_input, stride_h_input,
+          output.stride(0), output.stride(1), output.stride(2));
+    });
+  });
+}
+
+template <bool is_query>
+static void quant_per_thread_int4_cuda_impl(
+                at::Tensor input,
+                at::Tensor mean,
+                at::Tensor output,
+                at::Tensor scale,
+                int tensor_layout,
+                bool subtract_mean)
+{
+  CHECK_CUDA(input);
+  CHECK_CUDA(output);
+  CHECK_CUDA(scale);
+  CHECK_LASTDIM_CONTIGUOUS(input);
+  CHECK_CONTIGUOUS(output);
+  CHECK_CONTIGUOUS(scale);
+  CHECK_DTYPE(output, at::ScalarType::Char);
+  CHECK_DTYPE(scale, at::ScalarType::Float);
+  CHECK_DIMS(input, 4);
+  CHECK_DIMS(output, 4);
+  CHECK_DIMS(scale, 3);
+  if (subtract_mean)
+  {
+    CHECK_CUDA(mean);
+    CHECK_CONTIGUOUS(mean);
+    CHECK_DTYPE(mean, at::ScalarType::Float);
+    CHECK_DIMS(mean, 4);
+  }
+
+  const int batch_size = input.size(0);
+  const int head_dim = input.size(3);
+  int num_tokens, num_heads, stride_seq_input, stride_h_input;
+  int stride_seq_output, stride_h_output;
+  if (tensor_layout == 0)
+  {
+    num_tokens = input.size(1);
+    num_heads = input.size(2);
+    stride_seq_input = input.stride(1);
+    stride_h_input = input.stride(2);
+    stride_seq_output = output.stride(1);
+    stride_h_output = output.stride(2);
+    CHECK_SHAPE(output, batch_size, num_tokens, num_heads, head_dim / 2);
+  }
+  else if (tensor_layout == 1)
+  {
+    num_tokens = input.size(2);
+    num_heads = input.size(1);
+    stride_seq_input = input.stride(2);
+    stride_h_input = input.stride(1);
+    stride_seq_output = output.stride(2);
+    stride_h_output = output.stride(1);
+    CHECK_SHAPE(output, batch_size, num_heads, num_tokens, head_dim / 2);
+  }
+  else
+  {
+    throw std::invalid_argument("tensor_layout must be 0 or 1");
+  }
+
+  constexpr int groups_per_block = is_query ? 32 : 4;
+  const int num_blocks = (num_tokens + 63) / 64;
+  CHECK_SHAPE(scale, batch_size, num_heads, num_blocks * groups_per_block);
+  if (subtract_mean)
+  {
+    const int mean_blocks = is_query ? num_blocks : 1;
+    CHECK_SHAPE(mean, batch_size, num_heads, mean_blocks, head_dim);
+  }
+
+  auto input_dtype = input.scalar_type();
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
+    DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
+      dim3 grid(num_blocks * groups_per_block, num_heads, batch_size);
+      if (subtract_mean)
+      {
+        QuantPerThreadInt4Kernel<HEAD_DIM, is_query, true, c_type><<<grid, 256>>>(
+            reinterpret_cast<c_type *>(input.data_ptr()), mean.data_ptr<float>(),
+            output.data_ptr<int8_t>(), scale.data_ptr<float>(), num_tokens,
+            input.stride(0), stride_seq_input, stride_h_input,
+            output.stride(0), stride_seq_output, stride_h_output,
+            mean.stride(0), mean.stride(1), mean.stride(2),
+            scale.stride(0), scale.stride(1));
+      }
+      else
+      {
+        QuantPerThreadInt4Kernel<HEAD_DIM, is_query, false, c_type><<<grid, 256>>>(
+            reinterpret_cast<c_type *>(input.data_ptr()), nullptr,
+            output.data_ptr<int8_t>(), scale.data_ptr<float>(), num_tokens,
+            input.stride(0), stride_seq_input, stride_h_input,
+            output.stride(0), stride_seq_output, stride_h_output,
+            0, 0, 0, scale.stride(0), scale.stride(1));
+      }
+    });
+  });
+}
+
+void quant_query_per_thread_int4_cuda(
+                at::Tensor input, at::Tensor mean, at::Tensor output,
+                at::Tensor scale, int tensor_layout, bool subtract_mean)
+{
+  quant_per_thread_int4_cuda_impl<true>(input, mean, output, scale, tensor_layout, subtract_mean);
+}
+
+void quant_key_per_thread_int4_cuda(
+                at::Tensor input, at::Tensor mean, at::Tensor output,
+                at::Tensor scale, int tensor_layout, bool subtract_mean)
+{
+  quant_per_thread_int4_cuda_impl<false>(input, mean, output, scale, tensor_layout, subtract_mean);
+}
+
 void quant_per_block_int8_cuda(
                 at::Tensor input,
                 at::Tensor output,

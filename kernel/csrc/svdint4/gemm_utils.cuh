@@ -1,7 +1,7 @@
 #pragma once
 
 #include <cstdint>
-#include "runtime.h"
+#include "tensor_bridge.h"
 #include "utils.cuh"
 
 namespace svdint4::kernels {

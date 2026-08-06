@@ -201,6 +201,10 @@ def _includes_sm75() -> bool:
     return any(arch.split("+")[0] == "7.5" for arch in ARCH_LIST.split(";") if arch)
 
 
+def _includes_sm75_ptx() -> bool:
+    return any(arch.upper() == "7.5+PTX" for arch in ARCH_LIST.split(";") if arch)
+
+
 ext_modules = [core_ext]
 if _includes_sm75():
     sm75_nvcc_flags = [
@@ -209,9 +213,18 @@ if _includes_sm75():
         "-gencode",
         "arch=compute_75,code=sm_75",
     ]
-    sage2_include_dirs = [
+    if _includes_sm75_ptx():
+        # A newer validation GPU JITs compute_75 PTX, so compilation cannot
+        # introduce Ampere instructions or BF16 hardware paths.
+        sm75_nvcc_flags.extend(
+            [
+                "-gencode",
+                "arch=compute_75,code=compute_75",
+            ]
+        )
+    sage_include_dirs = [
         str((ROOT / "csrc" / "turing").resolve()),
-        str((ROOT / "csrc" / "turing" / "sage2").resolve()),
+        str((ROOT / "csrc" / "turing" / "sage").resolve()),
         *CCCL_INCLUDE_DIRS,
     ]
     ext_modules.extend(
@@ -219,20 +232,20 @@ if _includes_sm75():
             CUDAExtension(
                 name="svdint4._sage_qattn_sm75",
                 sources=[
-                    "csrc/turing/sage2/pybind_sm75.cpp",
-                    "csrc/turing/sage2/qk_int_sv_f16_cuda_sm75.cu",
-                    "csrc/turing/sage2/qk_int_sv_f16_varlen_cuda_sm75.cu",
+                    "csrc/turing/sage/pybind_sm75.cpp",
+                    "csrc/turing/sage/qk_int_sv_f16_cuda_sm75.cu",
+                    "csrc/turing/sage/qk_int_sv_f16_varlen_cuda_sm75.cu",
                 ],
-                include_dirs=sage2_include_dirs,
+                include_dirs=sage_include_dirs,
                 extra_compile_args={"cxx": CXX_FLAGS, "nvcc": sm75_nvcc_flags},
             ),
             CUDAExtension(
                 name="svdint4._sage_fused_sm75",
                 sources=[
-                    "csrc/turing/sage2/pybind_fused.cpp",
-                    "csrc/turing/sage2/fused.cu",
+                    "csrc/turing/sage/pybind_fused.cpp",
+                    "csrc/turing/sage/fused.cu",
                 ],
-                include_dirs=sage2_include_dirs,
+                include_dirs=sage_include_dirs,
                 extra_compile_args={"cxx": CXX_FLAGS, "nvcc": sm75_nvcc_flags},
             ),
         ]
@@ -241,7 +254,7 @@ if _includes_sm75():
 
 setup(
     name="svdint4-kernel",
-    version="0.4.1",
+    version="0.6.0",
     packages=find_packages(),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

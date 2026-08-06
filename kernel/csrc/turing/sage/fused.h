@@ -68,6 +68,28 @@ void quant_per_warp_int8_varlen_cuda(
                 int block_size,
                 int warp_block_size);
 
+void token_block_mean_cuda(
+                at::Tensor input,
+                at::Tensor output,
+                int block_size,
+                int tensor_layout);
+
+void quant_query_per_thread_int4_cuda(
+                at::Tensor input,
+                at::Tensor mean,
+                at::Tensor output,
+                at::Tensor scale,
+                int tensor_layout,
+                bool subtract_mean);
+
+void quant_key_per_thread_int4_cuda(
+                at::Tensor input,
+                at::Tensor mean,
+                at::Tensor output,
+                at::Tensor scale,
+                int tensor_layout,
+                bool subtract_mean);
+
 void sub_mean_cuda(
                 at::Tensor input,
                 at::Tensor mean,

@@ -110,6 +110,114 @@ __device__ __forceinline__ void load_global_to_share(T **lane_ptr, uint32_t &sme
   *lane_ptr += (CTA - smem_iters_col * global_to_shared_copy_lines_per_warp_per_iter) * gmem_stride;
 }
 
+template <uint32_t global_to_shared_line_lanes, uint32_t global_to_shared_copy_lines_per_warp_per_iter,
+          uint32_t smem_iters_row, uint32_t smem_iters_col, SwizzleMode swizzle_mode,
+          uint32_t stride, uint32_t CTA, typename T>
+__device__ __forceinline__ void load_global_to_share(
+    T **lane_ptr,
+    uint32_t &smem_offset,
+    const uint32_t &gmem_stride,
+    const smem_t<swizzle_mode, stride> &smem,
+    uint32_t base_idx,
+    uint32_t max_len);
+
+__device__ __forceinline__ b128_t bf16_pack_to_half(const nv_bfloat16 *source)
+{
+  b128_t output;
+  half2 *half_pairs = reinterpret_cast<half2 *>(&output);
+  const nv_bfloat162 *bf16_pairs = reinterpret_cast<const nv_bfloat162 *>(source);
+#pragma unroll
+  for (int pair = 0; pair < 4; ++pair)
+  {
+    half_pairs[pair] = __float22half2_rn(__bfloat1622float2(bf16_pairs[pair]));
+  }
+  return output;
+}
+
+template <uint32_t global_to_shared_line_lanes, uint32_t global_to_shared_copy_lines_per_warp_per_iter,
+          uint32_t smem_iters_row, uint32_t smem_iters_col, SwizzleMode swizzle_mode,
+          uint32_t stride, uint32_t CTA, typename DTypeV>
+__device__ __forceinline__ void load_v_global_to_share(
+    DTypeV **lane_ptr,
+    uint32_t &smem_offset,
+    const uint32_t &gmem_stride,
+    const smem_t<swizzle_mode, stride> &smem)
+{
+  static_assert(std::is_same<DTypeV, half>::value || std::is_same<DTypeV, nv_bfloat16>::value);
+  if constexpr (std::is_same<DTypeV, half>::value)
+  {
+    load_global_to_share<global_to_shared_line_lanes,
+                         global_to_shared_copy_lines_per_warp_per_iter,
+                         smem_iters_row, smem_iters_col, swizzle_mode, stride, CTA>(
+        lane_ptr, smem_offset, gmem_stride, smem);
+  }
+  else
+  {
+#pragma unroll
+    for (uint32_t i = 0; i < smem_iters_col; ++i)
+    {
+#pragma unroll
+      for (uint32_t j = 0; j < smem_iters_row; ++j)
+      {
+        smem.base[smem_offset] = bf16_pack_to_half(*lane_ptr);
+        *lane_ptr += global_to_shared_line_lanes * 8;
+        smem_offset = smem.advance_offset_by_column<global_to_shared_line_lanes>(smem_offset);
+      }
+      smem_offset = smem.advance_offset_by_row<global_to_shared_copy_lines_per_warp_per_iter>(
+          smem_offset - smem_iters_row * global_to_shared_line_lanes);
+      *lane_ptr += global_to_shared_copy_lines_per_warp_per_iter * gmem_stride -
+                   smem_iters_row * global_to_shared_line_lanes * 8;
+    }
+    smem_offset -= smem_iters_col * global_to_shared_copy_lines_per_warp_per_iter * stride;
+    *lane_ptr += (CTA - smem_iters_col * global_to_shared_copy_lines_per_warp_per_iter) * gmem_stride;
+  }
+}
+
+template <uint32_t global_to_shared_line_lanes, uint32_t global_to_shared_copy_lines_per_warp_per_iter,
+          uint32_t smem_iters_row, uint32_t smem_iters_col, SwizzleMode swizzle_mode,
+          uint32_t stride, uint32_t CTA, typename DTypeV>
+__device__ __forceinline__ void load_v_global_to_share(
+    DTypeV **lane_ptr,
+    uint32_t &smem_offset,
+    const uint32_t &gmem_stride,
+    const smem_t<swizzle_mode, stride> &smem,
+    uint32_t base_idx,
+    uint32_t max_len)
+{
+  static_assert(std::is_same<DTypeV, half>::value || std::is_same<DTypeV, nv_bfloat16>::value);
+  if constexpr (std::is_same<DTypeV, half>::value)
+  {
+    load_global_to_share<global_to_shared_line_lanes,
+                         global_to_shared_copy_lines_per_warp_per_iter,
+                         smem_iters_row, smem_iters_col, swizzle_mode, stride, CTA>(
+        lane_ptr, smem_offset, gmem_stride, smem, base_idx, max_len);
+  }
+  else
+  {
+#pragma unroll
+    for (uint32_t i = 0; i < smem_iters_col; ++i)
+    {
+#pragma unroll
+      for (uint32_t j = 0; j < smem_iters_row; ++j)
+      {
+        if (base_idx < max_len)
+        {
+          smem.base[smem_offset] = bf16_pack_to_half(*lane_ptr);
+        }
+        *lane_ptr += global_to_shared_line_lanes * 8;
+        smem_offset = smem.advance_offset_by_column<global_to_shared_line_lanes>(smem_offset);
+      }
+      smem_offset = smem.advance_offset_by_row<global_to_shared_copy_lines_per_warp_per_iter>(
+          smem_offset - smem_iters_row * global_to_shared_line_lanes);
+      *lane_ptr += global_to_shared_copy_lines_per_warp_per_iter * gmem_stride -
+                   smem_iters_row * global_to_shared_line_lanes * 8;
+      base_idx += global_to_shared_copy_lines_per_warp_per_iter;
+    }
+    smem_offset -= smem_iters_col * global_to_shared_copy_lines_per_warp_per_iter * stride;
+    *lane_ptr += (CTA - smem_iters_col * global_to_shared_copy_lines_per_warp_per_iter) * gmem_stride;
+  }
+}
+
 // with predicate
 template <uint32_t global_to_shared_line_lanes, uint32_t global_to_shared_copy_lines_per_warp_per_iter,
           uint32_t smem_iters_row, uint32_t smem_iters_col, SwizzleMode swizzle_mode, uint32_t stride, uint32_t CTA, typename T>

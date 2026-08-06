@@ -13,6 +13,7 @@
 
 #include <cfloat>
 #include <cmath>
+#include <type_traits>
 
 #include "kernel_api.h"
 
@@ -232,6 +233,49 @@ __global__ void quantize_from_partials_kernel(
     }
 }
 
+template <typename InputType>
+__global__ void quantize_int4_from_partials_kernel(
+    const InputType *__restrict__ rotated,
+    const float *__restrict__ partial_absmax,
+    int8_t *__restrict__ output,
+    float *__restrict__ scales,
+    int k) {
+    constexpr int kWarps = kQuantThreads / kWarpThreads;
+    __shared__ float warp_values[kWarps];
+    __shared__ float block_value;
+
+    const int row = static_cast<int>(blockIdx.x);
+    const int tid = threadIdx.x;
+    const int groups = k / kConvRotGroup;
+    const int64_t input_row = static_cast<int64_t>(row) * k;
+    const int64_t output_row = static_cast<int64_t>(row) * (k / 2);
+    const float *row_partials = partial_absmax + static_cast<int64_t>(row) * groups;
+
+    float abs_max = 0.0f;
+    for (int group = tid; group < groups; group += kQuantThreads) {
+        abs_max = fmaxf(abs_max, row_partials[group]);
+    }
+    abs_max = block_reduce_max<kWarps>(abs_max, warp_values, &block_value);
+    const float scale = fmaxf(
+        fminf(abs_max, finite_max<InputType>()) * (1.0f / 7.0f),
+        1.0e-10f);
+    if (tid == 0) {
+        scales[row] = scale;
+    }
+
+    for (int packed_col = tid; packed_col < k / 2; packed_col += kQuantThreads) {
+        const int col = packed_col * 2;
+        const float inv_scale = 1.0f / scale;
+        float low = nearbyintf(to_float(rotated[input_row + col]) * inv_scale);
+        float high = nearbyintf(to_float(rotated[input_row + col + 1]) * inv_scale);
+        low = fminf(7.0f, fmaxf(-7.0f, low));
+        high = fminf(7.0f, fmaxf(-7.0f, high));
+        const uint8_t low_bits = static_cast<uint8_t>(static_cast<int8_t>(low)) & 0x0f;
+        const uint8_t high_bits = static_cast<uint8_t>(static_cast<int8_t>(high)) & 0x0f;
+        output[output_row + packed_col] = static_cast<int8_t>(low_bits | (high_bits << 4));
+    }
+}
+
 __device__ __forceinline__ uint16_t float_to_bf16_rn_bits(float value) {
     const uint32_t bits = __float_as_uint(value);
     if ((bits & 0x7fffffffU) > 0x7f800000U) {
@@ -287,7 +331,7 @@ __device__ __forceinline__ float load_bf16_input(
 // inactive row is stored as BF16 while each active group retains FP32 scratch.
 // This preserves the staged path's BF16 rounding but removes its global-memory
 // intermediate and second kernel launch.
-template <int BlockThreads, bool SwiGLU>
+template <int BlockThreads, bool SwiGLU, bool Int4>
 __global__ void bf16_rowbuffer_convrot_quantize_kernel(
     const nv_bfloat16 *__restrict__ input,
     int8_t *__restrict__ output,
@@ -346,33 +390,52 @@ __global__ void bf16_rowbuffer_convrot_quantize_kernel(
     }
 
     abs_max = block_reduce_max<kWarps>(abs_max, warp_values, &block_value);
+    constexpr float quant_max = Int4 ? 7.0f : 127.0f;
     const float scale = fmaxf(
-        fminf(abs_max, finite_max<nv_bfloat16>()) * (1.0f / 127.0f),
-        1.0e-30f);
+        fminf(abs_max, finite_max<nv_bfloat16>()) / quant_max,
+        Int4 ? 1.0e-10f : 1.0e-30f);
     if (tid == 0) {
         scales[row] = scale;
     }
 
     const float rounded_scale = bf16_bits_to_float(float_to_bf16_rn_bits(scale));
-    for (int column = tid; column < k; column += BlockThreads) {
-        const float value = bf16_bits_to_float(row_buffer[column]);
-        const float divided = bf16_bits_to_float(
-            float_to_bf16_rn_bits(value / rounded_scale));
-        float quantized = nearbyintf(divided);
-        quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
-        output[output_row + column] = static_cast<int8_t>(quantized);
+    if constexpr (Int4) {
+        const float inv_scale = 1.0f / scale;
+        const int64_t packed_output_row = static_cast<int64_t>(row) * (k / 2);
+        for (int packed_column = tid; packed_column < k / 2; packed_column += BlockThreads) {
+            const int column = packed_column * 2;
+            const float low_value = bf16_bits_to_float(row_buffer[column]);
+            const float high_value = bf16_bits_to_float(row_buffer[column + 1]);
+            float low = nearbyintf(low_value * inv_scale);
+            float high = nearbyintf(high_value * inv_scale);
+            low = fminf(7.0f, fmaxf(-7.0f, low));
+            high = fminf(7.0f, fmaxf(-7.0f, high));
+            const uint8_t low_bits = static_cast<uint8_t>(static_cast<int8_t>(low)) & 0x0f;
+            const uint8_t high_bits = static_cast<uint8_t>(static_cast<int8_t>(high)) & 0x0f;
+            output[packed_output_row + packed_column] =
+                static_cast<int8_t>(low_bits | (high_bits << 4));
+        }
+    } else {
+        for (int column = tid; column < k; column += BlockThreads) {
+            const float value = bf16_bits_to_float(row_buffer[column]);
+            const float divided = bf16_bits_to_float(
+                float_to_bf16_rn_bits(value / rounded_scale));
+            float quantized = nearbyintf(divided);
+            quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
+            output[output_row + column] = static_cast<int8_t>(quantized);
+        }
     }
 }
 
-template <int BlockThreads, bool SwiGLU>
+template <int BlockThreads, bool SwiGLU, bool Int4 = false>
 void launch_bf16_rowbuffer(Tensor input, Tensor output, Tensor scales) {
     const int rows = input.size(0);
-    const int k = output.size(1);
+    const int k = Int4 ? output.size(1) * 2 : output.size(1);
     constexpr int kGroupsInFlight = BlockThreads / kGroupThreads;
     const size_t shared_bytes =
         static_cast<size_t>(k) * sizeof(uint16_t) +
         kGroupsInFlight * 2 * kConvRotGroup * sizeof(float);
-    bf16_rowbuffer_convrot_quantize_kernel<BlockThreads, SwiGLU>
+    bf16_rowbuffer_convrot_quantize_kernel<BlockThreads, SwiGLU, Int4>
         <<<rows, BlockThreads, shared_bytes, getCurrentCUDAStream()>>>(
             static_cast<const nv_bfloat16 *>(input.ptr),
             static_cast<int8_t *>(output.ptr),
@@ -381,14 +444,14 @@ void launch_bf16_rowbuffer(Tensor input, Tensor output, Tensor scales) {
     checkCUDA(cudaGetLastError());
 }
 
-template <typename InputType>
+template <typename InputType, bool Int4 = false>
 void launch_swiglu_quantize(Tensor input,
                             Tensor rotated,
                             Tensor partial_absmax,
                             Tensor output,
                             Tensor scales) {
     const int rows = input.size(0);
-    const int k = output.size(1);
+    const int k = rotated.size(1);
     const int group_blocks = ceilDiv(k / kConvRotGroup, kGroupsPerBlock);
     const dim3 grid(static_cast<unsigned int>(rows), static_cast<unsigned int>(group_blocks));
     constexpr size_t smem_bytes =
@@ -400,12 +463,23 @@ void launch_swiglu_quantize(Tensor input,
         k);
     checkCUDA(cudaGetLastError());
 
-    quantize_from_partials_kernel<InputType><<<rows, kQuantThreads, 0, getCurrentCUDAStream()>>>(
-        static_cast<const InputType *>(rotated.ptr),
-        static_cast<const float *>(partial_absmax.ptr),
-        static_cast<int8_t *>(output.ptr),
-        static_cast<float *>(scales.ptr),
-        k);
+    if constexpr (Int4) {
+        quantize_int4_from_partials_kernel<InputType>
+            <<<rows, kQuantThreads, 0, getCurrentCUDAStream()>>>(
+                static_cast<const InputType *>(rotated.ptr),
+                static_cast<const float *>(partial_absmax.ptr),
+                static_cast<int8_t *>(output.ptr),
+                static_cast<float *>(scales.ptr),
+                k);
+    } else {
+        quantize_from_partials_kernel<InputType>
+            <<<rows, kQuantThreads, 0, getCurrentCUDAStream()>>>(
+                static_cast<const InputType *>(rotated.ptr),
+                static_cast<const float *>(partial_absmax.ptr),
+                static_cast<int8_t *>(output.ptr),
+                static_cast<float *>(scales.ptr),
+                k);
+    }
     checkCUDA(cudaGetLastError());
 }
 
@@ -422,6 +496,20 @@ void turing_swiglu_int8_convrot_quantize(Tensor input,
         launch_swiglu_quantize<half>(input, rotated, partial_absmax, output, scales);
     } else {
         throw std::runtime_error("SwiGLU staged ConvRot requires float16 or bfloat16 input");
+    }
+}
+
+void turing_swiglu_int4_convrot_quantize(Tensor input,
+                                          Tensor rotated,
+                                          Tensor partial_absmax,
+                                          Tensor output,
+                                          Tensor scales) {
+    if (input.scalar_type() == Tensor::BF16) {
+        launch_swiglu_quantize<nv_bfloat16, true>(input, rotated, partial_absmax, output, scales);
+    } else if (input.scalar_type() == Tensor::FP16) {
+        launch_swiglu_quantize<half, true>(input, rotated, partial_absmax, output, scales);
+    } else {
+        throw std::runtime_error("SwiGLU staged INT4 ConvRot requires float16 or bfloat16 input");
     }
 }
 
@@ -447,6 +535,31 @@ void turing_bf16_int8_convrot_quantize(Tensor input,
         launch_bf16_rowbuffer<768, false>(input, output, scales);
     } else {
         launch_bf16_rowbuffer<512, false>(input, output, scales);
+    }
+}
+
+void turing_bf16_int4_convrot_quantize(Tensor input,
+                                        Tensor output,
+                                        Tensor scales,
+                                        bool swiglu,
+                                        int block_threads) {
+    if (input.scalar_type() != Tensor::BF16) {
+        throw std::runtime_error("BF16 row-buffer INT4 ConvRot requires bfloat16 input");
+    }
+    if (swiglu) {
+        if (block_threads == 1024) {
+            launch_bf16_rowbuffer<1024, true, true>(input, output, scales);
+        } else if (block_threads == 768) {
+            launch_bf16_rowbuffer<768, true, true>(input, output, scales);
+        } else {
+            launch_bf16_rowbuffer<512, true, true>(input, output, scales);
+        }
+    } else if (block_threads == 1024) {
+        launch_bf16_rowbuffer<1024, false, true>(input, output, scales);
+    } else if (block_threads == 768) {
+        launch_bf16_rowbuffer<768, false, true>(input, output, scales);
+    } else {
+        launch_bf16_rowbuffer<512, false, true>(input, output, scales);
     }
 }
 

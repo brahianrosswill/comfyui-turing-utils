@@ -15,10 +15,11 @@ SETUP_PATH = PLUGIN_ROOT / "kernel" / "setup.py"
 
 
 class KernelSetupTest(unittest.TestCase):
-    def _run_windows_setup(self, conda_prefix: Path):
-        def extension(*, name, **kwargs):
-            return SimpleNamespace(name=name, kwargs=kwargs)
+    @staticmethod
+    def _extension(*, name, **kwargs):
+        return SimpleNamespace(name=name, kwargs=kwargs)
 
+    def _run_windows_setup(self, conda_prefix: Path):
         environment = {
             "CONDA_PREFIX": str(conda_prefix),
             "SVDINT4_ARCH_LIST": "8.6",
@@ -27,13 +28,36 @@ class KernelSetupTest(unittest.TestCase):
             mock.patch.object(platform, "system", return_value="Windows"),
             mock.patch.dict(os.environ, environment, clear=False),
             mock.patch("torch.utils.cpp_extension.CUDA_HOME", None),
-            mock.patch("torch.utils.cpp_extension.CUDAExtension", side_effect=extension),
+            mock.patch("torch.utils.cpp_extension.CUDAExtension", side_effect=self._extension),
             mock.patch("torch.utils.cpp_extension.BuildExtension", object()),
             mock.patch("shutil.which", return_value=None),
             mock.patch("setuptools.setup") as setup,
         ):
             runpy.run_path(str(SETUP_PATH), run_name="__svdint4_windows_setup_test__")
         return setup.call_args.kwargs["ext_modules"]
+
+    def test_sage_compatibility_ptx_is_opt_in_and_keeps_sm75(self):
+        environment = {
+            "SVDINT4_ARCH_LIST": "7.5+PTX",
+        }
+        with (
+            mock.patch.object(platform, "system", return_value="Linux"),
+            mock.patch.dict(os.environ, environment, clear=False),
+            mock.patch("torch.utils.cpp_extension.CUDAExtension", side_effect=self._extension),
+            mock.patch("torch.utils.cpp_extension.BuildExtension", object()),
+            mock.patch("setuptools.setup") as setup,
+        ):
+            runpy.run_path(str(SETUP_PATH), run_name="__svdint4_linux_setup_test__")
+
+        extensions = setup.call_args.kwargs["ext_modules"]
+        self.assertEqual(
+            [extension.name for extension in extensions],
+            ["svdint4._C", "svdint4._sage_qattn_sm75", "svdint4._sage_fused_sm75"],
+        )
+        flags = extensions[1].kwargs["extra_compile_args"]["nvcc"]
+        self.assertIn("arch=compute_75,code=sm_75", flags)
+        self.assertIn("arch=compute_75,code=compute_75", flags)
+        self.assertNotIn("arch=compute_86,code=sm_86", flags)
 
     def test_windows_conda_target_specific_cccl_path_is_added(self):
         with tempfile.TemporaryDirectory() as temp_dir:

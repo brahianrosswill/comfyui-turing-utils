@@ -29,8 +29,8 @@ def turing_w4a8_linear(
 ) -> torch.Tensor:
     if activation.device.type != "cuda":
         raise RuntimeError("SVDInt4 Turing W4A8 requires CUDA tensors")
-    if torch.cuda.get_device_capability(activation.device) != (7, 5):
-        raise RuntimeError("SVDInt4 Turing W4A8 requires NVIDIA Turing/sm75")
+    if torch.cuda.get_device_capability(activation.device) < (7, 5):
+        raise RuntimeError("SVDInt4 Turing W4A8 requires sm75 or newer")
     return _C.turing_w4a8_linear(
         activation.contiguous(),
         weight.contiguous(),
@@ -79,6 +79,23 @@ def turing_swiglu_int8_convrot_quantize(
     return _C.turing_swiglu_int8_convrot_quantize(x.contiguous(), group_size)
 
 
+def turing_swiglu_int4_convrot_quantize(
+    x: torch.Tensor,
+    group_size: int = 256,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse SwiGLU into staged ConvRot INT4 activation quantization."""
+    if x.device.type != "cuda":
+        raise RuntimeError("SVDInt4 Turing SwiGLU INT4 ConvRot requires CUDA tensors")
+    major, minor = torch.cuda.get_device_capability(x.device)
+    if (major, minor) < (7, 5):
+        raise RuntimeError("SVDInt4 Turing SwiGLU INT4 ConvRot requires sm75 or newer")
+    if x.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("SwiGLU INT4 ConvRot input must be float16 or bfloat16")
+    if x.ndim != 2:
+        raise ValueError("SwiGLU INT4 ConvRot input must be 2D [M, 2K]")
+    return _C.turing_swiglu_int4_convrot_quantize(x.contiguous(), group_size)
+
+
 def turing_bf16_int8_convrot_quantize(
     x: torch.Tensor,
     group_size: int = 256,
@@ -96,6 +113,27 @@ def turing_bf16_int8_convrot_quantize(
     if x.ndim != 2:
         raise ValueError("BF16 row-buffer ConvRot input must be 2D")
     return _C.turing_bf16_int8_convrot_quantize(
+        x.contiguous(), group_size, swiglu
+    )
+
+
+def turing_bf16_int4_convrot_quantize(
+    x: torch.Tensor,
+    group_size: int = 256,
+    *,
+    swiglu: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Whole-row BF16 ConvRot INT4 quantization under the SM75 48 KiB limit."""
+    if x.device.type != "cuda":
+        raise RuntimeError("SVDInt4 BF16 row-buffer INT4 ConvRot requires CUDA tensors")
+    major, minor = torch.cuda.get_device_capability(x.device)
+    if (major, minor) < (7, 5):
+        raise RuntimeError("SVDInt4 BF16 row-buffer INT4 ConvRot requires sm75 or newer")
+    if x.dtype != torch.bfloat16:
+        raise TypeError("BF16 row-buffer INT4 ConvRot input must be bfloat16")
+    if x.ndim != 2:
+        raise ValueError("BF16 row-buffer INT4 ConvRot input must be 2D")
+    return _C.turing_bf16_int4_convrot_quantize(
         x.contiguous(), group_size, swiglu
     )
 

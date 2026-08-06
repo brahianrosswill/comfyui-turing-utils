@@ -59,6 +59,7 @@ class SVDInt4LoaderPolicyTest(unittest.TestCase):
             mock.patch("comfy.model_detection.unet_prefix_from_state_dict", return_value="model."),
             mock.patch("comfy.model_detection.model_config_from_unet", return_value=model_config),
             mock.patch("comfy.model_management.get_torch_device", return_value=load_device),
+            mock.patch.object(loader, "prepare_turing_runtime") as prepare_runtime,
             mock.patch.object(loader, "select_compute_dtype", return_value=torch.bfloat16) as select_dtype,
             mock.patch.object(loader, "SVDInt4Ops", return_value=custom_ops),
             mock.patch("comfy.sd.load_diffusion_model_state_dict", return_value=fake_model) as load_state,
@@ -68,6 +69,7 @@ class SVDInt4LoaderPolicyTest(unittest.TestCase):
             output = loader.load_svdint4_model("model.safetensors")
 
         self.assertIs(output, fake_model)
+        prepare_runtime.assert_called_once_with(loader._NoConvRot(), load_device, "auto")
         select_dtype.assert_called_once()
         self.assertEqual(
             load_state.call_args.kwargs["model_options"],

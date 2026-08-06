@@ -18,12 +18,12 @@ import comfy.weight_adapter
 from comfy.patcher_extension import CallbacksMP
 
 try:
-    from .attention_backends import apply_attention_backend, normalize_attention_backend
-    from .bf16_policy import select_compute_dtype
+    from .attention import apply_attention_backend, normalize_attention_backend
+    from .precision import prepare_turing_runtime, select_compute_dtype
     from .model_format import validate_svdint4_metadata
 except ImportError:
-    from attention_backends import apply_attention_backend, normalize_attention_backend
-    from bf16_policy import select_compute_dtype
+    from attention import apply_attention_backend, normalize_attention_backend
+    from precision import prepare_turing_runtime, select_compute_dtype
     from model_format import validate_svdint4_metadata
 
 try:
@@ -1116,7 +1116,8 @@ def load_svdint4_model(
         metadata=metadata,
     )
     load_device = comfy.model_management.get_torch_device()
-    compute_dtype = select_compute_dtype(model_config, load_device, _NoConvRot(), attention_backend)
+    prepare_turing_runtime(_NoConvRot(), load_device, attention_backend)
+    compute_dtype = select_compute_dtype(model_config, load_device)
     packed_bytes = sum(_tensor_nbytes(tensor) for fields in packed_layer_tensors.values() for tensor in fields.values())
     packed_state_bytes = packed_bytes if _HAS_COMFY_QUANTIZED_TENSOR else 0
     unused_packed_layers: tuple[str, ...] = ()

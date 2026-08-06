@@ -53,11 +53,11 @@
   }
 
 #define DISPATCH_QK_QUANT_GRAN(qk_quant_gran, QK_QUANT_GRAN, ...)              \
-  if (qk_quant_gran == 2) {                                         \
-    constexpr int QK_QUANT_GRAN = 2;                            \
+  if (qk_quant_gran == 1) {                                         \
+    constexpr int QK_QUANT_GRAN = 1;                            \
     __VA_ARGS__                                                 \
-  } else if (qk_quant_gran == 3) {                                  \
-    constexpr int QK_QUANT_GRAN = 3;                           \
+  } else if (qk_quant_gran == 2) {                                  \
+    constexpr int QK_QUANT_GRAN = 2;                            \
     __VA_ARGS__                                                 \
   }  else {                                                     \
     std::ostringstream err_msg;                                 \
