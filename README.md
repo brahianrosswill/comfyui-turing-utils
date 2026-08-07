@@ -46,10 +46,12 @@ internal arithmetic remain FP32. Explicit ComfyUI dtype flags still win.
 The ConvRot path reuses comfy-kitchen W8A8 and W4A4 operators and supplies a
 packed W4A8 SM75 Tensor Core kernel. Its row-buffer quantizers retain completed
 rows in BF16, use FP32 only for active rotation/reduction scratch, and stay under
-the default 48 KiB shared-memory limit. MiniMax-specific block integration is
-isolated in `minimax_adapter.py`. Wan/Bernini integration is isolated in
-`wan_adapter.py`; it adds context-aware VRAM planning, shared QKV activation
-quantization, FP32-reduction LayerNorm+AdaLN, and GELU-to-ConvRot fusion.
+the default 48 KiB shared-memory limit. MiniMax-specific integration is isolated
+in `minimax_adapter.py`, including packed-sequence VRAM planning for text,
+keyframes, and multimodal references. Wan/Bernini integration is isolated in
+`wan_adapter.py`; it adds batch-aware, per-reference-padded VRAM planning,
+shared QKV activation quantization, FP32-reduction LayerNorm+AdaLN, and
+GELU-to-ConvRot fusion.
 Generic dtype, attention, and fused operators remain model-independent.
 
 The bundled Sage backend accepts FP16/BF16 Q/K/V, GQA, causal attention,

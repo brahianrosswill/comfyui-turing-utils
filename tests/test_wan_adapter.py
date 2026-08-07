@@ -19,6 +19,9 @@ import wan_adapter  # noqa: E402
 
 
 class WanMemoryPlanningTest(unittest.TestCase):
+    def test_empty_context_has_no_synthetic_shape(self):
+        self.assertIsNone(wan_adapter._context_latents_shape([]))
+
     def test_context_shape_aggregates_multiple_latents(self):
         latents = [
             torch.empty(1, 16, 5, 8, 8),
@@ -27,6 +30,27 @@ class WanMemoryPlanningTest(unittest.TestCase):
         self.assertEqual(
             wan_adapter._context_latents_shape(latents),
             [1, 16, 8 * 8 * 8],
+        )
+
+    def test_context_shape_sums_per_reference_padding(self):
+        latents = [
+            torch.empty(1, 16, 1, 3, 3),
+            torch.empty(1, 16, 1, 3, 3),
+        ]
+        shape = wan_adapter._context_latents_shape(latents, (1, 2, 2))
+        self.assertEqual(shape, [1, 16, 2 * 1 * 4 * 4])
+        self.assertEqual(wan_adapter._shape_token_rows(shape, (1, 2, 2)), 8)
+
+    def test_context_shape_uses_sampler_batch_hint(self):
+        latents = [
+            torch.empty(1, 16, 5, 8, 8),
+            torch.empty(1, 16, 3, 8, 8),
+        ]
+        self.assertEqual(
+            wan_adapter._context_latents_shape(
+                latents, (1, 2, 2), estimate_batch_size=3
+            ),
+            [3, 16, 8 * 8 * 8],
         )
 
     def test_shape_token_rows_handles_spatial_and_flat_cond_shapes(self):
@@ -50,6 +74,9 @@ class WanMemoryPlanningTest(unittest.TestCase):
             memory_usage_factor_conds = ("existing",)
             diffusion_model = diffusion
 
+            def extra_conds(self, **kwargs):
+                return {}
+
             def extra_conds_shapes(self, **kwargs):
                 return {"existing": [1, 1, 4]}
 
@@ -63,7 +90,7 @@ class WanMemoryPlanningTest(unittest.TestCase):
             mock.patch("wan_adapter.is_supported_turing_device", return_value=True),
             mock.patch(
                 "wan_adapter._quantized_wan_summary",
-                return_value=(Counter({"w8a8": 2}), 4096),
+                return_value=(Counter({"w8a8": 2}), (4096,)),
             ),
             mock.patch(
                 "wan_adapter._install_wan_forward_fusions", return_value=(0, 0)
@@ -87,6 +114,54 @@ class WanMemoryPlanningTest(unittest.TestCase):
             ),
             1_572_964.0,
         )
+
+    def test_workspace_uses_largest_live_accumulator_not_largest_output(self):
+        class Base:
+            def memory_required(self, input_shape, cond_shapes={}):
+                return 0
+
+        base = Base()
+        base.memory_required = wan_adapter._make_memory_required(
+            base, (1, 2, 2), (2048, 4096)
+        )
+        # 4096 columns cross the fixed-workspace threshold and need no global
+        # accumulator, while 2048 columns still need a 40,960,000-byte buffer.
+        self.assertEqual(
+            base.memory_required([1, 16, 1, 100, 200]),
+            5_000 * 2_048 * 4,
+        )
+
+    def test_outer_sample_wrapper_makes_context_estimate_batch_aware(self):
+        base = SimpleNamespace()
+        seen = []
+
+        class Executor:
+            def __call__(self, *args, **kwargs):
+                seen.append(getattr(base, wan_adapter._MEMORY_CONTEXT_ATTR))
+                return "ok"
+
+        wrapper = wan_adapter._make_outer_sample_wrapper(base)
+        result = wrapper(Executor(), torch.empty(3, 16, 5, 8, 8))
+        self.assertEqual(result, "ok")
+        self.assertEqual(seen, [{"batch_size": 3}])
+        self.assertFalse(hasattr(base, wan_adapter._MEMORY_CONTEXT_ATTR))
+
+    def test_runtime_context_condition_reports_padded_batch_shape(self):
+        import comfy.conds
+
+        latents = [
+            torch.empty(1, 16, 1, 3, 3),
+            torch.empty(1, 16, 1, 3, 3),
+        ]
+
+        class Base:
+            def extra_conds(self, **kwargs):
+                return {"context_latents": comfy.conds.CONDList(latents)}
+
+        base = Base()
+        base.extra_conds = wan_adapter._make_extra_conds(base, (1, 2, 2))
+        cond = base.extra_conds()["context_latents"].process_cond(3)
+        self.assertEqual(cond.size(), [1, 16, 3 * 2 * 1 * 4 * 4])
 
     def test_wan_attention_releases_qk_through_prequantized_sage_bridge(self):
         from comfy.ldm.wan import model as wan_model

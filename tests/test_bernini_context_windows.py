@@ -168,6 +168,33 @@ class BerniniContextWindowsTest(unittest.TestCase):
         self.assertIs(result[1], conds)
         self.assertIs(conds["positive"][0]["context_latents"][0], context)
 
+    def test_prepare_sampling_slices_matching_video_and_keeps_independent_refs(self):
+        handler = SimpleNamespace(dim=2, context_length=3, causal_window_fix=True)
+        source = torch.zeros(1, 16, 8, 4, 4)
+        independent_ref = torch.zeros(1, 16, 3, 6, 6)
+        conds = {
+            "positive": [
+                {"context_latents": [source, independent_ref]}
+            ]
+        }
+        captured = {}
+
+        def executor(model, noise_shape, estimated_conds, *args, **kwargs):
+            captured["conds"] = estimated_conds
+            return model, estimated_conds, []
+
+        bernini_nodes._bernini_prepare_sampling_wrapper(
+            executor,
+            object(),
+            (1, 16, 8, 4, 4),
+            conds,
+            model_options={"context_handler": handler},
+        )
+        estimated = captured["conds"]["positive"][0]["context_latents"]
+        self.assertEqual(estimated[0].shape, (1, 16, 4, 4, 4))
+        self.assertIs(estimated[1], independent_ref)
+        self.assertEqual(source.shape, (1, 16, 8, 4, 4))
+
     def test_prepare_sampling_keeps_packed_latent_estimate_conservative(self):
         handler = SimpleNamespace(dim=2, context_length=8, causal_window_fix=True)
         conds = {"positive": []}

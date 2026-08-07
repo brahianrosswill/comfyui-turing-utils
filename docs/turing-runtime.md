@@ -27,7 +27,7 @@ not skip attention or quantized-kernel preflight.
 | `attention.py` | generic backend selection and bundled Sage adapter |
 | `turing_ops.py` | exact-sm75 Kitchen backend and W8/W4 dispatch policy |
 | `turing_fusions.py` | model-independent fused Linear activation and segmented norm calls |
-| `minimax_adapter.py` | MiniMax block discovery and ModelPatcher object patches only |
+| `minimax_adapter.py` | MiniMax packed-sequence memory planning and ModelPatcher object patches |
 | `wan_adapter.py` | Wan/Bernini memory planning and model-specific object patches |
 | `kernel/csrc/turing` | separately installed Turing kernels, including bundled Sage |
 
@@ -71,6 +71,20 @@ normal generic path.
 Bernini context latents are included in ComfyUI's memory estimate; context
 windows budget both the context tokens and the possible causal anchor without
 changing the conditioning used at runtime.
+
+MiniMax planning receives the sampler's original nested video/audio shapes
+before ComfyUI flattens them. It mirrors `PackedLayout` row accounting for text,
+first/last keyframes, reference images, reference video, reference audio, and
+the target streams. The normal ComfyUI heuristic is scaled by the complete
+packed sequence, with a lower bound from the known FP32 condition-row buffers
+and BF16 packed hidden state. W8A8 planning checks every distinct output width
+and reserves the largest live INT32 accumulator; it does not assume that the
+widest layer owns the largest workspace after fixed-workspace dispatch.
+
+Wan/Bernini reference shapes are padded per stream before aggregation. The
+outer sampling wrapper also supplies the real sampler batch, so repeated
+context conditions are represented during initial model loading as well as in
+the per-step batching check.
 
 Wan patch embedding deliberately retains ComfyUI's FP32 convolution boundary.
 An A40 test with TF32 disabled found the prospective FP16 path slower and
