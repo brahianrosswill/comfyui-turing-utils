@@ -4,23 +4,16 @@ from __future__ import annotations
 
 import logging
 import math
-import inspect
 import types
 from collections import Counter
 
 import torch
 
 try:
-    from .turing_fusions import (
-        convrot_weight_kind,
-        turing_linear_group,
-    )
+    from .turing_fusions import convrot_weight_kind
     from .turing_ops import is_supported_turing_device, turing_int8_workspace_bytes
 except ImportError:
-    from turing_fusions import (
-        convrot_weight_kind,
-        turing_linear_group,
-    )
+    from turing_fusions import convrot_weight_kind
     from turing_ops import is_supported_turing_device, turing_int8_workspace_bytes
 
 
@@ -224,93 +217,6 @@ def _quantized_wan_summary(diffusion_model) -> tuple[Counter, tuple[int, ...]]:
     return formats, tuple(sorted(w8_outputs))
 
 
-def _make_self_attention_forward(attention, wan_model):
-    original = attention.forward
-
-    def forward(self, x, freqs, transformer_options={}):
-        projected = turing_linear_group((self.q, self.k, self.v), x)
-        if projected is None:
-            return original(x, freqs, transformer_options=transformer_options)
-
-        q, k, v = projected
-        b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
-        q = wan_model.apply_rope1(self.norm_q(q).view(b, s, n, d), freqs)
-        k = wan_model.apply_rope1(self.norm_k(k).view(b, s, n, d), freqs)
-        v = v.view(b, s, n, d)
-        attention_patches = transformer_options.get("patches", {}).get(
-            "attn1_patch", ()
-        )
-        bundled_sage = (
-            transformer_options.get("turing_utils_attention_implementation")
-            == "bundled_turing_sage"
-            and d in (64, 128)
-            and not attention_patches
-        )
-        if bundled_sage:
-            from comfyui_turing_utils_kernel.turing_sage.core import (
-                sageattn_prequantized,
-            )
-            from comfyui_turing_utils_kernel.turing_sage.quant import per_warp_int8
-
-            q_int8, q_scale, k_int8, k_scale = per_warp_int8(
-                q, k, tensor_layout="NHD", fuse_qk=False
-            )
-            del q, k
-            output = sageattn_prequantized(
-                q_int8,
-                q_scale,
-                k_int8,
-                k_scale,
-                v,
-                tensor_layout="NHD",
-            ).reshape(b, s, n * d)
-        else:
-            output = wan_model.optimized_attention(
-                q.view(b, s, n * d),
-                k.view(b, s, n * d),
-                v.view(b, s, n * d),
-                heads=self.num_heads,
-                transformer_options=transformer_options,
-            )
-        for patch in attention_patches:
-            output = patch(
-                {
-                    "x": output,
-                    "q": q,
-                    "k": k,
-                    "transformer_options": transformer_options,
-                }
-            )
-        return self.o(output)
-
-    return types.MethodType(forward, attention)
-
-
-def _install_wan_self_attention_fusion(model, diffusion_model) -> int:
-    from comfy.ldm.wan import model as wan_model
-
-    attention_signature = tuple(inspect.signature(wan_model.WanSelfAttention.forward).parameters)
-    if attention_signature != ("self", "x", "freqs", "transformer_options"):
-        LOG.warning("Wan Turing self-attention fusion disabled because ComfyUI's Wan contract changed")
-        return 0
-
-    attention_count = 0
-    for name, module in diffusion_model.named_modules():
-        object_name = f"diffusion_model.{name}"
-        if type(module) is wan_model.WanSelfAttention:
-            kinds = [
-                convrot_weight_kind(getattr(linear, "weight", None))
-                for linear in (module.q, module.k, module.v)
-            ]
-            if kinds[0] is not None and all(kind == kinds[0] for kind in kinds):
-                model.add_object_patch(
-                    f"{object_name}.forward",
-                    _make_self_attention_forward(module, wan_model),
-                )
-                attention_count += 1
-    return attention_count
-
-
 def apply_wan_adapter(model, device: torch.device) -> int:
     """Install Wan-specific planning without imposing input-size restrictions."""
     if not is_supported_turing_device(device):
@@ -352,13 +258,10 @@ def apply_wan_adapter(model, device: torch.device) -> int:
             _make_outer_sample_wrapper(base_model),
         )
 
-    attention_count = _install_wan_self_attention_fusion(model, diffusion_model)
-
     LOG.info(
         "Enabled Wan Turing adapter: formats=[%s], context-aware VRAM planning, "
-        "w8_outputs=[%s], shared_qkv=%d",
+        "w8_outputs=[%s]",
         ",".join(f"{kind}:{count}" for kind, count in sorted(formats.items())),
         ",".join(map(str, w8_output_channels)) or "none",
-        attention_count,
     )
     return sum(formats.values())

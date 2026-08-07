@@ -92,9 +92,6 @@ class WanMemoryPlanningTest(unittest.TestCase):
                 "wan_adapter._quantized_wan_summary",
                 return_value=(Counter({"w8a8": 2}), (4096,)),
             ),
-            mock.patch(
-                "wan_adapter._install_wan_self_attention_fusion", return_value=0
-            ),
             mock.patch("wan_adapter.turing_int8_workspace_bytes", return_value=64.0),
         ):
             count = wan_adapter.apply_wan_adapter(patcher, torch.device("cuda", 0))
@@ -162,96 +159,6 @@ class WanMemoryPlanningTest(unittest.TestCase):
         base.extra_conds = wan_adapter._make_extra_conds(base, (1, 2, 2))
         cond = base.extra_conds()["context_latents"].process_cond(3)
         self.assertEqual(cond.size(), [1, 16, 3 * 2 * 1 * 4 * 4])
-
-    def test_wan_attention_releases_qk_through_prequantized_sage_bridge(self):
-        from comfy.ldm.wan import model as wan_model
-        from comfyui_turing_utils_kernel.turing_sage import core, quant
-
-        attention = SimpleNamespace(
-            q=object(),
-            k=object(),
-            v=object(),
-            o=torch.nn.Identity(),
-            norm_q=torch.nn.Identity(),
-            norm_k=torch.nn.Identity(),
-            num_heads=2,
-            head_dim=64,
-        )
-        attention.forward = lambda *_args, **_kwargs: None
-        x = torch.zeros(1, 3, 128, dtype=torch.bfloat16)
-        projected = tuple(torch.full_like(x, value) for value in (1, 2, 3))
-        q_int8 = torch.zeros(1, 3, 2, 64, dtype=torch.int8)
-        k_int8 = torch.zeros_like(q_int8)
-        q_scale = torch.ones(1, 2, 4)
-        k_scale = torch.ones(1, 2, 1)
-        prequantized = torch.full_like(projected[0].reshape(1, 3, 2, 64), 4)
-
-        with (
-            mock.patch("wan_adapter.turing_linear_group", return_value=projected),
-            mock.patch.object(wan_model, "apply_rope1", side_effect=lambda value, _freqs: value),
-            mock.patch.object(wan_model, "optimized_attention") as generic_attention,
-            mock.patch.object(
-                quant,
-                "per_warp_int8",
-                return_value=(q_int8, q_scale, k_int8, k_scale),
-            ) as quantize,
-            mock.patch.object(
-                core, "sageattn_prequantized", return_value=prequantized
-            ) as sage,
-        ):
-            patched = wan_adapter._make_self_attention_forward(attention, wan_model)
-            output = patched(
-                x,
-                None,
-                transformer_options={
-                    "turing_utils_attention_implementation": "bundled_turing_sage"
-                },
-            )
-
-        self.assertEqual(output.shape, x.shape)
-        quantize.assert_called_once()
-        sage.assert_called_once()
-        self.assertEqual(sage.call_args.args[4].shape, (1, 3, 2, 64))
-        generic_attention.assert_not_called()
-
-    def test_wan_install_only_patches_self_attention(self):
-        from comfy.ldm.wan import model as wan_model
-
-        attention = wan_model.WanSelfAttention.__new__(wan_model.WanSelfAttention)
-        torch.nn.Module.__init__(attention)
-        attention.q = torch.nn.Linear(1, 1)
-        attention.k = torch.nn.Linear(1, 1)
-        attention.v = torch.nn.Linear(1, 1)
-        block = wan_model.WanAttentionBlock.__new__(wan_model.WanAttentionBlock)
-        torch.nn.Module.__init__(block)
-
-        diffusion = SimpleNamespace(
-            named_modules=lambda: (
-                ("blocks.0", block),
-                ("blocks.0.self_attn", attention),
-            )
-        )
-        patches = {}
-        patcher = SimpleNamespace(
-            add_object_patch=lambda name, value: patches.__setitem__(name, value)
-        )
-
-        with (
-            mock.patch("wan_adapter.convrot_weight_kind", return_value="w4a4"),
-            mock.patch(
-                "wan_adapter._make_self_attention_forward", return_value="patched"
-            ),
-        ):
-            count = wan_adapter._install_wan_self_attention_fusion(
-                patcher, diffusion
-            )
-
-        self.assertEqual(count, 1)
-        self.assertEqual(
-            patches,
-            {"diffusion_model.blocks.0.self_attn.forward": "patched"},
-        )
-
 
 if __name__ == "__main__":
     unittest.main()
