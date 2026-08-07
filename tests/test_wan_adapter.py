@@ -19,6 +19,40 @@ import wan_adapter  # noqa: E402
 
 
 class WanMemoryPlanningTest(unittest.TestCase):
+    @staticmethod
+    def _w4_weight(dtype: torch.dtype, linear_dtype: str):
+        from comfy.quant_ops import QuantizedTensor, TensorCoreConvRotW4A4Layout
+
+        params = TensorCoreConvRotW4A4Layout.Params(
+            scale=torch.ones(4, dtype=torch.float32),
+            orig_dtype=dtype,
+            orig_shape=(4, 256),
+            convrot_groupsize=256,
+            quant_group_size=64,
+            linear_dtype=linear_dtype,
+        )
+        return QuantizedTensor(
+            torch.zeros((4, 128), dtype=torch.uint8),
+            "TensorCoreConvRotW4A4Layout",
+            params,
+        )
+
+    def test_planning_format_is_independent_of_logical_activation_dtype(self):
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                self.assertEqual(
+                    wan_adapter._convrot_planning_kind(
+                        self._w4_weight(dtype, "int4")
+                    ),
+                    "w4a4",
+                )
+                self.assertEqual(
+                    wan_adapter._convrot_planning_kind(
+                        self._w4_weight(dtype, "int8")
+                    ),
+                    "w4a8",
+                )
+
     def test_empty_context_has_no_synthetic_shape(self):
         self.assertIsNone(wan_adapter._context_latents_shape([]))
 

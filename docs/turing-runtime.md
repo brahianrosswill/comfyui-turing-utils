@@ -7,9 +7,9 @@ MiniMax or Wan/Bernini block structure to those capabilities.
 checkpoint metadata
   -> quantization summary
   -> prepare exact-sm75 runtime and run kernel self-tests
-  -> select the model-declared BF16 inference boundary
+  -> replace an unsupported-FP16 model's sm75 FP32 fallback with BF16
   -> ComfyUI constructs the ModelPatcher
-  -> normalize ConvRot logical weight dtype without copying packed data
+  -> when BF16 was selected, normalize ConvRot logical dtype without copying packed data
   -> install optional model adapter object patches
   -> install attention override
 ```
@@ -28,7 +28,7 @@ not skip attention or quantized-kernel preflight.
 | `turing_ops.py` | exact-sm75 Kitchen backend and W8/W4 dispatch policy |
 | `turing_fusions.py` | model-independent fused Linear activation and segmented norm calls |
 | `minimax_adapter.py` | MiniMax packed-sequence memory planning and ModelPatcher object patches |
-| `wan_adapter.py` | Wan/Bernini memory planning and model-specific object patches |
+| `wan_adapter.py` | Wan/Bernini context-aware memory planning hooks |
 | `kernel/csrc/turing` | separately installed Turing kernels, including bundled Sage |
 
 ## Linear matrix

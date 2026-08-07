@@ -10,10 +10,8 @@ from collections import Counter
 import torch
 
 try:
-    from .turing_fusions import convrot_weight_kind
     from .turing_ops import is_supported_turing_device, turing_int8_workspace_bytes
 except ImportError:
-    from turing_fusions import convrot_weight_kind
     from turing_ops import is_supported_turing_device, turing_int8_workspace_bytes
 
 
@@ -21,6 +19,8 @@ LOG = logging.getLogger("comfyui-turing-utils")
 _CONTEXT_SHAPE_KEY = "context_latents"
 _MEMORY_CONTEXT_ATTR = "_turing_utils_wan_memory_context"
 _OUTER_SAMPLE_WRAPPER_KEY = "turing_utils_wan_memory_context"
+_W4_LAYOUT = "TensorCoreConvRotW4A4Layout"
+_W8_LAYOUT = "TensorWiseINT8Layout"
 
 
 def _context_latents_from_kwargs(kwargs):
@@ -203,12 +203,29 @@ def _make_outer_sample_wrapper(base_model):
     return outer_sample_wrapper
 
 
+def _convrot_planning_kind(weight) -> str | None:
+    """Classify storage for planning without imposing a compute dtype."""
+    params = getattr(weight, "_params", None)
+    if (
+        getattr(params, "transposed", False)
+        or getattr(params, "convrot_groupsize", None) != 256
+    ):
+        return None
+    layout = getattr(weight, "_layout_cls", None)
+    if layout == _W8_LAYOUT and bool(getattr(params, "convrot", False)):
+        return "w8a8"
+    if layout != _W4_LAYOUT or getattr(params, "quant_group_size", None) != 64:
+        return None
+    linear_dtype = getattr(params, "linear_dtype", None)
+    return {"int4": "w4a4", "int8": "w4a8"}.get(linear_dtype)
+
+
 def _quantized_wan_summary(diffusion_model) -> tuple[Counter, tuple[int, ...]]:
     formats = Counter()
     w8_outputs = set()
     for module in diffusion_model.modules():
         weight = getattr(module, "weight", None)
-        kind = convrot_weight_kind(weight)
+        kind = _convrot_planning_kind(weight)
         if kind is None:
             continue
         formats[kind] += 1

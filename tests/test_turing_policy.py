@@ -22,6 +22,9 @@ from comfy_kitchen.backends import cuda as kitchen_cuda  # noqa: E402
 SUMMARY = SimpleNamespace(w4a4=1, w4a8=1, w8a8=1)
 NO_CONVROT = SimpleNamespace(w4a4=0, w4a8=0, w8a8=0)
 BF16_CONFIG = SimpleNamespace(supported_inference_dtypes=[torch.bfloat16, torch.float32])
+FP16_BF16_CONFIG = SimpleNamespace(
+    supported_inference_dtypes=[torch.float16, torch.bfloat16, torch.float32]
+)
 
 
 class BF16PolicyTest(unittest.TestCase):
@@ -60,14 +63,14 @@ class BF16PolicyTest(unittest.TestCase):
         module.register_parameter("weight", torch.nn.Parameter(weight, requires_grad=False))
         return module
 
-    def test_any_model_declaring_bf16_uses_it_on_non_turing_cuda(self):
+    def test_non_turing_cuda_keeps_comfyui_policy(self):
         with (
             mock.patch("precision._explicit_dtype_override", return_value=False),
             mock.patch("torch.cuda.is_available", return_value=True),
             mock.patch("torch.cuda.get_device_capability", return_value=(8, 6)),
         ):
             dtype = bf16_policy.select_compute_dtype(BF16_CONFIG, torch.device("cuda", 0))
-        self.assertIs(dtype, torch.bfloat16)
+        self.assertIsNone(dtype)
 
     def test_model_without_declared_bf16_keeps_comfyui_policy(self):
         config = SimpleNamespace(supported_inference_dtypes=[torch.float16, torch.float32])
@@ -89,6 +92,18 @@ class BF16PolicyTest(unittest.TestCase):
         ):
             dtype = bf16_policy.select_compute_dtype(BF16_CONFIG, torch.device("cuda", 1))
         self.assertIs(dtype, torch.bfloat16)
+
+    def test_turing_model_with_fp16_support_keeps_comfyui_policy(self):
+        with (
+            mock.patch("precision._explicit_dtype_override", return_value=False),
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch("torch.cuda.get_device_capability", return_value=(7, 5)),
+            mock.patch("precision.is_supported_turing_device", return_value=True),
+        ):
+            dtype = bf16_policy.select_compute_dtype(
+                FP16_BF16_CONFIG, torch.device("cuda", 0)
+            )
+        self.assertIsNone(dtype)
 
     def test_turing_preflight_failure_does_not_silently_fallback_to_fp32(self):
         with (

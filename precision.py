@@ -147,7 +147,7 @@ def select_compute_dtype(
     model_config,
     device: torch.device,
 ) -> torch.dtype | None:
-    """Select BF16 storage/compute without changing model-internal accumulation rules."""
+    """Replace only an exact-sm75 FP32 fallback with BF16 storage/compute."""
     if model_config is None or _explicit_dtype_override():
         return None
     supported = tuple(getattr(model_config, "supported_inference_dtypes", ()) or ())
@@ -158,16 +158,18 @@ def select_compute_dtype(
 
     index = device.index if device.index is not None else torch.cuda.current_device()
     capability = torch.cuda.get_device_capability(index)
-    if capability == (7, 5) and not is_supported_turing_device(device):
+    if capability != (7, 5):
+        return None
+    if not is_supported_turing_device(device):
         LOG.warning(
             "BF16 forcing is disabled for %s because the bundled SM75 kernels require a Turing GPU with tensor cores",
             torch.cuda.get_device_name(index),
         )
         return None
-    if capability == (7, 5):
-        LOG.info("Using BF16 activation storage with bundled Turing kernels")
-    else:
-        LOG.info("Using the model's declared BF16 inference mode")
+    if torch.float16 in supported:
+        LOG.info("Keeping ComfyUI's native FP16 inference mode on Turing")
+        return None
+    LOG.info("Replacing the Turing FP32 fallback with BF16 activation storage")
     return torch.bfloat16
 
 
