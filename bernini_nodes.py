@@ -1,25 +1,67 @@
 from __future__ import annotations
 
 import logging
+import types
 
 import comfy.context_windows
+import comfy.conds
 import comfy.patcher_extension
+import comfy.utils
+import node_helpers
 import torch
+import torch.nn.functional as F
+from comfy_api.latest import io
+
+try:
+    from .reference_nodes import (
+        ImageReferenceSet,
+        ImageReferences,
+        SpatialOptions,
+        VideoReferenceSet,
+        VideoReferences,
+        _spatial_transform,
+        _validate_image,
+    )
+except ImportError:
+    from reference_nodes import (
+        ImageReferenceSet,
+        ImageReferences,
+        SpatialOptions,
+        VideoReferenceSet,
+        VideoReferences,
+        _spatial_transform,
+        _validate_image,
+    )
 
 
 LOG = logging.getLogger("comfyui-turing-utils")
 _BERNINI_ROPE_WRAPPER_KEY = "turing_utils_bernini_context_rope"
 _ABSOLUTE_INDEX_KEY = "turing_utils_bernini_absolute_latent_indices"
+_CONTEXT_ROLES_KEY = "turing_utils_bernini_context_roles"
 
 
-def _slice_context_latents_for_estimate(value, full_length: int, estimate_length: int, dim: int):
+def _context_roles(value, count: int) -> tuple[str, ...] | None:
+    value = getattr(value, "cond", value)
+    if not isinstance(value, (list, tuple)) or len(value) != count:
+        return None
+    roles = tuple(str(role) for role in value)
+    if any(role not in ("aligned", "global") for role in roles):
+        return None
+    return roles
+
+
+def _slice_context_latents_for_estimate(value, full_length: int, estimate_length: int, dim: int, roles=None):
     if not isinstance(value, (list, tuple)):
         return value
+    roles = _context_roles(roles, len(value))
     changed = False
     sliced = []
-    for latent in value:
-        if torch.is_tensor(latent) and latent.ndim > dim and latent.shape[dim] == full_length:
-            latent = latent.narrow(dim, 0, min(estimate_length, full_length))
+    for index, latent in enumerate(value):
+        aligned = roles[index] == "aligned" if roles is not None else (
+            torch.is_tensor(latent) and latent.ndim > dim and latent.shape[dim] == full_length
+        )
+        if aligned and torch.is_tensor(latent) and latent.ndim > dim:
+            latent = latent.narrow(dim, 0, min(estimate_length, int(latent.shape[dim])))
             changed = True
         sliced.append(latent)
     if not changed:
@@ -35,7 +77,8 @@ def _estimate_conditioning(conds, full_length: int, estimate_length: int, dim: i
         for entry in entries:
             new_entry = entry
             raw = entry.get("context_latents")
-            sliced = _slice_context_latents_for_estimate(raw, full_length, estimate_length, dim)
+            raw_roles = entry.get(_CONTEXT_ROLES_KEY)
+            sliced = _slice_context_latents_for_estimate(raw, full_length, estimate_length, dim, raw_roles)
             if sliced is not raw:
                 new_entry = dict(entry)
                 new_entry["context_latents"] = sliced
@@ -45,7 +88,8 @@ def _estimate_conditioning(conds, full_length: int, estimate_length: int, dim: i
             if isinstance(model_conds, dict) and "context_latents" in model_conds:
                 cond = model_conds["context_latents"]
                 value = getattr(cond, "cond", None)
-                sliced = _slice_context_latents_for_estimate(value, full_length, estimate_length, dim)
+                roles = model_conds.get(_CONTEXT_ROLES_KEY)
+                sliced = _slice_context_latents_for_estimate(value, full_length, estimate_length, dim, roles)
                 if sliced is not value:
                     if new_entry is entry:
                         new_entry = dict(entry)
@@ -107,21 +151,6 @@ def _validate_context_window_frames(context_length: int, context_overlap: int) -
             f"length={context_length} -> {latent_context_length}."
         )
     return latent_context_length, latent_context_overlap
-
-
-def _window_start_and_stride(window) -> tuple[float, float]:
-    indices = list(getattr(window, "index_list", []) or [])
-    if not indices:
-        return 0.0, 1.0
-
-    start = indices[0]
-    stride = 1
-    if len(indices) > 1:
-        deltas = [b - a for a, b in zip(indices, indices[1:])]
-        if deltas and all(delta == deltas[0] for delta in deltas) and deltas[0] > 0:
-            stride = deltas[0]
-
-    return float(start), float(stride)
 
 
 def _with_transformer_options(args, kwargs, transformer_options):
@@ -200,9 +229,13 @@ def _wan_forward_with_optional_absolute_indices(
 
     context_latents = kwargs.get("context_latents", None)
     if context_latents is not None:
+        roles = _context_roles(kwargs.get(_CONTEXT_ROLES_KEY), len(context_latents))
         context_latents = [comfy.ldm.common_dit.pad_to_patch_size(lat, self.patch_size) for lat in context_latents]
         for i, lat in enumerate(context_latents):
-            context_indices = target_indices if lat.shape[-3] == len(target_indices) else None
+            if roles is None:
+                context_indices = target_indices if lat.shape[-3] == len(target_indices) else None
+            else:
+                context_indices = target_indices if roles[i] == "aligned" else None
             freqs = torch.cat(
                 [
                     freqs,
@@ -335,28 +368,162 @@ def _bernini_context_rope_wrapper(executor, *args, **kwargs):
         new_transformer_options[_ABSOLUTE_INDEX_KEY] = tuple(int(index) for index in indices)
         args, kwargs = _with_transformer_options(args, kwargs, new_transformer_options)
         return executor(*args, **kwargs)
-
-    start, stride = _window_start_and_stride(window)
-    if start == 0.0 and stride == 1.0:
-        return executor(*args, **kwargs)
-
-    rope_options = dict(transformer_options.get("rope_options") or {})
-    rope_options["shift_t"] = float(rope_options.get("shift_t", 0.0)) + start
-    if stride != 1.0:
-        rope_options["scale_t"] = float(rope_options.get("scale_t", 1.0)) * stride
-
-    new_transformer_options = dict(transformer_options)
-    new_transformer_options["rope_options"] = rope_options
-    args, kwargs = _with_transformer_options(args, kwargs, new_transformer_options)
     return executor(*args, **kwargs)
 
 
 class BerniniScheduledContextHandler(comfy.context_windows.IndexListContextHandler):
+    def __init__(self, *args, turing_utils_absolute_positions: bool = True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.turing_utils_absolute_positions = bool(turing_utils_absolute_positions)
+
     def get_context_windows(self, model, x_in: torch.Tensor, model_options: dict[str]):
         windows = super().get_context_windows(model, x_in, model_options)
         for window in windows:
-            window.turing_utils_use_absolute_indices = True
+            window.turing_utils_use_absolute_indices = self.turing_utils_absolute_positions
         return windows
+
+
+def _resize_bernini_context(cond_key, cond_value, window, x_in, device, new_cond_item):
+    if cond_key != "context_latents" or not isinstance(getattr(cond_value, "cond", None), list):
+        return None
+    roles = _context_roles(new_cond_item.get(_CONTEXT_ROLES_KEY), len(cond_value.cond))
+    if roles is None:
+        return None
+
+    resized = []
+    for role, latent in zip(roles, cond_value.cond):
+        if role == "aligned" and latent.ndim > window.dim and latent.shape[window.dim] > 1:
+            resized.append(window.get_tensor(latent, device, dim=window.dim))
+        else:
+            resized.append(latent.to(device))
+    return cond_value._copy_with(resized)
+
+
+def _make_extra_conds_with_bernini_roles(base_model):
+    original = base_model.extra_conds
+
+    def extra_conds(self, **kwargs):
+        out = original(**kwargs)
+        roles = kwargs.get(_CONTEXT_ROLES_KEY)
+        if roles is not None:
+            out[_CONTEXT_ROLES_KEY] = comfy.conds.CONDConstant(tuple(roles))
+        return out
+
+    return types.MethodType(extra_conds, base_model)
+
+
+def _align_source_video_and_mask(source_video, mask, length: int):
+    source_video = _validate_image(source_video, "source_video")
+    source_length = int(source_video.shape[0])
+    if mask is not None:
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+        if mask.ndim != 3 or mask.shape[-2:] != source_video.shape[1:3]:
+            raise ValueError(
+                "MASK must match source_video spatial dimensions; expected "
+                f"(*, {source_video.shape[1]}, {source_video.shape[2]}), got {tuple(mask.shape)}"
+            )
+        if mask.shape[0] == 1 and source_length > 1:
+            mask = mask.repeat(source_length, 1, 1)
+        elif mask.shape[0] != source_length:
+            raise ValueError(
+                f"MASK must contain one frame or match source_video ({source_length} frames); got {mask.shape[0]}"
+            )
+
+    if source_length > length:
+        source_video = source_video[:length]
+        if mask is not None:
+            mask = mask[:length]
+    elif source_length < length:
+        pad = length - source_length
+        source_video = torch.cat((source_video, source_video[-1:].repeat(pad, 1, 1, 1)), dim=0)
+        if mask is not None:
+            mask = torch.cat((mask, mask[-1:].repeat(pad, 1, 1)), dim=0)
+    return source_video, mask
+
+
+def _upper_bound_latent_mask(mask: torch.Tensor, latent: torch.Tensor) -> torch.Tensor:
+    target = tuple(int(size) for size in latent.shape[-3:])
+    mask = mask.float().clamp(0.0, 1.0).reshape(1, 1, *mask.shape)
+    mask = F.adaptive_max_pool3d(mask, target)
+    return F.max_pool3d(mask, kernel_size=3, stride=1, padding=1).clamp_(0.0, 1.0)
+
+
+class BerniniInpaintCondition(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="TuringUtilsBerniniInpaintCondition",
+            display_name="Bernini Inpaint Condition",
+            category="Turing Utils/conditioning",
+            inputs=[
+                io.Conditioning.Input("positive"),
+                io.Conditioning.Input("negative"),
+                io.Vae.Input("vae"),
+                io.Image.Input("source_video"),
+                io.Int.Input("width", default=832, min=16, max=8192, step=16),
+                io.Int.Input("height", default=480, min=16, max=8192, step=16),
+                io.Int.Input("length", default=81, min=1, max=8192, step=4),
+                io.Int.Input("batch_size", default=1, min=1, max=4096),
+                io.Boolean.Input("source_as_context", default=False, tooltip="Also append the aligned source video as Bernini context tokens."),
+                io.Mask.Input("mask", optional=True, tooltip="White is repainted and black is preserved. Omit for global repaint."),
+                ImageReferences.Input("image_references", optional=True),
+                VideoReferences.Input("video_references", optional=True),
+            ],
+            outputs=[
+                io.Conditioning.Output(display_name="positive"),
+                io.Conditioning.Output(display_name="negative"),
+                io.Latent.Output(display_name="latent"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, positive, negative, vae, source_video, width, height, length, batch_size,
+                source_as_context=False, mask=None, image_references=None, video_references=None):
+        length = int(length)
+        if (length - 1) % 4 != 0:
+            raise ValueError(f"Bernini length must be 4*n+1 real frames; got {length}")
+
+        source_video, mask = _align_source_video_and_mask(source_video, mask, length)
+        source_options = SpatialOptions(
+            enabled=True,
+            width=int(width),
+            height=int(height),
+            mode="fill",
+            method="area",
+            crop_position="center",
+        )
+        if mask is None:
+            source_video = _spatial_transform(source_video, source_options)
+        else:
+            source_video, mask = _spatial_transform(source_video, source_options, mask)
+
+        source_latent = vae.encode(source_video)
+        source_latent = comfy.utils.repeat_to_batch_size(source_latent, int(batch_size))
+        latent = {"samples": source_latent}
+        if mask is not None:
+            latent["noise_mask"] = _upper_bound_latent_mask(mask, source_latent)
+
+        context = []
+        roles = []
+        if source_as_context:
+            context.append(source_latent)
+            roles.append("aligned")
+
+        if isinstance(video_references, VideoReferenceSet):
+            for video in video_references.materialize():
+                context.append(vae.encode(video))
+                roles.append("global")
+        if isinstance(image_references, ImageReferenceSet):
+            for image in image_references.materialize():
+                context.append(vae.encode(image))
+                roles.append("global")
+
+        if context:
+            values = {"context_latents": context, _CONTEXT_ROLES_KEY: tuple(roles)}
+            positive = node_helpers.conditioning_set_values(positive, values)
+            negative = node_helpers.conditioning_set_values(negative, values)
+        return io.NodeOutput(positive, negative, latent)
 
 
 class BerniniContextWindowsCore:
@@ -378,10 +545,18 @@ class BerniniContextWindowsCore:
                 "context_overlap": (
                     "INT",
                     {
-                        "default": 30,
+                        "default": 28,
                         "min": 0,
                         "max": 16384,
+                        "step": 4,
                         "tooltip": "The overlap of the context window in real frames.",
+                    },
+                ),
+                "position_mode": (
+                    ["absolute", "relative"],
+                    {
+                        "default": "absolute",
+                        "tooltip": "Absolute keeps global latent-frame RoPE positions; relative matches official ComfyUI window-local positions.",
                     },
                 ),
                 "context_schedule": (
@@ -429,18 +604,6 @@ class BerniniContextWindowsCore:
                         "tooltip": "Whether to apply FreeNoise noise shuffling, improves window blending.",
                     },
                 ),
-                "retain_first_frame": (
-                    "BOOLEAN",
-                    {"default": False, "tooltip": "Retain the first I2V frame in every context window."},
-                ),
-                "split_conds_to_windows": (
-                    "BOOLEAN",
-                    {
-                        "default": False,
-                        "advanced": True,
-                        "tooltip": "Whether to split multiple conditionings to each window based on region index.",
-                    },
-                ),
             },
         }
 
@@ -456,18 +619,18 @@ class BerniniContextWindowsCore:
         context_length: int,
         context_overlap: int,
         context_schedule: str,
+        position_mode: str = "absolute",
         context_stride: int = 1,
         closed_loop: bool = False,
         fuse_method: str = comfy.context_windows.ContextFuseMethods.PYRAMID,
         freenoise: bool = True,
-        retain_first_frame: bool = False,
-        split_conds_to_windows: bool = False,
     ):
+        if position_mode not in ("absolute", "relative"):
+            raise ValueError(f"position_mode must be absolute or relative; got {position_mode}")
         latent_context_length, latent_context_overlap = _validate_context_window_frames(
             context_length,
             context_overlap,
         )
-        retain_index_list = "0" if retain_first_frame else ""
         context_handler = BerniniScheduledContextHandler(
             context_schedule=comfy.context_windows.get_matching_context_schedule(context_schedule),
             fuse_method=comfy.context_windows.get_matching_fuse_method(fuse_method),
@@ -477,15 +640,24 @@ class BerniniContextWindowsCore:
             closed_loop=bool(closed_loop),
             dim=2,
             freenoise=bool(freenoise),
-            cond_retain_index_list=retain_index_list,
-            split_conds_to_windows=bool(split_conds_to_windows),
+            cond_retain_index_list="",
+            split_conds_to_windows=False,
             latent_retain_index_list="",
             causal_window_fix=True,
+            turing_utils_absolute_positions=position_mode == "absolute",
+        )
+        comfy.patcher_extension.add_callback(
+            comfy.context_windows.IndexListCallbacks.RESIZE_COND_ITEM,
+            _resize_bernini_context,
+            context_handler.callbacks,
         )
 
         patched = model.clone()
         patched.model_options["context_handler"] = context_handler
         patched.model_options.setdefault("transformer_options", {})
+        base_model = getattr(patched, "model", None)
+        if base_model is not None and callable(getattr(base_model, "extra_conds", None)) and hasattr(patched, "add_object_patch"):
+            patched.add_object_patch("extra_conds", _make_extra_conds_with_bernini_roles(base_model))
 
         patched.remove_wrappers_with_key(
             comfy.patcher_extension.WrappersMP.PREPARE_SAMPLING,
@@ -507,17 +679,18 @@ class BerniniContextWindowsCore:
         )
         if freenoise:
             comfy.context_windows.create_sampler_sample_wrapper(patched)
-        _install_bernini_absolute_rope_patch()
-        patched.add_wrapper_with_key(
-            comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
-            _BERNINI_ROPE_WRAPPER_KEY,
-            _bernini_context_rope_wrapper,
-        )
+        if position_mode == "absolute":
+            _install_bernini_absolute_rope_patch()
+            patched.add_wrapper_with_key(
+                comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL,
+                _BERNINI_ROPE_WRAPPER_KEY,
+                _bernini_context_rope_wrapper,
+            )
 
         LOG.info(
             "Bernini context windows enabled: schedule=%s, length=%s -> %s latent frames, "
             "overlap=%s -> %s latent frames, stride=%s, closed_loop=%s, "
-            "retain_first_frame=%s, split_conds_to_windows=%s, causal_window_fix=True, fuse=%s",
+            "position=%s, causal_window_fix=True, fuse=%s",
             context_schedule,
             context_length,
             latent_context_length,
@@ -525,8 +698,7 @@ class BerniniContextWindowsCore:
             latent_context_overlap,
             context_stride,
             closed_loop,
-            retain_first_frame,
-            split_conds_to_windows,
+            position_mode,
             fuse_method,
         )
         return (patched,)

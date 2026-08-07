@@ -32,9 +32,18 @@ only after its CUDA sources or required version change.
 - `Load ConvRot DiT` loads ComfyUI ConvRot diffusion models. It supports W8A8,
   W4A8, and W4A4 dispatch and selects bundled Sage automatically on exact sm75.
 - `Load ConvRot CLIP` loads a ConvRot text encoder independently of the DiT.
-- `Bernini Context Windows` applies ComfyUI's Wan context-window controls plus
-  Bernini-compatible absolute temporal RoPE indices.
+- `Reference Image/Video/Audio Hub` collects ordered heterogeneous references.
+  Hubs can be chained; image/video resizing is optional, and video frame-count
+  alignment is independent from spatial resizing.
+- `Bernini Inpaint Condition` starts sampling from the source-video latent,
+  supports local or global repainting, and optionally adds the source as aligned
+  context tokens.
+- `MiniMax H3 Reference Condition (Hub)` feeds fixed Hub inputs into H3's native
+  picture/video/audio reference protocol.
+- `Bernini Context Windows` applies reference-aware Wan context windows with
+  selectable absolute or official relative temporal positions.
 - `Wan Video Frames Padding` exposes Wan-compatible frame padding.
+- `MiniMax H3 Video Frames Padding` pads to H3's `17*n+5` frame grid.
 
 ## Turing behavior
 

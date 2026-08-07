@@ -4,6 +4,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -14,6 +15,7 @@ sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 import comfy.context_windows  # noqa: E402
+import comfy.conds  # noqa: E402
 import bernini_nodes  # noqa: E402
 
 
@@ -51,14 +53,17 @@ class BerniniContextWindowsTest(unittest.TestCase):
                 "model",
                 "context_length",
                 "context_overlap",
+                "position_mode",
                 "context_schedule",
                 "context_stride",
                 "closed_loop",
                 "fuse_method",
                 "freenoise",
-                "retain_first_frame",
-                "split_conds_to_windows",
             ],
+        )
+        self.assertEqual(
+            bernini_nodes.BerniniContextWindowsCore.INPUT_TYPES()["required"]["context_overlap"][1]["step"],
+            4,
         )
 
     def test_apply_uses_official_wan_context_options(self):
@@ -68,14 +73,13 @@ class BerniniContextWindowsTest(unittest.TestCase):
             patched = bernini_nodes.BerniniContextWindowsCore().apply(
                 FakeModel(),
                 context_length=81,
-                context_overlap=30,
+                context_overlap=28,
                 context_schedule=comfy.context_windows.ContextSchedules.UNIFORM_LOOPED,
+                position_mode="absolute",
                 context_stride=2,
                 closed_loop=True,
                 fuse_method=comfy.context_windows.ContextFuseMethods.PYRAMID,
                 freenoise=True,
-                retain_first_frame=True,
-                split_conds_to_windows=True,
             )[0]
         finally:
             bernini_nodes._install_bernini_absolute_rope_patch = original_install
@@ -89,10 +93,11 @@ class BerniniContextWindowsTest(unittest.TestCase):
         self.assertIs(handler.closed_loop, True)
         self.assertEqual(handler.dim, 2)
         self.assertIs(handler.freenoise, True)
-        self.assertEqual(handler.cond_retain_index_list, [0])
+        self.assertEqual(handler.cond_retain_index_list, [])
         self.assertEqual(handler.latent_retain_index_list, [])
-        self.assertIs(handler.split_conds_to_windows, True)
+        self.assertIs(handler.split_conds_to_windows, False)
         self.assertIs(handler.causal_window_fix, True)
+        self.assertIs(handler.turing_utils_absolute_positions, True)
 
     def test_context_windows_are_marked_for_absolute_rope(self):
         handler = bernini_nodes.BerniniScheduledContextHandler(
@@ -111,6 +116,24 @@ class BerniniContextWindowsTest(unittest.TestCase):
         windows = handler.get_context_windows(None, torch.zeros(1, 4, 8), {})
         self.assertTrue(windows)
         self.assertTrue(all(getattr(window, "turing_utils_use_absolute_indices", False) for window in windows))
+
+    def test_relative_mode_does_not_install_absolute_rope_wrapper(self):
+        with mock.patch.object(
+            bernini_nodes,
+            "_install_bernini_absolute_rope_patch",
+            side_effect=AssertionError("absolute patch must not be installed"),
+        ):
+            patched = bernini_nodes.BerniniContextWindowsCore().apply(
+                FakeModel(),
+                context_length=81,
+                context_overlap=28,
+                context_schedule=comfy.context_windows.ContextSchedules.STATIC_STANDARD,
+                position_mode="relative",
+                freenoise=False,
+            )[0]
+        handler = patched.model_options["context_handler"]
+        self.assertIs(handler.turing_utils_absolute_positions, False)
+        self.assertFalse(any(key == bernini_nodes._BERNINI_ROPE_WRAPPER_KEY for _, key, _ in patched.added_wrappers))
 
     def test_rope_wrapper_includes_causal_anchor_index(self):
         window = comfy.context_windows.IndexListContextWindow([3, 4, 5], dim=2, total_frames=8)
@@ -138,6 +161,23 @@ class BerniniContextWindowsTest(unittest.TestCase):
         patched_options = captured["args"][5]
         self.assertIsNot(patched_options, transformer_options)
         self.assertEqual(patched_options[bernini_nodes._ABSOLUTE_INDEX_KEY], (2, 3, 4, 5))
+
+    def test_relative_rope_wrapper_keeps_official_window_local_positions(self):
+        window = comfy.context_windows.IndexListContextWindow([3, 5, 7], dim=2, total_frames=8)
+        window.turing_utils_use_absolute_indices = False
+        transformer_options = {"context_window": window}
+        captured = {}
+
+        def executor(*args, **kwargs):
+            captured["args"] = args
+            return "ok"
+
+        result = bernini_nodes._bernini_context_rope_wrapper(
+            executor, None, None, None, None, None, transformer_options
+        )
+        self.assertEqual(result, "ok")
+        self.assertIs(captured["args"][5], transformer_options)
+        self.assertNotIn("rope_options", transformer_options)
 
     def test_prepare_sampling_budgets_context_and_anchor_without_mutating_conds(self):
         handler = type(
@@ -174,7 +214,10 @@ class BerniniContextWindowsTest(unittest.TestCase):
         independent_ref = torch.zeros(1, 16, 3, 6, 6)
         conds = {
             "positive": [
-                {"context_latents": [source, independent_ref]}
+                {
+                    "context_latents": [source, independent_ref],
+                    bernini_nodes._CONTEXT_ROLES_KEY: ("aligned", "global"),
+                }
             ]
         }
         captured = {}
@@ -194,6 +237,36 @@ class BerniniContextWindowsTest(unittest.TestCase):
         self.assertEqual(estimated[0].shape, (1, 16, 4, 4, 4))
         self.assertIs(estimated[1], independent_ref)
         self.assertEqual(source.shape, (1, 16, 8, 4, 4))
+
+    def test_explicit_global_role_keeps_equal_length_reference(self):
+        aligned = torch.zeros(1, 16, 8, 4, 4)
+        global_ref = torch.zeros(1, 16, 8, 6, 6)
+        conds = {
+            "positive": [{
+                "context_latents": [aligned, global_ref],
+                bernini_nodes._CONTEXT_ROLES_KEY: ("aligned", "global"),
+            }]
+        }
+        estimated = bernini_nodes._estimate_conditioning(conds, 8, 4, 2)
+        values = estimated["positive"][0]["context_latents"]
+        self.assertEqual(values[0].shape[2], 4)
+        self.assertIs(values[1], global_ref)
+
+    def test_context_resize_uses_roles_instead_of_shape_heuristic(self):
+        window = comfy.context_windows.IndexListContextWindow([2, 3], dim=2, total_frames=5)
+        aligned = torch.arange(5).reshape(1, 1, 5, 1, 1)
+        global_ref = torch.zeros(1, 1, 5, 2, 2)
+        cond = comfy.conds.CONDList([aligned, global_ref])
+        resized = bernini_nodes._resize_bernini_context(
+            "context_latents",
+            cond,
+            window,
+            aligned,
+            torch.device("cpu"),
+            {bernini_nodes._CONTEXT_ROLES_KEY: comfy.conds.CONDConstant(("aligned", "global"))},
+        )
+        self.assertEqual(resized.cond[0].flatten().tolist(), [2, 3])
+        self.assertIs(resized.cond[1], global_ref)
 
     def test_prepare_sampling_keeps_packed_latent_estimate_conservative(self):
         handler = SimpleNamespace(dim=2, context_length=8, causal_window_fix=True)
