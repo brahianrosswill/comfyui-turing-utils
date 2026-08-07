@@ -486,12 +486,12 @@ class BerniniInpaintCondition(io.ComfyNode):
 
         source_video, mask = _align_source_video_and_mask(source_video, mask, length)
         source_options = SpatialOptions(
-            enabled=True,
             width=int(width),
             height=int(height),
-            mode="fill",
-            method="area",
+            upscale_method="area",
+            keep_proportion="crop",
             crop_position="center",
+            divisible_by=1,
         )
         if mask is None:
             source_video = _spatial_transform(source_video, source_options)

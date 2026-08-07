@@ -20,14 +20,14 @@ import reference_nodes  # noqa: E402
 
 def _spatial_kwargs(**overrides):
     values = {
-        "resize_enabled": False,
         "width": 0,
         "height": 0,
-        "resize_mode": "fill",
         "upscale_method": "bilinear",
+        "keep_proportion": "stretch",
+        "pad_color": "0, 0, 0",
         "crop_position": "center",
         "divisible_by": 1,
-        "pad_color": "0, 0, 0",
+        "device": "cpu",
     }
     values.update(overrides)
     return values
@@ -49,6 +49,59 @@ class FakeVAE:
 
 
 class ReferenceNodesTest(unittest.TestCase):
+    def test_reference_hubs_place_previous_before_ordered_autogrow_slots(self):
+        cases = (
+            (reference_nodes.ReferenceImageHub, "images", "image_"),
+            (reference_nodes.ReferenceAudioHub, "audios", "audio_"),
+            (reference_nodes.ReferenceVideoHub, "videos", "video_"),
+        )
+        for hub, autogrow_id, prefix in cases:
+            with self.subTest(hub=hub.__name__):
+                inputs = hub.define_schema().inputs
+                self.assertEqual([item.id for item in inputs[:2]], ["previous", autogrow_id])
+                self.assertEqual(inputs[1].template.names[:3], [f"{prefix}{index}" for index in range(3)])
+
+    def test_image_and_video_hubs_match_kj_resize_v2_controls_and_defaults(self):
+        expected_ids = [
+            "width",
+            "height",
+            "upscale_method",
+            "keep_proportion",
+            "pad_color",
+            "crop_position",
+            "divisible_by",
+            "device",
+        ]
+        for hub in (reference_nodes.ReferenceImageHub, reference_nodes.ReferenceVideoHub):
+            with self.subTest(hub=hub.__name__):
+                spatial = hub.define_schema().inputs[2:10]
+                self.assertEqual([item.id for item in spatial], expected_ids)
+                self.assertEqual(spatial[0].default, 512)
+                self.assertEqual(spatial[1].default, 512)
+                self.assertEqual(spatial[2].default, "nearest-exact")
+                self.assertEqual(
+                    spatial[2].options,
+                    ["nearest-exact", "bilinear", "area", "bicubic", "lanczos", "nvidia_rtx_vsr"],
+                )
+                self.assertEqual(spatial[3].default, "stretch")
+                self.assertEqual(
+                    spatial[3].options,
+                    ["stretch", "resize", "pad", "pad_edge", "pad_edge_pixel", "crop", "pillarbox_blur", "total_pixels"],
+                )
+                self.assertEqual(spatial[4].default, "0, 0, 0")
+                self.assertEqual(spatial[5].default, "center")
+                self.assertEqual(spatial[6].default, 2)
+                self.assertEqual(spatial[7].default, "cpu")
+
+    def test_video_hub_uses_end_aligned_trim_and_pad_modes(self):
+        frame_inputs = reference_nodes.ReferenceVideoHub.define_schema().inputs[10:]
+        self.assertEqual(
+            [item.id for item in frame_inputs],
+            ["frame_align_enabled", "frame_count_mode", "frame_count", "short_video_fill"],
+        )
+        self.assertEqual(frame_inputs[1].options, ["trim", "pad", "specified"])
+        self.assertEqual(frame_inputs[1].default, "trim")
+
     def test_image_hubs_chain_without_batching_different_sizes(self):
         first = reference_nodes.ReferenceImageHub.execute(
             images={"image_0": torch.zeros(1, 8, 12, 3)},
@@ -57,7 +110,7 @@ class ReferenceNodesTest(unittest.TestCase):
         second = reference_nodes.ReferenceImageHub.execute(
             images={"image_0": torch.ones(1, 10, 6, 3)},
             previous=first,
-            **_spatial_kwargs(resize_enabled=True, width=16, height=16, resize_mode="fit"),
+            **_spatial_kwargs(width=16, height=16, keep_proportion="pad"),
         )[0]
 
         self.assertEqual(len(second.items), 2)
@@ -71,42 +124,92 @@ class ReferenceNodesTest(unittest.TestCase):
         mask = torch.zeros(1, 16, 16)
         mask[0, 7, 7] = 1.0
         options = reference_nodes.SpatialOptions(
-            enabled=True,
             width=4,
             height=4,
-            mode="stretch",
-            method="area",
+            keep_proportion="stretch",
+            upscale_method="area",
+            divisible_by=1,
         )
 
         _, resized = reference_nodes._spatial_transform(image, options, mask)
         self.assertGreater(float(resized.sum()), 0.0)
 
-    def test_video_frame_alignment_minimum_and_maximum(self):
+    def test_kj_resize_v2_modes_produce_matching_output_geometry(self):
+        image = torch.linspace(0, 1, 10 * 6 * 3).reshape(1, 10, 6, 3)
+        expected_shapes = {
+            "stretch": (1, 16, 16, 3),
+            "resize": (1, 16, 10, 3),
+            "pad": (1, 16, 16, 3),
+            "pad_edge": (1, 16, 16, 3),
+            "pad_edge_pixel": (1, 16, 16, 3),
+            "crop": (1, 16, 16, 3),
+            "pillarbox_blur": (1, 16, 16, 3),
+            "total_pixels": (1, 20, 12, 3),
+        }
+        for mode, expected in expected_shapes.items():
+            with self.subTest(mode=mode):
+                output = reference_nodes._spatial_transform(
+                    image,
+                    reference_nodes.SpatialOptions(
+                        width=16,
+                        height=16,
+                        upscale_method="bilinear",
+                        keep_proportion=mode,
+                        divisible_by=2,
+                    ),
+                )
+                self.assertEqual(tuple(output.shape), expected)
+
+    def test_video_frame_alignment_trim_and_pad(self):
         short = torch.ones(3, 4, 4, 3)
         long = torch.full((5, 4, 4, 3), 2.0)
+        identity = reference_nodes.SpatialOptions(width=0, height=0, divisible_by=1)
         minimum = reference_nodes.VideoReferenceSet(
             (short, long),
-            reference_nodes.VideoOptions(align_frames=True, frame_count_mode="minimum"),
+            reference_nodes.VideoOptions(
+                spatial=identity,
+                align_frames=True,
+                frame_count_mode="trim",
+            ),
         ).materialize()
         self.assertEqual([video.shape[0] for video in minimum], [3, 3])
+        self.assertTrue(torch.equal(minimum[1], long[:3]))
 
         maximum = reference_nodes.VideoReferenceSet(
             (short, long),
             reference_nodes.VideoOptions(
+                spatial=identity,
                 align_frames=True,
-                frame_count_mode="maximum",
+                frame_count_mode="pad",
                 short_video_fill="black",
             ),
         ).materialize()
         self.assertEqual([video.shape[0] for video in maximum], [5, 5])
+        self.assertTrue(torch.equal(maximum[0][:3], short))
         self.assertEqual(float(maximum[0][-1].sum()), 0.0)
+
+        numbered = torch.arange(5, dtype=torch.float32).reshape(5, 1, 1, 1).repeat(1, 2, 2, 3)
+        specified = reference_nodes.VideoOptions(
+            spatial=identity,
+            align_frames=True,
+            frame_count_mode="specified",
+            frame_count=3,
+        )
+        trimmed = reference_nodes.VideoReferenceSet((numbered,), specified).materialize()[0]
+        self.assertTrue(torch.equal(trimmed, numbered[:3]))
 
     def test_spatial_resize_and_frame_alignment_are_independent(self):
         video = torch.ones(3, 8, 12, 3)
         spatial_only = reference_nodes.VideoReferenceSet(
             (video,),
             reference_nodes.VideoOptions(
-                spatial=reference_nodes.SpatialOptions(enabled=True, width=4, height=4, mode="stretch", method="area"),
+                spatial=reference_nodes.SpatialOptions(
+                    width=4,
+                    height=4,
+                    keep_proportion="stretch",
+                    upscale_method="area",
+                    divisible_by=1,
+                ),
                 align_frames=False,
                 frame_count_mode="specified",
                 frame_count=7,
@@ -117,7 +220,7 @@ class ReferenceNodesTest(unittest.TestCase):
         temporal_only = reference_nodes.VideoReferenceSet(
             (video,),
             reference_nodes.VideoOptions(
-                spatial=reference_nodes.SpatialOptions(enabled=False, width=4, height=4),
+                spatial=reference_nodes.SpatialOptions(width=0, height=0, divisible_by=1),
                 align_frames=True,
                 frame_count_mode="specified",
                 frame_count=5,

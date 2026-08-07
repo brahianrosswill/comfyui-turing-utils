@@ -33,8 +33,8 @@ only after its CUDA sources or required version change.
   W4A8, and W4A4 dispatch and selects bundled Sage automatically on exact sm75.
 - `Load ConvRot CLIP` loads a ConvRot text encoder independently of the DiT.
 - `Reference Image/Video/Audio Hub` collects ordered heterogeneous references.
-  Hubs can be chained; image/video resizing is optional, and video frame-count
-  alignment is independent from spatial resizing.
+  Hubs can be chained; image/video resizing follows KJ Resize Image v2 controls,
+  and video frame-count alignment is independent from spatial resizing.
 - `Bernini Inpaint Condition` starts sampling from the source-video latent,
   supports local or global repainting, and optionally adds the source as aligned
   context tokens.
