@@ -93,14 +93,11 @@ class ReferenceNodesTest(unittest.TestCase):
                 self.assertEqual(spatial[6].default, 2)
                 self.assertEqual(spatial[7].default, "cpu")
 
-    def test_video_hub_uses_end_aligned_trim_and_pad_modes(self):
+    def test_video_hub_uses_single_optional_frame_count(self):
         frame_inputs = reference_nodes.ReferenceVideoHub.define_schema().inputs[10:]
-        self.assertEqual(
-            [item.id for item in frame_inputs],
-            ["frame_align_enabled", "frame_count_mode", "frame_count", "short_video_fill"],
-        )
-        self.assertEqual(frame_inputs[1].options, ["trim", "pad", "specified"])
-        self.assertEqual(frame_inputs[1].default, "trim")
+        self.assertEqual([item.id for item in frame_inputs], ["frame_count", "short_video_fill"])
+        self.assertEqual(frame_inputs[0].default, 0)
+        self.assertEqual(frame_inputs[1].default, "repeat_last")
 
     def test_image_hubs_chain_without_batching_different_sizes(self):
         first = reference_nodes.ReferenceImageHub.execute(
@@ -160,42 +157,50 @@ class ReferenceNodesTest(unittest.TestCase):
                 )
                 self.assertEqual(tuple(output.shape), expected)
 
-    def test_video_frame_alignment_trim_and_pad(self):
+    def test_spatial_resize_is_disabled_when_either_dimension_is_zero(self):
+        image = torch.rand(3, 9, 13, 3)
+        for width, height in ((0, 512), (512, 0), (0, 0)):
+            with self.subTest(width=width, height=height):
+                output = reference_nodes._spatial_transform(
+                    image,
+                    reference_nodes.SpatialOptions(
+                        width=width,
+                        height=height,
+                        keep_proportion="crop",
+                        divisible_by=8,
+                    ),
+                )
+                self.assertEqual(tuple(output.shape), tuple(image.shape))
+                self.assertTrue(torch.equal(output, image))
+
+    def test_video_frame_count_zero_preserves_lengths_and_positive_value_aligns_at_end(self):
         short = torch.ones(3, 4, 4, 3)
         long = torch.full((5, 4, 4, 3), 2.0)
         identity = reference_nodes.SpatialOptions(width=0, height=0, divisible_by=1)
-        minimum = reference_nodes.VideoReferenceSet(
+        unchanged = reference_nodes.VideoReferenceSet(
             (short, long),
-            reference_nodes.VideoOptions(
-                spatial=identity,
-                align_frames=True,
-                frame_count_mode="trim",
-            ),
+            reference_nodes.VideoOptions(spatial=identity, frame_count=0),
         ).materialize()
-        self.assertEqual([video.shape[0] for video in minimum], [3, 3])
-        self.assertTrue(torch.equal(minimum[1], long[:3]))
+        self.assertEqual([video.shape[0] for video in unchanged], [3, 5])
 
-        maximum = reference_nodes.VideoReferenceSet(
+        aligned = reference_nodes.VideoReferenceSet(
             (short, long),
             reference_nodes.VideoOptions(
                 spatial=identity,
-                align_frames=True,
-                frame_count_mode="pad",
+                frame_count=4,
                 short_video_fill="black",
             ),
         ).materialize()
-        self.assertEqual([video.shape[0] for video in maximum], [5, 5])
-        self.assertTrue(torch.equal(maximum[0][:3], short))
-        self.assertEqual(float(maximum[0][-1].sum()), 0.0)
+        self.assertEqual([video.shape[0] for video in aligned], [4, 4])
+        self.assertTrue(torch.equal(aligned[0][:3], short))
+        self.assertEqual(float(aligned[0][-1].sum()), 0.0)
+        self.assertTrue(torch.equal(aligned[1], long[:4]))
 
         numbered = torch.arange(5, dtype=torch.float32).reshape(5, 1, 1, 1).repeat(1, 2, 2, 3)
-        specified = reference_nodes.VideoOptions(
-            spatial=identity,
-            align_frames=True,
-            frame_count_mode="specified",
-            frame_count=3,
-        )
-        trimmed = reference_nodes.VideoReferenceSet((numbered,), specified).materialize()[0]
+        trimmed = reference_nodes.VideoReferenceSet(
+            (numbered,),
+            reference_nodes.VideoOptions(spatial=identity, frame_count=3),
+        ).materialize()[0]
         self.assertTrue(torch.equal(trimmed, numbered[:3]))
 
     def test_spatial_resize_and_frame_alignment_are_independent(self):
@@ -210,9 +215,7 @@ class ReferenceNodesTest(unittest.TestCase):
                     upscale_method="area",
                     divisible_by=1,
                 ),
-                align_frames=False,
-                frame_count_mode="specified",
-                frame_count=7,
+                frame_count=0,
             ),
         ).materialize()[0]
         self.assertEqual(tuple(spatial_only.shape), (3, 4, 4, 3))
@@ -221,8 +224,6 @@ class ReferenceNodesTest(unittest.TestCase):
             (video,),
             reference_nodes.VideoOptions(
                 spatial=reference_nodes.SpatialOptions(width=0, height=0, divisible_by=1),
-                align_frames=True,
-                frame_count_mode="specified",
                 frame_count=5,
             ),
         ).materialize()[0]

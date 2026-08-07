@@ -30,8 +30,6 @@ class SpatialOptions:
 @dataclass(frozen=True)
 class VideoOptions:
     spatial: SpatialOptions = SpatialOptions()
-    align_frames: bool = False
-    frame_count_mode: str = "trim"
     frame_count: int = 0
     short_video_fill: str = "repeat_last"
 
@@ -52,18 +50,9 @@ class VideoReferenceSet:
 
     def materialize(self) -> tuple[torch.Tensor, ...]:
         videos = [_spatial_transform(video, self.options.spatial) for video in self.items]
-        if not self.options.align_frames or not videos:
+        target = int(self.options.frame_count)
+        if target <= 0 or not videos:
             return tuple(videos)
-
-        lengths = [int(video.shape[0]) for video in videos]
-        if self.options.frame_count_mode in ("trim", "minimum"):
-            target = min(lengths)
-        elif self.options.frame_count_mode in ("pad", "maximum"):
-            target = max(lengths)
-        else:
-            target = int(self.options.frame_count)
-            if target < 1:
-                raise ValueError("specified frame alignment requires frame_count >= 1")
         return tuple(_align_video_frames(video, target, self.options) for video in videos)
 
 
@@ -242,6 +231,9 @@ def _spatial_transform(image: torch.Tensor, options: SpatialOptions, mask: torch
     source_height, source_width = int(image.shape[1]), int(image.shape[2])
     width = int(options.width)
     height = int(options.height)
+    if width <= 0 or height <= 0:
+        return (image, mask) if mask is not None else image
+
     mode = str(options.keep_proportion)
     supported_modes = {
         "stretch", "resize", "pad", "pad_edge", "pad_edge_pixel",
@@ -360,8 +352,22 @@ def _align_video_frames(video: torch.Tensor, target: int, options: VideoOptions)
 
 def _spatial_inputs() -> list:
     return [
-        io.Int.Input("width", default=512, min=0, max=16384, step=1),
-        io.Int.Input("height", default=512, min=0, max=16384, step=1),
+        io.Int.Input(
+            "width",
+            default=512,
+            min=0,
+            max=16384,
+            step=1,
+            tooltip="Set width or height to 0 to disable spatial resizing.",
+        ),
+        io.Int.Input(
+            "height",
+            default=512,
+            min=0,
+            max=16384,
+            step=1,
+            tooltip="Set width or height to 0 to disable spatial resizing.",
+        ),
         io.Combo.Input(
             "upscale_method",
             options=["nearest-exact", "bilinear", "area", "bicubic", "lanczos", "nvidia_rtx_vsr"],
@@ -439,24 +445,26 @@ class ReferenceVideoHub(io.ComfyNode):
                 VideoReferences.Input("previous", optional=True),
                 io.Autogrow.Input("videos", template=template, optional=True),
                 *_spatial_inputs(),
-                io.Boolean.Input("frame_align_enabled", default=False),
-                io.Combo.Input("frame_count_mode", options=["trim", "pad", "specified"], default="trim"),
-                io.Int.Input("frame_count", default=0, min=0, max=16385, step=1),
+                io.Int.Input(
+                    "frame_count",
+                    default=0,
+                    min=0,
+                    max=16385,
+                    step=1,
+                    tooltip="0 keeps every video's original length; positive values trim or pad at the end.",
+                ),
                 io.Combo.Input("short_video_fill", options=["repeat_last", "black"], default="repeat_last"),
             ],
             outputs=[VideoReferences.Output("references")],
         )
 
     @classmethod
-    def execute(cls, videos=None, previous=None, frame_align_enabled=False, frame_count_mode="trim", frame_count=0,
-                short_video_fill="repeat_last", **kwargs):
+    def execute(cls, videos=None, previous=None, frame_count=0, short_video_fill="repeat_last", **kwargs):
         items = list(previous.items) if isinstance(previous, VideoReferenceSet) else []
         for video in (videos or {}).values():
             items.append(_validate_image(video, "video reference"))
         options = VideoOptions(
             spatial=_spatial_options(**kwargs),
-            align_frames=bool(frame_align_enabled),
-            frame_count_mode=str(frame_count_mode),
             frame_count=int(frame_count),
             short_video_fill=str(short_video_fill),
         )
