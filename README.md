@@ -59,8 +59,8 @@ the default 48 KiB shared-memory limit. MiniMax-specific integration is isolated
 in `minimax_adapter.py`, including packed-sequence VRAM planning for text,
 keyframes, and multimodal references. Wan/Bernini integration is isolated in
 `wan_adapter.py`; it adds batch-aware, per-reference-padded VRAM planning,
-shared QKV activation quantization, FP32-reduction LayerNorm+AdaLN, and
-GELU-to-ConvRot fusion.
+shared QKV activation quantization, and prequantized bundled Sage dispatch while
+leaving Wan block normalization and feed-forward execution to ComfyUI.
 Generic dtype, attention, and fused operators remain model-independent.
 
 The bundled Sage backend accepts FP16/BF16 Q/K/V, GQA, causal attention,

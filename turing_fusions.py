@@ -183,25 +183,6 @@ def turing_linear_group(
             comfy.ops.uncast_bias_weight(linear, weight, bias, offload)
 
 
-def layer_norm_adaln(
-    norm: torch.nn.Module,
-    x: torch.Tensor,
-    shift: torch.Tensor,
-    scale: torch.Tensor,
-) -> torch.Tensor:
-    """Run non-affine LayerNorm and Wan's repeated AdaLN mapping in one kernel."""
-    if getattr(norm, "elementwise_affine", False):
-        raise RuntimeError("Wan LayerNorm+AdaLN fusion requires a non-affine LayerNorm")
-    try:
-        from comfyui_turing_utils_kernel import turing_layer_norm_adaln
-    except (ImportError, AttributeError) as exc:
-        raise RuntimeError(
-            "Wan LayerNorm+AdaLN requires an updated comfyui-turing-utils-kernel; "
-            "reinstall the kernel package"
-        ) from exc
-    return turing_layer_norm_adaln(x, scale, shift, float(norm.eps))
-
-
 def _normalized_segments(
     segments: Sequence[tuple[int, int, int]],
     rows: int,

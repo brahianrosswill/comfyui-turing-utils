@@ -61,13 +61,13 @@ the fixed-workspace fused path even for contraction/square layers. If Kitchen
 cannot serve that shape, it falls back without narrowing the accepted input.
 
 Wan self-attention reuses one ConvRot activation quantization across Q/K/V when
-all three projections have the same W8A8, W4A8, or W4A4 format. Wan blocks fuse
-non-affine LayerNorm and repeated AdaLN mapping with FP32 mean/variance
-reduction, and feed fc1 directly into the tanh-GELU ConvRot quantizer for fc2.
-When bundled Sage is active and no attention patch needs Q/K afterward, the Wan
-adapter invokes the existing per-warp quantizer directly and releases BF16 Q/K
-before the score/value kernel. Unsupported heads and patched attention keep the
-normal generic path.
+all three projections have the same W8A8, W4A8, or W4A4 format. When bundled
+Sage is active and no attention patch needs Q/K afterward, the Wan adapter
+invokes the existing per-warp quantizer directly and releases BF16 Q/K before
+the score/value kernel. Wan block normalization and feed-forward execution stay
+on ComfyUI's native path; current ComfyUI folds tanh-GELU through
+`linear_input_act` without replacing the block forward. Unsupported heads and
+patched attention keep the normal generic path.
 Bernini context latents are included in ComfyUI's memory estimate; context
 windows budget both the context tokens and the possible causal anchor without
 changing the conditioning used at runtime.

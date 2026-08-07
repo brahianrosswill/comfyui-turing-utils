@@ -13,19 +13,13 @@ import torch
 try:
     from .turing_fusions import (
         convrot_weight_kind,
-        is_turing_convrot_linear,
-        layer_norm_adaln,
         turing_linear_group,
-        turing_linear_input_act,
     )
     from .turing_ops import is_supported_turing_device, turing_int8_workspace_bytes
 except ImportError:
     from turing_fusions import (
         convrot_weight_kind,
-        is_turing_convrot_linear,
-        layer_norm_adaln,
         turing_linear_group,
-        turing_linear_input_act,
     )
     from turing_ops import is_supported_turing_device, turing_int8_workspace_bytes
 
@@ -292,91 +286,14 @@ def _make_self_attention_forward(attention, wan_model):
     return types.MethodType(forward, attention)
 
 
-def _make_block_forward(block, wan_model):
-    import comfy.model_management
-
-    original = block.forward
-
-    def forward(
-        self,
-        x,
-        e,
-        freqs,
-        context,
-        context_img_len=257,
-        transformer_options={},
-    ):
-        if (
-            x.dtype != torch.bfloat16
-            or comfy.model_management.in_training
-            or (torch.is_grad_enabled() and (x.requires_grad or e.requires_grad))
-        ):
-            return original(
-                x,
-                e,
-                freqs,
-                context,
-                context_img_len=context_img_len,
-                transformer_options=transformer_options,
-            )
-
-        if e.ndim < 4:
-            modulation = comfy.model_management.cast_to(
-                self.modulation, dtype=x.dtype, device=x.device
-            )
-            modulation = (modulation + e).chunk(6, dim=1)
-        else:
-            modulation = comfy.model_management.cast_to(
-                self.modulation, dtype=x.dtype, device=x.device
-            )
-            modulation = (modulation.unsqueeze(0) + e).unbind(2)
-
-        normalized = layer_norm_adaln(
-            self.norm1, x.contiguous(), modulation[0], modulation[1]
-        )
-        y = self.self_attn(
-            normalized, freqs, transformer_options=transformer_options
-        )
-        x = torch.addcmul(x, y, wan_model.repeat_e(modulation[2], x))
-        del y, normalized
-
-        x = x + self.cross_attn(
-            self.norm3(x),
-            context,
-            context_img_len=context_img_len,
-            transformer_options=transformer_options,
-        )
-        for patch in transformer_options.get("patches", {}).get("attn2_patch", ()):
-            x = patch({"x": x, "transformer_options": transformer_options})
-
-        normalized = layer_norm_adaln(
-            self.norm2, x.contiguous(), modulation[3], modulation[4]
-        )
-        y = turing_linear_input_act(
-            self.ffn[2], self.ffn[0](normalized), "gelu_tanh"
-        )
-        return torch.addcmul(x, y, wan_model.repeat_e(modulation[5], x))
-
-    return types.MethodType(forward, block)
-
-
-def _install_wan_forward_fusions(model, diffusion_model) -> tuple[int, int]:
+def _install_wan_self_attention_fusion(model, diffusion_model) -> int:
     from comfy.ldm.wan import model as wan_model
 
-    block_signature = tuple(inspect.signature(wan_model.WanAttentionBlock.forward).parameters)
     attention_signature = tuple(inspect.signature(wan_model.WanSelfAttention.forward).parameters)
-    if block_signature != (
-        "self", "x", "e", "freqs", "context", "context_img_len", "transformer_options"
-    ) or attention_signature != ("self", "x", "freqs", "transformer_options"):
-        LOG.warning("Wan Turing forward fusions disabled because ComfyUI's Wan contract changed")
-        return 0, 0
+    if attention_signature != ("self", "x", "freqs", "transformer_options"):
+        LOG.warning("Wan Turing self-attention fusion disabled because ComfyUI's Wan contract changed")
+        return 0
 
-    try:
-        from comfyui_turing_utils_kernel import turing_layer_norm_adaln
-    except (ImportError, AttributeError):
-        turing_layer_norm_adaln = None
-
-    block_count = 0
     attention_count = 0
     for name, module in diffusion_model.named_modules():
         object_name = f"diffusion_model.{name}"
@@ -391,17 +308,7 @@ def _install_wan_forward_fusions(model, diffusion_model) -> tuple[int, int]:
                     _make_self_attention_forward(module, wan_model),
                 )
                 attention_count += 1
-        elif (
-            type(module) is wan_model.WanAttentionBlock
-            and callable(turing_layer_norm_adaln)
-            and len(module.ffn) >= 3
-            and is_turing_convrot_linear(module.ffn[2])
-        ):
-            model.add_object_patch(
-                f"{object_name}.forward", _make_block_forward(module, wan_model)
-            )
-            block_count += 1
-    return block_count, attention_count
+    return attention_count
 
 
 def apply_wan_adapter(model, device: torch.device) -> int:
@@ -445,16 +352,13 @@ def apply_wan_adapter(model, device: torch.device) -> int:
             _make_outer_sample_wrapper(base_model),
         )
 
-    block_count, attention_count = _install_wan_forward_fusions(
-        model, diffusion_model
-    )
+    attention_count = _install_wan_self_attention_fusion(model, diffusion_model)
 
     LOG.info(
         "Enabled Wan Turing adapter: formats=[%s], context-aware VRAM planning, "
-        "w8_outputs=[%s], layernorm_gelu_blocks=%d, shared_qkv=%d",
+        "w8_outputs=[%s], shared_qkv=%d",
         ",".join(f"{kind}:{count}" for kind, count in sorted(formats.items())),
         ",".join(map(str, w8_output_channels)) or "none",
-        block_count,
         attention_count,
     )
     return sum(formats.values())

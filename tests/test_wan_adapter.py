@@ -93,7 +93,7 @@ class WanMemoryPlanningTest(unittest.TestCase):
                 return_value=(Counter({"w8a8": 2}), (4096,)),
             ),
             mock.patch(
-                "wan_adapter._install_wan_forward_fusions", return_value=(0, 0)
+                "wan_adapter._install_wan_self_attention_fusion", return_value=0
             ),
             mock.patch("wan_adapter.turing_int8_workspace_bytes", return_value=64.0),
         ):
@@ -213,6 +213,44 @@ class WanMemoryPlanningTest(unittest.TestCase):
         sage.assert_called_once()
         self.assertEqual(sage.call_args.args[4].shape, (1, 3, 2, 64))
         generic_attention.assert_not_called()
+
+    def test_wan_install_only_patches_self_attention(self):
+        from comfy.ldm.wan import model as wan_model
+
+        attention = wan_model.WanSelfAttention.__new__(wan_model.WanSelfAttention)
+        torch.nn.Module.__init__(attention)
+        attention.q = torch.nn.Linear(1, 1)
+        attention.k = torch.nn.Linear(1, 1)
+        attention.v = torch.nn.Linear(1, 1)
+        block = wan_model.WanAttentionBlock.__new__(wan_model.WanAttentionBlock)
+        torch.nn.Module.__init__(block)
+
+        diffusion = SimpleNamespace(
+            named_modules=lambda: (
+                ("blocks.0", block),
+                ("blocks.0.self_attn", attention),
+            )
+        )
+        patches = {}
+        patcher = SimpleNamespace(
+            add_object_patch=lambda name, value: patches.__setitem__(name, value)
+        )
+
+        with (
+            mock.patch("wan_adapter.convrot_weight_kind", return_value="w4a4"),
+            mock.patch(
+                "wan_adapter._make_self_attention_forward", return_value="patched"
+            ),
+        ):
+            count = wan_adapter._install_wan_self_attention_fusion(
+                patcher, diffusion
+            )
+
+        self.assertEqual(count, 1)
+        self.assertEqual(
+            patches,
+            {"diffusion_model.blocks.0.self_attn.forward": "patched"},
+        )
 
 
 if __name__ == "__main__":
