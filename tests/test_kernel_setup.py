@@ -92,6 +92,8 @@ class KernelSetupTest(unittest.TestCase):
         self.assertEqual([extension.name for extension in extensions], ["comfyui_turing_utils_kernel._C"])
         self.assertEqual(extensions[0].kwargs["include_dirs"][1], str(conda_include.resolve()))
         self.assertIn(str(cccl.resolve()), extensions[0].kwargs["include_dirs"])
+        self.assertIn("/std:c++20", extensions[0].kwargs["extra_compile_args"]["cxx"])
+        self.assertIn("-std=c++20", extensions[0].kwargs["extra_compile_args"]["nvcc"])
 
     def test_nvidia_cutlass_python_package_is_auto_detected(self):
         with tempfile.TemporaryDirectory() as temp_dir:

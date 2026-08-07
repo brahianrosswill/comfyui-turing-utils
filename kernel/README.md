@@ -55,8 +55,10 @@ python kernel/scripts/validate_wan_fusions.py --device cuda:0
 On Windows, use an x64 Visual Studio Developer shell. CUDA 12.8 Conda users
 must have the CCCL directory containing `nv/target`; the build discovers
 `%CONDA_PREFIX%\Library\include\targets\x64` automatically.
-The extension uses C++17, which is the newest language level required by the
-bundled operators and remains compatible with older CUDA host compilers.
+The extension uses C++20 by default. This is required for the bundled CUTLASS
+W4A8 templates to compile reliably with NVCC and MSVC. The host and device
+standards can be overridden with `COMFYUI_TURING_UTILS_HOST_CXX_STANDARD` and
+`COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD` when diagnosing a toolchain issue.
 
 ## Check
 
