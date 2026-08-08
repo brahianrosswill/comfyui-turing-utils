@@ -227,6 +227,49 @@ def sageattn_prequantized(
 
 
 @_on_input_device
+def sol_sparse_sageattn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    tensor_layout: str = "HND",
+    sm_scale: Optional[float] = None,
+    prefix_tokens: int = 0,
+    tau: float = 1.0,
+    return_route: bool = False,
+):
+    """Experimental SM75 Sol-style sparse attention with centroid correction."""
+    if not q.is_cuda:
+        raise ValueError("Input tensors must be on CUDA")
+    if tensor_layout != "HND":
+        raise ValueError("experimental sparse attention currently requires HND layout")
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("Turing sparse Q/K/V must be float16 or bfloat16")
+    if q.device != k.device or q.device != v.device:
+        raise ValueError("Q/K/V must be on the same device")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise TypeError("Q/K/V must have matching dtypes")
+    _validate_fixed_qkv(q, k, v, tensor_layout)
+    if q.size(-1) != 128:
+        raise ValueError("experimental sparse attention requires head_dim=128")
+    if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
+        raise ValueError("the last Q/K/V dimension must be contiguous")
+
+    scale = float(sm_scale) if sm_scale is not None else 128**-0.5
+    output = torch.empty_like(q)
+    route = sm75_compile.sol_sparse_f16_attn(
+        q,
+        k,
+        v,
+        output,
+        int(prefix_tokens),
+        float(tau),
+        scale,
+    )
+    return (output, route) if return_route else output
+
+
+@_on_input_device
 def sageattn_varlen(
     q: torch.Tensor,
     k: torch.Tensor,

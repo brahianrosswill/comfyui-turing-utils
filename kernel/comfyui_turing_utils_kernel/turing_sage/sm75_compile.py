@@ -57,3 +57,23 @@ def qk_int8_sv_f16_varlen_accum_f32_attn(
         is_causal,
         sm_scale,
     )
+
+
+def sol_sparse_f16_attn(
+    query,
+    key,
+    value,
+    output,
+    prefix_tokens,
+    tau,
+    sm_scale,
+):
+    return _qattn_sm75.sol_sparse_f16_attn(
+        query,
+        key,
+        value,
+        output,
+        prefix_tokens,
+        tau,
+        sm_scale,
+    )

@@ -17,10 +17,16 @@ except ImportError:
 LOG = logging.getLogger("comfyui-turing-utils")
 SUPPORTED_KERNEL_DTYPES = (torch.float16, torch.bfloat16)
 SUPPORTED_INPUT_DTYPES = (*SUPPORTED_KERNEL_DTYPES, torch.float32)
+SPARSE_MIN_SEQUENCE = 4096
+SPARSE_PREFIX_TOKENS = 512
+SPARSE_ROUTE_TAU = 1.0
 _PREFLIGHTED_DEVICES: set[int] = set()
+_PREFLIGHTED_SPARSE_DEVICES: set[int] = set()
 _LOGGED_FP32_COMPAT = False
 _LOGGED_TURING_KERNELS: set[tuple] = set()
 _LOGGED_TURING_FALLBACKS: set[str] = set()
+_LOGGED_SPARSE_KERNELS: set[tuple] = set()
+_LOGGED_SPARSE_DENSE_REASONS: set[str] = set()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -165,10 +171,24 @@ def bundled_available() -> bool:
     return available()
 
 
+def bundled_sparse_available() -> bool:
+    try:
+        from comfyui_turing_utils_kernel.turing_sage import sparse_available
+    except (ImportError, OSError):
+        return False
+    return sparse_available()
+
+
 def _sageattn(*args, **kwargs):
     from comfyui_turing_utils_kernel import turing_sage
 
     return turing_sage.sageattn(*args, **kwargs)
+
+
+def _sol_sparse_sageattn(*args, **kwargs):
+    from comfyui_turing_utils_kernel import turing_sage
+
+    return turing_sage.sol_sparse_sageattn(*args, **kwargs)
 
 
 def preflight_bundled(device: torch.device) -> None:
@@ -181,6 +201,18 @@ def preflight_bundled(device: torch.device) -> None:
 
     preflight(device)
     _PREFLIGHTED_DEVICES.add(index)
+
+
+def preflight_bundled_sparse(device: torch.device) -> None:
+    if not is_supported_turing_device(device):
+        raise RuntimeError(f"unsupported Turing device {device}")
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index in _PREFLIGHTED_SPARSE_DEVICES:
+        return
+    from comfyui_turing_utils_kernel.turing_sage import preflight_sparse
+
+    preflight_sparse(device)
+    _PREFLIGHTED_SPARSE_DEVICES.add(index)
 
 
 def _reshape_qkv(q, k, v, heads: int, enable_gqa: bool):
@@ -354,6 +386,138 @@ def turing_sage_attention(
     return result.to(input_dtype) if input_dtype == torch.float32 else result
 
 
+def _sparse_dense_baseline(
+    reason: str,
+    fallback: Callable,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    heads: int,
+    **kwargs,
+) -> torch.Tensor:
+    if reason not in _LOGGED_SPARSE_DENSE_REASONS:
+        LOG.info("Experimental sparse attention uses stable Sage for %s", reason)
+        _LOGGED_SPARSE_DENSE_REASONS.add(reason)
+    return turing_sage_attention(fallback, q, k, v, heads, **kwargs)
+
+
+def turing_sol_sparse_attention(
+    fallback: Callable,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    heads: int,
+    mask=None,
+    attn_precision=None,
+    skip_reshape: bool = False,
+    skip_output_reshape: bool = False,
+    min_sequence_tokens: int = SPARSE_MIN_SEQUENCE,
+    dense_prefix_tokens: int = SPARSE_PREFIX_TOKENS,
+    route_threshold: float = SPARSE_ROUTE_TAU,
+    **kwargs,
+) -> torch.Tensor:
+    original_q, original_k, original_v = q, k, v
+    common = {
+        "mask": mask,
+        "attn_precision": attn_precision,
+        "skip_reshape": skip_reshape,
+        "skip_output_reshape": skip_output_reshape,
+        **kwargs,
+    }
+
+    def dense(reason: str):
+        return _sparse_dense_baseline(
+            reason,
+            fallback,
+            original_q,
+            original_k,
+            original_v,
+            heads,
+            **common,
+        )
+
+    if not is_supported_turing_device(q.device):
+        return dense("Q/K/V are not on a supported sm75 GPU")
+    if mask is not None:
+        return dense("an attention mask was supplied")
+    if kwargs.get("low_precision_attention", True) is False:
+        return dense("low_precision_attention=False")
+    if bool(kwargs.get("is_causal", False)):
+        return dense("causal attention")
+    if q.dtype != k.dtype or q.dtype != v.dtype or q.dtype not in SUPPORTED_INPUT_DTYPES:
+        return dense("Q/K/V dtypes are incompatible")
+    if q.device != k.device or q.device != v.device:
+        return dense("Q/K/V devices are incompatible")
+
+    input_dtype = q.dtype
+    enable_gqa = bool(kwargs.get("enable_gqa", False))
+    if skip_reshape:
+        if q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or q.shape[1] != heads:
+            return dense("skip_reshape Q/K/V layout is incompatible")
+        batch, _, _, head_dim = q.shape
+    else:
+        try:
+            q, k, v, batch, head_dim = _reshape_qkv(q, k, v, heads, enable_gqa)
+        except ValueError:
+            return dense("unreshaped Q/K/V layout is incompatible")
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+    if head_dim != 128:
+        return dense(f"head_dim={head_dim} is not 128")
+    if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
+        return dense("Q/K/V batch sizes are incompatible")
+    if k.shape[1] != v.shape[1] or k.shape[2:] != v.shape[2:]:
+        return dense("K/V shapes are incompatible")
+    if k.shape[-1] != 128 or k.shape[1] <= 0 or heads % k.shape[1] != 0:
+        return dense("Q/K/V head counts are incompatible")
+    if q.shape[2] < min_sequence_tokens or k.shape[2] < min_sequence_tokens:
+        return dense(f"sequences shorter than {min_sequence_tokens} tokens")
+
+    prefix_tokens = min(dense_prefix_tokens, k.shape[2])
+    if input_dtype == torch.float32:
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
+    kernel_key = (
+        q.device.index,
+        input_dtype,
+        tuple(q.shape),
+        tuple(k.shape),
+        min_sequence_tokens,
+        prefix_tokens,
+        route_threshold,
+    )
+    if kernel_key not in _LOGGED_SPARSE_KERNELS:
+        LOG.info(
+            "Experimental Turing Sol sparse attention active: dtype=%s Q=%s K=%s "
+            "min_sequence=%d dense_prefix=%d route_threshold=%.2f",
+            input_dtype,
+            tuple(q.shape),
+            tuple(k.shape),
+            min_sequence_tokens,
+            prefix_tokens,
+            route_threshold,
+        )
+        _LOGGED_SPARSE_KERNELS.add(kernel_key)
+
+    output = _sol_sparse_sageattn(
+        q,
+        k,
+        v,
+        tensor_layout="HND",
+        sm_scale=kwargs.get("scale"),
+        prefix_tokens=prefix_tokens,
+        tau=route_threshold,
+    )
+    batch, _, _, head_dim = q.shape
+    result = output if skip_output_reshape else output.transpose(1, 2).reshape(
+        batch, -1, heads * head_dim
+    )
+    return result.to(input_dtype) if input_dtype == torch.float32 else result
+
+
 def _uses_bundled_turing_sage(option: str, device: torch.device | None) -> bool:
     option = normalize_attention_backend(option)
     return bool(
@@ -412,6 +576,78 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
     attention_override.turing_utils_attention_backend = backend.option
     attention_override.turing_utils_attention_implementation = implementation
     return attention_override
+
+
+def make_sparse_attention_override(
+    device: torch.device,
+    min_sequence_tokens: int = SPARSE_MIN_SEQUENCE,
+    dense_prefix_tokens: int = SPARSE_PREFIX_TOKENS,
+    route_threshold: float = SPARSE_ROUTE_TAU,
+) -> Callable:
+    min_sequence_tokens = int(min_sequence_tokens)
+    dense_prefix_tokens = int(dense_prefix_tokens)
+    route_threshold = float(route_threshold)
+    if min_sequence_tokens < 1:
+        raise ValueError("min_sequence_tokens must be positive")
+    if dense_prefix_tokens < 0:
+        raise ValueError("dense_prefix_tokens must be non-negative")
+    if route_threshold < 0:
+        raise ValueError("route_threshold must be non-negative")
+    if not is_supported_turing_device(device):
+        raise RuntimeError("Sol sparse attention requires an sm75 Turing GPU")
+    if not bundled_sparse_available():
+        raise RuntimeError(
+            "The experimental Turing sparse extension is unavailable. "
+            "Rebuild comfyui-turing-utils-kernel 0.9.0 or newer with sm75 enabled."
+        )
+    preflight_bundled(device)
+    preflight_bundled_sparse(device)
+
+    def attention_override(original: Callable, *args, **kwargs):
+        fallback = lambda *fallback_args, **fallback_kwargs: _dtype_compatible_fallback(
+            original, *fallback_args, **fallback_kwargs
+        )
+        return turing_sol_sparse_attention(
+            fallback,
+            *args,
+            min_sequence_tokens=min_sequence_tokens,
+            dense_prefix_tokens=dense_prefix_tokens,
+            route_threshold=route_threshold,
+            **kwargs,
+        )
+
+    attention_override.turing_utils_attention_backend = "sol_sparse_attn"
+    attention_override.turing_utils_attention_implementation = "bundled_turing_sol_sparse_experimental"
+    return attention_override
+
+
+def apply_sparse_attention_patch(
+    model,
+    min_sequence_tokens: int = SPARSE_MIN_SEQUENCE,
+    dense_prefix_tokens: int = SPARSE_PREFIX_TOKENS,
+    route_threshold: float = SPARSE_ROUTE_TAU,
+):
+    patched = model.clone()
+    override = make_sparse_attention_override(
+        patched.load_device,
+        min_sequence_tokens=min_sequence_tokens,
+        dense_prefix_tokens=dense_prefix_tokens,
+        route_threshold=route_threshold,
+    )
+    transformer_options = patched.model_options.setdefault("transformer_options", {})
+    transformer_options["optimized_attention_override"] = override
+    transformer_options["turing_utils_attention_backend"] = "sol_sparse_attn"
+    transformer_options["turing_utils_attention_implementation"] = (
+        "bundled_turing_sol_sparse_experimental"
+    )
+    LOG.info(
+        "Sol sparse attention patch enabled: min_sequence=%d dense_prefix=%d "
+        "route_threshold=%.2f",
+        min_sequence_tokens,
+        dense_prefix_tokens,
+        route_threshold,
+    )
+    return patched
 
 
 def apply_attention_backend(model, option: str, device: torch.device | None = None):

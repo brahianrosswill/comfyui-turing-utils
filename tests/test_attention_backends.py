@@ -39,6 +39,8 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertEqual(attention_backends.normalize_attention_backend("flash-attn"), "flash_attn")
         with self.assertRaises(ValueError):
             attention_backends.normalize_attention_backend("sage1")
+        with self.assertRaises(ValueError):
+            attention_backends.normalize_attention_backend("sol-sparse")
 
     def test_backend_registration_rejects_alias_collisions_without_partial_registration(self):
         backend = attention_backends.AttentionBackend(
@@ -285,6 +287,49 @@ class AttentionBackendsTest(unittest.TestCase):
         ):
             override = attention_backends.make_attention_override("flash_attn", device=torch.device("cuda", 0))
         self.assertEqual(override.turing_utils_attention_backend, "flash_attn")
+
+    def test_sparse_override_preflights_independent_kernel(self):
+        q = torch.zeros((1, 2, 256, 128), dtype=torch.bfloat16)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention.bundled_sparse_available", return_value=True),
+            mock.patch("attention.preflight_bundled") as stable_preflight,
+            mock.patch("attention.preflight_bundled_sparse") as preflight,
+            mock.patch("attention.turing_sol_sparse_attention", return_value=q) as sparse,
+        ):
+            override = attention_backends.make_sparse_attention_override(
+                torch.device("cuda", 0),
+                min_sequence_tokens=8192,
+                dense_prefix_tokens=256,
+                route_threshold=1.5,
+            )
+            output = override(
+                mock.Mock(),
+                q,
+                q,
+                q,
+                2,
+                skip_reshape=True,
+            )
+
+        self.assertIs(output, q)
+        sparse.assert_called_once()
+        stable_preflight.assert_called_once_with(torch.device("cuda", 0))
+        preflight.assert_called_once_with(torch.device("cuda", 0))
+        self.assertEqual(sparse.call_args.kwargs["min_sequence_tokens"], 8192)
+        self.assertEqual(sparse.call_args.kwargs["dense_prefix_tokens"], 256)
+        self.assertEqual(sparse.call_args.kwargs["route_threshold"], 1.5)
+        self.assertEqual(
+            override.turing_utils_attention_implementation,
+            "bundled_turing_sol_sparse_experimental",
+        )
+
+    def test_experimental_sparse_rejects_non_turing_device(self):
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=False),
+            self.assertRaisesRegex(RuntimeError, "sm75 Turing"),
+        ):
+            attention_backends.make_sparse_attention_override(torch.device("cuda", 0))
 
 
 if __name__ == "__main__":

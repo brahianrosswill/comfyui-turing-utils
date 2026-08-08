@@ -608,7 +608,8 @@ class ConvRotDiffusionModelLoader:
                             "Select this ConvRot model's attention backend. "
                             "sage_attn uses the bundled implementation on Turing and the installed SageAttention "
                             "package elsewhere. auto uses the same Turing path; elsewhere it tries sage_attn, "
-                            "then flash_attn, then PyTorch SDPA."
+                            "then flash_attn, then PyTorch SDPA. Experimental sparse attention is configured "
+                            "with the separate Patch Sol Sparse Attention node."
                         ),
                     },
                 ),

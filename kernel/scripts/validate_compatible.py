@@ -247,6 +247,65 @@ def validate_sage(device: torch.device) -> None:
     _validate_varlen_batches(output, q, k, v, cu_q, cu_k, q_lengths, k_lengths)
 
 
+def validate_sparse(device: torch.device) -> None:
+    from comfyui_turing_utils_kernel.turing_sage import sol_sparse_sageattn
+
+    for dtype in (torch.float16, torch.bfloat16):
+        q = torch.randn((1, 4, 129, 128), device=device, dtype=dtype)
+        k = torch.randn((1, 2, 151, 128), device=device, dtype=dtype)
+        v = torch.randn_like(k)
+        output, route = sol_sparse_sageattn(
+            q, k, v, prefix_tokens=k.size(2), return_route=True
+        )
+        reference = torch.nn.functional.scaled_dot_product_attention(
+            q.float(), k.float(), v.float(), enable_gqa=True
+        )
+        _assert_close(
+            f"experimental sparse exact route {dtype}",
+            output,
+            reference,
+            rtol=0.02,
+            atol=0.02,
+        )
+        if route.dtype != torch.int32 or route.shape[:3] != (1, 4, 3):
+            raise RuntimeError("experimental sparse route shape is incompatible")
+
+    sequence = 1025
+    blocks = (sequence + 63) // 64
+
+    def correlated(heads: int) -> torch.Tensor:
+        centers = torch.randn((1, heads, blocks, 128), device=device)
+        values = centers.repeat_interleave(64, dim=2)[:, :, :sequence]
+        values = values + torch.randn_like(values) * 0.1
+        values = values * torch.rsqrt(values.square().mean(dim=-1, keepdim=True) + 1.0e-6)
+        return values.to(torch.bfloat16)
+
+    q = correlated(4)
+    k = correlated(2)
+    v_centers = torch.randn((1, 2, blocks, 128), device=device)
+    v = v_centers.repeat_interleave(64, dim=2)[:, :, :sequence]
+    v = (v + torch.randn_like(v) * 0.1).to(torch.bfloat16)
+    output, route = sol_sparse_sageattn(
+        q, k, v, prefix_tokens=128, return_route=True
+    )
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.float(), k.float(), v.float(), enable_gqa=True
+    )
+    _assert_close(
+        "experimental sparse correlated sequence",
+        output,
+        reference,
+        rtol=0.02,
+        atol=0.02,
+    )
+    selected = sum(
+        (int(word) & 0xFFFF).bit_count() for word in route.cpu().reshape(-1)
+    )
+    density = selected / (4 * blocks * blocks)
+    if not 0.1 < density < 0.9:
+        raise RuntimeError(f"experimental sparse route density is implausible: {density:.3f}")
+
+
 def _elapsed_ms(function, iterations: int) -> float:
     for _ in range(5):
         function()
@@ -272,10 +331,34 @@ def benchmark_sage(device: torch.device, iterations: int) -> None:
         print(f"sage HND N=2048 Hq=8 Hkv=4 D=128 {dtype}: {elapsed:.3f} ms")
 
 
+def benchmark_sparse(device: torch.device, iterations: int) -> None:
+    from comfyui_turing_utils_kernel.turing_sage import sageattn, sol_sparse_sageattn
+
+    for sequence in (4096, 8192, 16384):
+        q = torch.randn((1, 4, sequence, 128), device=device, dtype=torch.float16) * 0.2
+        k = torch.randn_like(q) * 0.2
+        v = torch.randn_like(q) * 0.2
+        sparse = lambda: sol_sparse_sageattn(q, k, v, prefix_tokens=512)
+        dense = lambda: sageattn(q, k, v)
+        sparse_ms = _elapsed_ms(sparse, iterations)
+        dense_ms = _elapsed_ms(dense, iterations)
+        _, route = sol_sparse_sageattn(q, k, v, prefix_tokens=512, return_route=True)
+        blocks = (sequence + 63) // 64
+        selected = sum(
+            (int(word) & 0xFFFF).bit_count() for word in route.cpu().reshape(-1)
+        )
+        density = selected / (4 * blocks * blocks)
+        print(
+            f"sparse HND N={sequence} H=4 D=128 density={density:.3f}: "
+            f"{sparse_ms:.3f} ms vs sage {dense_ms:.3f} ms, {dense_ms / sparse_ms:.3f}x"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--benchmark", action="store_true")
+    parser.add_argument("--experimental-sparse", action="store_true")
     parser.add_argument("--iterations", type=int, default=20)
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -292,10 +375,14 @@ def main() -> None:
         validate_w4a8(device)
         validate_segmented_norm(device)
         validate_sage(device)
+        if args.experimental_sparse:
+            validate_sparse(device)
         torch.cuda.synchronize(device)
         print("numerical validation passed")
         if args.benchmark:
             benchmark_sage(device, args.iterations)
+            if args.experimental_sparse:
+                benchmark_sparse(device, args.iterations)
 
 
 if __name__ == "__main__":

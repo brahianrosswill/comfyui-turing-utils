@@ -28,6 +28,14 @@ at::Tensor qk_int8_sv_f16_accum_f32_attn(at::Tensor query,
                     float sm_scale,
                     int return_lse);
 
+at::Tensor sol_sparse_f16_attn(at::Tensor query,
+                    at::Tensor key,
+                    at::Tensor value,
+                    at::Tensor output,
+                    int prefix_tokens,
+                    float tau,
+                    float softmax_scale);
+
 #ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
 at::Tensor qk_int8_sv_f16_accum_f16_attn(at::Tensor query,
                     at::Tensor key,

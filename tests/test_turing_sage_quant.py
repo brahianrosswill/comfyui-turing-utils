@@ -38,10 +38,18 @@ class TuringSageQuantContractTest(unittest.TestCase):
         self.assertFalse(hasattr(quant, "sage2_score_correction"))
         self.assertFalse(hasattr(quant, "per_block_int8"))
 
-    def test_public_sage_api_has_no_experimental_variants(self):
+    def test_public_sage_api_exposes_only_stable_and_current_sparse_entrypoints(self):
         self.assertEqual(
             turing_sage.__all__,
-            ["available", "preflight", "sageattn", "sageattn_varlen"],
+            [
+                "available",
+                "preflight",
+                "preflight_sparse",
+                "sageattn",
+                "sageattn_varlen",
+                "sol_sparse_sageattn",
+                "sparse_available",
+            ],
         )
         self.assertFalse(hasattr(turing_sage, "sageattn_sage1"))
         self.assertFalse(hasattr(turing_sage, "sageattn_sage2"))

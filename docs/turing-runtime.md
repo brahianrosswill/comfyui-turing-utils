@@ -25,6 +25,7 @@ not skip attention or quantized-kernel preflight.
 |---|---|
 | `precision.py` | BF16 selection, Kitchen contract, exact-sm75 preflight |
 | `attention.py` | generic backend selection and bundled Sage adapter |
+| `attention_nodes.py` | model-independent experimental sparse-attention patch UI |
 | `turing_ops.py` | exact-sm75 Kitchen backend and W8/W4 dispatch policy |
 | `turing_fusions.py` | model-independent fused Linear activation and segmented norm calls |
 | `minimax_adapter.py` | MiniMax packed-sequence memory planning and ModelPatcher object patches |
@@ -99,6 +100,7 @@ normalize invisibly to `sage_attn` and are not displayed by either loader.
 | Option | Q/K path | Smoothing | PV path |
 |---|---|---|---|
 | `sage_attn` on Turing | INT8, per-16-token Q-warp scales | disabled | FP16 V tiles with direct FP32 accumulation |
+| `Patch Sol Sparse Attention` | 64-token centroid routing, selected tiles use FP16 Tensor Cores | K-block variance mass correction | exact FP16 V tiles plus skipped-block V centroids, FP32 online accumulation |
 
 Integer Q/K MMA accumulates into INT32. The stable facade supports FP16 and
 BF16 Q/K/V, HND/NHD, GQA, causal mode, unequal Q/KV lengths, head dimensions
@@ -109,6 +111,29 @@ use one BF16 boundary conversion and restore FP32 output.
 When either logical sequence is shorter than the 64-token SM75 CTA, the facade
 uses a bounded exact FP32 SDPA path. It contains fewer than 4096 scores per head
 and cannot reproduce the large-sequence SDPA allocation failure.
+
+The sparse backend is installed only by the independent
+`Patch Sol Sparse Attention (Experimental)` node and is never part of a loader's
+`auto` priority list. Dispatch depends only on the attention call: matching
+FP16, BF16, or FP32 Q/K/V; 128-dimensional heads; unmasked non-causal attention;
+and both Q and K meeting the configurable minimum sequence length. HND and
+ComfyUI's unreshaped layout, GQA, unequal Q/K lengths, and incomplete final
+blocks are supported. Other calls use bundled stable Sage without model-family,
+sampling-step, or transformer-layer checks.
+
+The configurable leading Q/K region and local neighboring blocks remain exact.
+Other centroid-selected blocks use exact token attention; skipped blocks retain
+approximate softmax mass and output through K/V centroids and a K-block variance
+correction. A higher routing threshold selects fewer exact blocks. The exact
+path uses FP16 Tensor Core QK/PV with FP32 softmax and output accumulation and
+stays within the default 48 KiB shared-memory limit. Routing tensors are
+temporary per-call allocations and are not cached.
+
+On an A40 JITing only compute_75 PTX, four-head 128-dimensional synthetic tests
+measured 1.07x, 1.70x, and 2.28x attention-kernel speedups over bundled Sage at
+4096, 8192, and 16384 tokens. These are kernel-level compatibility results, not
+an H3 end-to-end prediction. Exact-sm75 visual and performance testing remains
+required before the backend can leave experimental status.
 
 The Sage1 and Sage2 adaptations produced severe block artefacts and black
 flicker in local Turing tests. They are unstable experiments, not production
@@ -126,7 +151,8 @@ The loader log reports `sage_attn via bundled_turing_sage` when `auto` or
 call for each distinct sequence shape also reports dtype, layout, and Q/K/V
 shapes. Any unsupported call reports its fallback reason once, so a masked,
 disabled-low-precision, or incompatible shape can no longer turn a performance
-regression into an invisible backend change. MiniMax additionally emits one
+regression into an invisible backend change. The sparse patch logs its selected
+minimum length, dense prefix, and routing threshold. MiniMax additionally emits one
 `phase=block` and one `phase=mlp` runtime-dispatch line after the first complete
 pass. A healthy H3 W8A8 run reports 50 fused and zero fallback calls for both
 phases; these counters use no CUDA events or device synchronization.
@@ -135,13 +161,14 @@ phases; these counters use no CUDA events or device synchronization.
 
 Release builds target sm75 for bundled Sage. Static tests validate dispatch,
 fallbacks, loader independence, shapes, dtypes, the 48 KiB policy, the public
-symbol boundary, and exclusion of experimental packages. For compatible A40
+symbol boundary, and exclusion of the retired Sage1/Sage2 variants. For compatible A40
 validation, build with:
 
 ```bash
 COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX" \
 python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
+python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-sparse
 python kernel/scripts/validate_wan_fusions.py --device cuda:0
 ```
 

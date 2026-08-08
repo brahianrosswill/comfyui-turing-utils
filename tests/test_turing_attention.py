@@ -145,6 +145,111 @@ class TuringAttentionContractTest(unittest.TestCase):
             output = turing_attention.turing_sage_attention(original, q, q, q, 1, skip_reshape=True)
         self.assertEqual(output, "fallback")
 
+    def test_experimental_sparse_uses_kernel_for_generic_long_attention(self):
+        q = torch.zeros((1, 4, 4096, 128), dtype=torch.bfloat16)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention._sol_sparse_sageattn", return_value=q) as sparse,
+        ):
+            output = turing_attention.turing_sol_sparse_attention(
+                mock.Mock(),
+                q,
+                q,
+                q,
+                4,
+                skip_reshape=True,
+                skip_output_reshape=True,
+            )
+        self.assertIs(output, q)
+        self.assertEqual(sparse.call_args.kwargs["prefix_tokens"], 512)
+        self.assertEqual(sparse.call_args.kwargs["tau"], 1.0)
+
+    def test_experimental_sparse_keeps_short_calls_dense(self):
+        q = torch.zeros((1, 4, 256, 128), dtype=torch.bfloat16)
+        baseline = mock.Mock(return_value=q)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention.turing_sage_attention", baseline),
+            mock.patch("attention._sol_sparse_sageattn") as sparse,
+        ):
+            output = turing_attention.turing_sol_sparse_attention(
+                mock.Mock(), q, q, q, 4,
+                skip_reshape=True,
+            )
+        self.assertIs(output, q)
+        baseline.assert_called_once()
+        sparse.assert_not_called()
+
+    def test_experimental_sparse_unreshaped_gqa_restores_output_layout(self):
+        q = torch.zeros((1, 4096, 4 * 128), dtype=torch.float16)
+        k = torch.zeros((1, 4096, 2 * 128), dtype=torch.float16)
+        v = torch.zeros_like(k)
+        kernel_output = torch.zeros((1, 4, 4096, 128), dtype=torch.float16)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention._sol_sparse_sageattn", return_value=kernel_output) as sparse,
+        ):
+            output = turing_attention.turing_sol_sparse_attention(
+                mock.Mock(), q, k, v, 4, enable_gqa=True
+            )
+        self.assertEqual(output.shape, q.shape)
+        self.assertEqual(sparse.call_args.args[1].shape, (1, 2, 4096, 128))
+
+    def test_experimental_sparse_fallback_preserves_original_layout(self):
+        q = torch.zeros((1, 4096, 4 * 64), dtype=torch.bfloat16)
+        baseline = mock.Mock(return_value=q)
+        with (
+            mock.patch("attention.turing_sage_attention", baseline),
+            mock.patch("attention._sol_sparse_sageattn") as sparse,
+        ):
+            output = turing_attention.turing_sol_sparse_attention(
+                mock.Mock(), q, q, q, 4
+            )
+        self.assertIs(output, q)
+        baseline.assert_called_once()
+        self.assertIs(baseline.call_args.args[1], q)
+        sparse.assert_not_called()
+
+    def test_experimental_sparse_forwards_patch_parameters(self):
+        q = torch.zeros((1, 4, 8192, 128), dtype=torch.bfloat16)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention._sol_sparse_sageattn", return_value=q) as sparse,
+        ):
+            turing_attention.turing_sol_sparse_attention(
+                mock.Mock(),
+                q,
+                q,
+                q,
+                4,
+                skip_reshape=True,
+                dense_prefix_tokens=192,
+                route_threshold=1.75,
+                min_sequence_tokens=8000,
+            )
+        self.assertEqual(sparse.call_args.kwargs["prefix_tokens"], 192)
+        self.assertEqual(sparse.call_args.kwargs["tau"], 1.75)
+
+    def test_experimental_sparse_fp32_uses_bf16_boundary_and_restores_output(self):
+        q = torch.zeros((1, 1, 4096, 128), dtype=torch.float32)
+        kernel_output = torch.ones_like(q, dtype=torch.bfloat16)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention._sol_sparse_sageattn", return_value=kernel_output) as sparse,
+        ):
+            output = turing_attention.turing_sol_sparse_attention(
+                mock.Mock(),
+                q,
+                q,
+                q,
+                1,
+                skip_reshape=True,
+                skip_output_reshape=True,
+            )
+        self.assertTrue(all(value.dtype == torch.bfloat16 for value in sparse.call_args.args[:3]))
+        self.assertEqual(output.dtype, torch.float32)
+        torch.testing.assert_close(output, kernel_output.float())
+
 
 if __name__ == "__main__":
     unittest.main()

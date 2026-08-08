@@ -45,6 +45,9 @@ only after its CUDA sources or required version change.
   selectable absolute or official relative temporal positions.
 - `Wan Video Frames Padding` exposes Wan-compatible frame padding.
 - `MiniMax H3 Video Frames Padding` pads to H3's `17*n+5` frame grid.
+- `Patch Sol Sparse Attention (Experimental)` applies the model-independent
+  long-sequence sparse backend and exposes its dense-prefix, activation-length,
+  and routing-threshold controls.
 
 ## Turing behavior
 
@@ -70,6 +73,13 @@ callers use BF16 boundary storage and receive FP32 output. On non-Turing GPUs,
 the plugin prefers an installed SageAttention backend and then follows ComfyUI's
 normal fallback order.
 
+Sparse attention is not a loader option and `auto` never selects it. Connect the
+model through `Patch Sol Sparse Attention (Experimental)` to enable it on any
+compatible attention call. The current kernel accepts FP16/BF16/FP32 Q/K/V,
+GQA, 128-dimensional heads, and unmasked non-causal sequences; incompatible or
+short calls use bundled stable Sage. It requires kernel package 0.9.0 and final
+quality/performance testing on an actual Turing GPU.
+
 See [`docs/turing-runtime.md`](docs/turing-runtime.md) for the dispatch and
 validation matrix. Experimental Sage1/Sage2 sources are not installed or
 exposed by loader nodes.
@@ -80,6 +90,7 @@ exposed by loader nodes.
 COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX" \
 python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
+python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-sparse
 ```
 
 Compatible A40 runs validate numerical behavior and allocation shapes but do

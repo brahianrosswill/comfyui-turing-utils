@@ -22,6 +22,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
   m.def("qk_int8_sv_f16_accum_f32_attn", &qk_int8_sv_f16_accum_f32_attn, "QK int8 sv f16 accum f32 attn per warp");
   m.def("qk_int8_sv_f16_varlen_accum_f32_attn", &qk_int8_sv_f16_varlen_accum_f32_attn, "Varlen QK int8 sv f16 accum f32 attn per warp");
+  m.def("sol_sparse_f16_attn", &sol_sparse_f16_attn, "Experimental Sol-style FP16 sparse attention for sm75");
 #ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
   m.def("qk_int8_sv_f16_accum_f16_attn", &qk_int8_sv_f16_accum_f16_attn, "Experimental QK int8/PV f16 attention");
   m.def("qk_int8_sv_f16_accum_f16_fuse_v_mean_attn", &qk_int8_sv_f16_accum_f16_fuse_v_mean_attn, "Experimental QK int8/PV f16 attention with V mean");
