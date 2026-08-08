@@ -100,7 +100,7 @@ normalize invisibly to `sage_attn` and are not displayed by either loader.
 | Option | Q/K path | Smoothing | PV path |
 |---|---|---|---|
 | `sage_attn` on Turing | INT8, per-16-token Q-warp scales | disabled | FP16 V tiles with direct FP32 accumulation |
-| `Patch Sol Sparse Attention` | 64-token centroid top-p routing, selected tiles use FP16 Tensor Cores | K-block variance mass correction | exact FP16 V tiles plus skipped-block V centroids, FP32 online accumulation |
+| `Patch Sol Sparse Attention` | fused 64-token centroid threshold routing; selected tiles use FP16 Tensor Cores | input-adaptive `mean + tau * std` threshold | exact FP16 V tiles plus skipped-block V centroids, FP32 online accumulation |
 
 Integer Q/K MMA accumulates into INT32. The stable facade supports FP16 and
 BF16 Q/K/V, HND/NHD, GQA, causal mode, unequal Q/KV lengths, head dimensions
@@ -119,34 +119,38 @@ FP16, BF16, or FP32 Q/K/V; 128-dimensional heads; unmasked non-causal attention;
 and both Q and K meeting the configurable minimum sequence length. HND and
 ComfyUI's unreshaped layout, GQA, unequal Q/K lengths, and incomplete final
 blocks are supported. Other calls use bundled stable Sage without model-family,
-sampling-step, or transformer-layer checks.
+sampling-step checks. A model adapter may publish semantic layer and topology
+metadata; unknown models remain fully generic.
 
 `min_sequence_tokens=0` selects the measured 4096-token crossover; a positive
-value remains a manual override. `attention_mass_recall` defaults to 0.30 for
-the explicitly experimental speed path. `dense_warmup_ratio=0` keeps all steps
-sparse for short-step workflows, while a positive ratio runs that fraction of
-the earliest sampler steps through stable Sage. Warmup step lookup is cached
-once per sampler timestep rather than synchronized in every transformer block.
+value remains a manual override. `routing_threshold=1.0` routes a block when
+its centroid score exceeds the current query row's projected mean by one
+standard deviation; lowering it evaluates more blocks exactly. The default
+`dense_warmup_ratio=0.25` protects one step in a four-step workflow,
+`dense_tail_ratio=0` avoids an extra dense tail by default, and
+`dense_prefix_layers=2` follows the validated H3 policy when layer metadata is
+available. Step lookup is cached once per sampler timestep rather than
+synchronized in every transformer block.
 
 The configurable local neighborhood remains exact. Prefix policy can use exact
 model-supplied semantic layout metadata, disable prefix protection, or accept a
 manual token count; `auto` does not guess a prefix for an unknown model. MiniMax
 publishes the actual target-video boundary, so text, reference, and target-audio
 rows plus their cross-modal attention remain exact without tying the generic
-backend to H3. Other blocks are selected
-until their estimated centroid softmax mass reaches the requested relative
-budget. Skipped blocks retain approximate mass and output through K/V centroids
-and a K-block variance correction. The exact path uses FP16 Tensor Core QK/PV
+backend to H3. It also publishes target-video frame geometry; the kernel can
+keep matching spatial ranges in adjacent frames exact without reordering tokens.
+Other blocks use the fused statistical threshold. Skipped blocks retain
+approximate mass and output through K/V centroids without the former K-variance
+overweighting. The exact path uses FP16 Tensor Core QK/PV
 with FP32 softmax and output accumulation and stays within the default 48 KiB
-shared-memory limit. Score and routing tensors are temporary per-call
-allocations and are not cached.
+shared-memory limit. Routing is written directly from the centroid Tensor Core
+tile, so no full proxy-score matrix is materialized.
 
-On an A40 JITing only compute_75 PTX, four-head 128-dimensional uniform
-synthetic tests at the default 0.30 mass budget measured 1.30x, 1.33x, and 1.40x
-BF16 speedups over bundled Sage at 4096, 8192, and 16384 tokens. FP16 measured
-1.64x, 1.80x, and 1.86x. Higher mass budgets can become slower than dense Sage
-when the estimated attention distribution is uniform; peaked model attention
-can select fewer blocks for the same budget. These are kernel-level
+On an A40 JITing only compute_75 PTX, 56-head BF16 uniform synthetic tests at
+`routing_threshold=1.0` with one adjacent temporal frame selected about 22.1%,
+19.1%, and 17.5% of blocks and measured 1.85x, 2.26x, and 2.37x kernel speedups
+over bundled Sage at 4096, 8192, and 16384 tokens. At 16K, temporal protection
+adds roughly 0.7 density points and 2.3% sparse-kernel time. These are kernel-level
 compatibility results, not an H3 end-to-end or quality prediction. Exact-sm75
 visual and performance testing remains required before the backend can leave
 experimental status.
@@ -168,8 +172,8 @@ call for each distinct sequence shape also reports dtype, layout, and Q/K/V
 shapes. Any unsupported call reports its fallback reason once, so a masked,
 disabled-low-precision, or incompatible shape can no longer turn a performance
 regression into an invisible backend change. The sparse patch logs its selected
-minimum length, prefix policy and resolved prefix, attention-mass budget, and
-local radius. MiniMax additionally emits one
+minimum length, prefix policy and resolved prefix, routing threshold, local and
+temporal neighborhoods, and resolved topology. MiniMax additionally emits one
 `phase=block` and one `phase=mlp` runtime-dispatch line after the first complete
 pass. A healthy H3 W8A8 run reports 50 fused and zero fallback calls for both
 phases; these counters use no CUDA events or device synchronization.

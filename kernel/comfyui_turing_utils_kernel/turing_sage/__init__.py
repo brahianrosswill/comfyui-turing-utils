@@ -21,7 +21,7 @@ def sparse_available() -> bool:
         module = importlib.import_module("comfyui_turing_utils_kernel._sage_qattn_sm75")
     except (ImportError, OSError):
         return False
-    return hasattr(module, "sol_sparse_f16_attn")
+    return hasattr(module, "sol_sparse_threshold_f16_attn")
 
 
 def sageattn(*args, **kwargs):

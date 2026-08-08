@@ -46,9 +46,10 @@ only after its CUDA sources or required version change.
 - `Wan Video Frames Padding` exposes Wan-compatible frame padding.
 - `MiniMax H3 Video Frames Padding` pads to H3's `17*n+5` frame grid.
 - `Patch Sol Sparse Attention (Experimental)` applies the model-independent
-  long-sequence sparse backend. It exposes a relative attention-mass budget,
-  semantic/manual/no-prefix policies, a local exact radius, dense warmup, and
-  an automatic short-sequence crossover.
+  long-sequence sparse backend. It uses an input-adaptive statistical threshold,
+  keeps skipped-block centroid residuals, accepts semantic prefix/video topology
+  metadata, and exposes dense step/layer safeguards plus an automatic
+  short-sequence crossover.
 
 ## Turing behavior
 
@@ -78,7 +79,7 @@ Sparse attention is not a loader option and `auto` never selects it. Connect the
 model through `Patch Sol Sparse Attention (Experimental)` to enable it on any
 compatible attention call. The current kernel accepts FP16/BF16/FP32 Q/K/V,
 GQA, 128-dimensional heads, and unmasked non-causal sequences; incompatible or
-short calls use bundled stable Sage. It requires kernel package 0.10.0 and final
+short calls use bundled stable Sage. It requires kernel package 0.11.0 and final
 quality/performance testing on an actual Turing GPU.
 
 See [`docs/turing-runtime.md`](docs/turing-runtime.md) for the dispatch and

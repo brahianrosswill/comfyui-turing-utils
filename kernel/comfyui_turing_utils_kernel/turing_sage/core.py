@@ -235,11 +235,15 @@ def sol_sparse_sageattn(
     tensor_layout: str = "HND",
     sm_scale: Optional[float] = None,
     prefix_tokens: int = 0,
-    attention_mass_recall: float = 0.3,
+    threshold_sigma: float = 1.0,
     local_block_radius: int = 1,
+    topology_start_tokens: int = 0,
+    topology_tokens: int = 0,
+    tokens_per_frame: int = 0,
+    temporal_neighbor_frames: int = 0,
     return_route: bool = False,
 ):
-    """Experimental SM75 sparse attention with centroid top-p routing."""
+    """Experimental SM75 Sol-style adaptive threshold sparse attention."""
     if not q.is_cuda:
         raise ValueError("Input tensors must be on CUDA")
     if tensor_layout != "HND":
@@ -258,14 +262,18 @@ def sol_sparse_sageattn(
 
     scale = float(sm_scale) if sm_scale is not None else 128**-0.5
     output = torch.empty_like(q)
-    route = sm75_compile.sol_sparse_f16_attn(
+    route = sm75_compile.sol_sparse_threshold_f16_attn(
         q,
         k,
         v,
         output,
         int(prefix_tokens),
-        float(attention_mass_recall),
+        float(threshold_sigma),
         int(local_block_radius),
+        int(topology_start_tokens),
+        int(topology_tokens),
+        int(tokens_per_frame),
+        int(temporal_neighbor_frames),
         scale,
     )
     return (output, route) if return_route else output

@@ -22,15 +22,15 @@ class SolSparseAttentionPatch:
                         "tooltip": "Use 0 for automatic crossover selection, or keep stable Sage below this Q or K length.",
                     },
                 ),
-                "attention_mass_recall": (
+                "routing_threshold": (
                     "FLOAT",
                     {
-                        "default": 0.3,
-                        "min": 0.1,
-                        "max": 1.0,
-                        "step": 0.01,
+                        "default": 1.0,
+                        "min": -4.0,
+                        "max": 4.0,
+                        "step": 0.1,
                         "round": 0.01,
-                        "tooltip": "Estimated centroid attention mass evaluated with exact token attention. Higher values preserve more detail and use more compute.",
+                        "tooltip": "Route blocks whose input-adaptive proxy score exceeds mean + threshold × standard deviation. Lower values preserve more exact blocks; 1.0 matches the official Sol policy.",
                     },
                 ),
                 "prefix_policy": (
@@ -60,7 +60,28 @@ class SolSparseAttentionPatch:
                         "tooltip": "Always evaluate this many neighboring 64-token blocks on each side exactly.",
                     },
                 ),
+                "temporal_neighbor_frames": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 0,
+                        "max": 8,
+                        "step": 1,
+                        "tooltip": "Keep matching spatial ranges in this many adjacent frames exact when a model adapter supplies video topology. Has no effect without metadata.",
+                    },
+                ),
                 "dense_warmup_ratio": (
+                    "FLOAT",
+                    {
+                        "default": 0.25,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.05,
+                        "round": 0.01,
+                        "tooltip": "Fraction of early denoising steps that use stable dense Sage. One of four steps is dense at the 0.25 default.",
+                    },
+                ),
+                "dense_tail_ratio": (
                     "FLOAT",
                     {
                         "default": 0.0,
@@ -68,7 +89,17 @@ class SolSparseAttentionPatch:
                         "max": 1.0,
                         "step": 0.05,
                         "round": 0.01,
-                        "tooltip": "Fraction of early denoising steps that use stable dense Sage. Zero favors short-step acceleration.",
+                        "tooltip": "Optional fraction of final denoising steps that use dense Sage. Keep zero unless late detail still flickers.",
+                    },
+                ),
+                "dense_prefix_layers": (
+                    "INT",
+                    {
+                        "default": 2,
+                        "min": 0,
+                        "max": 256,
+                        "step": 1,
+                        "tooltip": "Keep the first transformer layers dense when an adapter supplies layer metadata. Official MiniMax H3 uses 2 of 50 layers.",
                     },
                 ),
             }
@@ -84,20 +115,26 @@ class SolSparseAttentionPatch:
         self,
         model,
         min_sequence_tokens: int = 0,
-        attention_mass_recall: float = 0.3,
+        routing_threshold: float = 1.0,
         prefix_policy: str = "auto",
         manual_prefix_tokens: int = 0,
         local_block_radius: int = 1,
-        dense_warmup_ratio: float = 0.0,
+        temporal_neighbor_frames: int = 1,
+        dense_warmup_ratio: float = 0.25,
+        dense_tail_ratio: float = 0.0,
+        dense_prefix_layers: int = 2,
     ):
         return (
             apply_sparse_attention_patch(
                 model,
                 min_sequence_tokens=min_sequence_tokens,
-                attention_mass_recall=attention_mass_recall,
+                routing_threshold=routing_threshold,
                 prefix_policy=prefix_policy,
                 manual_prefix_tokens=manual_prefix_tokens,
                 local_block_radius=local_block_radius,
+                temporal_neighbor_frames=temporal_neighbor_frames,
                 dense_warmup_ratio=dense_warmup_ratio,
+                dense_tail_ratio=dense_tail_ratio,
+                dense_prefix_layers=dense_prefix_layers,
             ),
         )

@@ -19,10 +19,13 @@ LOG = logging.getLogger("comfyui-turing-utils")
 SUPPORTED_KERNEL_DTYPES = (torch.float16, torch.bfloat16)
 SUPPORTED_INPUT_DTYPES = (*SUPPORTED_KERNEL_DTYPES, torch.float32)
 SPARSE_AUTO_MIN_SEQUENCE = 4096
-SPARSE_ATTENTION_MASS_RECALL = 0.3
+SPARSE_ROUTING_THRESHOLD = 1.0
 SPARSE_PREFIX_POLICY = "auto"
 SPARSE_LOCAL_BLOCK_RADIUS = 1
-SPARSE_DENSE_WARMUP_RATIO = 0.0
+SPARSE_TEMPORAL_NEIGHBOR_FRAMES = 1
+SPARSE_DENSE_WARMUP_RATIO = 0.25
+SPARSE_DENSE_TAIL_RATIO = 0.0
+SPARSE_DENSE_PREFIX_LAYERS = 2
 SPARSE_LAYOUT_KEY = "turing_utils_attention_layout"
 _PREFLIGHTED_DEVICES: set[int] = set()
 _PREFLIGHTED_SPARSE_DEVICES: set[int] = set()
@@ -434,12 +437,42 @@ def _sparse_prefix_tokens(
     return min(max(prefix_tokens, 0), sequence_limit)
 
 
-def _sparse_dense_warmup(
+def _sparse_temporal_topology(transformer_options, sequence_limit: int):
+    layout = (
+        transformer_options.get(SPARSE_LAYOUT_KEY)
+        if isinstance(transformer_options, dict)
+        else None
+    )
+    if not isinstance(layout, dict):
+        return 0, 0, 0
+    values = tuple(
+        layout.get(key, 0)
+        for key in ("topology_start_tokens", "topology_tokens", "tokens_per_frame")
+    )
+    if any(not isinstance(value, int) or isinstance(value, bool) for value in values):
+        return 0, 0, 0
+    start, tokens, frame_tokens = values
+    if (
+        start < 0
+        or tokens <= 0
+        or frame_tokens <= 0
+        or start + tokens > sequence_limit
+        or tokens % frame_tokens != 0
+    ):
+        return 0, 0, 0
+    return start, tokens, frame_tokens
+
+
+def _sparse_dense_schedule(
     transformer_options,
-    ratio: float,
+    warmup_ratio: float,
+    tail_ratio: float,
     state: dict[str, object],
 ) -> bool:
-    if ratio <= 0.0 or not isinstance(transformer_options, dict):
+    if (
+        warmup_ratio <= 0.0
+        and tail_ratio <= 0.0
+    ) or not isinstance(transformer_options, dict):
         return False
     sample_sigmas = transformer_options.get("sample_sigmas")
     current_sigmas = transformer_options.get("sigmas")
@@ -459,8 +492,12 @@ def _sparse_dense_warmup(
         return bool(state["dense"])
     current = current_sigmas.flatten()[0].to(sample_sigmas)
     step = int(torch.argmin((sample_sigmas.flatten() - current).abs()).item())
-    warmup_steps = math.ceil((sample_sigmas.numel() - 1) * ratio)
-    dense = step < warmup_steps
+    sampling_steps = sample_sigmas.numel() - 1
+    warmup_steps = math.ceil(sampling_steps * warmup_ratio)
+    tail_steps = math.ceil(sampling_steps * tail_ratio)
+    dense = step < warmup_steps or (
+        tail_steps > 0 and step >= sampling_steps - tail_steps
+    )
     state.clear()
     state.update(
         sample_sigmas=sample_sigmas,
@@ -468,6 +505,29 @@ def _sparse_dense_warmup(
         dense=dense,
     )
     return dense
+
+
+def _sparse_dense_warmup(
+    transformer_options,
+    ratio: float,
+    state: dict[str, object],
+) -> bool:
+    """Compatibility wrapper retained for callers testing the warmup policy."""
+    return _sparse_dense_schedule(transformer_options, ratio, 0.0, state)
+
+
+def _sparse_dense_layer(transformer_options, dense_prefix_layers: int) -> bool:
+    if dense_prefix_layers <= 0 or not isinstance(transformer_options, dict):
+        return False
+    layout = transformer_options.get(SPARSE_LAYOUT_KEY)
+    if not isinstance(layout, dict):
+        return False
+    layer_index = layout.get("layer_index")
+    return (
+        isinstance(layer_index, int)
+        and not isinstance(layer_index, bool)
+        and 0 <= layer_index < dense_prefix_layers
+    )
 
 
 def turing_sol_sparse_attention(
@@ -481,10 +541,11 @@ def turing_sol_sparse_attention(
     skip_reshape: bool = False,
     skip_output_reshape: bool = False,
     min_sequence_tokens: int = 0,
-    attention_mass_recall: float = SPARSE_ATTENTION_MASS_RECALL,
+    routing_threshold: float = SPARSE_ROUTING_THRESHOLD,
     prefix_policy: str = SPARSE_PREFIX_POLICY,
     manual_prefix_tokens: int = 0,
     local_block_radius: int = SPARSE_LOCAL_BLOCK_RADIUS,
+    temporal_neighbor_frames: int = SPARSE_TEMPORAL_NEIGHBOR_FRAMES,
     **kwargs,
 ) -> torch.Tensor:
     original_q, original_k, original_v = q, k, v
@@ -553,6 +614,10 @@ def turing_sol_sparse_attention(
         kwargs.get("transformer_options"),
         min(q.shape[2], k.shape[2]),
     )
+    topology_start, topology_tokens, tokens_per_frame = _sparse_temporal_topology(
+        kwargs.get("transformer_options"),
+        min(q.shape[2], k.shape[2]),
+    )
     if input_dtype == torch.float32:
         q = q.to(torch.bfloat16)
         k = k.to(torch.bfloat16)
@@ -564,22 +629,30 @@ def turing_sol_sparse_attention(
         tuple(k.shape),
         effective_min_sequence,
         prefix_tokens,
-        attention_mass_recall,
+        routing_threshold,
         local_block_radius,
+        topology_start,
+        topology_tokens,
+        tokens_per_frame,
+        temporal_neighbor_frames,
     )
     if kernel_key not in _LOGGED_SPARSE_KERNELS:
         LOG.info(
             "Experimental Turing Sol sparse attention active: dtype=%s Q=%s K=%s "
-            "min_sequence=%d prefix_policy=%s dense_prefix=%d mass_recall=%.2f "
-            "local_radius=%d",
+            "min_sequence=%d prefix_policy=%s dense_prefix=%d threshold=%.2f "
+            "local_radius=%d temporal_frames=%d topology=(%d,%d,%d)",
             input_dtype,
             tuple(q.shape),
             tuple(k.shape),
             effective_min_sequence,
             prefix_policy,
             prefix_tokens,
-            attention_mass_recall,
+            routing_threshold,
             local_block_radius,
+            temporal_neighbor_frames,
+            topology_start,
+            topology_tokens,
+            tokens_per_frame,
         )
         _LOGGED_SPARSE_KERNELS.add(kernel_key)
 
@@ -590,8 +663,12 @@ def turing_sol_sparse_attention(
         tensor_layout="HND",
         sm_scale=kwargs.get("scale"),
         prefix_tokens=prefix_tokens,
-        attention_mass_recall=attention_mass_recall,
+        threshold_sigma=routing_threshold,
         local_block_radius=local_block_radius,
+        topology_start_tokens=topology_start,
+        topology_tokens=topology_tokens,
+        tokens_per_frame=tokens_per_frame,
+        temporal_neighbor_frames=temporal_neighbor_frames,
     )
     batch, _, _, head_dim = q.shape
     result = output if skip_output_reshape else output.transpose(1, 2).reshape(
@@ -663,36 +740,50 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
 def make_sparse_attention_override(
     device: torch.device,
     min_sequence_tokens: int = 0,
-    attention_mass_recall: float = SPARSE_ATTENTION_MASS_RECALL,
+    routing_threshold: float = SPARSE_ROUTING_THRESHOLD,
     prefix_policy: str = SPARSE_PREFIX_POLICY,
     manual_prefix_tokens: int = 0,
     local_block_radius: int = SPARSE_LOCAL_BLOCK_RADIUS,
+    temporal_neighbor_frames: int = SPARSE_TEMPORAL_NEIGHBOR_FRAMES,
     dense_warmup_ratio: float = SPARSE_DENSE_WARMUP_RATIO,
+    dense_tail_ratio: float = SPARSE_DENSE_TAIL_RATIO,
+    dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
 ) -> Callable:
     min_sequence_tokens = int(min_sequence_tokens)
-    attention_mass_recall = float(attention_mass_recall)
+    routing_threshold = float(routing_threshold)
     prefix_policy = str(prefix_policy).strip().lower()
     manual_prefix_tokens = int(manual_prefix_tokens)
     local_block_radius = int(local_block_radius)
+    temporal_neighbor_frames = int(temporal_neighbor_frames)
     dense_warmup_ratio = float(dense_warmup_ratio)
+    dense_tail_ratio = float(dense_tail_ratio)
+    dense_prefix_layers = int(dense_prefix_layers)
     if min_sequence_tokens < 0:
         raise ValueError("min_sequence_tokens must be non-negative")
-    if not 0.0 < attention_mass_recall <= 1.0:
-        raise ValueError("attention_mass_recall must be in (0, 1]")
+    if not math.isfinite(routing_threshold):
+        raise ValueError("routing_threshold must be finite")
     if prefix_policy not in {"auto", "none", "manual"}:
         raise ValueError("prefix_policy must be auto, none, or manual")
     if manual_prefix_tokens < 0:
         raise ValueError("manual_prefix_tokens must be non-negative")
     if local_block_radius < 0:
         raise ValueError("local_block_radius must be non-negative")
+    if temporal_neighbor_frames < 0:
+        raise ValueError("temporal_neighbor_frames must be non-negative")
     if not 0.0 <= dense_warmup_ratio <= 1.0:
         raise ValueError("dense_warmup_ratio must be in [0, 1]")
+    if not 0.0 <= dense_tail_ratio <= 1.0:
+        raise ValueError("dense_tail_ratio must be in [0, 1]")
+    if dense_warmup_ratio + dense_tail_ratio > 1.0:
+        raise ValueError("dense warmup and tail ratios must sum to at most 1")
+    if dense_prefix_layers < 0:
+        raise ValueError("dense_prefix_layers must be non-negative")
     if not is_supported_turing_device(device):
         raise RuntimeError("Sol sparse attention requires an sm75 Turing GPU")
     if not bundled_sparse_available():
         raise RuntimeError(
             "The experimental Turing sparse extension is unavailable. "
-            "Rebuild comfyui-turing-utils-kernel 0.10.0 or newer with sm75 enabled."
+            "Rebuild comfyui-turing-utils-kernel 0.11.0 or newer with sm75 enabled."
         )
     preflight_bundled(device)
     preflight_bundled_sparse(device)
@@ -702,16 +793,23 @@ def make_sparse_attention_override(
         fallback = lambda *fallback_args, **fallback_kwargs: _dtype_compatible_fallback(
             original, *fallback_args, **fallback_kwargs
         )
-        if _sparse_dense_warmup(kwargs.get("transformer_options"), dense_warmup_ratio, warmup_state):
+        transformer_options = kwargs.get("transformer_options")
+        if _sparse_dense_schedule(
+            transformer_options,
+            dense_warmup_ratio,
+            dense_tail_ratio,
+            warmup_state,
+        ) or _sparse_dense_layer(transformer_options, dense_prefix_layers):
             return turing_sage_attention(fallback, *args, **kwargs)
         return turing_sol_sparse_attention(
             fallback,
             *args,
             min_sequence_tokens=min_sequence_tokens,
-            attention_mass_recall=attention_mass_recall,
+            routing_threshold=routing_threshold,
             prefix_policy=prefix_policy,
             manual_prefix_tokens=manual_prefix_tokens,
             local_block_radius=local_block_radius,
+            temporal_neighbor_frames=temporal_neighbor_frames,
             **kwargs,
         )
 
@@ -723,21 +821,27 @@ def make_sparse_attention_override(
 def apply_sparse_attention_patch(
     model,
     min_sequence_tokens: int = 0,
-    attention_mass_recall: float = SPARSE_ATTENTION_MASS_RECALL,
+    routing_threshold: float = SPARSE_ROUTING_THRESHOLD,
     prefix_policy: str = SPARSE_PREFIX_POLICY,
     manual_prefix_tokens: int = 0,
     local_block_radius: int = SPARSE_LOCAL_BLOCK_RADIUS,
+    temporal_neighbor_frames: int = SPARSE_TEMPORAL_NEIGHBOR_FRAMES,
     dense_warmup_ratio: float = SPARSE_DENSE_WARMUP_RATIO,
+    dense_tail_ratio: float = SPARSE_DENSE_TAIL_RATIO,
+    dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
 ):
     patched = model.clone()
     override = make_sparse_attention_override(
         patched.load_device,
         min_sequence_tokens=min_sequence_tokens,
-        attention_mass_recall=attention_mass_recall,
+        routing_threshold=routing_threshold,
         prefix_policy=prefix_policy,
         manual_prefix_tokens=manual_prefix_tokens,
         local_block_radius=local_block_radius,
+        temporal_neighbor_frames=temporal_neighbor_frames,
         dense_warmup_ratio=dense_warmup_ratio,
+        dense_tail_ratio=dense_tail_ratio,
+        dense_prefix_layers=dense_prefix_layers,
     )
     transformer_options = patched.model_options.setdefault("transformer_options", {})
     transformer_options["optimized_attention_override"] = override
@@ -746,14 +850,19 @@ def apply_sparse_attention_patch(
         "bundled_turing_sol_sparse_experimental"
     )
     LOG.info(
-        "Sol sparse attention patch enabled: min_sequence=%s mass_recall=%.2f "
-        "prefix_policy=%s manual_prefix=%d local_radius=%d dense_warmup=%.2f",
+        "Sol sparse attention patch enabled: min_sequence=%s threshold=%.2f "
+        "prefix_policy=%s manual_prefix=%d local_radius=%d temporal_frames=%d "
+        "dense_warmup=%.2f "
+        "dense_tail=%.2f dense_prefix_layers=%d",
         min_sequence_tokens or "auto",
-        attention_mass_recall,
+        routing_threshold,
         prefix_policy,
         manual_prefix_tokens,
         local_block_radius,
+        temporal_neighbor_frames,
         dense_warmup_ratio,
+        dense_tail_ratio,
+        dense_prefix_layers,
     )
     return patched
 

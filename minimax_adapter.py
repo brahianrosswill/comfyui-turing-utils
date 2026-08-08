@@ -445,11 +445,45 @@ def _make_mlp_forward(mlp: torch.nn.Module, audit: _RuntimeDispatchAudit):
     return types.MethodType(forward, mlp)
 
 
+def _minimax_temporal_topology(base_model, diffusion_model, mod_segments):
+    """Describe only the contiguous target-video tail; the sparse kernel stays generic."""
+    if base_model is None or diffusion_model is None or not mod_segments:
+        return {}
+    context = getattr(base_model, _MEMORY_CONTEXT_ATTR, None)
+    latent_shapes = context.get("latent_shapes") if isinstance(context, dict) else None
+    if not isinstance(latent_shapes, (list, tuple)) or not latent_shapes:
+        return {}
+    video_shape = tuple(int(value) for value in latent_shapes[0])
+    if len(video_shape) != 5:
+        return {}
+    patch_size = tuple(int(value) for value in diffusion_model.patch_size)
+    if len(patch_size) != 3 or any(value <= 0 for value in patch_size):
+        return {}
+    pt, ph, pw = patch_size
+    frames = math.ceil(video_shape[2] / pt)
+    tokens_per_frame = (
+        math.ceil(video_shape[3] / ph) * math.ceil(video_shape[4] / pw)
+    )
+    topology_tokens = frames * tokens_per_frame
+    topology_start = int(mod_segments[-1][0])
+    if int(mod_segments[-1][1]) - topology_start != topology_tokens:
+        return {}
+    return {
+        "topology_start_tokens": topology_start,
+        "topology_tokens": topology_tokens,
+        "tokens_per_frame": tokens_per_frame,
+    }
+
+
 def _make_block_forward(
     block: torch.nn.Module,
     device_index: int,
     mod_gate,
     audit: _RuntimeDispatchAudit,
+    layer_index: int = 0,
+    layer_count: int = 0,
+    base_model=None,
+    diffusion_model=None,
 ):
     original = block.forward
 
@@ -470,9 +504,22 @@ def _make_block_forward(
             # visually plausible.
             dense_prefix_tokens = int(mod_segments[-1][0])
             layout = transformer_options.get(_ATTENTION_LAYOUT_KEY)
-            if not isinstance(layout, dict) or layout.get("dense_prefix_tokens") != dense_prefix_tokens:
+            expected_layout = {
+                "dense_prefix_tokens": dense_prefix_tokens,
+                "layer_index": layer_index,
+                "layer_count": layer_count,
+                **_minimax_temporal_topology(
+                    base_model,
+                    diffusion_model,
+                    mod_segments,
+                ),
+            }
+            if not isinstance(layout, dict) or any(
+                layout.get(key) != value for key, value in expected_layout.items()
+            ):
                 transformer_options[_ATTENTION_LAYOUT_KEY] = {
-                    "dense_prefix_tokens": dense_prefix_tokens,
+                    **(layout if isinstance(layout, dict) else {}),
+                    **expected_layout,
                 }
         blocker = _block_fusion_blocker(x, t_emb, device_index)
         audit.record("block", blocker is None, x, blocker)
@@ -539,7 +586,7 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
     expected_blocks = len(candidates) if callable(turing_segmented_rms_adaln) else 0
     audit = _RuntimeDispatchAudit(expected_blocks, eligible_fc2)
 
-    for name, block in candidates:
+    for layer_index, (name, block) in enumerate(candidates):
         if hasattr(block.mlp, "fc2") and is_turing_convrot_linear(block.mlp.fc2):
             model.add_object_patch(
                 f"{name}.mlp.forward",
@@ -549,7 +596,16 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
         if callable(turing_segmented_rms_adaln):
             model.add_object_patch(
                 f"{name}.forward",
-                _make_block_forward(block, index, _mod_gate, audit),
+                _make_block_forward(
+                    block,
+                    index,
+                    _mod_gate,
+                    audit,
+                    layer_index,
+                    len(candidates),
+                    root,
+                    diffusion_model,
+                ),
             )
             block_fusions += 1
 

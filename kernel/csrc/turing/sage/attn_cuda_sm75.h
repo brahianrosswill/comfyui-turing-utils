@@ -28,13 +28,17 @@ at::Tensor qk_int8_sv_f16_accum_f32_attn(at::Tensor query,
                     float sm_scale,
                     int return_lse);
 
-at::Tensor sol_sparse_f16_attn(at::Tensor query,
+at::Tensor sol_sparse_threshold_f16_attn(at::Tensor query,
                     at::Tensor key,
                     at::Tensor value,
                     at::Tensor output,
                     int prefix_tokens,
-                    float attention_mass_recall,
+                    float threshold_sigma,
                     int local_block_radius,
+                    int topology_start_tokens,
+                    int topology_tokens,
+                    int tokens_per_frame,
+                    int temporal_neighbor_frames,
                     float softmax_scale);
 
 #ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS

@@ -163,8 +163,10 @@ class TuringAttentionContractTest(unittest.TestCase):
             )
         self.assertIs(output, q)
         self.assertEqual(sparse.call_args.kwargs["prefix_tokens"], 0)
-        self.assertEqual(sparse.call_args.kwargs["attention_mass_recall"], 0.3)
+        self.assertEqual(sparse.call_args.kwargs["threshold_sigma"], 1.0)
         self.assertEqual(sparse.call_args.kwargs["local_block_radius"], 1)
+        self.assertEqual(sparse.call_args.kwargs["temporal_neighbor_frames"], 1)
+        self.assertEqual(sparse.call_args.kwargs["topology_tokens"], 0)
 
     def test_experimental_sparse_keeps_short_calls_dense(self):
         q = torch.zeros((1, 4, 256, 128), dtype=torch.bfloat16)
@@ -225,18 +227,26 @@ class TuringAttentionContractTest(unittest.TestCase):
                 q,
                 4,
                 skip_reshape=True,
-                attention_mass_recall=0.82,
+                routing_threshold=0.82,
                 prefix_policy="auto",
                 manual_prefix_tokens=192,
                 local_block_radius=3,
                 min_sequence_tokens=8000,
                 transformer_options={
-                    "turing_utils_attention_layout": {"dense_prefix_tokens": 320}
+                    "turing_utils_attention_layout": {
+                        "dense_prefix_tokens": 320,
+                        "topology_start_tokens": 320,
+                        "topology_tokens": 7680,
+                        "tokens_per_frame": 960,
+                    }
                 },
             )
         self.assertEqual(sparse.call_args.kwargs["prefix_tokens"], 320)
-        self.assertEqual(sparse.call_args.kwargs["attention_mass_recall"], 0.82)
+        self.assertEqual(sparse.call_args.kwargs["threshold_sigma"], 0.82)
         self.assertEqual(sparse.call_args.kwargs["local_block_radius"], 3)
+        self.assertEqual(sparse.call_args.kwargs["topology_start_tokens"], 320)
+        self.assertEqual(sparse.call_args.kwargs["topology_tokens"], 7680)
+        self.assertEqual(sparse.call_args.kwargs["tokens_per_frame"], 960)
 
     def test_sparse_prefix_policy_never_guesses_a_generic_layout(self):
         options = {
@@ -303,6 +313,28 @@ class TuringAttentionContractTest(unittest.TestCase):
                 )
             )
 
+    def test_sparse_dense_schedule_supports_a_tail_and_layer_metadata(self):
+        sample_sigmas = torch.tensor([1.0, 0.8, 0.5, 0.2, 0.0])
+        self.assertTrue(
+            turing_attention._sparse_dense_schedule(
+                {"sample_sigmas": sample_sigmas, "sigmas": sample_sigmas[3:4]},
+                0.0,
+                0.25,
+                {},
+            )
+        )
+        self.assertTrue(
+            turing_attention._sparse_dense_layer(
+                {"turing_utils_attention_layout": {"layer_index": 1}},
+                2,
+            )
+        )
+        self.assertFalse(
+            turing_attention._sparse_dense_layer(
+                {"turing_utils_attention_layout": {"layer_index": 2}},
+                2,
+            )
+        )
     def test_experimental_sparse_fp32_uses_bf16_boundary_and_restores_output(self):
         q = torch.zeros((1, 1, 4096, 128), dtype=torch.float32)
         kernel_output = torch.ones_like(q, dtype=torch.bfloat16)

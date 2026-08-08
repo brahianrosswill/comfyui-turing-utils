@@ -59,23 +59,31 @@ def qk_int8_sv_f16_varlen_accum_f32_attn(
     )
 
 
-def sol_sparse_f16_attn(
+def sol_sparse_threshold_f16_attn(
     query,
     key,
     value,
     output,
     prefix_tokens,
-    attention_mass_recall,
+    threshold_sigma,
     local_block_radius,
+    topology_start_tokens,
+    topology_tokens,
+    tokens_per_frame,
+    temporal_neighbor_frames,
     sm_scale,
 ):
-    return _qattn_sm75.sol_sparse_f16_attn(
+    return _qattn_sm75.sol_sparse_threshold_f16_attn(
         query,
         key,
         value,
         output,
         prefix_tokens,
-        attention_mass_recall,
+        threshold_sigma,
         local_block_radius,
+        topology_start_tokens,
+        topology_tokens,
+        tokens_per_frame,
+        temporal_neighbor_frames,
         sm_scale,
     )

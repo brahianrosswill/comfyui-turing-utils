@@ -234,7 +234,11 @@ class MiniMaxAdapterTest(unittest.TestCase):
         )
         self.assertEqual(
             options[minimax_adapter._ATTENTION_LAYOUT_KEY],
-            {"dense_prefix_tokens": 16},
+            {
+                "dense_prefix_tokens": 16,
+                "layer_index": 0,
+                "layer_count": 0,
+            },
         )
 
     def test_memory_rows_match_packed_layout_for_multimodal_references(self):
@@ -397,6 +401,49 @@ class MiniMaxAdapterTest(unittest.TestCase):
         self.assertEqual(result, "ok")
         self.assertEqual(seen[0]["latent_shapes"], latent_shapes)
         self.assertFalse(hasattr(base, minimax_adapter._MEMORY_CONTEXT_ATTR))
+
+    def test_temporal_topology_matches_the_target_video_tail(self):
+        base = SimpleNamespace()
+        latent_shapes = self._latent_shapes()
+        setattr(
+            base,
+            minimax_adapter._MEMORY_CONTEXT_ATTR,
+            {"latent_shapes": latent_shapes},
+        )
+        # Seven frames at 8x10 latent resolution with a 1x2x2 patch become
+        # seven contiguous 20-token frames.  Only the final target-video
+        # segment is described; text, references and target audio stay prefix.
+        topology = minimax_adapter._minimax_temporal_topology(
+            base,
+            self._diffusion_spec(),
+            [(0, 64, 0), (64, 88, 2), (88, 228, 3)],
+        )
+
+        self.assertEqual(
+            topology,
+            {
+                "topology_start_tokens": 88,
+                "topology_tokens": 140,
+                "tokens_per_frame": 20,
+            },
+        )
+
+    def test_temporal_topology_rejects_a_mismatched_packed_segment(self):
+        base = SimpleNamespace()
+        setattr(
+            base,
+            minimax_adapter._MEMORY_CONTEXT_ATTR,
+            {"latent_shapes": self._latent_shapes()},
+        )
+
+        self.assertEqual(
+            minimax_adapter._minimax_temporal_topology(
+                base,
+                self._diffusion_spec(),
+                [(0, 64, 0), (64, 200, 3)],
+            ),
+            {},
+        )
 
     def test_runtime_memory_condition_reports_the_same_plan(self):
         class Base:

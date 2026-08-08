@@ -24,7 +24,7 @@ class FakeModel:
 
 
 class AttentionBackendsTest(unittest.TestCase):
-    def test_sparse_backend_requires_the_top_p_kernel_abi(self):
+    def test_sparse_backend_requires_the_threshold_kernel_abi(self):
         sage_module = SimpleNamespace(sparse_available=lambda: True)
         with mock.patch.dict(
             sys.modules,
@@ -37,7 +37,7 @@ class AttentionBackendsTest(unittest.TestCase):
         with mock.patch.dict(
             sys.modules,
             {
-                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.10.0"),
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.11.0"),
                 "comfyui_turing_utils_kernel.turing_sage": sage_module,
             },
         ):
@@ -320,11 +320,14 @@ class AttentionBackendsTest(unittest.TestCase):
             override = attention_backends.make_sparse_attention_override(
                 torch.device("cuda", 0),
                 min_sequence_tokens=8192,
-                attention_mass_recall=0.85,
+                routing_threshold=0.85,
                 prefix_policy="manual",
                 manual_prefix_tokens=256,
                 local_block_radius=2,
+                temporal_neighbor_frames=2,
                 dense_warmup_ratio=0.25,
+                dense_tail_ratio=0.1,
+                dense_prefix_layers=3,
             )
             output = override(
                 mock.Mock(),
@@ -340,10 +343,11 @@ class AttentionBackendsTest(unittest.TestCase):
         stable_preflight.assert_called_once_with(torch.device("cuda", 0))
         preflight.assert_called_once_with(torch.device("cuda", 0))
         self.assertEqual(sparse.call_args.kwargs["min_sequence_tokens"], 8192)
-        self.assertEqual(sparse.call_args.kwargs["attention_mass_recall"], 0.85)
+        self.assertEqual(sparse.call_args.kwargs["routing_threshold"], 0.85)
         self.assertEqual(sparse.call_args.kwargs["prefix_policy"], "manual")
         self.assertEqual(sparse.call_args.kwargs["manual_prefix_tokens"], 256)
         self.assertEqual(sparse.call_args.kwargs["local_block_radius"], 2)
+        self.assertEqual(sparse.call_args.kwargs["temporal_neighbor_frames"], 2)
         self.assertEqual(
             override.turing_utils_attention_implementation,
             "bundled_turing_sol_sparse_experimental",

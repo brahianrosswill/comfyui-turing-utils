@@ -36,19 +36,25 @@ class SparseAttentionNodeTest(unittest.TestCase):
             (
                 "model",
                 "min_sequence_tokens",
-                "attention_mass_recall",
+                "routing_threshold",
                 "prefix_policy",
                 "manual_prefix_tokens",
                 "local_block_radius",
+                "temporal_neighbor_frames",
                 "dense_warmup_ratio",
+                "dense_tail_ratio",
+                "dense_prefix_layers",
             ),
         )
         self.assertEqual(inputs["min_sequence_tokens"][1]["default"], 0)
-        self.assertEqual(inputs["attention_mass_recall"][1]["default"], 0.3)
+        self.assertEqual(inputs["routing_threshold"][1]["default"], 1.0)
         self.assertEqual(inputs["prefix_policy"][0][0], "auto")
         self.assertEqual(inputs["manual_prefix_tokens"][1]["default"], 0)
         self.assertEqual(inputs["local_block_radius"][1]["default"], 1)
-        self.assertEqual(inputs["dense_warmup_ratio"][1]["default"], 0.0)
+        self.assertEqual(inputs["temporal_neighbor_frames"][1]["default"], 1)
+        self.assertEqual(inputs["dense_warmup_ratio"][1]["default"], 0.25)
+        self.assertEqual(inputs["dense_tail_ratio"][1]["default"], 0.0)
+        self.assertEqual(inputs["dense_prefix_layers"][1]["default"], 2)
 
     def test_patch_clones_model_and_installs_generic_override(self):
         model = FakePatcher()
@@ -59,11 +65,14 @@ class SparseAttentionNodeTest(unittest.TestCase):
             patched = attention_backends.apply_sparse_attention_patch(
                 model,
                 min_sequence_tokens=8192,
-                attention_mass_recall=0.85,
+                routing_threshold=0.85,
                 prefix_policy="manual",
                 manual_prefix_tokens=256,
                 local_block_radius=2,
+                temporal_neighbor_frames=2,
                 dense_warmup_ratio=0.25,
+                dense_tail_ratio=0.1,
+                dense_prefix_layers=3,
             )
 
         self.assertIsNot(patched, model)
@@ -76,11 +85,14 @@ class SparseAttentionNodeTest(unittest.TestCase):
         make_override.assert_called_once_with(
             torch.device("cuda", 0),
             min_sequence_tokens=8192,
-            attention_mass_recall=0.85,
+            routing_threshold=0.85,
             prefix_policy="manual",
             manual_prefix_tokens=256,
             local_block_radius=2,
+            temporal_neighbor_frames=2,
             dense_warmup_ratio=0.25,
+            dense_tail_ratio=0.1,
+            dense_prefix_layers=3,
         )
 
     def test_node_returns_the_patched_model(self):
@@ -90,17 +102,20 @@ class SparseAttentionNodeTest(unittest.TestCase):
             "attention_nodes.apply_sparse_attention_patch", return_value=patched
         ) as apply_patch:
             output = attention_nodes.SolSparseAttentionPatch().patch(
-                model, 8192, 0.85, "manual", 256, 2, 0.25
+                model, 8192, 0.85, "manual", 256, 2, 2, 0.25, 0.1, 3
             )
         self.assertEqual(output, (patched,))
         apply_patch.assert_called_once_with(
             model,
             min_sequence_tokens=8192,
-            attention_mass_recall=0.85,
+            routing_threshold=0.85,
             prefix_policy="manual",
             manual_prefix_tokens=256,
             local_block_radius=2,
+            temporal_neighbor_frames=2,
             dense_warmup_ratio=0.25,
+            dense_tail_ratio=0.1,
+            dense_prefix_layers=3,
         )
 
 
