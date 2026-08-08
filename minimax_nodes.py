@@ -169,31 +169,31 @@ class MiniMaxH3ProgressiveResolutionPatch:
                     "INT",
                     {
                         "default": 2,
-                        "min": 1,
+                        "min": 0,
                         "max": 1000,
                         "step": 1,
-                        "tooltip": "Number of initial model evaluations to run at the lower spatial resolution.",
+                        "tooltip": "Number of initial model evaluations to run at the low-stage short edge.",
                     },
                 ),
                 "input_downscale": (
                     ["sigma_blend", "nearest-exact", "area"],
                     {
                         "default": "sigma_blend",
-                        "tooltip": "Sigma blend transitions from noise-preserving nearest sampling toward area filtering during the low-resolution phase.",
+                        "tooltip": "Sigma blend transitions from noise-preserving nearest sampling toward area filtering across the combined low and medium stages.",
                     },
                 ),
                 "output_upscale": (
                     ["bilinear", "bicubic", "nearest-exact"],
                     {
                         "default": "bilinear",
-                        "tooltip": "Interpolation used to return the low-resolution denoised video prediction to the sampler's final resolution.",
+                        "tooltip": "Interpolation used to return each staged denoised video prediction to the sampler's final resolution.",
                     },
                 ),
                 "visual_condition_policy": (
                     ["resize_keyframes", "keep_original"],
                     {
                         "default": "resize_keyframes",
-                        "tooltip": "Resize already-encoded first/last-frame latents for early calls, or retain their final-resolution condition tokens.",
+                        "tooltip": "Resize already-encoded first/last-frame latents for staged calls, or retain their final-resolution condition tokens.",
                     },
                 ),
             },
@@ -202,7 +202,27 @@ class MiniMaxH3ProgressiveResolutionPatch:
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Log the resolved low-resolution latent geometry once per sampling run.",
+                        "tooltip": "Log the resolved latent geometry once for each active stage per sampling run.",
+                    },
+                ),
+                "medium_short_edge": (
+                    "INT",
+                    {
+                        "default": 720,
+                        "min": 32,
+                        "max": 16384,
+                        "step": 32,
+                        "tooltip": "After the low stage, H3 DiT calls use this pixel short edge. Stage names describe order; this value may be smaller than low_short_edge.",
+                    },
+                ),
+                "medium_resolution_steps": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 1000,
+                        "step": 1,
+                        "tooltip": "Number of model evaluations after the low stage to run at medium_short_edge. Zero disables this stage.",
                     },
                 ),
             },
@@ -224,12 +244,16 @@ class MiniMaxH3ProgressiveResolutionPatch:
         output_upscale: str = "bilinear",
         visual_condition_policy: str = "resize_keyframes",
         debug: bool = False,
+        medium_short_edge: int = 720,
+        medium_resolution_steps: int = 0,
     ):
         return (
             apply_h3_progressive_resolution_patch(
                 model,
                 low_short_edge=low_short_edge,
                 low_resolution_steps=low_resolution_steps,
+                medium_short_edge=medium_short_edge,
+                medium_resolution_steps=medium_resolution_steps,
                 input_downscale=input_downscale,
                 output_upscale=output_upscale,
                 visual_condition_policy=visual_condition_policy,

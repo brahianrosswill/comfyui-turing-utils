@@ -554,6 +554,8 @@ def _make_block_forward(
 class _H3ProgressiveResolutionConfig:
     low_short_edge: int
     low_resolution_steps: int
+    medium_short_edge: int
+    medium_resolution_steps: int
     input_downscale: str
     output_upscale: str
     visual_condition_policy: str
@@ -629,13 +631,13 @@ def _downsample_h3_video(
     # deterministic blend avoids injecting a second, unrelated noise trajectory.
     nearest = _resize_h3_video(video, height, width, "nearest-exact")
     area = _resize_h3_video(video, height, width, "area")
-    low_steps = max(int(state.get("low_steps", 1)), 1)
+    progressive_steps = max(int(state.get("progressive_steps", 1)), 1)
     step = max(int(state.get("step", 0)), 0)
-    low_sigmas = state.get("low_sigmas", ())
-    if len(low_sigmas) >= 2:
-        sigma_start = float(low_sigmas[0])
-        sigma_end = float(low_sigmas[-1])
-        sigma = float(low_sigmas[min(step, len(low_sigmas) - 1)])
+    progressive_sigmas = state.get("progressive_sigmas", ())
+    if len(progressive_sigmas) >= 2:
+        sigma_start = float(progressive_sigmas[0])
+        sigma_end = float(progressive_sigmas[-1])
+        sigma = float(progressive_sigmas[min(step, len(progressive_sigmas) - 1)])
         denominator = sigma_start - sigma_end
         nearest_weight = (
             (sigma - sigma_end) / denominator
@@ -644,7 +646,7 @@ def _downsample_h3_video(
         )
         nearest_weight = min(max(nearest_weight, 0.0), 1.0)
     else:
-        nearest_weight = max(0.0, 1.0 - float(step) / float(low_steps))
+        nearest_weight = max(0.0, 1.0 - float(step) / float(progressive_steps))
     return torch.lerp(area, nearest, nearest_weight)
 
 
@@ -814,20 +816,27 @@ def _make_h3_progressive_wrappers(config: _H3ProgressiveResolutionConfig):
             sigmas = args[3]
         total_steps = max(int(getattr(sigmas, "shape", (0,))[-1]) - 1, 0)
         low_steps = min(max(int(config.low_resolution_steps), 0), total_steps)
-        if low_steps <= 0:
+        medium_steps = min(
+            max(int(config.medium_resolution_steps), 0),
+            total_steps - low_steps,
+        )
+        progressive_steps = low_steps + medium_steps
+        if progressive_steps <= 0:
             return executor(*args, **kwargs)
 
         state = {
             "step": 0,
             "low_steps": low_steps,
+            "medium_steps": medium_steps,
+            "progressive_steps": progressive_steps,
             "total_steps": total_steps,
-            "low_sigmas": (
-                sigmas[:low_steps + 1].detach().to("cpu", torch.float32).tolist()
+            "progressive_sigmas": (
+                sigmas[:progressive_steps + 1].detach().to("cpu", torch.float32).tolist()
                 if torch.is_tensor(sigmas)
                 else ()
             ),
             "condition_cache": {},
-            "logged": False,
+            "logged_stages": set(),
             "fallback_logged": False,
         }
         callback = kwargs.get("callback")
@@ -857,12 +866,12 @@ def _make_h3_progressive_wrappers(config: _H3ProgressiveResolutionConfig):
 
     def calc_cond_batch_wrapper(executor, model, conds, x_in, timestep, model_options):
         state = runtime.get()
-        if state is None or int(state["step"]) >= int(state["low_steps"]):
+        if state is None or int(state["step"]) >= int(state["progressive_steps"]):
             return executor(model, conds, x_in, timestep, model_options)
         if not _h3_conds_support_progressive_resize(conds):
             if config.debug and not state["fallback_logged"]:
                 LOG.warning(
-                    "H3 progressive resolution skipped a low-resolution step because spatial areas, masks, or controls are attached"
+                    "H3 progressive resolution skipped a staged step because spatial areas, masks, or controls are attached"
                 )
                 state["fallback_logged"] = True
             return executor(model, conds, x_in, timestep, model_options)
@@ -871,7 +880,13 @@ def _make_h3_progressive_wrappers(config: _H3ProgressiveResolutionConfig):
         if high_shapes is None:
             return executor(model, conds, x_in, timestep, model_options)
         video_shape = high_shapes[0]
-        low_h, low_w = _h3_progressive_target_hw(video_shape, config.low_short_edge)
+        if int(state["step"]) < int(state["low_steps"]):
+            stage_name = "low"
+            stage_short_edge = config.low_short_edge
+        else:
+            stage_name = "medium"
+            stage_short_edge = config.medium_short_edge
+        low_h, low_w = _h3_progressive_target_hw(video_shape, stage_short_edge)
         if (low_h, low_w) == tuple(video_shape[-2:]):
             return executor(model, conds, x_in, timestep, model_options)
 
@@ -895,10 +910,13 @@ def _make_h3_progressive_wrappers(config: _H3ProgressiveResolutionConfig):
             state,
         )
 
-        if config.debug and not state["logged"]:
+        if config.debug and stage_name not in state["logged_stages"]:
             LOG.warning(
-                "Experimental H3 progressive resolution active: steps=%d/%d video_latent=%sx%s -> %sx%s input=%s output=%s",
-                state["low_steps"],
+                "Experimental H3 progressive resolution active: stage=%s step_range=%d:%d total_processed=%d/%d video_latent=%sx%s -> %sx%s input=%s output=%s",
+                stage_name,
+                0 if stage_name == "low" else state["low_steps"],
+                state["low_steps"] if stage_name == "low" else state["progressive_steps"],
+                state["progressive_steps"],
                 state["total_steps"],
                 video_shape[-1],
                 video_shape[-2],
@@ -907,7 +925,7 @@ def _make_h3_progressive_wrappers(config: _H3ProgressiveResolutionConfig):
                 config.input_downscale,
                 config.output_upscale,
             )
-            state["logged"] = True
+            state["logged_stages"].add(stage_name)
 
         previous_memory_context = (
             getattr(model, _MEMORY_CONTEXT_ATTR, None) if model is not None else None
@@ -947,6 +965,8 @@ def apply_h3_progressive_resolution_patch(
     *,
     low_short_edge: int = 480,
     low_resolution_steps: int = 2,
+    medium_short_edge: int = 720,
+    medium_resolution_steps: int = 0,
     input_downscale: str = "sigma_blend",
     output_upscale: str = "bilinear",
     visual_condition_policy: str = "resize_keyframes",
@@ -964,14 +984,20 @@ def apply_h3_progressive_resolution_patch(
         raise ValueError(f"Unsupported visual_condition_policy: {visual_condition_policy}")
     if int(low_short_edge) < 32:
         raise ValueError("low_short_edge must be at least 32 pixels")
-    if int(low_resolution_steps) < 1:
-        raise ValueError("low_resolution_steps must be at least 1")
+    if int(medium_short_edge) < 32:
+        raise ValueError("medium_short_edge must be at least 32 pixels")
+    if int(low_resolution_steps) < 0:
+        raise ValueError("low_resolution_steps must be non-negative")
+    if int(medium_resolution_steps) < 0:
+        raise ValueError("medium_resolution_steps must be non-negative")
 
     import comfy.patcher_extension
 
     config = _H3ProgressiveResolutionConfig(
         low_short_edge=int(low_short_edge),
         low_resolution_steps=int(low_resolution_steps),
+        medium_short_edge=int(medium_short_edge),
+        medium_resolution_steps=int(medium_resolution_steps),
         input_downscale=input_downscale,
         output_upscale=output_upscale,
         visual_condition_policy=visual_condition_policy,
@@ -999,9 +1025,11 @@ def apply_h3_progressive_resolution_patch(
         cond_wrapper,
     )
     LOG.info(
-        "Enabled experimental H3 progressive resolution: short_edge=%d low_steps=%d input=%s output=%s visual_conditions=%s",
+        "Enabled experimental H3 progressive resolution: low_edge=%d low_steps=%d medium_edge=%d medium_steps=%d input=%s output=%s visual_conditions=%s",
         config.low_short_edge,
         config.low_resolution_steps,
+        config.medium_short_edge,
+        config.medium_resolution_steps,
         config.input_downscale,
         config.output_upscale,
         config.visual_condition_policy,

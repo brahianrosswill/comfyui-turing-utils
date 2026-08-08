@@ -46,9 +46,11 @@ only after its CUDA sources or required version change.
 - `Wan Video Frames Padding` exposes Wan-compatible frame padding.
 - `MiniMax H3 Video Frames Padding` pads to H3's `17*n+5` frame grid.
 - `Patch H3 Progressive Resolution (Experimental)` keeps one final-resolution
-  H3 video/audio latent but evaluates the first configured DiT steps at a lower
-  video short edge. Audio stays untouched, and already-encoded first/last-frame
-  latents can be resized and cached without running conditioning a second time.
+  H3 video/audio latent but can evaluate an initial low stage and a following
+  medium stage at independently configured video short edges. Stage names
+  describe execution order rather than size; either target may be larger than
+  the other. Audio stays untouched, and already-encoded first/last-frame latents
+  can be resized and cached without running conditioning a second time.
 - `Patch Sol Sparse Attention (Experimental)` applies the model-independent
   long-sequence sparse backend. It uses an input-adaptive statistical threshold,
   keeps skipped-block centroid residuals (two 32-token centroids by default),
@@ -77,13 +79,17 @@ Generic dtype, attention, and fused operators remain model-independent.
 The progressive-resolution patch is explicit and is never selected by a
 loader. Build H3 conditioning once at the final output size, then connect the
 model through the patch before constructing the guider or KSampler. The sampler
-continues to own the final-resolution noisy state. During early steps the patch
-temporarily repacks a lower-resolution video stream with the unchanged audio
-stream, runs the normal H3 conditioning path, and enlarges the denoised video
-prediction before returning it to the sampler. H3 rebuilds its packed layout
-from the temporary latent shape. `sigma_blend` is the default input policy: it
-blends noise-variance-preserving nearest sampling with area filtering over the
-low-resolution phase. Spatial condition areas, masks, controls, and GLIGEN are
+continues to own the final-resolution noisy state. The first
+`low_resolution_steps` evaluations use `low_short_edge`; the following
+`medium_resolution_steps` evaluations use `medium_short_edge`, so their sum is
+the complete staged interval. During those steps the patch temporarily repacks
+a staged-resolution video stream with the unchanged audio stream, runs the
+normal H3 conditioning path, and enlarges the denoised video prediction before
+returning it to the sampler. A target at or above the final short edge is a
+no-op for that stage. H3 rebuilds its packed layout from the temporary latent
+shape. `sigma_blend` is the default input policy: it blends
+noise-variance-preserving nearest sampling with area filtering over the complete
+staged interval. Spatial condition areas, masks, controls, and GLIGEN are
 currently unsupported and make that model call fall back to full resolution.
 Peak memory is still set by the later final-resolution steps, and final quality
 and speed require local workflow validation.
