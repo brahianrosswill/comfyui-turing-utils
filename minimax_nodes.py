@@ -4,6 +4,7 @@ from comfy_api.latest import io
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
 
 try:
+    from .minimax_adapter import apply_h3_progressive_resolution_patch
     from .reference_nodes import (
         AudioReferenceSet,
         AudioReferences,
@@ -14,6 +15,7 @@ try:
     )
     from .wan_nodes import WanVideoFramesPadding, _pad_first_dim
 except ImportError:
+    from minimax_adapter import apply_h3_progressive_resolution_patch
     from reference_nodes import (
         AudioReferenceSet,
         AudioReferences,
@@ -144,4 +146,93 @@ class MiniMaxH3ReferenceConditionHub(io.ComfyNode):
             ref_videos=ref_videos,
             ref_video_audios=ref_video_audios,
             ref_audios=ref_audios,
+        )
+
+
+class MiniMaxH3ProgressiveResolutionPatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "low_short_edge": (
+                    "INT",
+                    {
+                        "default": 480,
+                        "min": 32,
+                        "max": 16384,
+                        "step": 32,
+                        "tooltip": "Early H3 DiT calls use this pixel short edge while the sampler keeps the final-resolution latent.",
+                    },
+                ),
+                "low_resolution_steps": (
+                    "INT",
+                    {
+                        "default": 2,
+                        "min": 1,
+                        "max": 1000,
+                        "step": 1,
+                        "tooltip": "Number of initial model evaluations to run at the lower spatial resolution.",
+                    },
+                ),
+                "input_downscale": (
+                    ["sigma_blend", "nearest-exact", "area"],
+                    {
+                        "default": "sigma_blend",
+                        "tooltip": "Sigma blend transitions from noise-preserving nearest sampling toward area filtering during the low-resolution phase.",
+                    },
+                ),
+                "output_upscale": (
+                    ["bilinear", "bicubic", "nearest-exact"],
+                    {
+                        "default": "bilinear",
+                        "tooltip": "Interpolation used to return the low-resolution denoised video prediction to the sampler's final resolution.",
+                    },
+                ),
+                "visual_condition_policy": (
+                    ["resize_keyframes", "keep_original"],
+                    {
+                        "default": "resize_keyframes",
+                        "tooltip": "Resize already-encoded first/last-frame latents for early calls, or retain their final-resolution condition tokens.",
+                    },
+                ),
+            },
+            "optional": {
+                "debug": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Log the resolved low-resolution latent geometry once per sampling run.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "patch"
+    CATEGORY = "Turing Utils/patches"
+    TITLE = "Patch H3 Progressive Resolution (Experimental)"
+    EXPERIMENTAL = True
+
+    def patch(
+        self,
+        model,
+        low_short_edge: int = 480,
+        low_resolution_steps: int = 2,
+        input_downscale: str = "sigma_blend",
+        output_upscale: str = "bilinear",
+        visual_condition_policy: str = "resize_keyframes",
+        debug: bool = False,
+    ):
+        return (
+            apply_h3_progressive_resolution_patch(
+                model,
+                low_short_edge=low_short_edge,
+                low_resolution_steps=low_resolution_steps,
+                input_downscale=input_downscale,
+                output_upscale=output_upscale,
+                visual_condition_policy=visual_condition_policy,
+                debug=debug,
+            ),
         )

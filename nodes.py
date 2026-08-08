@@ -3,7 +3,11 @@ from __future__ import annotations
 from .attention_nodes import SolSparseAttentionPatch
 from .bernini_nodes import BerniniContextWindowsCore, BerniniInpaintCondition
 from .convrot_nodes import ConvRotCLIPLoader, ConvRotDiffusionModelLoader
-from .minimax_nodes import MiniMaxH3ReferenceConditionHub, MiniMaxH3VideoFramesPadding
+from .minimax_nodes import (
+    MiniMaxH3ProgressiveResolutionPatch,
+    MiniMaxH3ReferenceConditionHub,
+    MiniMaxH3VideoFramesPadding,
+)
 from .reference_nodes import ReferenceAudioHub, ReferenceImageHub, ReferenceVideoHub
 from .wan_nodes import WanVideoFramesPadding
 
@@ -19,6 +23,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsReferenceVideoHub": ReferenceVideoHub,
     "TuringUtilsReferenceAudioHub": ReferenceAudioHub,
     "TuringUtilsMiniMaxH3ReferenceConditionHub": MiniMaxH3ReferenceConditionHub,
+    "TuringUtilsMiniMaxH3ProgressiveResolutionPatch": MiniMaxH3ProgressiveResolutionPatch,
     "TuringUtilsSolSparseAttentionPatch": SolSparseAttentionPatch,
 }
 
@@ -33,5 +38,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsReferenceVideoHub": "Reference Video Hub",
     "TuringUtilsReferenceAudioHub": "Reference Audio Hub",
     "TuringUtilsMiniMaxH3ReferenceConditionHub": "MiniMax H3 Reference Condition (Hub)",
+    "TuringUtilsMiniMaxH3ProgressiveResolutionPatch": "Patch H3 Progressive Resolution (Experimental)",
     "TuringUtilsSolSparseAttentionPatch": "Patch Sol Sparse Attention (Experimental)",
 }

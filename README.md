@@ -45,6 +45,10 @@ only after its CUDA sources or required version change.
   selectable absolute or official relative temporal positions.
 - `Wan Video Frames Padding` exposes Wan-compatible frame padding.
 - `MiniMax H3 Video Frames Padding` pads to H3's `17*n+5` frame grid.
+- `Patch H3 Progressive Resolution (Experimental)` keeps one final-resolution
+  H3 video/audio latent but evaluates the first configured DiT steps at a lower
+  video short edge. Audio stays untouched, and already-encoded first/last-frame
+  latents can be resized and cached without running conditioning a second time.
 - `Patch Sol Sparse Attention (Experimental)` applies the model-independent
   long-sequence sparse backend. It uses an input-adaptive statistical threshold,
   keeps skipped-block centroid residuals (two 32-token centroids by default),
@@ -69,6 +73,20 @@ keyframes, and multimodal references. Wan/Bernini integration is isolated in
 and leaves Wan block normalization, projections, attention dispatch, and
 feed-forward execution to ComfyUI.
 Generic dtype, attention, and fused operators remain model-independent.
+
+The progressive-resolution patch is explicit and is never selected by a
+loader. Build H3 conditioning once at the final output size, then connect the
+model through the patch before constructing the guider or KSampler. The sampler
+continues to own the final-resolution noisy state. During early steps the patch
+temporarily repacks a lower-resolution video stream with the unchanged audio
+stream, runs the normal H3 conditioning path, and enlarges the denoised video
+prediction before returning it to the sampler. H3 rebuilds its packed layout
+from the temporary latent shape. `sigma_blend` is the default input policy: it
+blends noise-variance-preserving nearest sampling with area filtering over the
+low-resolution phase. Spatial condition areas, masks, controls, and GLIGEN are
+currently unsupported and make that model call fall back to full resolution.
+Peak memory is still set by the later final-resolution steps, and final quality
+and speed require local workflow validation.
 
 The bundled Sage backend accepts FP16/BF16 Q/K/V, GQA, causal attention,
 unequal sequence lengths, HND/NHD layouts, and head dimensions up to 128. FP32
