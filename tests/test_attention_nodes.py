@@ -35,7 +35,6 @@ class SparseAttentionNodeTest(unittest.TestCase):
             tuple(inputs),
             (
                 "model",
-                "min_sequence_tokens",
                 "routing_threshold",
                 "prefix_policy",
                 "manual_prefix_tokens",
@@ -44,12 +43,12 @@ class SparseAttentionNodeTest(unittest.TestCase):
                 "skipped_residual",
                 "minimum_route_density",
                 "maximum_route_density",
-                "dense_warmup_ratio",
-                "dense_tail_ratio",
+                "dense_prefix_steps",
+                "dense_suffix_steps",
                 "dense_prefix_layers",
+                "dense_suffix_layers",
             ),
         )
-        self.assertEqual(inputs["min_sequence_tokens"][1]["default"], 0)
         self.assertEqual(inputs["routing_threshold"][1]["default"], 1.0)
         self.assertEqual(inputs["prefix_policy"][0][0], "auto")
         self.assertEqual(inputs["manual_prefix_tokens"][1]["default"], 0)
@@ -58,9 +57,12 @@ class SparseAttentionNodeTest(unittest.TestCase):
         self.assertEqual(inputs["skipped_residual"][0][0], "2x32")
         self.assertEqual(inputs["minimum_route_density"][1]["default"], 0.0)
         self.assertEqual(inputs["maximum_route_density"][1]["default"], 1.0)
-        self.assertEqual(inputs["dense_warmup_ratio"][1]["default"], 0.25)
-        self.assertEqual(inputs["dense_tail_ratio"][1]["default"], 0.0)
-        self.assertEqual(inputs["dense_prefix_layers"][1]["default"], 2)
+        self.assertEqual(inputs["dense_prefix_steps"][0], "INT")
+        self.assertEqual(inputs["dense_prefix_steps"][1]["default"], 0)
+        self.assertEqual(inputs["dense_suffix_steps"][0], "INT")
+        self.assertEqual(inputs["dense_suffix_steps"][1]["default"], 0)
+        self.assertEqual(inputs["dense_prefix_layers"][1]["default"], 1)
+        self.assertEqual(inputs["dense_suffix_layers"][1]["default"], 1)
         optional = attention_nodes.SolSparseAttentionPatch.INPUT_TYPES()["optional"]
         self.assertEqual(tuple(optional), ("debug_route_density",))
         self.assertFalse(optional["debug_route_density"][1]["default"])
@@ -82,9 +84,10 @@ class SparseAttentionNodeTest(unittest.TestCase):
                 skipped_residual="1x64",
                 minimum_route_density=0.2,
                 maximum_route_density=0.7,
-                dense_warmup_ratio=0.25,
-                dense_tail_ratio=0.1,
+                dense_prefix_steps=2,
+                dense_suffix_steps=1,
                 dense_prefix_layers=3,
+                dense_suffix_layers=4,
             )
 
         self.assertIsNot(patched, model)
@@ -105,9 +108,10 @@ class SparseAttentionNodeTest(unittest.TestCase):
             skipped_residual="1x64",
             minimum_route_density=0.2,
             maximum_route_density=0.7,
-            dense_warmup_ratio=0.25,
-            dense_tail_ratio=0.1,
+            dense_prefix_steps=2,
+            dense_suffix_steps=1,
             dense_prefix_layers=3,
+            dense_suffix_layers=4,
             debug_route_density=False,
         )
 
@@ -119,7 +123,6 @@ class SparseAttentionNodeTest(unittest.TestCase):
         ) as apply_patch:
             output = attention_nodes.SolSparseAttentionPatch().patch(
                 model,
-                8192,
                 0.85,
                 "manual",
                 256,
@@ -128,14 +131,14 @@ class SparseAttentionNodeTest(unittest.TestCase):
                 "1x64",
                 0.2,
                 0.7,
-                0.25,
-                0.1,
+                2,
+                1,
                 3,
+                4,
             )
         self.assertEqual(output, (patched,))
         apply_patch.assert_called_once_with(
             model,
-            min_sequence_tokens=8192,
             routing_threshold=0.85,
             prefix_policy="manual",
             manual_prefix_tokens=256,
@@ -144,9 +147,10 @@ class SparseAttentionNodeTest(unittest.TestCase):
             skipped_residual="1x64",
             minimum_route_density=0.2,
             maximum_route_density=0.7,
-            dense_warmup_ratio=0.25,
-            dense_tail_ratio=0.1,
+            dense_prefix_steps=2,
+            dense_suffix_steps=1,
             dense_prefix_layers=3,
+            dense_suffix_layers=4,
             debug_route_density=False,
         )
 

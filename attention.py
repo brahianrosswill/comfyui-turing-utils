@@ -26,9 +26,10 @@ SPARSE_TEMPORAL_NEIGHBOR_FRAMES = 1
 SPARSE_SKIPPED_RESIDUAL = "2x32"
 SPARSE_MINIMUM_ROUTE_DENSITY = 0.0
 SPARSE_MAXIMUM_ROUTE_DENSITY = 1.0
-SPARSE_DENSE_WARMUP_RATIO = 0.25
-SPARSE_DENSE_TAIL_RATIO = 0.0
-SPARSE_DENSE_PREFIX_LAYERS = 2
+SPARSE_DENSE_PREFIX_STEPS = 0
+SPARSE_DENSE_SUFFIX_STEPS = 0
+SPARSE_DENSE_PREFIX_LAYERS = 1
+SPARSE_DENSE_SUFFIX_LAYERS = 1
 SPARSE_LAYOUT_KEY = "turing_utils_attention_layout"
 _PREFLIGHTED_DEVICES: set[int] = set()
 _PREFLIGHTED_SPARSE_DEVICES: set[int] = set()
@@ -480,15 +481,15 @@ def _sparse_temporal_topology(transformer_options, sequence_limit: int):
 
 def _sparse_dense_schedule(
     transformer_options,
-    warmup_ratio: float,
-    tail_ratio: float,
+    prefix_steps: int,
+    suffix_steps: int,
     state: dict[str, object],
     *,
     track_step: bool = False,
 ) -> bool:
     if (
-        warmup_ratio <= 0.0
-        and tail_ratio <= 0.0
+        prefix_steps <= 0
+        and suffix_steps <= 0
         and not track_step
     ) or not isinstance(transformer_options, dict):
         return False
@@ -511,10 +512,11 @@ def _sparse_dense_schedule(
     current = current_sigmas.flatten()[0].to(sample_sigmas)
     step = int(torch.argmin((sample_sigmas.flatten() - current).abs()).item())
     sampling_steps = sample_sigmas.numel() - 1
-    warmup_steps = math.ceil(sampling_steps * warmup_ratio)
-    tail_steps = math.ceil(sampling_steps * tail_ratio)
-    dense = step < warmup_steps or (
-        tail_steps > 0 and step >= sampling_steps - tail_steps
+    effective_prefix_steps = min(prefix_steps, sampling_steps)
+    effective_suffix_steps = min(suffix_steps, sampling_steps)
+    dense = step < effective_prefix_steps or (
+        effective_suffix_steps > 0
+        and step >= sampling_steps - effective_suffix_steps
     )
     state.clear()
     state.update(
@@ -523,32 +525,46 @@ def _sparse_dense_schedule(
         dense=dense,
         step=step,
         sampling_steps=sampling_steps,
-        warmup_steps=warmup_steps,
-        tail_steps=tail_steps,
+        prefix_steps=effective_prefix_steps,
+        suffix_steps=effective_suffix_steps,
     )
     return dense
 
 
-def _sparse_dense_warmup(
+def _sparse_dense_prefix_steps(
     transformer_options,
-    ratio: float,
+    steps: int,
     state: dict[str, object],
 ) -> bool:
-    """Compatibility wrapper retained for callers testing the warmup policy."""
-    return _sparse_dense_schedule(transformer_options, ratio, 0.0, state)
+    """Compatibility wrapper retained for callers testing the prefix-step policy."""
+    return _sparse_dense_schedule(transformer_options, steps, 0, state)
 
 
-def _sparse_dense_layer(transformer_options, dense_prefix_layers: int) -> bool:
-    if dense_prefix_layers <= 0 or not isinstance(transformer_options, dict):
+def _sparse_dense_layer(
+    transformer_options,
+    dense_prefix_layers: int,
+    dense_suffix_layers: int = 0,
+) -> bool:
+    if (dense_prefix_layers <= 0 and dense_suffix_layers <= 0) or not isinstance(
+        transformer_options, dict
+    ):
         return False
     layout = transformer_options.get(SPARSE_LAYOUT_KEY)
     if not isinstance(layout, dict):
         return False
     layer_index = layout.get("layer_index")
+    layer_count = layout.get("layer_count")
+    if not isinstance(layer_index, int) or isinstance(layer_index, bool):
+        return False
+    if 0 <= layer_index < dense_prefix_layers:
+        return True
     return (
-        isinstance(layer_index, int)
-        and not isinstance(layer_index, bool)
-        and 0 <= layer_index < dense_prefix_layers
+        dense_suffix_layers > 0
+        and isinstance(layer_count, int)
+        and not isinstance(layer_count, bool)
+        and layer_count > 0
+        and 0 <= layer_index < layer_count
+        and layer_index >= max(layer_count - dense_suffix_layers, 0)
     )
 
 
@@ -712,6 +728,10 @@ def turing_sol_sparse_attention(
     step = context.get("step")
     layer_index = context.get("layer_index")
     layer_count = context.get("layer_count")
+    last_sparse_layer = context.get(
+        "last_sparse_layer",
+        layer_count - 1 if isinstance(layer_count, int) else None,
+    )
     aggregate_route_stats = (
         debug_route_density
         and debug_route_state is not None
@@ -723,6 +743,9 @@ def turing_sol_sparse_attention(
         and not isinstance(layer_count, bool)
         and layer_count > 0
         and 0 <= layer_index < layer_count
+        and isinstance(last_sparse_layer, int)
+        and not isinstance(last_sparse_layer, bool)
+        and 0 <= last_sparse_layer < layer_count
     )
     collect_route_stats = debug_route_density and (
         aggregate_route_stats or kernel_key not in route_keys
@@ -757,7 +780,7 @@ def turing_sol_sparse_attention(
                 aggregate_key = (step, context.get("sampling_steps"), kernel_key)
                 entries = debug_route_state.setdefault(aggregate_key, [])
                 entries.append((selected_device, possible_blocks, layer_index))
-                if layer_index == layer_count - 1:
+                if layer_index == last_sparse_layer:
                     selected = torch.cat([entry[0] for entry in entries]).float()
                     possible = torch.tensor(
                         [entry[1] for entry in entries],
@@ -915,9 +938,10 @@ def make_sparse_attention_override(
     skipped_residual: str = SPARSE_SKIPPED_RESIDUAL,
     minimum_route_density: float = SPARSE_MINIMUM_ROUTE_DENSITY,
     maximum_route_density: float = SPARSE_MAXIMUM_ROUTE_DENSITY,
-    dense_warmup_ratio: float = SPARSE_DENSE_WARMUP_RATIO,
-    dense_tail_ratio: float = SPARSE_DENSE_TAIL_RATIO,
+    dense_prefix_steps: int = SPARSE_DENSE_PREFIX_STEPS,
+    dense_suffix_steps: int = SPARSE_DENSE_SUFFIX_STEPS,
     dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
+    dense_suffix_layers: int = SPARSE_DENSE_SUFFIX_LAYERS,
     debug_route_density: bool = False,
 ) -> Callable:
     min_sequence_tokens = int(min_sequence_tokens)
@@ -929,9 +953,10 @@ def make_sparse_attention_override(
     skipped_residual = str(skipped_residual).strip().lower()
     minimum_route_density = float(minimum_route_density)
     maximum_route_density = float(maximum_route_density)
-    dense_warmup_ratio = float(dense_warmup_ratio)
-    dense_tail_ratio = float(dense_tail_ratio)
+    dense_prefix_steps = int(dense_prefix_steps)
+    dense_suffix_steps = int(dense_suffix_steps)
     dense_prefix_layers = int(dense_prefix_layers)
+    dense_suffix_layers = int(dense_suffix_layers)
     debug_route_density = bool(debug_route_density)
     if min_sequence_tokens < 0:
         raise ValueError("min_sequence_tokens must be non-negative")
@@ -951,14 +976,14 @@ def make_sparse_attention_override(
         raise ValueError(
             "route density bounds must satisfy 0 <= minimum <= maximum <= 1"
         )
-    if not 0.0 <= dense_warmup_ratio <= 1.0:
-        raise ValueError("dense_warmup_ratio must be in [0, 1]")
-    if not 0.0 <= dense_tail_ratio <= 1.0:
-        raise ValueError("dense_tail_ratio must be in [0, 1]")
-    if dense_warmup_ratio + dense_tail_ratio > 1.0:
-        raise ValueError("dense warmup and tail ratios must sum to at most 1")
+    if dense_prefix_steps < 0:
+        raise ValueError("dense_prefix_steps must be non-negative")
+    if dense_suffix_steps < 0:
+        raise ValueError("dense_suffix_steps must be non-negative")
     if dense_prefix_layers < 0:
         raise ValueError("dense_prefix_layers must be non-negative")
+    if dense_suffix_layers < 0:
+        raise ValueError("dense_suffix_layers must be non-negative")
     if not is_supported_turing_device(device):
         raise RuntimeError("Sol sparse attention requires an sm75 Turing GPU")
     if not bundled_sparse_available():
@@ -968,7 +993,7 @@ def make_sparse_attention_override(
         )
     preflight_bundled(device)
     preflight_bundled_sparse(device)
-    warmup_state: dict[str, object] = {}
+    schedule_state: dict[str, object] = {}
     debug_route_keys: set[tuple] = set()
     debug_route_state: dict[tuple, list[tuple[torch.Tensor, int, int]]] = {}
     debug_dense_reasons: set[str] = set()
@@ -980,22 +1005,26 @@ def make_sparse_attention_override(
         transformer_options = kwargs.get("transformer_options")
         dense_schedule = _sparse_dense_schedule(
             transformer_options,
-            dense_warmup_ratio,
-            dense_tail_ratio,
-            warmup_state,
+            dense_prefix_steps,
+            dense_suffix_steps,
+            schedule_state,
             track_step=debug_route_density,
         )
-        dense_layer = _sparse_dense_layer(transformer_options, dense_prefix_layers)
+        dense_layer = _sparse_dense_layer(
+            transformer_options,
+            dense_prefix_layers,
+            dense_suffix_layers,
+        )
         if debug_route_density and dense_schedule:
-            debug_key = f"schedule:{warmup_state.get('step')}"
+            debug_key = f"schedule:{schedule_state.get('step')}"
             if debug_key not in debug_dense_reasons:
                 LOG.warning(
                     "[Turing sparse debug] stable Sage selected by dense schedule: "
-                    "step=%s/%s warmup_steps=%s tail_steps=%s",
-                    warmup_state.get("step"),
-                    warmup_state.get("sampling_steps"),
-                    warmup_state.get("warmup_steps"),
-                    warmup_state.get("tail_steps"),
+                    "step=%s/%s prefix_steps=%s suffix_steps=%s",
+                    schedule_state.get("step"),
+                    schedule_state.get("sampling_steps"),
+                    schedule_state.get("prefix_steps"),
+                    schedule_state.get("suffix_steps"),
                 )
                 debug_dense_reasons.add(debug_key)
         if debug_route_density and dense_layer:
@@ -1018,10 +1047,16 @@ def make_sparse_attention_override(
                 else {}
             )
             debug_context = {
-                "step": warmup_state.get("step"),
-                "sampling_steps": warmup_state.get("sampling_steps"),
+                "step": schedule_state.get("step"),
+                "sampling_steps": schedule_state.get("sampling_steps"),
                 "layer_index": layout.get("layer_index"),
                 "layer_count": layout.get("layer_count"),
+                "last_sparse_layer": (
+                    layout.get("layer_count") - dense_suffix_layers - 1
+                    if isinstance(layout.get("layer_count"), int)
+                    and not isinstance(layout.get("layer_count"), bool)
+                    else None
+                ),
             }
         return turing_sol_sparse_attention(
             fallback,
@@ -1058,9 +1093,10 @@ def apply_sparse_attention_patch(
     skipped_residual: str = SPARSE_SKIPPED_RESIDUAL,
     minimum_route_density: float = SPARSE_MINIMUM_ROUTE_DENSITY,
     maximum_route_density: float = SPARSE_MAXIMUM_ROUTE_DENSITY,
-    dense_warmup_ratio: float = SPARSE_DENSE_WARMUP_RATIO,
-    dense_tail_ratio: float = SPARSE_DENSE_TAIL_RATIO,
+    dense_prefix_steps: int = SPARSE_DENSE_PREFIX_STEPS,
+    dense_suffix_steps: int = SPARSE_DENSE_SUFFIX_STEPS,
     dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
+    dense_suffix_layers: int = SPARSE_DENSE_SUFFIX_LAYERS,
     debug_route_density: bool = False,
 ):
     patched = model.clone()
@@ -1075,9 +1111,10 @@ def apply_sparse_attention_patch(
         skipped_residual=skipped_residual,
         minimum_route_density=minimum_route_density,
         maximum_route_density=maximum_route_density,
-        dense_warmup_ratio=dense_warmup_ratio,
-        dense_tail_ratio=dense_tail_ratio,
+        dense_prefix_steps=dense_prefix_steps,
+        dense_suffix_steps=dense_suffix_steps,
         dense_prefix_layers=dense_prefix_layers,
+        dense_suffix_layers=dense_suffix_layers,
         debug_route_density=debug_route_density,
     )
     transformer_options = patched.model_options.setdefault("transformer_options", {})
@@ -1087,12 +1124,12 @@ def apply_sparse_attention_patch(
         "bundled_turing_sol_sparse_experimental"
     )
     LOG.info(
-        "Sol sparse attention patch enabled: min_sequence=%s threshold=%.2f "
+        "Sol sparse attention patch enabled: threshold=%.2f "
         "prefix_policy=%s manual_prefix=%d local_radius=%d temporal_frames=%d "
         "skipped_residual=%s route_budget=[%.2f,%.2f] "
-        "dense_warmup=%.2f "
-        "dense_tail=%.2f dense_prefix_layers=%d debug_route_density=%s",
-        min_sequence_tokens or "auto",
+        "dense_prefix_steps=%d dense_suffix_steps=%d "
+        "dense_prefix_layers=%d dense_suffix_layers=%d "
+        "dense_backend=bundled_turing_sage debug_route_density=%s",
         routing_threshold,
         prefix_policy,
         manual_prefix_tokens,
@@ -1101,9 +1138,10 @@ def apply_sparse_attention_patch(
         skipped_residual,
         minimum_route_density,
         maximum_route_density,
-        dense_warmup_ratio,
-        dense_tail_ratio,
+        dense_prefix_steps,
+        dense_suffix_steps,
         dense_prefix_layers,
+        dense_suffix_layers,
         debug_route_density,
     )
     return patched

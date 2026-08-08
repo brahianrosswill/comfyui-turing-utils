@@ -12,16 +12,6 @@ class SolSparseAttentionPatch:
         return {
             "required": {
                 "model": ("MODEL",),
-                "min_sequence_tokens": (
-                    "INT",
-                    {
-                        "default": 0,
-                        "min": 0,
-                        "max": 262144,
-                        "step": 64,
-                        "tooltip": "Use 0 for automatic crossover selection, or keep stable Sage below this Q or K length.",
-                    },
-                ),
                 "routing_threshold": (
                     "FLOAT",
                     {
@@ -99,36 +89,44 @@ class SolSparseAttentionPatch:
                         "tooltip": "Maximum adaptive exact-route density per 16-block routing tile. Forced semantic and local blocks are never removed.",
                     },
                 ),
-                "dense_warmup_ratio": (
-                    "FLOAT",
+                "dense_prefix_steps": (
+                    "INT",
                     {
-                        "default": 0.25,
-                        "min": 0.0,
-                        "max": 1.0,
-                        "step": 0.05,
-                        "round": 0.01,
-                        "tooltip": "Fraction of early denoising steps that use stable dense Sage. One of four steps is dense at the 0.25 default.",
+                        "default": 0,
+                        "min": 0,
+                        "max": 1000,
+                        "step": 1,
+                        "tooltip": "Number of early denoising steps that use stable dense Sage across every transformer layer.",
                     },
                 ),
-                "dense_tail_ratio": (
-                    "FLOAT",
+                "dense_suffix_steps": (
+                    "INT",
                     {
-                        "default": 0.0,
-                        "min": 0.0,
-                        "max": 1.0,
-                        "step": 0.05,
-                        "round": 0.01,
-                        "tooltip": "Optional fraction of final denoising steps that use dense Sage. Keep zero unless late detail still flickers.",
+                        "default": 0,
+                        "min": 0,
+                        "max": 1000,
+                        "step": 1,
+                        "tooltip": "Number of final denoising steps that use stable dense Sage across every transformer layer.",
                     },
                 ),
                 "dense_prefix_layers": (
                     "INT",
                     {
-                        "default": 2,
+                        "default": 1,
                         "min": 0,
                         "max": 256,
                         "step": 1,
-                        "tooltip": "Keep the first transformer layers dense when an adapter supplies layer metadata. Official MiniMax H3 uses 2 of 50 layers.",
+                        "tooltip": "Keep this many transformer layers at the beginning of every sparse step on stable dense Sage.",
+                    },
+                ),
+                "dense_suffix_layers": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 0,
+                        "max": 256,
+                        "step": 1,
+                        "tooltip": "Keep this many transformer layers at the end of every sparse step on stable dense Sage. Requires layer-count metadata.",
                     },
                 ),
             },
@@ -152,7 +150,6 @@ class SolSparseAttentionPatch:
     def patch(
         self,
         model,
-        min_sequence_tokens: int = 0,
         routing_threshold: float = 1.0,
         prefix_policy: str = "auto",
         manual_prefix_tokens: int = 0,
@@ -161,15 +158,15 @@ class SolSparseAttentionPatch:
         skipped_residual: str = "2x32",
         minimum_route_density: float = 0.0,
         maximum_route_density: float = 1.0,
-        dense_warmup_ratio: float = 0.25,
-        dense_tail_ratio: float = 0.0,
-        dense_prefix_layers: int = 2,
+        dense_prefix_steps: int = 0,
+        dense_suffix_steps: int = 0,
+        dense_prefix_layers: int = 1,
+        dense_suffix_layers: int = 1,
         debug_route_density: bool = False,
     ):
         return (
             apply_sparse_attention_patch(
                 model,
-                min_sequence_tokens=min_sequence_tokens,
                 routing_threshold=routing_threshold,
                 prefix_policy=prefix_policy,
                 manual_prefix_tokens=manual_prefix_tokens,
@@ -178,9 +175,10 @@ class SolSparseAttentionPatch:
                 skipped_residual=skipped_residual,
                 minimum_route_density=minimum_route_density,
                 maximum_route_density=maximum_route_density,
-                dense_warmup_ratio=dense_warmup_ratio,
-                dense_tail_ratio=dense_tail_ratio,
+                dense_prefix_steps=dense_prefix_steps,
+                dense_suffix_steps=dense_suffix_steps,
                 dense_prefix_layers=dense_prefix_layers,
+                dense_suffix_layers=dense_suffix_layers,
                 debug_route_density=debug_route_density,
             ),
         )

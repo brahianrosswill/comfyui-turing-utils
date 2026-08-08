@@ -344,9 +344,10 @@ class AttentionBackendsTest(unittest.TestCase):
                 skipped_residual="1x64",
                 minimum_route_density=0.2,
                 maximum_route_density=0.7,
-                dense_warmup_ratio=0.25,
-                dense_tail_ratio=0.1,
+                dense_prefix_steps=2,
+                dense_suffix_steps=1,
                 dense_prefix_layers=3,
+                dense_suffix_layers=4,
                 debug_route_density=True,
             )
             output = override(
@@ -377,6 +378,41 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertEqual(
             override.turing_utils_attention_implementation,
             "bundled_turing_sol_sparse_experimental",
+        )
+
+    def test_sparse_override_uses_stable_sage_for_first_and_last_layers(self):
+        q = torch.zeros((1, 2, 4096, 128), dtype=torch.bfloat16)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention.bundled_sparse_available", return_value=True),
+            mock.patch("attention.preflight_bundled"),
+            mock.patch("attention.preflight_bundled_sparse"),
+            mock.patch("attention.turing_sage_attention", return_value=q) as stable,
+            mock.patch("attention.turing_sol_sparse_attention", return_value=q) as sparse,
+        ):
+            override = attention_backends.make_sparse_attention_override(
+                torch.device("cuda", 0), debug_route_density=True
+            )
+            for layer_index in (0, 1, 49):
+                override(
+                    mock.Mock(),
+                    q,
+                    q,
+                    q,
+                    2,
+                    skip_reshape=True,
+                    transformer_options={
+                        "turing_utils_attention_layout": {
+                            "layer_index": layer_index,
+                            "layer_count": 50,
+                        }
+                    },
+                )
+
+        self.assertEqual(stable.call_count, 2)
+        self.assertEqual(sparse.call_count, 1)
+        self.assertEqual(
+            sparse.call_args.kwargs["debug_context"]["last_sparse_layer"], 48
         )
 
     def test_experimental_sparse_rejects_non_turing_device(self):

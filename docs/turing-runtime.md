@@ -122,19 +122,29 @@ blocks are supported. Other calls use bundled stable Sage without model-family,
 sampling-step checks. A model adapter may publish semantic layer and topology
 metadata; unknown models remain fully generic.
 
-`min_sequence_tokens=0` selects the measured 4096-token crossover; a positive
-value remains a manual override. `routing_threshold=1.0` routes a block when
-its centroid score exceeds the current query row's projected mean by one
+The patch node keeps the measured 4096-token crossover internally; shorter
+calls use stable Sage and no manual sequence-length control is exposed.
+`routing_threshold=1.0` routes a block when its centroid score exceeds the
+current query row's projected mean by one
 standard deviation; lowering it evaluates more blocks exactly.
 `minimum_route_density` and `maximum_route_density` optionally clamp the
 adaptive selection count inside each 16-key routing tile. Defaults `0/1`
 preserve threshold-only routing with a fast path. Prefix, local, and temporal
 blocks remain forced and may exceed the requested maximum. The default
-`dense_warmup_ratio=0.25` protects one step in a four-step workflow,
-`dense_tail_ratio=0` avoids an extra dense tail by default, and
-`dense_prefix_layers=2` follows the validated H3 policy when layer metadata is
-available. Step lookup is cached once per sampler timestep rather than
-synchronized in every transformer block.
+`dense_prefix_steps` and `dense_suffix_steps` are explicit counts of whole
+denoising steps that use stable Sage across every layer; both default to zero.
+`dense_prefix_layers=1` and `dense_suffix_layers=1` keep the first and last
+transformer layers dense while only the middle layers use sparse attention.
+Suffix protection requires adapter-provided layer-count metadata. Step lookup
+is cached once per sampler timestep rather than synchronized in every
+transformer block.
+
+All dense schedule and protected-layer calls go directly through the bundled
+stable Turing Sage backend. They do not run Sol with a 100% route and therefore
+do not allocate Sol summaries or execute its routing kernels. A previously
+installed model attention override is replaced by the Sol patch; unsupported
+calls can still reach ComfyUI's original attention through stable Sage's normal
+fallback handling.
 
 The configurable local neighborhood remains exact. Prefix policy can use exact
 model-supplied semantic layout metadata, disable prefix protection, or accept a

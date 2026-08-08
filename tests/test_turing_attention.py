@@ -387,46 +387,46 @@ class TuringAttentionContractTest(unittest.TestCase):
             0,
         )
 
-    def test_sparse_dense_warmup_uses_sampling_progress(self):
+    def test_sparse_dense_prefix_steps_use_sampling_progress(self):
         sample_sigmas = torch.tensor([1.0, 0.8, 0.5, 0.2, 0.0])
         state = {}
         self.assertTrue(
-            turing_attention._sparse_dense_warmup(
+            turing_attention._sparse_dense_prefix_steps(
                 {"sample_sigmas": sample_sigmas, "sigmas": sample_sigmas[0:1]},
-                0.25,
+                1,
                 state,
             )
         )
         self.assertFalse(
-            turing_attention._sparse_dense_warmup(
+            turing_attention._sparse_dense_prefix_steps(
                 {"sample_sigmas": sample_sigmas, "sigmas": sample_sigmas[1:2]},
-                0.25,
+                1,
                 state,
             )
         )
 
-    def test_sparse_dense_warmup_accepts_inference_tensors(self):
+    def test_sparse_dense_prefix_steps_accept_inference_tensors(self):
         state = {}
         with torch.inference_mode():
             sample_sigmas = torch.tensor([1.0, 0.8, 0.5, 0.2, 0.0])
             current_sigmas = sample_sigmas[0:1]
             self.assertTrue(
-                turing_attention._sparse_dense_warmup(
+                turing_attention._sparse_dense_prefix_steps(
                     {
                         "sample_sigmas": sample_sigmas,
                         "sigmas": current_sigmas,
                     },
-                    0.25,
+                    1,
                     state,
                 )
             )
             self.assertTrue(
-                turing_attention._sparse_dense_warmup(
+                turing_attention._sparse_dense_prefix_steps(
                     {
                         "sample_sigmas": sample_sigmas,
                         "sigmas": current_sigmas,
                     },
-                    0.25,
+                    1,
                     state,
                 )
             )
@@ -436,20 +436,44 @@ class TuringAttentionContractTest(unittest.TestCase):
         self.assertTrue(
             turing_attention._sparse_dense_schedule(
                 {"sample_sigmas": sample_sigmas, "sigmas": sample_sigmas[3:4]},
-                0.0,
-                0.25,
+                0,
+                1,
                 {},
             )
         )
         self.assertTrue(
             turing_attention._sparse_dense_layer(
-                {"turing_utils_attention_layout": {"layer_index": 1}},
+                {
+                    "turing_utils_attention_layout": {
+                        "layer_index": 1,
+                        "layer_count": 50,
+                    }
+                },
+                2,
                 2,
             )
         )
         self.assertFalse(
             turing_attention._sparse_dense_layer(
-                {"turing_utils_attention_layout": {"layer_index": 2}},
+                {
+                    "turing_utils_attention_layout": {
+                        "layer_index": 2,
+                        "layer_count": 50,
+                    }
+                },
+                2,
+                2,
+            )
+        )
+        self.assertTrue(
+            turing_attention._sparse_dense_layer(
+                {
+                    "turing_utils_attention_layout": {
+                        "layer_index": 48,
+                        "layer_count": 50,
+                    }
+                },
+                2,
                 2,
             )
         )
@@ -460,8 +484,8 @@ class TuringAttentionContractTest(unittest.TestCase):
         self.assertFalse(
             turing_attention._sparse_dense_schedule(
                 {"sample_sigmas": sample_sigmas, "sigmas": sample_sigmas[2:3]},
-                0.0,
-                0.0,
+                0,
+                0,
                 state,
                 track_step=True,
             )

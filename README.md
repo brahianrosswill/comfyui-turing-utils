@@ -53,8 +53,8 @@ only after its CUDA sources or required version change.
   long-sequence sparse backend. It uses an input-adaptive statistical threshold,
   keeps skipped-block centroid residuals (two 32-token centroids by default),
   accepts semantic prefix/video topology metadata, and exposes stable route
-  budgets, dense step/layer safeguards, and an automatic short-sequence
-  crossover.
+  budgets, integer dense-step safeguards, dense first/last-layer protection,
+  and an internal automatic short-sequence crossover.
 
 ## Turing behavior
 
