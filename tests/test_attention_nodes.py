@@ -154,6 +154,86 @@ class SparseAttentionNodeTest(unittest.TestCase):
             debug_route_density=False,
         )
 
+    def test_frame_sparse_schema_exposes_structured_video_parameters(self):
+        inputs = attention_nodes.FrameSparseAttentionPatch.INPUT_TYPES()["required"]
+        self.assertEqual(
+            tuple(inputs),
+            (
+                "model",
+                "quality_profile",
+                "sparse_pattern",
+                "prefix_policy",
+                "manual_prefix_tokens",
+                "temporal_window_frames",
+                "global_anchor_stride",
+                "rotate_global_anchors",
+                "sink_frames",
+                "radial_spatial_radius",
+                "radial_max_temporal_stride",
+                "dense_prefix_steps",
+                "dense_suffix_steps",
+                "dense_prefix_layers",
+                "dense_suffix_layers",
+            ),
+        )
+        self.assertEqual(inputs["prefix_policy"][0][0], "auto")
+        self.assertEqual(inputs["quality_profile"][0][0], "custom")
+        self.assertEqual(inputs["sparse_pattern"][0][0], "frame_window")
+        self.assertEqual(inputs["temporal_window_frames"][1]["default"], 2)
+        self.assertEqual(inputs["global_anchor_stride"][1]["default"], 12)
+        self.assertTrue(inputs["rotate_global_anchors"][1]["default"])
+        self.assertEqual(inputs["sink_frames"][1]["default"], 1)
+        self.assertEqual(inputs["radial_spatial_radius"][1]["default"], 1)
+        self.assertEqual(inputs["radial_max_temporal_stride"][1]["default"], 16)
+        self.assertEqual(inputs["dense_prefix_steps"][1]["default"], 0)
+        self.assertEqual(inputs["dense_suffix_steps"][1]["default"], 0)
+        self.assertEqual(inputs["dense_prefix_layers"][1]["default"], 1)
+        self.assertEqual(inputs["dense_suffix_layers"][1]["default"], 1)
+
+    def test_frame_sparse_node_returns_patched_model(self):
+        model = object()
+        patched = object()
+        with mock.patch(
+            "attention_nodes.apply_frame_sparse_attention_patch", return_value=patched
+        ) as apply_patch:
+            output = attention_nodes.FrameSparseAttentionPatch().patch(
+                model,
+                "custom",
+                "radial",
+                "manual",
+                256,
+                3,
+                16,
+                False,
+                2,
+                1,
+                8,
+                4,
+                1,
+                2,
+                3,
+                True,
+            )
+        self.assertEqual(output, (patched,))
+        apply_patch.assert_called_once_with(
+            model,
+            quality_profile="custom",
+            sparse_pattern="radial",
+            prefix_policy="manual",
+            manual_prefix_tokens=256,
+            temporal_window_frames=3,
+            global_anchor_stride=16,
+            rotate_global_anchors=False,
+            sink_frames=2,
+            radial_spatial_radius=1,
+            radial_max_temporal_stride=8,
+            dense_prefix_steps=4,
+            dense_suffix_steps=1,
+            dense_prefix_layers=2,
+            dense_suffix_layers=3,
+            debug_route_density=True,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

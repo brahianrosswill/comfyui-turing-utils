@@ -24,6 +24,16 @@ def sparse_available() -> bool:
     return hasattr(module, "sol_sparse_threshold_int8_f16_attn")
 
 
+def frame_sparse_available() -> bool:
+    if not available():
+        return False
+    try:
+        module = importlib.import_module("comfyui_turing_utils_kernel._sage_qattn_sm75")
+    except (ImportError, OSError):
+        return False
+    return hasattr(module, "frame_sparse_int8_f16_attn")
+
+
 def sageattn(*args, **kwargs):
     """Run the stable bundled SM75 Sage attention implementation."""
     from .core import sageattn as implementation
@@ -39,6 +49,12 @@ def sageattn_varlen(*args, **kwargs):
 
 def sol_sparse_sageattn(*args, **kwargs):
     from .core import sol_sparse_sageattn as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def frame_sparse_sageattn(*args, **kwargs):
+    from .core import frame_sparse_sageattn as implementation
 
     return implementation(*args, **kwargs)
 
@@ -80,6 +96,48 @@ def preflight_sparse(device: torch.device) -> None:
             or not torch.allclose(output.float(), reference, rtol=0.08, atol=0.06)
         ):
             raise RuntimeError("Turing sparse attention BF16 self-test failed")
+        torch.cuda.synchronize(device)
+
+
+def preflight_frame_sparse(device: torch.device) -> None:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError(f"Turing frame-sparse attention requires CUDA, got {device}")
+    if torch.cuda.get_device_capability(device) != (7, 5):
+        raise RuntimeError(f"Turing frame-sparse attention requires sm75, got {device}")
+    if not frame_sparse_available():
+        raise RuntimeError("the experimental Turing frame-sparse extension is not built")
+
+    with torch.inference_mode(), torch.cuda.device(device):
+        for dtype in (torch.float16, torch.bfloat16):
+            values = torch.arange(4 * 384 * 128, device=device, dtype=torch.float32)
+            kv_values = torch.arange(2 * 384 * 128, device=device, dtype=torch.float32)
+            q = (((values % 29) - 14) / 16).reshape(1, 4, 384, 128).to(dtype)
+            k = ((((kv_values * 3) % 31) - 15) / 16).reshape(1, 2, 384, 128).to(dtype)
+            v = ((((kv_values * 5) % 37) - 18) / 16).reshape_as(k).to(dtype)
+            output = frame_sparse_sageattn(
+                q,
+                k,
+                v,
+                prefix_tokens=64,
+                topology_start_tokens=64,
+                topology_tokens=320,
+                tokens_per_frame=64,
+                temporal_window_frames=4,
+                global_anchor_stride=1,
+                sink_frames=1,
+            )
+            reference = torch.nn.functional.scaled_dot_product_attention(
+                q.float(), k.float(), v.float(), enable_gqa=True
+            )
+            if (
+                output.dtype != dtype
+                or output.shape != q.shape
+                or not torch.isfinite(output).all()
+                or not torch.allclose(output.float(), reference, rtol=0.08, atol=0.06)
+            ):
+                raise RuntimeError(
+                    f"Turing frame-sparse attention {dtype} dense-route self-test failed"
+                )
         torch.cuda.synchronize(device)
 
 
@@ -139,7 +197,10 @@ def preflight(device: torch.device) -> None:
 
 __all__ = [
     "available",
+    "frame_sparse_available",
+    "frame_sparse_sageattn",
     "preflight",
+    "preflight_frame_sparse",
     "preflight_sparse",
     "sageattn",
     "sageattn_varlen",

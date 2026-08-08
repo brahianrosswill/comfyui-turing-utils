@@ -425,6 +425,267 @@ def validate_sparse(device: torch.device) -> None:
     )
 
 
+def validate_frame_sparse(device: torch.device) -> None:
+    from comfyui_turing_utils_kernel.turing_sage import (
+        frame_sparse_sageattn,
+        sageattn,
+    )
+    from comfyui_turing_utils_kernel.turing_sage.core import (
+        _frame_sparse_schedule_cpu,
+    )
+
+    # A full schedule must reduce to the production dense Sage path for both
+    # storage dtypes, including a non-aligned semantic Query prefix and GQA.
+    for dtype in (torch.float16, torch.bfloat16):
+        prefix = 77
+        topology_tokens = 4 * 64
+        sequence = prefix + topology_tokens
+        q = torch.randn((1, 4, sequence, 128), device=device, dtype=dtype) * 0.3
+        k = torch.randn((1, 2, sequence, 128), device=device, dtype=dtype) * 0.3
+        v = torch.randn_like(k) * 0.3
+        output, density = frame_sparse_sageattn(
+            q,
+            k,
+            v,
+            prefix_tokens=prefix,
+            topology_start_tokens=prefix,
+            topology_tokens=topology_tokens,
+            tokens_per_frame=64,
+            temporal_window_frames=4,
+            global_anchor_stride=1,
+            sink_frames=1,
+            return_schedule_density=True,
+        )
+        dense = sageattn(q, k, v)
+        if density != 1.0:
+            raise RuntimeError(f"frame-sparse dense route has density {density}, expected 1")
+        _assert_close(
+            f"frame-sparse full route {dtype}",
+            output,
+            dense,
+            rtol=0.02,
+            atol=0.01,
+        )
+
+    # Compare a genuinely sparse, frame-misaligned route with an explicit
+    # FP32 block mask. Prefix Query rows remain globally dense; video Query
+    # rows see exactly the CSR-selected 64-token blocks.
+    prefix = 77
+    tokens_per_frame = 65
+    topology_tokens = 7 * tokens_per_frame
+    sequence = prefix + topology_tokens
+    schedule_kwargs = {
+        "prefix_tokens": prefix,
+        "topology_start_tokens": prefix,
+        "topology_tokens": topology_tokens,
+        "tokens_per_frame": tokens_per_frame,
+        "temporal_window_frames": 1,
+        "global_anchor_stride": 4,
+        "global_anchor_offset": 2,
+        "sink_frames": 1,
+    }
+    q = torch.randn((1, 4, sequence, 128), device=device, dtype=torch.bfloat16) * 0.3
+    k = torch.randn((1, 2, sequence, 128), device=device, dtype=torch.bfloat16) * 0.3
+    v = torch.randn_like(k) * 0.3
+    output, density = frame_sparse_sageattn(
+        q,
+        k,
+        v,
+        return_schedule_density=True,
+        **schedule_kwargs,
+    )
+    row_offsets, key_blocks, expected_density = _frame_sparse_schedule_cpu(
+        key_length=sequence,
+        **schedule_kwargs,
+    )
+    mask = torch.zeros(
+        (topology_tokens, sequence), device=device, dtype=torch.bool
+    )
+    for query_block, (start, end) in enumerate(
+        zip(row_offsets, row_offsets[1:])
+    ):
+        query_start = query_block * 64
+        query_end = min(query_start + 64, topology_tokens)
+        for key_block in key_blocks[start:end]:
+            key_start = key_block * 64
+            key_end = min(key_start + 64, sequence)
+            mask[query_start:query_end, key_start:key_end] = True
+    reference_prefix = torch.nn.functional.scaled_dot_product_attention(
+        q[:, :, :prefix].float(),
+        k.float(),
+        v.float(),
+        enable_gqa=True,
+    )
+    reference_video = torch.nn.functional.scaled_dot_product_attention(
+        q[:, :, prefix:].float(),
+        k.float(),
+        v.float(),
+        attn_mask=mask,
+        enable_gqa=True,
+    )
+    reference = torch.cat((reference_prefix, reference_video), dim=2)
+    if density != expected_density or not 0.0 < density < 1.0:
+        raise RuntimeError(
+            f"frame-sparse schedule density is incompatible: {density}"
+        )
+    _assert_close(
+        "frame-sparse explicit CSR mask",
+        output,
+        reference,
+        rtol=0.08,
+        atol=0.06,
+    )
+
+    # Exercise the static radial policy separately.  The exact 2D topology is
+    # deliberately non-square so row-major spatial addressing and partial
+    # 8x8 tiles are both covered.
+    prefix = 64
+    spatial_height, spatial_width = 12, 16
+    tokens_per_frame = spatial_height * spatial_width
+    topology_tokens = 6 * tokens_per_frame
+    sequence = prefix + topology_tokens
+    radial_kwargs = {
+        "prefix_tokens": prefix,
+        "topology_start_tokens": prefix,
+        "topology_tokens": topology_tokens,
+        "tokens_per_frame": tokens_per_frame,
+        "temporal_window_frames": 0,
+        "global_anchor_stride": 0,
+        "global_anchor_offset": 1,
+        "sink_frames": 1,
+        "sparse_pattern": "radial",
+        "spatial_tokens_height": spatial_height,
+        "spatial_tokens_width": spatial_width,
+        "radial_spatial_radius": 0,
+        "radial_max_temporal_stride": 8,
+    }
+    q = torch.randn((1, 4, sequence, 128), device=device, dtype=torch.bfloat16) * 0.3
+    k = torch.randn((1, 2, sequence, 128), device=device, dtype=torch.bfloat16) * 0.3
+    v = torch.randn_like(k) * 0.3
+    output, density = frame_sparse_sageattn(
+        q, k, v, return_schedule_density=True, **radial_kwargs
+    )
+    row_offsets, key_blocks, expected_density = _frame_sparse_schedule_cpu(
+        key_length=sequence, **radial_kwargs
+    )
+    mask = torch.zeros(
+        (topology_tokens, sequence), device=device, dtype=torch.bool
+    )
+    for query_block, (start, end) in enumerate(zip(row_offsets, row_offsets[1:])):
+        query_start = query_block * 64
+        query_end = min(query_start + 64, topology_tokens)
+        for key_block in key_blocks[start:end]:
+            key_start = key_block * 64
+            key_end = min(key_start + 64, sequence)
+            mask[query_start:query_end, key_start:key_end] = True
+    reference_prefix = torch.nn.functional.scaled_dot_product_attention(
+        q[:, :, :prefix].float(), k.float(), v.float(), enable_gqa=True
+    )
+    reference_video = torch.nn.functional.scaled_dot_product_attention(
+        q[:, :, prefix:].float(),
+        k.float(),
+        v.float(),
+        attn_mask=mask,
+        enable_gqa=True,
+    )
+    reference = torch.cat((reference_prefix, reference_video), dim=2)
+    if density != expected_density or not 0.0 < density < 1.0:
+        raise RuntimeError(f"radial frame-sparse density is incompatible: {density}")
+    _assert_close(
+        "radial frame-sparse explicit CSR mask",
+        output,
+        reference,
+        rtol=0.08,
+        atol=0.06,
+    )
+
+    # A deterministic, temporally correlated proxy reports approximation
+    # error against dense Sage.  It is a screening metric rather than a visual
+    # quality gate; real H3 clips are still required before changing defaults.
+    prefix = 64
+    spatial_height, spatial_width, frames = 16, 16, 16
+    tokens_per_frame = spatial_height * spatial_width
+    topology_tokens = frames * tokens_per_frame
+    sequence = prefix + topology_tokens
+    generator = torch.Generator(device=device).manual_seed(20260809)
+    prefix_q = torch.randn(
+        (1, 2, prefix, 128), generator=generator, device=device, dtype=torch.float32
+    )
+    spatial_q = torch.randn(
+        (1, 2, 1, tokens_per_frame, 128),
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    )
+    temporal_q = torch.randn(
+        (1, 2, frames, 1, 128),
+        generator=generator,
+        device=device,
+        dtype=torch.float32,
+    ) * 0.08
+    video_q = (spatial_q + temporal_q).reshape(1, 2, topology_tokens, 128)
+    q = torch.cat((prefix_q, video_q), dim=2).to(torch.bfloat16)
+    k = (q.float() * 0.91 + torch.randn(
+        q.shape, generator=generator, device=device, dtype=torch.float32
+    ) * 0.04).to(torch.bfloat16)
+    v = (q.float() * 0.73 + torch.randn(
+        q.shape, generator=generator, device=device, dtype=torch.float32
+    ) * 0.06).to(torch.bfloat16)
+    dense = sageattn(q, k, v)
+    proxy_policies = {
+        "conservative": dict(
+            sparse_pattern="frame_window",
+            temporal_window_frames=3,
+            global_anchor_stride=8,
+            sink_frames=2,
+            radial_spatial_radius=1,
+            radial_max_temporal_stride=8,
+        ),
+        "balanced": dict(
+            sparse_pattern="radial",
+            temporal_window_frames=2,
+            global_anchor_stride=0,
+            sink_frames=1,
+            radial_spatial_radius=0,
+            radial_max_temporal_stride=16,
+        ),
+        "fast": dict(
+            sparse_pattern="radial",
+            temporal_window_frames=1,
+            global_anchor_stride=0,
+            sink_frames=1,
+            radial_spatial_radius=0,
+            radial_max_temporal_stride=32,
+        ),
+    }
+    for name, policy in proxy_policies.items():
+        sparse, density = frame_sparse_sageattn(
+            q,
+            k,
+            v,
+            prefix_tokens=prefix,
+            topology_start_tokens=prefix,
+            topology_tokens=topology_tokens,
+            tokens_per_frame=tokens_per_frame,
+            spatial_tokens_height=spatial_height,
+            spatial_tokens_width=spatial_width,
+            return_schedule_density=True,
+            **policy,
+        )
+        error = sparse.float() - dense.float()
+        nrmse = (
+            error.square().mean().sqrt()
+            / dense.float().square().mean().sqrt().clamp_min(1.0e-8)
+        ).item()
+        cosine = torch.nn.functional.cosine_similarity(
+            sparse.float().flatten(), dense.float().flatten(), dim=0
+        ).item()
+        print(
+            f"frame sparse proxy {name}: density={density:.4f} "
+            f"nrmse={nrmse:.6f} cosine={cosine:.6f}"
+        )
+
+
 def _elapsed_ms(function, iterations: int) -> float:
     for _ in range(5):
         function()
@@ -484,11 +745,72 @@ def benchmark_sparse(device: torch.device, iterations: int) -> None:
         )
 
 
+def benchmark_frame_sparse(device: torch.device, iterations: int) -> None:
+    from comfyui_turing_utils_kernel.turing_sage import (
+        frame_sparse_sageattn,
+        sageattn,
+    )
+
+    cases = (
+        ("480p-like", 46773, 3438, 43335, 405, 15, 27),
+        ("720p-like", 100483, 2043, 98440, 920, 23, 40),
+    )
+    results: dict[tuple[str, str], tuple[float, float, float]] = {}
+    for name, sequence, prefix, topology_tokens, tokens_per_frame, height, width in cases:
+        q = torch.randn(
+            (1, 8, sequence, 128), device=device, dtype=torch.bfloat16
+        ) * 0.2
+        k = torch.randn_like(q) * 0.2
+        v = torch.randn_like(q) * 0.2
+
+        dense_ms = _elapsed_ms(lambda: sageattn(q, k, v), iterations)
+        for pattern in ("frame_window", "radial"):
+            kwargs = dict(
+                prefix_tokens=prefix,
+                topology_start_tokens=prefix,
+                topology_tokens=topology_tokens,
+                tokens_per_frame=tokens_per_frame,
+                temporal_window_frames=2,
+                global_anchor_stride=12 if pattern == "frame_window" else 0,
+                sink_frames=1,
+                sparse_pattern=pattern,
+                spatial_tokens_height=height,
+                spatial_tokens_width=width,
+                radial_spatial_radius=0,
+                radial_max_temporal_stride=16,
+            )
+
+            def sparse():
+                return frame_sparse_sageattn(q, k, v, **kwargs)
+
+            _, density = frame_sparse_sageattn(
+                q, k, v, return_schedule_density=True, **kwargs
+            )
+            sparse_ms = _elapsed_ms(sparse, iterations)
+            results[(name, pattern)] = (sparse_ms, dense_ms, density)
+            print(
+                f"frame sparse {name} {pattern} H=8 D=128 density={density:.4f}: "
+                f"{sparse_ms:.3f} ms, sage {dense_ms:.3f} ms, "
+                f"{dense_ms / sparse_ms:.3f}x"
+            )
+        del q, k, v
+        torch.cuda.empty_cache()
+
+    dense_480 = results[("480p-like", "frame_window")][1]
+    for pattern in ("frame_window", "radial"):
+        sparse_720 = results[("720p-like", pattern)][0]
+        print(
+            f"frame sparse 720p-like {pattern} / dense Sage 480p-like: "
+            f"{sparse_720 / dense_480:.3f}x attention time"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--experimental-sparse", action="store_true")
+    parser.add_argument("--experimental-frame-sparse", action="store_true")
     parser.add_argument("--iterations", type=int, default=20)
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -507,12 +829,16 @@ def main() -> None:
         validate_sage(device)
         if args.experimental_sparse:
             validate_sparse(device)
+        if args.experimental_frame_sparse:
+            validate_frame_sparse(device)
         torch.cuda.synchronize(device)
         print("numerical validation passed")
         if args.benchmark:
             benchmark_sage(device, args.iterations)
             if args.experimental_sparse:
                 benchmark_sparse(device, args.iterations)
+            if args.experimental_frame_sparse:
+                benchmark_frame_sparse(device, args.iterations)
 
 
 if __name__ == "__main__":

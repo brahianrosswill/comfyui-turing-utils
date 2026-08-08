@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .attention_nodes import SolSparseAttentionPatch
+from .attention_nodes import FrameSparseAttentionPatch, SolSparseAttentionPatch
 from .bernini_nodes import BerniniContextWindowsCore, BerniniInpaintCondition
 from .convrot_nodes import ConvRotCLIPLoader, ConvRotDiffusionModelLoader
 from .minimax_nodes import (
@@ -25,6 +25,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsMiniMaxH3ReferenceConditionHub": MiniMaxH3ReferenceConditionHub,
     "TuringUtilsMiniMaxH3ProgressiveResolutionPatch": MiniMaxH3ProgressiveResolutionPatch,
     "TuringUtilsSolSparseAttentionPatch": SolSparseAttentionPatch,
+    "TuringUtilsFrameSparseAttentionPatch": FrameSparseAttentionPatch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -40,4 +41,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsMiniMaxH3ReferenceConditionHub": "MiniMax H3 Reference Condition (Hub)",
     "TuringUtilsMiniMaxH3ProgressiveResolutionPatch": "Patch H3 Progressive Resolution (Experimental)",
     "TuringUtilsSolSparseAttentionPatch": "Patch Sol Sparse Attention (Experimental)",
+    "TuringUtilsFrameSparseAttentionPatch": "Patch Sage Frame Sparse Attention (Experimental)",
 }

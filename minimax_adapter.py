@@ -465,9 +465,9 @@ def _minimax_temporal_topology(base_model, diffusion_model, mod_segments):
         return {}
     pt, ph, pw = patch_size
     frames = math.ceil(video_shape[2] / pt)
-    tokens_per_frame = (
-        math.ceil(video_shape[3] / ph) * math.ceil(video_shape[4] / pw)
-    )
+    spatial_tokens_height = math.ceil(video_shape[3] / ph)
+    spatial_tokens_width = math.ceil(video_shape[4] / pw)
+    tokens_per_frame = spatial_tokens_height * spatial_tokens_width
     topology_tokens = frames * tokens_per_frame
     topology_start = int(mod_segments[-1][0])
     if int(mod_segments[-1][1]) - topology_start != topology_tokens:
@@ -476,6 +476,8 @@ def _minimax_temporal_topology(base_model, diffusion_model, mod_segments):
         "topology_start_tokens": topology_start,
         "topology_tokens": topology_tokens,
         "tokens_per_frame": tokens_per_frame,
+        "spatial_tokens_height": spatial_tokens_height,
+        "spatial_tokens_width": spatial_tokens_width,
     }
 
 

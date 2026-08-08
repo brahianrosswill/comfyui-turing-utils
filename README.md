@@ -57,6 +57,11 @@ only after its CUDA sources or required version change.
   accepts semantic prefix/video topology metadata, and exposes stable route
   budgets, integer dense-step safeguards, dense first/last-layer protection,
   and an internal automatic short-sequence crossover.
+- `Patch Sage Frame Sparse Attention (Experimental)` applies a lower-overhead
+  structured video path. Non-video queries remain on stable Sage; video queries
+  attend the exact semantic prefix, complete local latent frames, fixed sink
+  frames, and layer-rotated periodic anchor frames. It has no online routing or
+  centroid residuals and is never selected by a loader or `auto`.
 
 ## Turing behavior
 
@@ -101,13 +106,13 @@ the plugin prefers an installed SageAttention backend and then follows ComfyUI's
 normal fallback order.
 
 Sparse attention is not a loader option and `auto` never selects it. Connect the
-model through `Patch Sol Sparse Attention (Experimental)` to enable it on any
-compatible attention call. The current kernel accepts FP16/BF16/FP32 Q/K/V,
+model through one of the experimental patch nodes to enable it explicitly. The
+current kernels accept FP16/BF16/FP32 Q/K/V,
 GQA, 128-dimensional heads, and unmasked non-causal sequences; incompatible or
 short calls use bundled stable Sage. Semantic-prefix Query rows run through
 stable Sage, while sparse target Query rows keep the prefix as an exact K/V
-sink. Selected sparse blocks reuse stable Sage's INT8 Tensor Core QK path. This
-ABI requires kernel package 0.13.0. Routing uses original FP16/BF16 Q/K
+sink. Selected sparse blocks reuse stable Sage's INT8 Tensor Core QK path. Sol
+routing requires kernel package 0.13.0. Routing uses original FP16/BF16 Q/K
 centroids, while skipped-block score estimates are reconstructed from the same
 INT8 Q/K tensors and scales as selected blocks. Original V means remain in the
 value path. `skipped_residual=2x32` improves bimodal skipped-block fidelity;
@@ -118,6 +123,32 @@ reconstructs its summary Q tile from the existing INT8 Q buffer instead of
 rereading the original Q tensor. The sparse CTA uses 32 KiB of shared memory so
 SM75 can admit two CTAs when registers permit. Final quality/performance testing
 on an actual Turing GPU remains required.
+
+The frame-sparse ABI requires kernel package 0.15.0. It consumes a cached,
+head-independent CSR schedule and evaluates only complete selected 64-token K/V
+blocks with the stable Sage math path. `frame_window` selects complete local,
+sink, and periodic anchor frames. `radial` keeps complete nearby frames, then
+uses exact 8x8 spatial-token neighborhoods at logarithmically increasing
+temporal strides. MiniMax H3 supplies the packed target-video boundary,
+tokens-per-frame, and exact spatial-token height/width through its adapter;
+unknown layouts fall back to stable Sage instead of guessing.
+
+The node defaults to `custom` plus the established `frame_window` policy, so an
+old workflow does not silently change. `conservative`, `balanced`, and `fast`
+are coherent presets; selecting one intentionally overrides pattern, coverage,
+anchors, sinks, radial controls, and protected layer counts. On an A40 executing
+compute_75 code, 56-head BF16 attention measured 187/577 ms for 480p/720p-like
+`frame_window` shapes and 178/442 ms for the balanced radial settings. Their
+720p block densities were 15.1% and 11.4%. The radial attention component was
+about 0.74x the earlier ~600 ms 480p dense Sage component, but total model-step
+time still includes QKV, MLP, normalization, and activation traffic proportional
+to the larger sequence. Exact-sm75 end-to-end and visual validation remains
+required.
+
+The retained CUDA CTA handles one Q64 block, uses 32 KiB dynamic shared memory,
+and has zero stack/local spill. An evaluated Q128/40 KiB design kept the same
+eight resident warps per SM75 but regressed the 720p-like main kernel from
+73.67 ms to 85.87 ms at eight heads, so it is not shipped.
 
 See [`docs/turing-runtime.md`](docs/turing-runtime.md) for the dispatch and
 validation matrix. Experimental Sage1/Sage2 sources are not installed or
@@ -130,6 +161,7 @@ COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX" \
 python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-sparse
+python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-frame-sparse
 ```
 
 Compatible A40 runs validate numerical behavior and allocation shapes but do

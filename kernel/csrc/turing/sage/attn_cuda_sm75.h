@@ -51,6 +51,16 @@ at::Tensor sol_sparse_threshold_int8_f16_attn(at::Tensor query,
 
 at::Tensor sol_sparse_route_selected(at::Tensor route);
 
+at::Tensor frame_sparse_int8_f16_attn(at::Tensor query_int8,
+                    at::Tensor key_int8,
+                    at::Tensor value,
+                    at::Tensor output,
+                    at::Tensor query_scale,
+                    at::Tensor key_scale,
+                    at::Tensor row_offsets,
+                    at::Tensor key_blocks,
+                    float softmax_scale);
+
 #ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
 at::Tensor qk_int8_sv_f16_accum_f16_attn(at::Tensor query,
                     at::Tensor key,

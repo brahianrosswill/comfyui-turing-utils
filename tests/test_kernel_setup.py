@@ -5,6 +5,7 @@ import platform
 import runpy
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -73,11 +74,18 @@ class KernelSetupTest(unittest.TestCase):
         self.assertNotIn("arch=compute_86,code=sm_86", flags)
         self.assertNotIn("-DCOMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS", flags)
         self.assertIn("csrc/turing/sage/sol_sparse_cuda_sm75.cu", extensions[1].kwargs["sources"])
-        self.assertEqual(setup.call_args.kwargs["version"], "0.13.0")
+        self.assertIn("csrc/turing/sage/frame_sparse_cuda_sm75.cu", extensions[1].kwargs["sources"])
+        self.assertEqual(setup.call_args.kwargs["version"], "0.15.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
         })
+
+    def test_setup_and_pyproject_versions_match(self):
+        metadata = tomllib.loads(
+            (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(metadata["project"]["version"], "0.15.0")
 
     def test_sparse_source_does_not_require_optional_cuda_library_headers(self):
         source = (
@@ -92,6 +100,27 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn("kAttentionSharedBytes == 32 * 1024", source)
         self.assertIn("minimum_route_density", source)
         self.assertIn("residual_subblocks", source)
+
+    def test_frame_sparse_source_uses_static_csr_without_optional_cuda_headers(self):
+        source = (
+            PLUGIN_ROOT
+            / "kernel"
+            / "csrc"
+            / "turing"
+            / "sage"
+            / "frame_sparse_cuda_sm75.cu"
+        ).read_text(encoding="utf-8")
+        self.assertIn('#include "torch_compat.h"', source)
+        self.assertNotIn("ATen/cuda/CUDAContext", source)
+        self.assertNotIn("CUDAGuard", source)
+        self.assertNotIn("cusparse", source.lower())
+        self.assertIn("row_offsets", source)
+        self.assertIn("key_blocks", source)
+        self.assertIn("constexpr int kWarps = 4", source)
+        self.assertIn("kAttentionSharedBytes == 32 * 1024", source)
+        self.assertNotIn("q128", source.lower())
+        self.assertNotIn("key_score_summary", source)
+        self.assertNotIn("route_threshold", source)
 
     def test_windows_conda_target_specific_cccl_path_is_added(self):
         with tempfile.TemporaryDirectory() as temp_dir:

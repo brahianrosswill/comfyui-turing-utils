@@ -394,6 +394,7 @@ if _includes_sm75():
                     "csrc/turing/sage/qk_int_sv_f16_cuda_sm75.cu",
                     "csrc/turing/sage/qk_int_sv_f16_varlen_cuda_sm75.cu",
                     "csrc/turing/sage/sol_sparse_cuda_sm75.cu",
+                    "csrc/turing/sage/frame_sparse_cuda_sm75.cu",
                 ],
                 include_dirs=sage_include_dirs,
                 extra_compile_args={"cxx": CXX_FLAGS, "nvcc": sm75_nvcc_flags},
@@ -413,7 +414,7 @@ if _includes_sm75():
 
 setup(
     name="comfyui-turing-utils-kernel",
-    version="0.13.0",
+    version="0.15.0",
     packages=find_packages(where=str(ROOT)),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

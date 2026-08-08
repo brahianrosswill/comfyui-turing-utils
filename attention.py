@@ -30,13 +30,22 @@ SPARSE_DENSE_PREFIX_STEPS = 0
 SPARSE_DENSE_SUFFIX_STEPS = 0
 SPARSE_DENSE_PREFIX_LAYERS = 1
 SPARSE_DENSE_SUFFIX_LAYERS = 1
+FRAME_SPARSE_TEMPORAL_WINDOW_FRAMES = 2
+FRAME_SPARSE_GLOBAL_ANCHOR_STRIDE = 12
+FRAME_SPARSE_SINK_FRAMES = 1
+FRAME_SPARSE_PATTERN = "frame_window"
+FRAME_SPARSE_QUALITY_PROFILE = "custom"
+FRAME_SPARSE_RADIAL_SPATIAL_RADIUS = 1
+FRAME_SPARSE_RADIAL_MAX_TEMPORAL_STRIDE = 16
 SPARSE_LAYOUT_KEY = "turing_utils_attention_layout"
 _PREFLIGHTED_DEVICES: set[int] = set()
 _PREFLIGHTED_SPARSE_DEVICES: set[int] = set()
+_PREFLIGHTED_FRAME_SPARSE_DEVICES: set[int] = set()
 _LOGGED_FP32_COMPAT = False
 _LOGGED_TURING_KERNELS: set[tuple] = set()
 _LOGGED_TURING_FALLBACKS: set[str] = set()
 _LOGGED_SPARSE_KERNELS: set[tuple] = set()
+_LOGGED_FRAME_SPARSE_KERNELS: set[tuple] = set()
 _LOGGED_SPARSE_DENSE_REASONS: set[str] = set()
 
 
@@ -196,6 +205,20 @@ def bundled_sparse_available() -> bool:
     return version_tuple >= (0, 13, 0) and sparse_available()
 
 
+def bundled_frame_sparse_available() -> bool:
+    try:
+        import comfyui_turing_utils_kernel
+        from comfyui_turing_utils_kernel.turing_sage import frame_sparse_available
+    except (ImportError, OSError):
+        return False
+    version = getattr(comfyui_turing_utils_kernel, "__version__", "0.0.0")
+    try:
+        version_tuple = tuple(int(part) for part in version.split(".")[:3])
+    except ValueError:
+        return False
+    return version_tuple >= (0, 15, 0) and frame_sparse_available()
+
+
 def _sageattn(*args, **kwargs):
     from comfyui_turing_utils_kernel import turing_sage
 
@@ -206,6 +229,12 @@ def _sol_sparse_sageattn(*args, **kwargs):
     from comfyui_turing_utils_kernel import turing_sage
 
     return turing_sage.sol_sparse_sageattn(*args, **kwargs)
+
+
+def _frame_sparse_sageattn(*args, **kwargs):
+    from comfyui_turing_utils_kernel import turing_sage
+
+    return turing_sage.frame_sparse_sageattn(*args, **kwargs)
 
 
 def _sol_sparse_route_selected(route: torch.Tensor) -> int:
@@ -242,6 +271,18 @@ def preflight_bundled_sparse(device: torch.device) -> None:
 
     preflight_sparse(device)
     _PREFLIGHTED_SPARSE_DEVICES.add(index)
+
+
+def preflight_bundled_frame_sparse(device: torch.device) -> None:
+    if not is_supported_turing_device(device):
+        raise RuntimeError(f"unsupported Turing device {device}")
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index in _PREFLIGHTED_FRAME_SPARSE_DEVICES:
+        return
+    from comfyui_turing_utils_kernel.turing_sage import preflight_frame_sparse
+
+    preflight_frame_sparse(device)
+    _PREFLIGHTED_FRAME_SPARSE_DEVICES.add(index)
 
 
 def _reshape_qkv(q, k, v, heads: int, enable_gqa: bool):
@@ -477,6 +518,75 @@ def _sparse_temporal_topology(transformer_options, sequence_limit: int):
     ):
         return 0, 0, 0
     return start, tokens, frame_tokens
+
+
+def _sparse_spatial_topology(transformer_options, tokens_per_frame: int):
+    layout = (
+        transformer_options.get(SPARSE_LAYOUT_KEY)
+        if isinstance(transformer_options, dict)
+        else None
+    )
+    if not isinstance(layout, dict):
+        return 0, 0
+    height = layout.get("spatial_tokens_height", 0)
+    width = layout.get("spatial_tokens_width", 0)
+    if any(
+        not isinstance(value, int) or isinstance(value, bool)
+        for value in (height, width)
+    ):
+        return 0, 0
+    if height <= 0 or width <= 0 or height * width != tokens_per_frame:
+        return 0, 0
+    return height, width
+
+
+_FRAME_SPARSE_QUALITY_PROFILES = {
+    "conservative": {
+        "sparse_pattern": "frame_window",
+        "temporal_window_frames": 3,
+        "global_anchor_stride": 8,
+        "rotate_global_anchors": True,
+        "sink_frames": 2,
+        "radial_spatial_radius": 1,
+        "radial_max_temporal_stride": 8,
+        "dense_prefix_layers": 2,
+        "dense_suffix_layers": 2,
+    },
+    "balanced": {
+        "sparse_pattern": "radial",
+        "temporal_window_frames": 2,
+        "global_anchor_stride": 0,
+        "rotate_global_anchors": True,
+        "sink_frames": 1,
+        "radial_spatial_radius": 0,
+        "radial_max_temporal_stride": 16,
+        "dense_prefix_layers": 1,
+        "dense_suffix_layers": 1,
+    },
+    "fast": {
+        "sparse_pattern": "radial",
+        "temporal_window_frames": 1,
+        "global_anchor_stride": 0,
+        "rotate_global_anchors": True,
+        "sink_frames": 1,
+        "radial_spatial_radius": 0,
+        "radial_max_temporal_stride": 32,
+        "dense_prefix_layers": 1,
+        "dense_suffix_layers": 1,
+    },
+}
+
+
+def _resolve_frame_sparse_quality_profile(quality_profile: str, **settings):
+    quality_profile = str(quality_profile).strip().lower()
+    if quality_profile == "custom":
+        return settings
+    try:
+        return {**settings, **_FRAME_SPARSE_QUALITY_PROFILES[quality_profile]}
+    except KeyError as error:
+        raise ValueError(
+            "quality_profile must be custom, conservative, balanced, or fast"
+        ) from error
 
 
 def _sparse_dense_schedule(
@@ -867,6 +977,223 @@ def turing_sol_sparse_attention(
     return result.to(input_dtype) if input_dtype == torch.float32 else result
 
 
+def turing_frame_sparse_attention(
+    fallback: Callable,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    heads: int,
+    mask=None,
+    attn_precision=None,
+    skip_reshape: bool = False,
+    skip_output_reshape: bool = False,
+    prefix_policy: str = SPARSE_PREFIX_POLICY,
+    manual_prefix_tokens: int = 0,
+    temporal_window_frames: int = FRAME_SPARSE_TEMPORAL_WINDOW_FRAMES,
+    global_anchor_stride: int = FRAME_SPARSE_GLOBAL_ANCHOR_STRIDE,
+    rotate_global_anchors: bool = True,
+    sink_frames: int = FRAME_SPARSE_SINK_FRAMES,
+    sparse_pattern: str = FRAME_SPARSE_PATTERN,
+    radial_spatial_radius: int = FRAME_SPARSE_RADIAL_SPATIAL_RADIUS,
+    radial_max_temporal_stride: int = FRAME_SPARSE_RADIAL_MAX_TEMPORAL_STRIDE,
+    debug_route_density: bool = False,
+    **kwargs,
+) -> torch.Tensor:
+    """Structured video-tail sparsity with the stable SM75 Sage math path."""
+    original_q, original_k, original_v = q, k, v
+    common = {
+        "mask": mask,
+        "attn_precision": attn_precision,
+        "skip_reshape": skip_reshape,
+        "skip_output_reshape": skip_output_reshape,
+        **kwargs,
+    }
+
+    def dense(reason: str):
+        return _sparse_dense_baseline(
+            reason,
+            fallback,
+            original_q,
+            original_k,
+            original_v,
+            heads,
+            **common,
+        )
+
+    if not is_supported_turing_device(q.device):
+        return dense("Q/K/V are not on a supported sm75 GPU")
+    if mask is not None:
+        return dense("an attention mask was supplied")
+    if kwargs.get("low_precision_attention", True) is False:
+        return dense("low_precision_attention=False")
+    if bool(kwargs.get("is_causal", False)):
+        return dense("causal attention")
+    if q.dtype != k.dtype or q.dtype != v.dtype or q.dtype not in SUPPORTED_INPUT_DTYPES:
+        return dense("Q/K/V dtypes are incompatible")
+    if q.device != k.device or q.device != v.device:
+        return dense("Q/K/V devices are incompatible")
+
+    input_dtype = q.dtype
+    enable_gqa = bool(kwargs.get("enable_gqa", False))
+    if skip_reshape:
+        if q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or q.shape[1] != heads:
+            return dense("skip_reshape Q/K/V layout is incompatible")
+        batch, _, _, head_dim = q.shape
+    else:
+        try:
+            q, k, v, batch, head_dim = _reshape_qkv(q, k, v, heads, enable_gqa)
+        except ValueError:
+            return dense("unreshaped Q/K/V layout is incompatible")
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+    if head_dim != 128:
+        return dense(f"head_dim={head_dim} is not 128")
+    if q.shape[0] != k.shape[0] or q.shape[0] != v.shape[0]:
+        return dense("Q/K/V batch sizes are incompatible")
+    if k.shape[1] != v.shape[1] or k.shape[2:] != v.shape[2:]:
+        return dense("K/V shapes are incompatible")
+    if k.shape[-1] != 128 or k.shape[1] <= 0 or heads % k.shape[1] != 0:
+        return dense("Q/K/V head counts are incompatible")
+    if q.shape[2] != k.shape[2]:
+        return dense("frame sparsity requires equal Q/K sequence lengths")
+    if q.shape[2] < SPARSE_AUTO_MIN_SEQUENCE:
+        return dense(f"sequences shorter than {SPARSE_AUTO_MIN_SEQUENCE} tokens")
+
+    transformer_options = kwargs.get("transformer_options")
+    topology_start, topology_tokens, tokens_per_frame = _sparse_temporal_topology(
+        transformer_options,
+        q.shape[2],
+    )
+    if topology_tokens <= 0 or topology_start + topology_tokens != q.shape[2]:
+        return dense("contiguous video-tail topology metadata is unavailable")
+    spatial_tokens_height, spatial_tokens_width = _sparse_spatial_topology(
+        transformer_options, tokens_per_frame
+    )
+    if sparse_pattern == "radial" and (
+        spatial_tokens_height <= 0 or spatial_tokens_width <= 0
+    ):
+        return dense("radial spatial topology metadata is unavailable")
+    prefix_tokens = _sparse_prefix_tokens(
+        prefix_policy,
+        manual_prefix_tokens,
+        transformer_options,
+        q.shape[2],
+    )
+    layout = (
+        transformer_options.get(SPARSE_LAYOUT_KEY)
+        if isinstance(transformer_options, dict)
+        else None
+    )
+    layer_index = layout.get("layer_index") if isinstance(layout, dict) else None
+    rotation_period = (
+        global_anchor_stride
+        if global_anchor_stride > 0
+        else radial_max_temporal_stride if sparse_pattern == "radial" else 0
+    )
+    anchor_offset = (
+        layer_index % rotation_period
+        if rotate_global_anchors
+        and rotation_period > 0
+        and isinstance(layer_index, int)
+        and not isinstance(layer_index, bool)
+        else 0
+    )
+
+    if input_dtype == torch.float32:
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
+    kernel_key = (
+        q.device.index,
+        input_dtype,
+        tuple(q.shape),
+        tuple(k.shape),
+        prefix_tokens,
+        topology_start,
+        topology_tokens,
+        tokens_per_frame,
+        temporal_window_frames,
+        global_anchor_stride,
+        anchor_offset,
+        sink_frames,
+        sparse_pattern,
+        spatial_tokens_height,
+        spatial_tokens_width,
+        radial_spatial_radius,
+        radial_max_temporal_stride,
+    )
+    first_kernel_use = kernel_key not in _LOGGED_FRAME_SPARSE_KERNELS
+    collect_density = debug_route_density or first_kernel_use
+    sparse_result = _frame_sparse_sageattn(
+        q,
+        k,
+        v,
+        tensor_layout="HND",
+        sm_scale=kwargs.get("scale"),
+        prefix_tokens=prefix_tokens,
+        topology_start_tokens=topology_start,
+        topology_tokens=topology_tokens,
+        tokens_per_frame=tokens_per_frame,
+        temporal_window_frames=temporal_window_frames,
+        global_anchor_stride=global_anchor_stride,
+        global_anchor_offset=anchor_offset,
+        sink_frames=sink_frames,
+        sparse_pattern=sparse_pattern,
+        spatial_tokens_height=spatial_tokens_height,
+        spatial_tokens_width=spatial_tokens_width,
+        radial_spatial_radius=radial_spatial_radius,
+        radial_max_temporal_stride=radial_max_temporal_stride,
+        return_schedule_density=collect_density,
+    )
+    if collect_density:
+        output, density = sparse_result
+        if first_kernel_use:
+            LOG.info(
+                "Experimental Turing frame-sparse Sage active: dtype=%s Q=%s K=%s "
+                "prefix_policy=%s dense_prefix_k=%d dense_prefix_q=%d "
+                "video=(tokens=%d frame_tokens=%d frames=%d) window=%d "
+                "pattern=%s anchor_stride=%d anchor_offset=%d sink_frames=%d "
+                "radial_radius=%d radial_max_stride=%d density=%.4f",
+                input_dtype,
+                tuple(q.shape),
+                tuple(k.shape),
+                prefix_policy,
+                prefix_tokens,
+                topology_start,
+                topology_tokens,
+                tokens_per_frame,
+                topology_tokens // tokens_per_frame,
+                temporal_window_frames,
+                sparse_pattern,
+                global_anchor_stride,
+                anchor_offset,
+                sink_frames,
+                radial_spatial_radius,
+                radial_max_temporal_stride,
+                density,
+            )
+            _LOGGED_FRAME_SPARSE_KERNELS.add(kernel_key)
+        if debug_route_density and first_kernel_use:
+            LOG.warning(
+                "[Turing frame sparse debug] layer=%s window=%d anchor_stride=%d "
+                "anchor_offset=%d sink_frames=%d density=%.4f",
+                layer_index,
+                temporal_window_frames,
+                global_anchor_stride,
+                anchor_offset,
+                sink_frames,
+                density,
+            )
+    else:
+        output = sparse_result
+    result = output if skip_output_reshape else output.transpose(1, 2).reshape(
+        batch, -1, heads * head_dim
+    )
+    return result.to(input_dtype) if input_dtype == torch.float32 else result
+
+
 def _uses_bundled_turing_sage(option: str, device: torch.device | None) -> bool:
     option = normalize_attention_backend(option)
     return bool(
@@ -1008,7 +1335,6 @@ def make_sparse_attention_override(
             dense_prefix_steps,
             dense_suffix_steps,
             schedule_state,
-            track_step=debug_route_density,
         )
         dense_layer = _sparse_dense_layer(
             transformer_options,
@@ -1142,6 +1468,246 @@ def apply_sparse_attention_patch(
         dense_suffix_steps,
         dense_prefix_layers,
         dense_suffix_layers,
+        debug_route_density,
+    )
+    return patched
+
+
+def make_frame_sparse_attention_override(
+    device: torch.device,
+    quality_profile: str = FRAME_SPARSE_QUALITY_PROFILE,
+    sparse_pattern: str = FRAME_SPARSE_PATTERN,
+    prefix_policy: str = SPARSE_PREFIX_POLICY,
+    manual_prefix_tokens: int = 0,
+    temporal_window_frames: int = FRAME_SPARSE_TEMPORAL_WINDOW_FRAMES,
+    global_anchor_stride: int = FRAME_SPARSE_GLOBAL_ANCHOR_STRIDE,
+    rotate_global_anchors: bool = True,
+    sink_frames: int = FRAME_SPARSE_SINK_FRAMES,
+    radial_spatial_radius: int = FRAME_SPARSE_RADIAL_SPATIAL_RADIUS,
+    radial_max_temporal_stride: int = FRAME_SPARSE_RADIAL_MAX_TEMPORAL_STRIDE,
+    dense_prefix_steps: int = SPARSE_DENSE_PREFIX_STEPS,
+    dense_suffix_steps: int = SPARSE_DENSE_SUFFIX_STEPS,
+    dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
+    dense_suffix_layers: int = SPARSE_DENSE_SUFFIX_LAYERS,
+    debug_route_density: bool = False,
+) -> Callable:
+    quality_profile = str(quality_profile).strip().lower()
+    sparse_pattern = str(sparse_pattern).strip().lower()
+    prefix_policy = str(prefix_policy).strip().lower()
+    manual_prefix_tokens = int(manual_prefix_tokens)
+    temporal_window_frames = int(temporal_window_frames)
+    global_anchor_stride = int(global_anchor_stride)
+    rotate_global_anchors = bool(rotate_global_anchors)
+    sink_frames = int(sink_frames)
+    radial_spatial_radius = int(radial_spatial_radius)
+    radial_max_temporal_stride = int(radial_max_temporal_stride)
+    dense_prefix_steps = int(dense_prefix_steps)
+    dense_suffix_steps = int(dense_suffix_steps)
+    dense_prefix_layers = int(dense_prefix_layers)
+    dense_suffix_layers = int(dense_suffix_layers)
+    debug_route_density = bool(debug_route_density)
+    resolved = _resolve_frame_sparse_quality_profile(
+        quality_profile,
+        sparse_pattern=sparse_pattern,
+        temporal_window_frames=temporal_window_frames,
+        global_anchor_stride=global_anchor_stride,
+        rotate_global_anchors=rotate_global_anchors,
+        sink_frames=sink_frames,
+        radial_spatial_radius=radial_spatial_radius,
+        radial_max_temporal_stride=radial_max_temporal_stride,
+        dense_prefix_layers=dense_prefix_layers,
+        dense_suffix_layers=dense_suffix_layers,
+    )
+    sparse_pattern = resolved["sparse_pattern"]
+    temporal_window_frames = resolved["temporal_window_frames"]
+    global_anchor_stride = resolved["global_anchor_stride"]
+    rotate_global_anchors = resolved["rotate_global_anchors"]
+    sink_frames = resolved["sink_frames"]
+    radial_spatial_radius = resolved["radial_spatial_radius"]
+    radial_max_temporal_stride = resolved["radial_max_temporal_stride"]
+    dense_prefix_layers = resolved["dense_prefix_layers"]
+    dense_suffix_layers = resolved["dense_suffix_layers"]
+    if sparse_pattern not in {"frame_window", "radial"}:
+        raise ValueError("sparse_pattern must be frame_window or radial")
+    if prefix_policy not in {"auto", "none", "manual"}:
+        raise ValueError("prefix_policy must be auto, none, or manual")
+    if manual_prefix_tokens < 0:
+        raise ValueError("manual_prefix_tokens must be non-negative")
+    if temporal_window_frames < 0:
+        raise ValueError("temporal_window_frames must be non-negative")
+    if global_anchor_stride < 0:
+        raise ValueError("global_anchor_stride must be non-negative")
+    if sink_frames < 0:
+        raise ValueError("sink_frames must be non-negative")
+    if radial_spatial_radius < 0:
+        raise ValueError("radial_spatial_radius must be non-negative")
+    if radial_max_temporal_stride <= 0:
+        raise ValueError("radial_max_temporal_stride must be positive")
+    if dense_prefix_steps < 0:
+        raise ValueError("dense_prefix_steps must be non-negative")
+    if dense_suffix_steps < 0:
+        raise ValueError("dense_suffix_steps must be non-negative")
+    if dense_prefix_layers < 0:
+        raise ValueError("dense_prefix_layers must be non-negative")
+    if dense_suffix_layers < 0:
+        raise ValueError("dense_suffix_layers must be non-negative")
+    if not is_supported_turing_device(device):
+        raise RuntimeError("frame-sparse attention requires an sm75 Turing GPU")
+    if not bundled_frame_sparse_available():
+        raise RuntimeError(
+            "The experimental Turing frame-sparse extension is unavailable. "
+            "Rebuild comfyui-turing-utils-kernel 0.15.0 or newer with sm75 enabled."
+        )
+    preflight_bundled(device)
+    preflight_bundled_frame_sparse(device)
+    schedule_state: dict[str, object] = {}
+    debug_dense_reasons: set[str] = set()
+
+    def attention_override(original: Callable, *args, **kwargs):
+        fallback = lambda *fallback_args, **fallback_kwargs: _dtype_compatible_fallback(
+            original, *fallback_args, **fallback_kwargs
+        )
+        transformer_options = kwargs.get("transformer_options")
+        dense_schedule = _sparse_dense_schedule(
+            transformer_options,
+            dense_prefix_steps,
+            dense_suffix_steps,
+            schedule_state,
+        )
+        dense_layer = _sparse_dense_layer(
+            transformer_options,
+            dense_prefix_layers,
+            dense_suffix_layers,
+        )
+        if debug_route_density and dense_schedule:
+            debug_key = f"schedule:{schedule_state.get('step')}"
+            if debug_key not in debug_dense_reasons:
+                LOG.warning(
+                    "[Turing frame sparse debug] stable Sage selected by dense schedule: "
+                    "step=%s/%s prefix_steps=%s suffix_steps=%s",
+                    schedule_state.get("step"),
+                    schedule_state.get("sampling_steps"),
+                    schedule_state.get("prefix_steps"),
+                    schedule_state.get("suffix_steps"),
+                )
+                debug_dense_reasons.add(debug_key)
+        if debug_route_density and dense_layer:
+            layout = (
+                transformer_options.get(SPARSE_LAYOUT_KEY, {})
+                if isinstance(transformer_options, dict)
+                else {}
+            )
+            debug_key = f"layer:{layout.get('layer_index')}"
+            if debug_key not in debug_dense_reasons:
+                LOG.warning(
+                    "[Turing frame sparse debug] stable Sage selected for protected layer %s/%s",
+                    layout.get("layer_index"),
+                    layout.get("layer_count"),
+                )
+                debug_dense_reasons.add(debug_key)
+        if dense_schedule or dense_layer:
+            return turing_sage_attention(fallback, *args, **kwargs)
+        return turing_frame_sparse_attention(
+            fallback,
+            *args,
+            prefix_policy=prefix_policy,
+            manual_prefix_tokens=manual_prefix_tokens,
+            temporal_window_frames=temporal_window_frames,
+            global_anchor_stride=global_anchor_stride,
+            rotate_global_anchors=rotate_global_anchors,
+            sink_frames=sink_frames,
+            sparse_pattern=sparse_pattern,
+            radial_spatial_radius=radial_spatial_radius,
+            radial_max_temporal_stride=radial_max_temporal_stride,
+            debug_route_density=debug_route_density,
+            **kwargs,
+        )
+
+    attention_override.turing_utils_attention_backend = "frame_sparse_attn"
+    attention_override.turing_utils_attention_implementation = (
+        "bundled_turing_frame_sparse_experimental"
+    )
+    attention_override.turing_utils_frame_sparse_settings = {
+        "quality_profile": quality_profile,
+        "sparse_pattern": sparse_pattern,
+        "temporal_window_frames": temporal_window_frames,
+        "global_anchor_stride": global_anchor_stride,
+        "rotate_global_anchors": rotate_global_anchors,
+        "sink_frames": sink_frames,
+        "radial_spatial_radius": radial_spatial_radius,
+        "radial_max_temporal_stride": radial_max_temporal_stride,
+        "dense_prefix_layers": dense_prefix_layers,
+        "dense_suffix_layers": dense_suffix_layers,
+    }
+    return attention_override
+
+
+def apply_frame_sparse_attention_patch(
+    model,
+    quality_profile: str = FRAME_SPARSE_QUALITY_PROFILE,
+    sparse_pattern: str = FRAME_SPARSE_PATTERN,
+    prefix_policy: str = SPARSE_PREFIX_POLICY,
+    manual_prefix_tokens: int = 0,
+    temporal_window_frames: int = FRAME_SPARSE_TEMPORAL_WINDOW_FRAMES,
+    global_anchor_stride: int = FRAME_SPARSE_GLOBAL_ANCHOR_STRIDE,
+    rotate_global_anchors: bool = True,
+    sink_frames: int = FRAME_SPARSE_SINK_FRAMES,
+    radial_spatial_radius: int = FRAME_SPARSE_RADIAL_SPATIAL_RADIUS,
+    radial_max_temporal_stride: int = FRAME_SPARSE_RADIAL_MAX_TEMPORAL_STRIDE,
+    dense_prefix_steps: int = SPARSE_DENSE_PREFIX_STEPS,
+    dense_suffix_steps: int = SPARSE_DENSE_SUFFIX_STEPS,
+    dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
+    dense_suffix_layers: int = SPARSE_DENSE_SUFFIX_LAYERS,
+    debug_route_density: bool = False,
+):
+    patched = model.clone()
+    override = make_frame_sparse_attention_override(
+        patched.load_device,
+        quality_profile=quality_profile,
+        sparse_pattern=sparse_pattern,
+        prefix_policy=prefix_policy,
+        manual_prefix_tokens=manual_prefix_tokens,
+        temporal_window_frames=temporal_window_frames,
+        global_anchor_stride=global_anchor_stride,
+        rotate_global_anchors=rotate_global_anchors,
+        sink_frames=sink_frames,
+        radial_spatial_radius=radial_spatial_radius,
+        radial_max_temporal_stride=radial_max_temporal_stride,
+        dense_prefix_steps=dense_prefix_steps,
+        dense_suffix_steps=dense_suffix_steps,
+        dense_prefix_layers=dense_prefix_layers,
+        dense_suffix_layers=dense_suffix_layers,
+        debug_route_density=debug_route_density,
+    )
+    transformer_options = patched.model_options.setdefault("transformer_options", {})
+    transformer_options["optimized_attention_override"] = override
+    transformer_options["turing_utils_attention_backend"] = "frame_sparse_attn"
+    transformer_options["turing_utils_attention_implementation"] = (
+        "bundled_turing_frame_sparse_experimental"
+    )
+    resolved = override.turing_utils_frame_sparse_settings
+    LOG.info(
+        "Frame-sparse attention patch enabled: profile=%s pattern=%s "
+        "prefix_policy=%s manual_prefix=%d "
+        "temporal_window=%d anchor_stride=%d rotate_anchors=%s sink_frames=%d "
+        "radial_radius=%d radial_max_stride=%d "
+        "dense_prefix_steps=%d dense_suffix_steps=%d "
+        "dense_prefix_layers=%d dense_suffix_layers=%d "
+        "dense_backend=bundled_turing_sage debug_route_density=%s",
+        resolved["quality_profile"],
+        resolved["sparse_pattern"],
+        prefix_policy,
+        manual_prefix_tokens,
+        resolved["temporal_window_frames"],
+        resolved["global_anchor_stride"],
+        resolved["rotate_global_anchors"],
+        resolved["sink_frames"],
+        resolved["radial_spatial_radius"],
+        resolved["radial_max_temporal_stride"],
+        dense_prefix_steps,
+        dense_suffix_steps,
+        resolved["dense_prefix_layers"],
+        resolved["dense_suffix_layers"],
         debug_route_density,
     )
     return patched

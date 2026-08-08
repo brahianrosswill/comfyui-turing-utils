@@ -425,6 +425,8 @@ class MiniMaxAdapterTest(unittest.TestCase):
                 "topology_start_tokens": 88,
                 "topology_tokens": 140,
                 "tokens_per_frame": 20,
+                "spatial_tokens_height": 4,
+                "spatial_tokens_width": 5,
             },
         )
 

@@ -60,7 +60,10 @@ class TuringSageQuantContractTest(unittest.TestCase):
             turing_sage.__all__,
             [
                 "available",
+                "frame_sparse_available",
+                "frame_sparse_sageattn",
                 "preflight",
+                "preflight_frame_sparse",
                 "preflight_sparse",
                 "sageattn",
                 "sageattn_varlen",

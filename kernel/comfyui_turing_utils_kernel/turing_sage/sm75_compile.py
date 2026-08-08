@@ -111,3 +111,31 @@ def sol_sparse_route_selected(route):
             "route-density debug requires comfyui-turing-utils-kernel 0.13.0 or newer"
         )
     return _qattn_sm75.sol_sparse_route_selected(route)
+
+
+def frame_sparse_int8_f16_attn(
+    query_int8,
+    key_int8,
+    value,
+    output,
+    query_scale,
+    key_scale,
+    row_offsets,
+    key_blocks,
+    sm_scale,
+):
+    if not hasattr(_qattn_sm75, "frame_sparse_int8_f16_attn"):
+        raise RuntimeError(
+            "frame-sparse attention requires comfyui-turing-utils-kernel 0.15.0 or newer"
+        )
+    return _qattn_sm75.frame_sparse_int8_f16_attn(
+        query_int8,
+        key_int8,
+        value,
+        output,
+        query_scale,
+        key_scale,
+        row_offsets,
+        key_blocks,
+        sm_scale,
+    )
