@@ -76,8 +76,8 @@ class ReferenceNodesTest(unittest.TestCase):
             with self.subTest(hub=hub.__name__):
                 spatial = hub.define_schema().inputs[2:10]
                 self.assertEqual([item.id for item in spatial], expected_ids)
-                self.assertEqual(spatial[0].default, 512)
-                self.assertEqual(spatial[1].default, 512)
+                self.assertEqual(spatial[0].default, 0)
+                self.assertEqual(spatial[1].default, 0)
                 self.assertEqual(spatial[2].default, "nearest-exact")
                 self.assertEqual(
                     spatial[2].options,

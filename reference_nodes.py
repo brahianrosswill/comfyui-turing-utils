@@ -17,8 +17,8 @@ AudioReferences = io.Custom("TURING_REFERENCE_AUDIOS")
 
 @dataclass(frozen=True)
 class SpatialOptions:
-    width: int = 512
-    height: int = 512
+    width: int = 0
+    height: int = 0
     upscale_method: str = "nearest-exact"
     keep_proportion: str = "stretch"
     pad_color: str = "0, 0, 0"
@@ -354,7 +354,7 @@ def _spatial_inputs() -> list:
     return [
         io.Int.Input(
             "width",
-            default=512,
+            default=0,
             min=0,
             max=16384,
             step=1,
@@ -362,7 +362,7 @@ def _spatial_inputs() -> list:
         ),
         io.Int.Input(
             "height",
-            default=512,
+            default=0,
             min=0,
             max=16384,
             step=1,

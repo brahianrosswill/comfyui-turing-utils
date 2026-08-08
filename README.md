@@ -34,8 +34,8 @@ only after its CUDA sources or required version change.
 - `Load ConvRot CLIP` loads a ConvRot text encoder independently of the DiT.
 - `Reference Image/Video/Audio Hub` collects ordered heterogeneous references.
   Hubs can be chained; image/video resizing follows KJ Resize Image v2 controls,
-  either zero spatial dimension disables resizing, and an optional positive
-  video frame count trims or pads only at the end.
+  zero width/height defaults disable resizing, and an optional positive video
+  frame count trims or pads only at the end.
 - `Bernini Inpaint Condition` starts sampling from the source-video latent,
   supports local or global repainting, and optionally adds the source as aligned
   context tokens.
