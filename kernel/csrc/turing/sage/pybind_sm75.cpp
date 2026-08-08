@@ -22,7 +22,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
   m.def("qk_int8_sv_f16_accum_f32_attn", &qk_int8_sv_f16_accum_f32_attn, "QK int8 sv f16 accum f32 attn per warp");
   m.def("qk_int8_sv_f16_varlen_accum_f32_attn", &qk_int8_sv_f16_varlen_accum_f32_attn, "Varlen QK int8 sv f16 accum f32 attn per warp");
-  m.def("sol_sparse_threshold_f16_attn", &sol_sparse_threshold_f16_attn, "Experimental Sol threshold FP16 sparse attention for sm75");
+  m.def("sol_sparse_threshold_int8_f16_attn", &sol_sparse_threshold_int8_f16_attn, "Experimental Sol threshold sparse attention with INT8 QK and FP16/BF16 V for sm75");
   m.def("sol_sparse_route_selected", &sol_sparse_route_selected, "Count selected blocks in a Sol sparse route");
 #ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
   m.def("qk_int8_sv_f16_accum_f16_attn", &qk_int8_sv_f16_accum_f16_attn, "Experimental QK int8/PV f16 attention");

@@ -189,7 +189,7 @@ def bundled_sparse_available() -> bool:
         version_tuple = tuple(int(part) for part in version.split(".")[:3])
     except ValueError:
         return False
-    return version_tuple >= (0, 10, 0) and sparse_available()
+    return version_tuple >= (0, 12, 0) and sparse_available()
 
 
 def _sageattn(*args, **kwargs):
@@ -627,6 +627,8 @@ def turing_sol_sparse_attention(
         kwargs.get("transformer_options"),
         min(q.shape[2], k.shape[2]),
     )
+    if prefix_tokens and q.shape[2] != k.shape[2]:
+        return dense("prefix Query splitting requires equal Q/K sequence lengths")
     topology_start, topology_tokens, tokens_per_frame = _sparse_temporal_topology(
         kwargs.get("transformer_options"),
         min(q.shape[2], k.shape[2]),
@@ -652,14 +654,16 @@ def turing_sol_sparse_attention(
     if kernel_key not in _LOGGED_SPARSE_KERNELS:
         LOG.info(
             "Experimental Turing Sol sparse attention active: dtype=%s Q=%s K=%s "
-            "min_sequence=%d prefix_policy=%s dense_prefix=%d threshold=%.2f "
-            "local_radius=%d temporal_frames=%d topology=(%d,%d,%d)",
+            "min_sequence=%d prefix_policy=%s stable_prefix_q=%d sparse_target_q=%d "
+            "selected_qk=int8 threshold=%.2f local_radius=%d temporal_frames=%d "
+            "topology=(%d,%d,%d)",
             input_dtype,
             tuple(q.shape),
             tuple(k.shape),
             effective_min_sequence,
             prefix_policy,
             prefix_tokens,
+            q.shape[2] - prefix_tokens,
             routing_threshold,
             local_block_radius,
             temporal_neighbor_frames,
@@ -690,20 +694,22 @@ def turing_sol_sparse_attention(
         output, route = sparse_result
         try:
             selected_blocks = _sol_sparse_route_selected(route)
-            query_blocks = math.ceil(q.shape[2] / 64)
+            sparse_query_tokens = q.shape[2] - prefix_tokens
+            query_blocks = route.shape[2]
             key_blocks = math.ceil(k.shape[2] / 64)
-            possible_blocks = q.shape[0] * q.shape[1] * query_blocks * key_blocks
+            possible_blocks = route.shape[0] * route.shape[1] * query_blocks * key_blocks
             LOG.warning(
-                "[Turing sparse debug] Q=%d K=%d Hq=%d Hkv=%d selected=%d/%d "
+                "[Turing sparse debug] Q=%d Qsparse=%d K=%d Hq=%d Hkv=%d selected=%d/%d "
                 "density=%.4f threshold=%.2f prefix=%d local=%d temporal=%d "
                 "step=%s/%s layer=%s/%s",
                 q.shape[2],
+                sparse_query_tokens,
                 k.shape[2],
                 q.shape[1],
                 k.shape[1],
                 selected_blocks,
                 possible_blocks,
-                selected_blocks / possible_blocks,
+                selected_blocks / possible_blocks if possible_blocks else 0.0,
                 routing_threshold,
                 prefix_tokens,
                 local_block_radius,
@@ -833,7 +839,7 @@ def make_sparse_attention_override(
     if not bundled_sparse_available():
         raise RuntimeError(
             "The experimental Turing sparse extension is unavailable. "
-            "Rebuild comfyui-turing-utils-kernel 0.11.0 or newer with sm75 enabled."
+            "Rebuild comfyui-turing-utils-kernel 0.12.0 or newer with sm75 enabled."
         )
     preflight_bundled(device)
     preflight_bundled_sparse(device)

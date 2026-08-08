@@ -21,7 +21,7 @@ def sparse_available() -> bool:
         module = importlib.import_module("comfyui_turing_utils_kernel._sage_qattn_sm75")
     except (ImportError, OSError):
         return False
-    return hasattr(module, "sol_sparse_threshold_f16_attn")
+    return hasattr(module, "sol_sparse_threshold_int8_f16_attn")
 
 
 def sageattn(*args, **kwargs):
@@ -63,7 +63,7 @@ def preflight_sparse(device: torch.device) -> None:
         q = (((q_values % 29) - 14) / 16).reshape(1, 4, 129, 128).to(torch.bfloat16)
         k = ((((kv_values * 3) % 31) - 15) / 16).reshape(1, 2, 151, 128).to(torch.bfloat16)
         v = ((((kv_values * 5) % 37) - 18) / 16).reshape_as(k).to(torch.bfloat16)
-        output = sol_sparse_sageattn(q, k, v, prefix_tokens=151)
+        output = sol_sparse_sageattn(q, k, v, threshold_sigma=-1000.0)
         reference = torch.nn.functional.scaled_dot_product_attention(
             q.float(), k.float(), v.float(), enable_gqa=True
         )

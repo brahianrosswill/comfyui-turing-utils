@@ -16,6 +16,23 @@ from comfyui_turing_utils_kernel.turing_sage import quant  # noqa: E402
 
 
 class TuringSageQuantContractTest(unittest.TestCase):
+    def test_split_quantizers_preserve_production_scale_contract(self):
+        q = torch.empty((2, 4, 129, 128), dtype=torch.bfloat16)
+        k = torch.empty((2, 2, 151, 128), dtype=torch.bfloat16)
+        with (
+            mock.patch.object(quant._fused, "quant_per_warp_int8_cuda") as quant_q,
+            mock.patch.object(quant._fused, "quant_per_block_int8_cuda") as quant_k,
+        ):
+            q_int8, q_scale = quant.quantize_query_per_warp(q)
+            k_int8, k_scale = quant.quantize_key_per_block(k)
+
+        self.assertEqual(q_int8.shape, q.shape)
+        self.assertEqual(k_int8.shape, k.shape)
+        self.assertEqual(q_scale.shape, (2, 4, 12))
+        self.assertEqual(k_scale.shape, (2, 2, 3))
+        quant_q.assert_called_once_with(q, q_int8, q_scale, 64, 16, 1)
+        quant_k.assert_called_once_with(k, k_int8, k_scale, 64, 1)
+
     def test_production_per_warp_scale_shapes(self):
         q = torch.empty((2, 4, 65, 64), dtype=torch.float16)
         k = torch.empty((2, 2, 73, 64), dtype=torch.float16)

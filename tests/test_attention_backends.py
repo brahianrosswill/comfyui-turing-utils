@@ -37,7 +37,15 @@ class AttentionBackendsTest(unittest.TestCase):
         with mock.patch.dict(
             sys.modules,
             {
-                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.11.0"),
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.11.1"),
+                "comfyui_turing_utils_kernel.turing_sage": sage_module,
+            },
+        ):
+            self.assertFalse(attention_backends.bundled_sparse_available())
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.12.0"),
                 "comfyui_turing_utils_kernel.turing_sage": sage_module,
             },
         ):

@@ -4,8 +4,9 @@
  * One 64-token centroid per block feeds an input-adaptive mean + tau * std
  * threshold. The threshold comparison is fused into the FP16 Tensor Core
  * centroid tile, so no full proxy map is materialized. Selected blocks are
- * evaluated exactly; skipped blocks retain a centroid contribution in the
- * same FP32 online softmax instead of being dropped.
+ * evaluated with the production per-warp/per-block INT8 Sage QK path; skipped
+ * blocks retain a centroid contribution in the same FP32 online softmax
+ * instead of being dropped.
  */
 
 #include "../utils.cuh"
@@ -30,7 +31,9 @@ constexpr int kHeadDim = 128;
 constexpr int kWarps = 4;
 constexpr int kRouteTile = 16;
 constexpr int kHalfPacks = kHeadDim / 8;
+constexpr int kInt8Packs = kHeadDim / 16;
 constexpr int kTilePacks = kBlockTokens * kHalfPacks;
+constexpr int kInt8TilePacks = kBlockTokens * kInt8Packs;
 constexpr int kTileBytes = kBlockTokens * kHeadDim * sizeof(half);
 
 __global__ void route_popcount_kernel(
@@ -186,6 +189,7 @@ __device__ __forceinline__ bool forced_route_block(
     int key_block,
     int prefix_blocks,
     int local_block_radius,
+    int query_token_offset,
     int topology_start_tokens,
     int topology_tokens,
     int tokens_per_frame,
@@ -284,6 +288,7 @@ __global__ void route_threshold_fused_kernel(
     int route_words,
     int prefix_blocks,
     int local_block_radius,
+    int query_token_offset,
     int topology_start_tokens,
     int topology_tokens,
     int tokens_per_frame,
@@ -345,6 +350,7 @@ __global__ void route_threshold_fused_kernel(
                  key_block,
                  prefix_blocks,
                  local_block_radius,
+                 query_token_offset,
                  topology_start_tokens,
                  topology_tokens,
                  tokens_per_frame,
@@ -367,39 +373,42 @@ __device__ __forceinline__ bool forced_route_block(
     int key_block,
     int prefix_blocks,
     int local_block_radius,
+    int query_token_offset,
     int topology_start_tokens,
     int topology_tokens,
     int tokens_per_frame,
     int temporal_neighbor_frames)
 {
-  const int distance = query_block > key_block
-      ? query_block - key_block
-      : key_block - query_block;
-  if (query_block < prefix_blocks || key_block < prefix_blocks ||
-      distance <= local_block_radius)
+  if (key_block < prefix_blocks)
+    return true;
+
+  const int query_start = query_token_offset + query_block * kBlockTokens;
+  const int query_end = query_start + kBlockTokens;
+  const int key_start = key_block * kBlockTokens;
+  const int key_end = key_start + kBlockTokens;
+  const int local_tokens = local_block_radius * kBlockTokens;
+  if (key_start < query_end + local_tokens &&
+      key_end > query_start - local_tokens)
     return true;
   if (temporal_neighbor_frames <= 0 || topology_tokens <= 0 ||
       tokens_per_frame <= 0)
     return false;
 
   const int topology_end = topology_start_tokens + topology_tokens;
-  const int query_start = query_block * kBlockTokens;
-  const int query_end = min(query_start + kBlockTokens, topology_end);
   if (query_start < topology_start_tokens || query_start >= topology_end)
     return false;
-  const int key_start = key_block * kBlockTokens;
-  const int key_end = key_start + kBlockTokens;
+  const int bounded_query_end = min(query_end, topology_end);
   for (int frame_offset = 1; frame_offset <= temporal_neighbor_frames;
        ++frame_offset)
   {
     const int token_offset = frame_offset * tokens_per_frame;
     const int previous_start = query_start - token_offset;
-    const int previous_end = query_end - token_offset;
+    const int previous_end = bounded_query_end - token_offset;
     if (previous_start < topology_end && previous_end > topology_start_tokens &&
         key_start < previous_end && key_end > previous_start)
       return true;
     const int next_start = query_start + token_offset;
-    const int next_end = query_end + token_offset;
+    const int next_end = bounded_query_end + token_offset;
     if (next_start < topology_end && next_end > topology_start_tokens &&
         key_start < next_end && key_end > next_start)
       return true;
@@ -467,6 +476,33 @@ __device__ __forceinline__ void load_half_tile(
   }
 }
 
+__device__ __forceinline__ void load_int8_tile(
+    const int8_t *__restrict__ source,
+    int64_t stride_sequence,
+    int row_start,
+    int row_limit,
+    const smem_t<SwizzleMode::k128B, kInt8Packs> &destination)
+{
+  const int linear_thread = threadIdx.y * WARP_SIZE + threadIdx.x;
+  for (int line = linear_thread; line < kInt8TilePacks;
+       line += kWarps * WARP_SIZE)
+  {
+    const int row = line / kInt8Packs;
+    const int column = line % kInt8Packs;
+    const uint32_t offset = destination.get_permuted_offset(row, column);
+    if (row_start + row < row_limit)
+    {
+      destination.base[offset] = *reinterpret_cast<const b128_t *>(
+          source + static_cast<int64_t>(row_start + row) * stride_sequence +
+          column * 16);
+    }
+    else
+    {
+      destination.base[offset] = make_uint4(0, 0, 0, 0);
+    }
+  }
+}
+
 __device__ __forceinline__ void compute_fp16_qk(
     const smem_t<SwizzleMode::k128B, kHalfPacks> &query,
     const smem_t<SwizzleMode::k128B, kHalfPacks> &key,
@@ -509,6 +545,21 @@ __device__ __forceinline__ void compute_fp16_qk(
   }
 }
 
+__device__ __forceinline__ void compute_int8_qk(
+    const smem_t<SwizzleMode::k128B, kInt8Packs> &query,
+    const smem_t<SwizzleMode::k128B, kInt8Packs> &key,
+    int32_t score[1][4][8])
+{
+  uint32_t query_offset = query.get_permuted_offset(
+      threadIdx.y * 16 + threadIdx.x % 16, threadIdx.x / 16);
+  uint32_t key_offset = key.get_permuted_offset(
+      threadIdx.x % 8 + (threadIdx.x / 16) * 8,
+      (threadIdx.x / 8) % 2);
+  compute_int_qk<4, 1, 1, 4, 4,
+                 SwizzleMode::k128B, kInt8Packs, DataType::kInt8>(
+      query, key, score, query_offset, key_offset);
+}
+
 __device__ __forceinline__ bool route_selected(
     const int32_t *__restrict__ route_row,
     int key_block)
@@ -521,9 +572,12 @@ __device__ __forceinline__ bool route_selected(
 template <typename T>
 __global__ void sparse_attention_kernel(
     const T *__restrict__ query,
-    const T *__restrict__ key,
+    const int8_t *__restrict__ query_int8,
+    const int8_t *__restrict__ key_int8,
     const T *__restrict__ value,
     T *__restrict__ output,
+    const float *__restrict__ query_scale,
+    const float *__restrict__ key_scale,
     const half *__restrict__ key_summary,
     const half *__restrict__ value_mean,
     const int32_t *__restrict__ route,
@@ -538,9 +592,12 @@ __global__ void sparse_attention_kernel(
     int64_t stride_batch_q,
     int64_t stride_head_q,
     int64_t stride_sequence_q,
-    int64_t stride_batch_k,
-    int64_t stride_head_k,
-    int64_t stride_sequence_k,
+    int64_t stride_batch_q_int8,
+    int64_t stride_head_q_int8,
+    int64_t stride_sequence_q_int8,
+    int64_t stride_batch_k_int8,
+    int64_t stride_head_k_int8,
+    int64_t stride_sequence_k_int8,
     int64_t stride_batch_v,
     int64_t stride_head_v,
     int64_t stride_sequence_v,
@@ -555,6 +612,8 @@ __global__ void sparse_attention_kernel(
   smem_t<SwizzleMode::k128B, kHalfPacks> shared_key(shared_bytes + kTileBytes);
   smem_t<SwizzleMode::k128B, kHalfPacks> shared_value(shared_bytes + 2 * kTileBytes);
   smem_t<SwizzleMode::k128B, kHalfPacks> shared_output(shared_bytes);
+  smem_t<SwizzleMode::k128B, kInt8Packs> shared_query_int8(shared_bytes);
+  smem_t<SwizzleMode::k128B, kInt8Packs> shared_key_int8(shared_bytes + kTileBytes);
 
   const int query_block = blockIdx.x;
   const int query_head = blockIdx.y;
@@ -562,7 +621,10 @@ __global__ void sparse_attention_kernel(
   const int kv_head = query_head / (num_query_heads / num_kv_heads);
   const T *query_head_ptr =
       query + batch * stride_batch_q + query_head * stride_head_q;
-  const T *key_head_ptr = key + batch * stride_batch_k + kv_head * stride_head_k;
+  const int8_t *query_int8_head_ptr = query_int8 +
+      batch * stride_batch_q_int8 + query_head * stride_head_q_int8;
+  const int8_t *key_int8_head_ptr = key_int8 +
+      batch * stride_batch_k_int8 + kv_head * stride_head_k_int8;
   const T *value_head_ptr =
       value + batch * stride_batch_v + kv_head * stride_head_v;
   T *output_head_ptr =
@@ -578,6 +640,12 @@ __global__ void sparse_attention_kernel(
            num_query_blocks +
        query_block) *
           route_words;
+  const float q_dequant_scale = query_scale[
+      (static_cast<int64_t>(batch) * num_query_heads + query_head) *
+          num_query_blocks * kWarps +
+      query_block * kWarps + threadIdx.y];
+  const float *key_scale_head = key_scale +
+      (static_cast<int64_t>(batch) * num_kv_heads + kv_head) * num_key_blocks;
 
   float output_fragment[1][8][8];
   float row_max[1][2];
@@ -666,19 +734,27 @@ __global__ void sparse_attention_kernel(
     __syncthreads();
   }
 
-  // Selected blocks retain exact token-level attention. FP16 tensor-core QK
-  // avoids the dense path's quantization buffers and is more accurate than the
-  // INT8 baseline while sparsity supplies the speedup.
+  // Selected blocks retain exact token-level attention. Q/K are quantized once
+  // with the production Sage per-16-row Q and per-64-row K scales, then use the
+  // same SM75 INT8 Tensor Core MMA as stable Sage. V and output stay FP16/BF16
+  // with FP32 online-softmax accumulation.
+  load_int8_tile(
+      query_int8_head_ptr,
+      stride_sequence_q_int8,
+      query_block * kBlockTokens,
+      query_length,
+      shared_query_int8);
+  __syncthreads();
   for (int key_block = 0; key_block < num_key_blocks; ++key_block)
   {
     if (!route_selected(route_row, key_block))
       continue;
-    load_half_tile(
-        key_head_ptr,
-        stride_sequence_k,
+    load_int8_tile(
+        key_int8_head_ptr,
+        stride_sequence_k_int8,
         key_block * kBlockTokens,
         key_length,
-        shared_key);
+        shared_key_int8);
     load_half_tile(
         value_head_ptr,
         stride_sequence_v,
@@ -687,13 +763,26 @@ __global__ void sparse_attention_kernel(
         shared_value);
     __syncthreads();
 
+    int32_t integer_score[1][4][8];
+    compute_int8_qk(shared_query_int8, shared_key_int8, integer_score);
     float score[1][4][8];
-    compute_fp16_qk(shared_query, shared_key, score);
+#pragma unroll
+    for (int key_tile = 0; key_tile < 4; ++key_tile)
+    {
+#pragma unroll
+      for (int element = 0; element < 8; ++element)
+        score[0][key_tile][element] =
+            __int2float_rz(integer_score[0][key_tile][element]);
+    }
     const uint32_t key_lane_base =
         key_block * kBlockTokens + 2 * (threadIdx.x % 4);
     apply_out_of_bound_mask<1, 4>(key_lane_base, score, key_length);
     update_mdo<1, 4, 8, false, false, false>(
-        score, output_fragment, row_max, denominator, scale_log2);
+        score,
+        output_fragment,
+        row_max,
+        denominator,
+        scale_log2 * q_dequant_scale * key_scale_head[key_block]);
     uint32_t probability[1][4][4];
     RS_32_to_16<1, 4>(score, probability);
     accumulate_d<1, 4, ComputeUnit::kTensorCore>(probability, denominator);
@@ -787,8 +876,12 @@ template <typename T>
 void launch_sparse_threshold_attention(
     at::Tensor query,
     at::Tensor key,
+    at::Tensor query_int8,
+    at::Tensor key_int8,
     at::Tensor value,
     at::Tensor output,
+    at::Tensor query_scale,
+    at::Tensor key_scale,
     at::Tensor query_summary,
     at::Tensor key_summary,
     at::Tensor value_mean,
@@ -798,6 +891,7 @@ void launch_sparse_threshold_attention(
     at::Tensor route,
     int prefix_blocks,
     int local_block_radius,
+    int query_token_offset,
     int topology_start_tokens,
     int topology_tokens,
     int tokens_per_frame,
@@ -892,6 +986,7 @@ void launch_sparse_threshold_attention(
       route_words,
       prefix_blocks,
       local_block_radius,
+      query_token_offset,
       topology_start_tokens,
       topology_tokens,
       tokens_per_frame,
@@ -906,9 +1001,12 @@ void launch_sparse_threshold_attention(
       3 * kTileBytes,
       stream>>>(
       reinterpret_cast<const T *>(query.data_ptr()),
-      reinterpret_cast<const T *>(key.data_ptr()),
+      query_int8.data_ptr<int8_t>(),
+      key_int8.data_ptr<int8_t>(),
       reinterpret_cast<const T *>(value.data_ptr()),
       reinterpret_cast<T *>(output.data_ptr()),
+      query_scale.data_ptr<float>(),
+      key_scale.data_ptr<float>(),
       reinterpret_cast<const half *>(key_summary.data_ptr()),
       reinterpret_cast<const half *>(value_mean.data_ptr()),
       route.data_ptr<int32_t>(),
@@ -923,9 +1021,12 @@ void launch_sparse_threshold_attention(
       query.stride(0),
       query.stride(1),
       query.stride(2),
-      key.stride(0),
-      key.stride(1),
-      key.stride(2),
+      query_int8.stride(0),
+      query_int8.stride(1),
+      query_int8.stride(2),
+      key_int8.stride(0),
+      key_int8.stride(1),
+      key_int8.stride(2),
       value.stride(0),
       value.stride(1),
       value.stride(2),
@@ -938,11 +1039,15 @@ void launch_sparse_threshold_attention(
 
 } // namespace
 
-static at::Tensor sol_sparse_threshold_f16_attn_impl(
+static at::Tensor sol_sparse_threshold_int8_f16_attn_impl(
     at::Tensor query,
     at::Tensor key,
+    at::Tensor query_int8,
+    at::Tensor key_int8,
     at::Tensor value,
     at::Tensor output,
+    at::Tensor query_scale,
+    at::Tensor key_scale,
     int prefix_tokens,
     float threshold_sigma,
     int local_block_radius,
@@ -950,20 +1055,33 @@ static at::Tensor sol_sparse_threshold_f16_attn_impl(
     int topology_tokens,
     int tokens_per_frame,
     int temporal_neighbor_frames,
+    int query_token_offset,
     float softmax_scale)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
+  CHECK_CUDA(query_int8);
+  CHECK_CUDA(key_int8);
   CHECK_CUDA(value);
   CHECK_CUDA(output);
+  CHECK_CUDA(query_scale);
+  CHECK_CUDA(key_scale);
   CHECK_LASTDIM_CONTIGUOUS(query);
   CHECK_LASTDIM_CONTIGUOUS(key);
+  CHECK_LASTDIM_CONTIGUOUS(query_int8);
+  CHECK_LASTDIM_CONTIGUOUS(key_int8);
   CHECK_LASTDIM_CONTIGUOUS(value);
   CHECK_LASTDIM_CONTIGUOUS(output);
+  CHECK_CONTIGUOUS(query_scale);
+  CHECK_CONTIGUOUS(key_scale);
   CHECK_DIMS(query, 4);
   CHECK_DIMS(key, 4);
+  CHECK_DIMS(query_int8, 4);
+  CHECK_DIMS(key_int8, 4);
   CHECK_DIMS(value, 4);
   CHECK_DIMS(output, 4);
+  CHECK_DIMS(query_scale, 3);
+  CHECK_DIMS(key_scale, 3);
   TORCH_CHECK(
       query.scalar_type() == at::ScalarType::Half ||
           query.scalar_type() == at::ScalarType::BFloat16,
@@ -973,9 +1091,17 @@ static at::Tensor sol_sparse_threshold_f16_attn_impl(
           value.scalar_type() == query.scalar_type() &&
           output.scalar_type() == query.scalar_type(),
       "sparse attention Q/K/V/output dtypes must match");
+  CHECK_DTYPE(query_int8, at::ScalarType::Char);
+  CHECK_DTYPE(key_int8, at::ScalarType::Char);
+  CHECK_DTYPE(query_scale, at::ScalarType::Float);
+  CHECK_DTYPE(key_scale, at::ScalarType::Float);
   TORCH_CHECK(
       query.device() == key.device() && query.device() == value.device() &&
-          query.device() == output.device(),
+          query.device() == output.device() &&
+          query.device() == query_int8.device() &&
+          query.device() == key_int8.device() &&
+          query.device() == query_scale.device() &&
+          query.device() == key_scale.device(),
       "sparse attention tensors must share one CUDA device");
   TORCH_CHECK(
       query.size(0) == key.size(0) && query.size(0) == value.size(0),
@@ -983,6 +1109,9 @@ static at::Tensor sol_sparse_threshold_f16_attn_impl(
   TORCH_CHECK(
       key.size(1) == value.size(1) && key.size(2) == value.size(2),
       "sparse attention K/V shapes must match");
+  TORCH_CHECK(
+      query_int8.sizes() == query.sizes() && key_int8.sizes() == key.sizes(),
+      "sparse attention INT8 Q/K must match the original Q/K shapes");
   TORCH_CHECK(
       query.size(3) == kHeadDim && key.size(3) == kHeadDim &&
           value.size(3) == kHeadDim,
@@ -993,9 +1122,29 @@ static at::Tensor sol_sparse_threshold_f16_attn_impl(
   TORCH_CHECK(query.size(2) > 0 && key.size(2) > 0, "empty attention is unsupported");
   TORCH_CHECK(
       output.sizes() == query.sizes(), "sparse attention output must match Q shape");
+  const int batch_size = query.size(0);
+  const int num_query_heads = query.size(1);
+  const int num_kv_heads = key.size(1);
+  const int num_query_blocks = div_ceil(query.size(2), kBlockTokens);
+  const int num_key_blocks = div_ceil(key.size(2), kBlockTokens);
+  TORCH_CHECK(
+      query_scale.size(0) == batch_size &&
+          query_scale.size(1) == num_query_heads &&
+          query_scale.size(2) == num_query_blocks * kWarps,
+      "sparse attention Q scale must have shape [B, Hq, ceil(Q/64) * 4]");
+  TORCH_CHECK(
+      key_scale.size(0) == batch_size &&
+          key_scale.size(1) == num_kv_heads &&
+          key_scale.size(2) == num_key_blocks,
+      "sparse attention K scale must have shape [B, Hkv, ceil(K/64)]");
   TORCH_CHECK(
       prefix_tokens >= 0 && prefix_tokens <= key.size(2),
       "sparse attention prefix_tokens is outside the K sequence");
+  TORCH_CHECK(
+      query_token_offset >= 0 &&
+          ((query_token_offset == 0 && prefix_tokens == 0) ||
+           query_token_offset + query.size(2) <= key.size(2)),
+      "sparse attention target Query range is outside the shared K sequence");
   TORCH_CHECK(
       std::isfinite(threshold_sigma),
       "sparse attention threshold_sigma must be finite");
@@ -1009,15 +1158,9 @@ static at::Tensor sol_sparse_threshold_f16_attn_impl(
   TORCH_CHECK(
       topology_tokens == 0 ||
           (tokens_per_frame > 0 &&
-           topology_start_tokens + topology_tokens <= query.size(2) &&
            topology_start_tokens + topology_tokens <= key.size(2)),
       "sparse attention topology is outside the shared Q/K sequence");
 
-  const int batch_size = query.size(0);
-  const int num_query_heads = query.size(1);
-  const int num_kv_heads = key.size(1);
-  const int num_query_blocks = div_ceil(query.size(2), kBlockTokens);
-  const int num_key_blocks = div_ceil(key.size(2), kBlockTokens);
   const int padded_query_blocks = div_ceil(num_query_blocks, kRouteTile) * kRouteTile;
   const int padded_key_blocks = div_ceil(num_key_blocks, kRouteTile) * kRouteTile;
   const int route_words = div_ceil(num_key_blocks, kRouteTile);
@@ -1046,8 +1189,12 @@ static at::Tensor sol_sparse_threshold_f16_attn_impl(
       launch_sparse_threshold_attention<half>(
           query,
           key,
+          query_int8,
+          key_int8,
           value,
           output,
+          query_scale,
+          key_scale,
           query_summary,
           key_summary,
           value_mean,
@@ -1057,6 +1204,7 @@ static at::Tensor sol_sparse_threshold_f16_attn_impl(
           route,
           prefix_blocks,
           local_block_radius,
+          query_token_offset,
           topology_start_tokens,
           topology_tokens,
           tokens_per_frame,
@@ -1069,8 +1217,12 @@ static at::Tensor sol_sparse_threshold_f16_attn_impl(
       launch_sparse_threshold_attention<nv_bfloat16>(
           query,
           key,
+          query_int8,
+          key_int8,
           value,
           output,
+          query_scale,
+          key_scale,
           query_summary,
           key_summary,
           value_mean,
@@ -1080,6 +1232,7 @@ static at::Tensor sol_sparse_threshold_f16_attn_impl(
           route,
           prefix_blocks,
           local_block_radius,
+          query_token_offset,
           topology_start_tokens,
           topology_tokens,
           tokens_per_frame,
@@ -1091,11 +1244,15 @@ static at::Tensor sol_sparse_threshold_f16_attn_impl(
   }
 }
 
-at::Tensor sol_sparse_threshold_f16_attn(
+at::Tensor sol_sparse_threshold_int8_f16_attn(
     at::Tensor query,
     at::Tensor key,
+    at::Tensor query_int8,
+    at::Tensor key_int8,
     at::Tensor value,
     at::Tensor output,
+    at::Tensor query_scale,
+    at::Tensor key_scale,
     int prefix_tokens,
     float threshold_sigma,
     int local_block_radius,
@@ -1103,13 +1260,18 @@ at::Tensor sol_sparse_threshold_f16_attn(
     int topology_tokens,
     int tokens_per_frame,
     int temporal_neighbor_frames,
+    int query_token_offset,
     float softmax_scale)
 {
-  return sol_sparse_threshold_f16_attn_impl(
+  return sol_sparse_threshold_int8_f16_attn_impl(
       query,
       key,
+      query_int8,
+      key_int8,
       value,
       output,
+      query_scale,
+      key_scale,
       prefix_tokens,
       threshold_sigma,
       local_block_radius,
@@ -1117,6 +1279,7 @@ at::Tensor sol_sparse_threshold_f16_attn(
       topology_tokens,
       tokens_per_frame,
       temporal_neighbor_frames,
+      query_token_offset,
       softmax_scale);
 }
 

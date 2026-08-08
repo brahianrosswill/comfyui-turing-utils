@@ -249,29 +249,62 @@ def validate_sage(device: torch.device) -> None:
 
 def validate_sparse(device: torch.device) -> None:
     from comfyui_turing_utils_kernel.turing_sage import (
+        sageattn,
         sol_sparse_route_selected,
         sol_sparse_sageattn,
     )
 
     for dtype in (torch.float16, torch.bfloat16):
-        q = torch.randn((1, 4, 129, 128), device=device, dtype=dtype)
-        k = torch.randn((1, 2, 151, 128), device=device, dtype=dtype)
-        v = torch.randn_like(k)
-        output, route = sol_sparse_sageattn(
-            q, k, v, prefix_tokens=k.size(2), return_route=True
-        )
-        reference = torch.nn.functional.scaled_dot_product_attention(
-            q.float(), k.float(), v.float(), enable_gqa=True
-        )
-        _assert_close(
-            f"experimental sparse exact route {dtype}",
-            output,
-            reference,
-            rtol=0.02,
-            atol=0.02,
-        )
-        if route.dtype != torch.int32 or route.shape[:3] != (1, 4, 3):
-            raise RuntimeError("experimental sparse route shape is incompatible")
+        for query_length, key_length in ((129, 151), (151, 129)):
+            q = torch.randn((1, 4, query_length, 128), device=device, dtype=dtype)
+            k = torch.randn((1, 2, key_length, 128), device=device, dtype=dtype)
+            v = torch.randn_like(k)
+            output, route = sol_sparse_sageattn(
+                q, k, v, threshold_sigma=-1000.0, return_route=True
+            )
+            reference = torch.nn.functional.scaled_dot_product_attention(
+                q.float(), k.float(), v.float(), enable_gqa=True
+            )
+            _assert_close(
+                f"experimental sparse exact route {dtype} Q={query_length} K={key_length}",
+                output,
+                reference,
+                rtol=0.08,
+                atol=0.06,
+            )
+            expected_query_blocks = (query_length + 63) // 64
+            if (
+                route.dtype != torch.int32
+                or route.shape[:3] != (1, 4, expected_query_blocks)
+            ):
+                raise RuntimeError("experimental sparse route shape is incompatible")
+
+    # A non-block-aligned semantic prefix is evaluated by stable Sage while
+    # only target-video Query blocks enter sparse routing. K quantization is
+    # shared by both paths, including GQA head mapping.
+    sequence = 321
+    prefix = 77
+    q = torch.randn((1, 4, sequence, 128), device=device, dtype=torch.bfloat16)
+    k = torch.randn((1, 2, sequence, 128), device=device, dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    output, route = sol_sparse_sageattn(
+        q,
+        k,
+        v,
+        prefix_tokens=prefix,
+        threshold_sigma=-1000.0,
+        return_route=True,
+    )
+    dense = sageattn(q, k, v)
+    _assert_close(
+        "experimental sparse split prefix full route",
+        output,
+        dense,
+        rtol=0.02,
+        atol=0.01,
+    )
+    if route.shape[:3] != (1, 4, (sequence - prefix + 63) // 64):
+        raise RuntimeError("sparse route must contain target-video Query blocks only")
 
     sequence = 1025
     blocks = (sequence + 63) // 64
@@ -309,7 +342,8 @@ def validate_sparse(device: torch.device) -> None:
         raise RuntimeError(
             f"experimental sparse route popcount mismatch: {selected_cuda} != {selected}"
         )
-    density = selected / (4 * blocks * blocks)
+    possible = route.shape[0] * route.shape[1] * route.shape[2] * blocks
+    density = selected / possible
     if not 0.1 < density < 0.9:
         raise RuntimeError(f"experimental sparse route density is implausible: {density:.3f}")
 

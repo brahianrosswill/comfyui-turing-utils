@@ -79,9 +79,11 @@ Sparse attention is not a loader option and `auto` never selects it. Connect the
 model through `Patch Sol Sparse Attention (Experimental)` to enable it on any
 compatible attention call. The current kernel accepts FP16/BF16/FP32 Q/K/V,
 GQA, 128-dimensional heads, and unmasked non-causal sequences; incompatible or
-short calls use bundled stable Sage. It requires kernel package 0.11.0; optional
-route-density debug logging requires 0.11.1. Final
-quality/performance testing on an actual Turing GPU.
+short calls use bundled stable Sage. Semantic-prefix Query rows run through
+stable Sage, while sparse target Query rows keep the prefix as an exact K/V
+sink. Selected sparse blocks reuse stable Sage's INT8 Tensor Core QK path. This
+ABI requires kernel package 0.12.0. Final quality/performance testing on an
+actual Turing GPU remains required.
 
 See [`docs/turing-runtime.md`](docs/turing-runtime.md) for the dispatch and
 validation matrix. Experimental Sage1/Sage2 sources are not installed or

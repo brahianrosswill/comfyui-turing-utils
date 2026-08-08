@@ -28,10 +28,14 @@ at::Tensor qk_int8_sv_f16_accum_f32_attn(at::Tensor query,
                     float sm_scale,
                     int return_lse);
 
-at::Tensor sol_sparse_threshold_f16_attn(at::Tensor query,
+at::Tensor sol_sparse_threshold_int8_f16_attn(at::Tensor query,
                     at::Tensor key,
+                    at::Tensor query_int8,
+                    at::Tensor key_int8,
                     at::Tensor value,
                     at::Tensor output,
+                    at::Tensor query_scale,
+                    at::Tensor key_scale,
                     int prefix_tokens,
                     float threshold_sigma,
                     int local_block_radius,
@@ -39,6 +43,7 @@ at::Tensor sol_sparse_threshold_f16_attn(at::Tensor query,
                     int topology_tokens,
                     int tokens_per_frame,
                     int temporal_neighbor_frames,
+                    int query_token_offset,
                     float softmax_scale);
 
 at::Tensor sol_sparse_route_selected(at::Tensor route);

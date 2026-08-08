@@ -184,6 +184,32 @@ class TuringAttentionContractTest(unittest.TestCase):
         baseline.assert_called_once()
         sparse.assert_not_called()
 
+    def test_experimental_sparse_keeps_cross_attention_with_prefix_dense(self):
+        q = torch.zeros((1, 4, 4096, 128), dtype=torch.bfloat16)
+        k = torch.zeros((1, 2, 4608, 128), dtype=torch.bfloat16)
+        v = torch.zeros_like(k)
+        baseline = mock.Mock(return_value=q)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention.turing_sage_attention", baseline),
+            mock.patch("attention._sol_sparse_sageattn") as sparse,
+        ):
+            output = turing_attention.turing_sol_sparse_attention(
+                mock.Mock(),
+                q,
+                k,
+                v,
+                4,
+                skip_reshape=True,
+                min_sequence_tokens=4096,
+                transformer_options={
+                    "turing_utils_attention_layout": {"dense_prefix_tokens": 320}
+                },
+            )
+        self.assertIs(output, q)
+        baseline.assert_called_once()
+        sparse.assert_not_called()
+
     def test_experimental_sparse_debug_counts_route_only_once_per_shape(self):
         q = torch.zeros((1, 4, 4096, 128), dtype=torch.bfloat16)
         route = torch.zeros((1, 4, 64, 4), dtype=torch.int32)

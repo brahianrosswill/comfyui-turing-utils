@@ -100,7 +100,7 @@ normalize invisibly to `sage_attn` and are not displayed by either loader.
 | Option | Q/K path | Smoothing | PV path |
 |---|---|---|---|
 | `sage_attn` on Turing | INT8, per-16-token Q-warp scales | disabled | FP16 V tiles with direct FP32 accumulation |
-| `Patch Sol Sparse Attention` | fused 64-token centroid threshold routing; selected tiles use FP16 Tensor Cores | input-adaptive `mean + tau * std` threshold | exact FP16 V tiles plus skipped-block V centroids, FP32 online accumulation |
+| `Patch Sol Sparse Attention` | fused 64-token centroid routing; selected tiles reuse stable Sage INT8 QK | input-adaptive `mean + tau * std` threshold | exact FP16 V tiles plus skipped-block V centroids, FP32 online accumulation |
 
 Integer Q/K MMA accumulates into INT32. The stable facade supports FP16 and
 BF16 Q/K/V, HND/NHD, GQA, causal mode, unequal Q/KV lengths, head dimensions
@@ -136,24 +136,36 @@ The configurable local neighborhood remains exact. Prefix policy can use exact
 model-supplied semantic layout metadata, disable prefix protection, or accept a
 manual token count; `auto` does not guess a prefix for an unknown model. MiniMax
 publishes the actual target-video boundary, so text, reference, and target-audio
-rows plus their cross-modal attention remain exact without tying the generic
-backend to H3. It also publishes target-video frame geometry; the kernel can
+Query rows run once through stable Sage, while target-video Query rows retain
+the semantic prefix as an exact K/V sink. This preserves exact cross-modal
+attention in both directions without paying sparse routing and output work for
+the prefix Query rows. It also publishes target-video frame geometry; the kernel can
 keep matching spatial ranges in adjacent frames exact without reordering tokens.
 Other blocks use the fused statistical threshold. Skipped blocks retain
 approximate mass and output through K/V centroids without the former K-variance
-overweighting. The exact path uses FP16 Tensor Core QK/PV
-with FP32 softmax and output accumulation and stays within the default 48 KiB
-shared-memory limit. Routing is written directly from the centroid Tensor Core
-tile, so no full proxy-score matrix is materialized.
+overweighting. Selected blocks reuse stable Sage's per-16-row Q and per-64-row K
+INT8 scales and SM75 integer Tensor Core QK. PV, softmax, and output accumulation
+retain the established FP16/FP32 behavior and the kernel stays within the
+default 48 KiB shared-memory limit. K is quantized once and shared by the dense
+prefix and sparse target paths. Routing is written directly from the centroid
+Tensor Core tile, so no full proxy-score matrix is materialized.
 
-On an A40 JITing only compute_75 PTX, 56-head BF16 uniform synthetic tests at
-`routing_threshold=1.0` with one adjacent temporal frame selected about 22.1%,
-19.1%, and 17.5% of blocks and measured 1.85x, 2.26x, and 2.37x kernel speedups
-over bundled Sage at 4096, 8192, and 16384 tokens. At 16K, temporal protection
-adds roughly 0.7 density points and 2.3% sparse-kernel time. These are kernel-level
-compatibility results, not an H3 end-to-end or quality prediction. Exact-sm75
-visual and performance testing remains required before the backend can leave
-experimental status.
+On an A40 JITing only compute_75 PTX, four-head FP16 uniform synthetic tests at
+`routing_threshold=1.0` selected 19.3%, 17.6%, and 16.6% of target blocks and
+measured 2.00x, 2.87x, and 3.26x speedups over bundled Sage at 4096, 8192, and
+16384 tokens. A 56-head BF16 H3-shaped synthetic test with 46,773 total tokens,
+a 3,438-token semantic prefix, 405 tokens per frame, and one adjacent temporal
+frame measured 2.06x at threshold 1.0 and 2.91x at threshold 1.5. Target-query
+route densities were 22.8% and 14.4%; including the separately evaluated dense
+prefix Query work gives approximate exact-work equivalents of 28.5% and 20.7%.
+These are kernel-level compatibility results, not an H3 end-to-end or quality
+prediction. Exact-sm75 visual and performance testing remains required before
+the backend can leave experimental status.
+
+The final compute_75 cubin reports 231 BF16 / 233 FP16 registers per sparse
+attention thread with zero stack and local-memory spill. The launch still uses
+48 KiB of dynamic shared memory; the INT8 selected-tile path did not raise the
+shared-memory budget to 64 KiB.
 
 The Sage1 and Sage2 adaptations produced severe block artefacts and black
 flicker in local Turing tests. They are unstable experiments, not production
@@ -179,13 +191,13 @@ pass. A healthy H3 W8A8 run reports 50 fused and zero fallback calls for both
 phases; these counters use no CUDA events or device synchronization.
 
 The patch node's optional `debug_route_density` switch is disabled by default.
-When enabled with kernel package 0.11.1 or newer, it launches one small CUDA
+When enabled with kernel package 0.12.0 or newer, it launches one small CUDA
 popcount reduction and synchronizes once for each distinct sparse sequence
-shape. The warning reports selected/possible blocks, density, sampling step,
-layer, prefix, local radius, and temporal radius. It also reports which warmup,
-tail, or protected-layer decisions selected stable Sage. No counter kernel,
-event, synchronization, or extra route allocation is used while the switch is
-off.
+shape. The warning reports selected/possible target-query blocks, density,
+sampling step, layer, prefix, local radius, and temporal radius. It also reports
+which warmup, tail, or protected-layer decisions selected stable Sage. No
+counter kernel, event, synchronization, or extra route allocation is used while
+the switch is off.
 
 ## Validation boundary
 

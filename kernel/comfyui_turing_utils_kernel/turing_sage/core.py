@@ -5,7 +5,12 @@ import torch
 
 from .. import _sage_fused_sm75 as _fused
 from . import sm75_compile
-from .quant import per_warp_int8, per_warp_int8_varlen
+from .quant import (
+    per_warp_int8,
+    per_warp_int8_varlen,
+    quantize_key_per_block,
+    quantize_query_per_warp,
+)
 
 
 def _on_input_device(function):
@@ -164,6 +169,7 @@ def sageattn_prequantized(
     is_causal: bool = False,
     sm_scale: Optional[float] = None,
     return_lse: bool = False,
+    output: Optional[torch.Tensor] = None,
 ):
     """Internal bridge for adapters that can release BF16 Q/K before attention."""
     if tensor_layout not in {"HND", "NHD"}:
@@ -209,7 +215,15 @@ def sageattn_prequantized(
 
     tensor_layout_id = 0 if tensor_layout == "NHD" else 1
     scale = float(sm_scale) if sm_scale is not None else head_dim**-0.5
-    output = torch.empty(q_int8.shape, dtype=v.dtype, device=v.device)
+    if output is None:
+        output = torch.empty(q_int8.shape, dtype=v.dtype, device=v.device)
+    elif (
+        output.shape != q_int8.shape
+        or output.dtype != v.dtype
+        or output.device != v.device
+        or output.stride(-1) != 1
+    ):
+        raise ValueError("prequantized Sage output is incompatible")
     lse = sm75_compile.qk_int8_sv_f16_accum_f32_attn(
         q_int8.contiguous(),
         k_int8.contiguous(),
@@ -261,12 +275,76 @@ def sol_sparse_sageattn(
         raise ValueError("the last Q/K/V dimension must be contiguous")
 
     scale = float(sm_scale) if sm_scale is not None else 128**-0.5
+    prefix_tokens = int(prefix_tokens)
+    if prefix_tokens < 0 or prefix_tokens > min(q.size(2), k.size(2)):
+        raise ValueError("prefix_tokens is outside the shared Q/K sequence")
+    if prefix_tokens and q.size(2) != k.size(2):
+        raise ValueError("prefix Query splitting requires equal Q/K sequence lengths")
+
+    if prefix_tokens == q.size(2):
+        dense = sageattn(q, k, v, tensor_layout="HND", sm_scale=scale)
+        if not return_route:
+            return dense
+        key_blocks = (k.size(2) + 63) // 64
+        route_words = (key_blocks + 15) // 16
+        route = torch.empty(
+            (q.size(0), q.size(1), 0, route_words),
+            dtype=torch.int32,
+            device=q.device,
+        )
+        return dense, route
+
     output = torch.empty_like(q)
-    route = sm75_compile.sol_sparse_threshold_f16_attn(
-        q,
+    k_int8, k_scale = quantize_key_per_block(k, tensor_layout="HND")
+    if prefix_tokens:
+        q_prefix = q[:, :, :prefix_tokens]
+        prefix_output = output[:, :, :prefix_tokens]
+        if prefix_tokens < 64:
+            q_prefix = torch.nn.functional.pad(
+                q_prefix, (0, 0, 0, 64 - prefix_tokens)
+            )
+        q_prefix_int8, q_prefix_scale = quantize_query_per_warp(
+            q_prefix, tensor_layout="HND"
+        )
+        if prefix_tokens < 64:
+            padded_prefix_output = torch.empty_like(q_prefix)
+            sageattn_prequantized(
+                q_prefix_int8,
+                q_prefix_scale,
+                k_int8,
+                k_scale,
+                v,
+                tensor_layout="HND",
+                sm_scale=scale,
+                output=padded_prefix_output,
+            )
+            prefix_output.copy_(padded_prefix_output[:, :, :prefix_tokens])
+            del padded_prefix_output
+        else:
+            sageattn_prequantized(
+                q_prefix_int8,
+                q_prefix_scale,
+                k_int8,
+                k_scale,
+                v,
+                tensor_layout="HND",
+                sm_scale=scale,
+                output=prefix_output,
+            )
+        del q_prefix_int8, q_prefix_scale
+
+    q_sparse = q[:, :, prefix_tokens:]
+    sparse_output = output[:, :, prefix_tokens:]
+    q_int8, q_scale = quantize_query_per_warp(q_sparse, tensor_layout="HND")
+    route = sm75_compile.sol_sparse_threshold_int8_f16_attn(
+        q_sparse,
         k,
+        q_int8,
+        k_int8,
         v,
-        output,
+        sparse_output,
+        q_scale,
+        k_scale,
         int(prefix_tokens),
         float(threshold_sigma),
         int(local_block_radius),
@@ -274,6 +352,7 @@ def sol_sparse_sageattn(
         int(topology_tokens),
         int(tokens_per_frame),
         int(temporal_neighbor_frames),
+        int(prefix_tokens),
         scale,
     )
     return (output, route) if return_route else output
