@@ -33,11 +33,22 @@ class SparseAttentionNodeTest(unittest.TestCase):
         inputs = attention_nodes.SolSparseAttentionPatch.INPUT_TYPES()["required"]
         self.assertEqual(
             tuple(inputs),
-            ("model", "min_sequence_tokens", "dense_prefix_tokens", "route_threshold"),
+            (
+                "model",
+                "min_sequence_tokens",
+                "attention_mass_recall",
+                "prefix_policy",
+                "manual_prefix_tokens",
+                "local_block_radius",
+                "dense_warmup_ratio",
+            ),
         )
-        self.assertEqual(inputs["min_sequence_tokens"][1]["default"], 4096)
-        self.assertEqual(inputs["dense_prefix_tokens"][1]["default"], 512)
-        self.assertEqual(inputs["route_threshold"][1]["default"], 1.0)
+        self.assertEqual(inputs["min_sequence_tokens"][1]["default"], 0)
+        self.assertEqual(inputs["attention_mass_recall"][1]["default"], 0.3)
+        self.assertEqual(inputs["prefix_policy"][0][0], "auto")
+        self.assertEqual(inputs["manual_prefix_tokens"][1]["default"], 0)
+        self.assertEqual(inputs["local_block_radius"][1]["default"], 1)
+        self.assertEqual(inputs["dense_warmup_ratio"][1]["default"], 0.0)
 
     def test_patch_clones_model_and_installs_generic_override(self):
         model = FakePatcher()
@@ -48,8 +59,11 @@ class SparseAttentionNodeTest(unittest.TestCase):
             patched = attention_backends.apply_sparse_attention_patch(
                 model,
                 min_sequence_tokens=8192,
-                dense_prefix_tokens=256,
-                route_threshold=1.5,
+                attention_mass_recall=0.85,
+                prefix_policy="manual",
+                manual_prefix_tokens=256,
+                local_block_radius=2,
+                dense_warmup_ratio=0.25,
             )
 
         self.assertIsNot(patched, model)
@@ -62,8 +76,11 @@ class SparseAttentionNodeTest(unittest.TestCase):
         make_override.assert_called_once_with(
             torch.device("cuda", 0),
             min_sequence_tokens=8192,
-            dense_prefix_tokens=256,
-            route_threshold=1.5,
+            attention_mass_recall=0.85,
+            prefix_policy="manual",
+            manual_prefix_tokens=256,
+            local_block_radius=2,
+            dense_warmup_ratio=0.25,
         )
 
     def test_node_returns_the_patched_model(self):
@@ -73,14 +90,17 @@ class SparseAttentionNodeTest(unittest.TestCase):
             "attention_nodes.apply_sparse_attention_patch", return_value=patched
         ) as apply_patch:
             output = attention_nodes.SolSparseAttentionPatch().patch(
-                model, 8192, 256, 1.5
+                model, 8192, 0.85, "manual", 256, 2, 0.25
             )
         self.assertEqual(output, (patched,))
         apply_patch.assert_called_once_with(
             model,
             min_sequence_tokens=8192,
-            dense_prefix_tokens=256,
-            route_threshold=1.5,
+            attention_mass_recall=0.85,
+            prefix_policy="manual",
+            manual_prefix_tokens=256,
+            local_block_radius=2,
+            dense_warmup_ratio=0.25,
         )
 
 

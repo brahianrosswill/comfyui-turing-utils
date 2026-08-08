@@ -65,7 +65,8 @@ def sol_sparse_f16_attn(
     value,
     output,
     prefix_tokens,
-    tau,
+    attention_mass_recall,
+    local_block_radius,
     sm_scale,
 ):
     return _qattn_sm75.sol_sparse_f16_attn(
@@ -74,6 +75,7 @@ def sol_sparse_f16_attn(
         value,
         output,
         prefix_tokens,
-        tau,
+        attention_mass_recall,
+        local_block_radius,
         sm_scale,
     )

@@ -100,7 +100,7 @@ normalize invisibly to `sage_attn` and are not displayed by either loader.
 | Option | Q/K path | Smoothing | PV path |
 |---|---|---|---|
 | `sage_attn` on Turing | INT8, per-16-token Q-warp scales | disabled | FP16 V tiles with direct FP32 accumulation |
-| `Patch Sol Sparse Attention` | 64-token centroid routing, selected tiles use FP16 Tensor Cores | K-block variance mass correction | exact FP16 V tiles plus skipped-block V centroids, FP32 online accumulation |
+| `Patch Sol Sparse Attention` | 64-token centroid top-p routing, selected tiles use FP16 Tensor Cores | K-block variance mass correction | exact FP16 V tiles plus skipped-block V centroids, FP32 online accumulation |
 
 Integer Q/K MMA accumulates into INT32. The stable facade supports FP16 and
 BF16 Q/K/V, HND/NHD, GQA, causal mode, unequal Q/KV lengths, head dimensions
@@ -121,19 +121,34 @@ ComfyUI's unreshaped layout, GQA, unequal Q/K lengths, and incomplete final
 blocks are supported. Other calls use bundled stable Sage without model-family,
 sampling-step, or transformer-layer checks.
 
-The configurable leading Q/K region and local neighboring blocks remain exact.
-Other centroid-selected blocks use exact token attention; skipped blocks retain
-approximate softmax mass and output through K/V centroids and a K-block variance
-correction. A higher routing threshold selects fewer exact blocks. The exact
-path uses FP16 Tensor Core QK/PV with FP32 softmax and output accumulation and
-stays within the default 48 KiB shared-memory limit. Routing tensors are
-temporary per-call allocations and are not cached.
+`min_sequence_tokens=0` selects the measured 4096-token crossover; a positive
+value remains a manual override. `attention_mass_recall` defaults to 0.30 for
+the explicitly experimental speed path. `dense_warmup_ratio=0` keeps all steps
+sparse for short-step workflows, while a positive ratio runs that fraction of
+the earliest sampler steps through stable Sage. Warmup step lookup is cached
+once per sampler timestep rather than synchronized in every transformer block.
 
-On an A40 JITing only compute_75 PTX, four-head 128-dimensional synthetic tests
-measured 1.07x, 1.70x, and 2.28x attention-kernel speedups over bundled Sage at
-4096, 8192, and 16384 tokens. These are kernel-level compatibility results, not
-an H3 end-to-end prediction. Exact-sm75 visual and performance testing remains
-required before the backend can leave experimental status.
+The configurable local neighborhood remains exact. Prefix policy can use exact
+model-supplied semantic layout metadata, disable prefix protection, or accept a
+manual token count; `auto` does not guess a prefix for an unknown model. MiniMax
+publishes the actual packed conditioning boundary, so text and reference rows
+remain exact without tying the generic backend to H3. Other blocks are selected
+until their estimated centroid softmax mass reaches the requested relative
+budget. Skipped blocks retain approximate mass and output through K/V centroids
+and a K-block variance correction. The exact path uses FP16 Tensor Core QK/PV
+with FP32 softmax and output accumulation and stays within the default 48 KiB
+shared-memory limit. Score and routing tensors are temporary per-call
+allocations and are not cached.
+
+On an A40 JITing only compute_75 PTX, four-head 128-dimensional uniform
+synthetic tests at the default 0.30 mass budget measured 1.30x, 1.33x, and 1.40x
+BF16 speedups over bundled Sage at 4096, 8192, and 16384 tokens. FP16 measured
+1.64x, 1.80x, and 1.86x. Higher mass budgets can become slower than dense Sage
+when the estimated attention distribution is uniform; peaked model attention
+can select fewer blocks for the same budget. These are kernel-level
+compatibility results, not an H3 end-to-end or quality prediction. Exact-sm75
+visual and performance testing remains required before the backend can leave
+experimental status.
 
 The Sage1 and Sage2 adaptations produced severe block artefacts and black
 flicker in local Turing tests. They are unstable experiments, not production
@@ -152,7 +167,8 @@ call for each distinct sequence shape also reports dtype, layout, and Q/K/V
 shapes. Any unsupported call reports its fallback reason once, so a masked,
 disabled-low-precision, or incompatible shape can no longer turn a performance
 regression into an invisible backend change. The sparse patch logs its selected
-minimum length, dense prefix, and routing threshold. MiniMax additionally emits one
+minimum length, prefix policy and resolved prefix, attention-mass budget, and
+local radius. MiniMax additionally emits one
 `phase=block` and one `phase=mlp` runtime-dispatch line after the first complete
 pass. A healthy H3 W8A8 run reports 50 fused and zero fallback calls for both
 phases; these counters use no CUDA events or device synchronization.

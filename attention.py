@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 from collections.abc import Callable
 
 import torch
@@ -17,9 +18,12 @@ except ImportError:
 LOG = logging.getLogger("comfyui-turing-utils")
 SUPPORTED_KERNEL_DTYPES = (torch.float16, torch.bfloat16)
 SUPPORTED_INPUT_DTYPES = (*SUPPORTED_KERNEL_DTYPES, torch.float32)
-SPARSE_MIN_SEQUENCE = 4096
-SPARSE_PREFIX_TOKENS = 512
-SPARSE_ROUTE_TAU = 1.0
+SPARSE_AUTO_MIN_SEQUENCE = 4096
+SPARSE_ATTENTION_MASS_RECALL = 0.3
+SPARSE_PREFIX_POLICY = "auto"
+SPARSE_LOCAL_BLOCK_RADIUS = 1
+SPARSE_DENSE_WARMUP_RATIO = 0.0
+SPARSE_LAYOUT_KEY = "turing_utils_attention_layout"
 _PREFLIGHTED_DEVICES: set[int] = set()
 _PREFLIGHTED_SPARSE_DEVICES: set[int] = set()
 _LOGGED_FP32_COMPAT = False
@@ -173,10 +177,16 @@ def bundled_available() -> bool:
 
 def bundled_sparse_available() -> bool:
     try:
+        import comfyui_turing_utils_kernel
         from comfyui_turing_utils_kernel.turing_sage import sparse_available
     except (ImportError, OSError):
         return False
-    return sparse_available()
+    version = getattr(comfyui_turing_utils_kernel, "__version__", "0.0.0")
+    try:
+        version_tuple = tuple(int(part) for part in version.split(".")[:3])
+    except ValueError:
+        return False
+    return version_tuple >= (0, 10, 0) and sparse_available()
 
 
 def _sageattn(*args, **kwargs):
@@ -401,6 +411,59 @@ def _sparse_dense_baseline(
     return turing_sage_attention(fallback, q, k, v, heads, **kwargs)
 
 
+def _sparse_prefix_tokens(
+    policy: str,
+    manual_tokens: int,
+    transformer_options,
+    sequence_limit: int,
+) -> int:
+    if policy == "none":
+        return 0
+    if policy == "manual":
+        return min(manual_tokens, sequence_limit)
+    layout = (
+        transformer_options.get(SPARSE_LAYOUT_KEY)
+        if isinstance(transformer_options, dict)
+        else None
+    )
+    if not isinstance(layout, dict):
+        return 0
+    prefix_tokens = layout.get("dense_prefix_tokens", 0)
+    if not isinstance(prefix_tokens, int) or isinstance(prefix_tokens, bool):
+        return 0
+    return min(max(prefix_tokens, 0), sequence_limit)
+
+
+def _sparse_dense_warmup(
+    transformer_options,
+    ratio: float,
+    state: dict[str, object],
+) -> bool:
+    if ratio <= 0.0 or not isinstance(transformer_options, dict):
+        return False
+    sample_sigmas = transformer_options.get("sample_sigmas")
+    current_sigmas = transformer_options.get("sigmas")
+    if not torch.is_tensor(sample_sigmas) or not torch.is_tensor(current_sigmas):
+        return False
+    if sample_sigmas.numel() < 2 or current_sigmas.numel() == 0:
+        return False
+    key = (
+        sample_sigmas.data_ptr(),
+        sample_sigmas.numel(),
+        id(current_sigmas),
+        current_sigmas.data_ptr(),
+        current_sigmas._version,
+    )
+    if state.get("key") == key:
+        return bool(state["dense"])
+    current = current_sigmas.flatten()[0].to(sample_sigmas)
+    step = int(torch.argmin((sample_sigmas.flatten() - current).abs()).item())
+    warmup_steps = math.ceil((sample_sigmas.numel() - 1) * ratio)
+    dense = step < warmup_steps
+    state.update(key=key, dense=dense)
+    return dense
+
+
 def turing_sol_sparse_attention(
     fallback: Callable,
     q: torch.Tensor,
@@ -411,9 +474,11 @@ def turing_sol_sparse_attention(
     attn_precision=None,
     skip_reshape: bool = False,
     skip_output_reshape: bool = False,
-    min_sequence_tokens: int = SPARSE_MIN_SEQUENCE,
-    dense_prefix_tokens: int = SPARSE_PREFIX_TOKENS,
-    route_threshold: float = SPARSE_ROUTE_TAU,
+    min_sequence_tokens: int = 0,
+    attention_mass_recall: float = SPARSE_ATTENTION_MASS_RECALL,
+    prefix_policy: str = SPARSE_PREFIX_POLICY,
+    manual_prefix_tokens: int = 0,
+    local_block_radius: int = SPARSE_LOCAL_BLOCK_RADIUS,
     **kwargs,
 ) -> torch.Tensor:
     original_q, original_k, original_v = q, k, v
@@ -472,10 +537,16 @@ def turing_sol_sparse_attention(
         return dense("K/V shapes are incompatible")
     if k.shape[-1] != 128 or k.shape[1] <= 0 or heads % k.shape[1] != 0:
         return dense("Q/K/V head counts are incompatible")
-    if q.shape[2] < min_sequence_tokens or k.shape[2] < min_sequence_tokens:
-        return dense(f"sequences shorter than {min_sequence_tokens} tokens")
+    effective_min_sequence = min_sequence_tokens or SPARSE_AUTO_MIN_SEQUENCE
+    if q.shape[2] < effective_min_sequence or k.shape[2] < effective_min_sequence:
+        return dense(f"sequences shorter than {effective_min_sequence} tokens")
 
-    prefix_tokens = min(dense_prefix_tokens, k.shape[2])
+    prefix_tokens = _sparse_prefix_tokens(
+        prefix_policy,
+        manual_prefix_tokens,
+        kwargs.get("transformer_options"),
+        min(q.shape[2], k.shape[2]),
+    )
     if input_dtype == torch.float32:
         q = q.to(torch.bfloat16)
         k = k.to(torch.bfloat16)
@@ -485,20 +556,24 @@ def turing_sol_sparse_attention(
         input_dtype,
         tuple(q.shape),
         tuple(k.shape),
-        min_sequence_tokens,
+        effective_min_sequence,
         prefix_tokens,
-        route_threshold,
+        attention_mass_recall,
+        local_block_radius,
     )
     if kernel_key not in _LOGGED_SPARSE_KERNELS:
         LOG.info(
             "Experimental Turing Sol sparse attention active: dtype=%s Q=%s K=%s "
-            "min_sequence=%d dense_prefix=%d route_threshold=%.2f",
+            "min_sequence=%d prefix_policy=%s dense_prefix=%d mass_recall=%.2f "
+            "local_radius=%d",
             input_dtype,
             tuple(q.shape),
             tuple(k.shape),
-            min_sequence_tokens,
+            effective_min_sequence,
+            prefix_policy,
             prefix_tokens,
-            route_threshold,
+            attention_mass_recall,
+            local_block_radius,
         )
         _LOGGED_SPARSE_KERNELS.add(kernel_key)
 
@@ -509,7 +584,8 @@ def turing_sol_sparse_attention(
         tensor_layout="HND",
         sm_scale=kwargs.get("scale"),
         prefix_tokens=prefix_tokens,
-        tau=route_threshold,
+        attention_mass_recall=attention_mass_recall,
+        local_block_radius=local_block_radius,
     )
     batch, _, _, head_dim = q.shape
     result = output if skip_output_reshape else output.transpose(1, 2).reshape(
@@ -580,39 +656,56 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
 
 def make_sparse_attention_override(
     device: torch.device,
-    min_sequence_tokens: int = SPARSE_MIN_SEQUENCE,
-    dense_prefix_tokens: int = SPARSE_PREFIX_TOKENS,
-    route_threshold: float = SPARSE_ROUTE_TAU,
+    min_sequence_tokens: int = 0,
+    attention_mass_recall: float = SPARSE_ATTENTION_MASS_RECALL,
+    prefix_policy: str = SPARSE_PREFIX_POLICY,
+    manual_prefix_tokens: int = 0,
+    local_block_radius: int = SPARSE_LOCAL_BLOCK_RADIUS,
+    dense_warmup_ratio: float = SPARSE_DENSE_WARMUP_RATIO,
 ) -> Callable:
     min_sequence_tokens = int(min_sequence_tokens)
-    dense_prefix_tokens = int(dense_prefix_tokens)
-    route_threshold = float(route_threshold)
-    if min_sequence_tokens < 1:
-        raise ValueError("min_sequence_tokens must be positive")
-    if dense_prefix_tokens < 0:
-        raise ValueError("dense_prefix_tokens must be non-negative")
-    if route_threshold < 0:
-        raise ValueError("route_threshold must be non-negative")
+    attention_mass_recall = float(attention_mass_recall)
+    prefix_policy = str(prefix_policy).strip().lower()
+    manual_prefix_tokens = int(manual_prefix_tokens)
+    local_block_radius = int(local_block_radius)
+    dense_warmup_ratio = float(dense_warmup_ratio)
+    if min_sequence_tokens < 0:
+        raise ValueError("min_sequence_tokens must be non-negative")
+    if not 0.0 < attention_mass_recall <= 1.0:
+        raise ValueError("attention_mass_recall must be in (0, 1]")
+    if prefix_policy not in {"auto", "none", "manual"}:
+        raise ValueError("prefix_policy must be auto, none, or manual")
+    if manual_prefix_tokens < 0:
+        raise ValueError("manual_prefix_tokens must be non-negative")
+    if local_block_radius < 0:
+        raise ValueError("local_block_radius must be non-negative")
+    if not 0.0 <= dense_warmup_ratio <= 1.0:
+        raise ValueError("dense_warmup_ratio must be in [0, 1]")
     if not is_supported_turing_device(device):
         raise RuntimeError("Sol sparse attention requires an sm75 Turing GPU")
     if not bundled_sparse_available():
         raise RuntimeError(
             "The experimental Turing sparse extension is unavailable. "
-            "Rebuild comfyui-turing-utils-kernel 0.9.0 or newer with sm75 enabled."
+            "Rebuild comfyui-turing-utils-kernel 0.10.0 or newer with sm75 enabled."
         )
     preflight_bundled(device)
     preflight_bundled_sparse(device)
+    warmup_state: dict[str, object] = {}
 
     def attention_override(original: Callable, *args, **kwargs):
         fallback = lambda *fallback_args, **fallback_kwargs: _dtype_compatible_fallback(
             original, *fallback_args, **fallback_kwargs
         )
+        if _sparse_dense_warmup(kwargs.get("transformer_options"), dense_warmup_ratio, warmup_state):
+            return turing_sage_attention(fallback, *args, **kwargs)
         return turing_sol_sparse_attention(
             fallback,
             *args,
             min_sequence_tokens=min_sequence_tokens,
-            dense_prefix_tokens=dense_prefix_tokens,
-            route_threshold=route_threshold,
+            attention_mass_recall=attention_mass_recall,
+            prefix_policy=prefix_policy,
+            manual_prefix_tokens=manual_prefix_tokens,
+            local_block_radius=local_block_radius,
             **kwargs,
         )
 
@@ -623,16 +716,22 @@ def make_sparse_attention_override(
 
 def apply_sparse_attention_patch(
     model,
-    min_sequence_tokens: int = SPARSE_MIN_SEQUENCE,
-    dense_prefix_tokens: int = SPARSE_PREFIX_TOKENS,
-    route_threshold: float = SPARSE_ROUTE_TAU,
+    min_sequence_tokens: int = 0,
+    attention_mass_recall: float = SPARSE_ATTENTION_MASS_RECALL,
+    prefix_policy: str = SPARSE_PREFIX_POLICY,
+    manual_prefix_tokens: int = 0,
+    local_block_radius: int = SPARSE_LOCAL_BLOCK_RADIUS,
+    dense_warmup_ratio: float = SPARSE_DENSE_WARMUP_RATIO,
 ):
     patched = model.clone()
     override = make_sparse_attention_override(
         patched.load_device,
         min_sequence_tokens=min_sequence_tokens,
-        dense_prefix_tokens=dense_prefix_tokens,
-        route_threshold=route_threshold,
+        attention_mass_recall=attention_mass_recall,
+        prefix_policy=prefix_policy,
+        manual_prefix_tokens=manual_prefix_tokens,
+        local_block_radius=local_block_radius,
+        dense_warmup_ratio=dense_warmup_ratio,
     )
     transformer_options = patched.model_options.setdefault("transformer_options", {})
     transformer_options["optimized_attention_override"] = override
@@ -641,11 +740,14 @@ def apply_sparse_attention_patch(
         "bundled_turing_sol_sparse_experimental"
     )
     LOG.info(
-        "Sol sparse attention patch enabled: min_sequence=%d dense_prefix=%d "
-        "route_threshold=%.2f",
-        min_sequence_tokens,
-        dense_prefix_tokens,
-        route_threshold,
+        "Sol sparse attention patch enabled: min_sequence=%s mass_recall=%.2f "
+        "prefix_policy=%s manual_prefix=%d local_radius=%d dense_warmup=%.2f",
+        min_sequence_tokens or "auto",
+        attention_mass_recall,
+        prefix_policy,
+        manual_prefix_tokens,
+        local_block_radius,
+        dense_warmup_ratio,
     )
     return patched
 

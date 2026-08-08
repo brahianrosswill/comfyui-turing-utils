@@ -42,6 +42,7 @@ _MEMORY_SHAPE_KEY = "turing_utils_minimax_packed_sequence"
 _MEMORY_CONTEXT_ATTR = "_turing_utils_minimax_memory_context"
 _MEMORY_ADAPTER_ATTR = "_turing_utils_minimax_memory_adapter"
 _OUTER_SAMPLE_WRAPPER_KEY = "turing_utils_minimax_memory_context"
+_ATTENTION_LAYOUT_KEY = "turing_utils_attention_layout"
 
 
 class _MiniMaxMemoryShape(list):
@@ -460,6 +461,13 @@ def _make_block_forward(
         rope_freqs,
         transformer_options={},
     ):
+        if len(mod_segments) >= 2:
+            dense_prefix_tokens = int(mod_segments[-2][0])
+            layout = transformer_options.get(_ATTENTION_LAYOUT_KEY)
+            if not isinstance(layout, dict) or layout.get("dense_prefix_tokens") != dense_prefix_tokens:
+                transformer_options[_ATTENTION_LAYOUT_KEY] = {
+                    "dense_prefix_tokens": dense_prefix_tokens,
+                }
         blocker = _block_fusion_blocker(x, t_emb, device_index)
         audit.record("block", blocker is None, x, blocker)
         if blocker is not None:

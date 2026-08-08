@@ -159,10 +159,12 @@ class TuringAttentionContractTest(unittest.TestCase):
                 4,
                 skip_reshape=True,
                 skip_output_reshape=True,
+                min_sequence_tokens=4096,
             )
         self.assertIs(output, q)
-        self.assertEqual(sparse.call_args.kwargs["prefix_tokens"], 512)
-        self.assertEqual(sparse.call_args.kwargs["tau"], 1.0)
+        self.assertEqual(sparse.call_args.kwargs["prefix_tokens"], 0)
+        self.assertEqual(sparse.call_args.kwargs["attention_mass_recall"], 0.3)
+        self.assertEqual(sparse.call_args.kwargs["local_block_radius"], 1)
 
     def test_experimental_sparse_keeps_short_calls_dense(self):
         q = torch.zeros((1, 4, 256, 128), dtype=torch.bfloat16)
@@ -190,7 +192,7 @@ class TuringAttentionContractTest(unittest.TestCase):
             mock.patch("attention._sol_sparse_sageattn", return_value=kernel_output) as sparse,
         ):
             output = turing_attention.turing_sol_sparse_attention(
-                mock.Mock(), q, k, v, 4, enable_gqa=True
+                mock.Mock(), q, k, v, 4, enable_gqa=True, min_sequence_tokens=4096
             )
         self.assertEqual(output.shape, q.shape)
         self.assertEqual(sparse.call_args.args[1].shape, (1, 2, 4096, 128))
@@ -223,12 +225,57 @@ class TuringAttentionContractTest(unittest.TestCase):
                 q,
                 4,
                 skip_reshape=True,
-                dense_prefix_tokens=192,
-                route_threshold=1.75,
+                attention_mass_recall=0.82,
+                prefix_policy="auto",
+                manual_prefix_tokens=192,
+                local_block_radius=3,
                 min_sequence_tokens=8000,
+                transformer_options={
+                    "turing_utils_attention_layout": {"dense_prefix_tokens": 320}
+                },
             )
-        self.assertEqual(sparse.call_args.kwargs["prefix_tokens"], 192)
-        self.assertEqual(sparse.call_args.kwargs["tau"], 1.75)
+        self.assertEqual(sparse.call_args.kwargs["prefix_tokens"], 320)
+        self.assertEqual(sparse.call_args.kwargs["attention_mass_recall"], 0.82)
+        self.assertEqual(sparse.call_args.kwargs["local_block_radius"], 3)
+
+    def test_sparse_prefix_policy_never_guesses_a_generic_layout(self):
+        options = {
+            "turing_utils_attention_layout": {"dense_prefix_tokens": 640}
+        }
+        self.assertEqual(
+            turing_attention._sparse_prefix_tokens("auto", 128, options, 4096),
+            640,
+        )
+        self.assertEqual(
+            turing_attention._sparse_prefix_tokens("none", 128, options, 4096),
+            0,
+        )
+        self.assertEqual(
+            turing_attention._sparse_prefix_tokens("manual", 128, options, 4096),
+            128,
+        )
+        self.assertEqual(
+            turing_attention._sparse_prefix_tokens("auto", 128, {}, 4096),
+            0,
+        )
+
+    def test_sparse_dense_warmup_uses_sampling_progress(self):
+        sample_sigmas = torch.tensor([1.0, 0.8, 0.5, 0.2, 0.0])
+        state = {}
+        self.assertTrue(
+            turing_attention._sparse_dense_warmup(
+                {"sample_sigmas": sample_sigmas, "sigmas": sample_sigmas[0:1]},
+                0.25,
+                state,
+            )
+        )
+        self.assertFalse(
+            turing_attention._sparse_dense_warmup(
+                {"sample_sigmas": sample_sigmas, "sigmas": sample_sigmas[1:2]},
+                0.25,
+                state,
+            )
+        )
 
     def test_experimental_sparse_fp32_uses_bf16_boundary_and_restores_output(self):
         q = torch.zeros((1, 1, 4096, 128), dtype=torch.float32)
@@ -245,6 +292,7 @@ class TuringAttentionContractTest(unittest.TestCase):
                 1,
                 skip_reshape=True,
                 skip_output_reshape=True,
+                min_sequence_tokens=4096,
             )
         self.assertTrue(all(value.dtype == torch.bfloat16 for value in sparse.call_args.args[:3]))
         self.assertEqual(output.dtype, torch.float32)

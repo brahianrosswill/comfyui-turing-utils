@@ -33,7 +33,8 @@ at::Tensor sol_sparse_f16_attn(at::Tensor query,
                     at::Tensor value,
                     at::Tensor output,
                     int prefix_tokens,
-                    float tau,
+                    float attention_mass_recall,
+                    int local_block_radius,
                     float softmax_scale);
 
 #ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS

@@ -213,6 +213,30 @@ class MiniMaxAdapterTest(unittest.TestCase):
         fused.assert_called_once_with(mlp.fc2, x, "swiglu")
         self.assertIn("phase=mlp fused=1 fallback=0", "\n".join(captured.output))
 
+    def test_block_forward_publishes_semantic_attention_prefix(self):
+        FakeBlock, _ = self._types("w8a8")
+        block = FakeBlock()
+        audit = minimax_adapter._RuntimeDispatchAudit(expected_blocks=1, expected_mlps=0)
+        patched = minimax_adapter._make_block_forward(
+            block,
+            0,
+            mock.Mock(),
+            audit,
+        )
+        options = {}
+        x = torch.zeros((32, 256), dtype=torch.bfloat16)
+        patched(
+            x,
+            x,
+            [(0, 8, 0), (8, 12, 1), (12, 16, 2), (16, 32, 3)],
+            None,
+            transformer_options=options,
+        )
+        self.assertEqual(
+            options[minimax_adapter._ATTENTION_LAYOUT_KEY],
+            {"dense_prefix_tokens": 12},
+        )
+
     def test_memory_rows_match_packed_layout_for_multimodal_references(self):
         from comfy.ldm.minimax.model import PackedLayout
 

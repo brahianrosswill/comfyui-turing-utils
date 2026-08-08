@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -23,6 +24,25 @@ class FakeModel:
 
 
 class AttentionBackendsTest(unittest.TestCase):
+    def test_sparse_backend_requires_the_top_p_kernel_abi(self):
+        sage_module = SimpleNamespace(sparse_available=lambda: True)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.9.0"),
+                "comfyui_turing_utils_kernel.turing_sage": sage_module,
+            },
+        ):
+            self.assertFalse(attention_backends.bundled_sparse_available())
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.10.0"),
+                "comfyui_turing_utils_kernel.turing_sage": sage_module,
+            },
+        ):
+            self.assertTrue(attention_backends.bundled_sparse_available())
+
     def test_backend_choices_are_stable(self):
         self.assertEqual(
             attention_backends.attention_backend_choices(),
@@ -300,8 +320,11 @@ class AttentionBackendsTest(unittest.TestCase):
             override = attention_backends.make_sparse_attention_override(
                 torch.device("cuda", 0),
                 min_sequence_tokens=8192,
-                dense_prefix_tokens=256,
-                route_threshold=1.5,
+                attention_mass_recall=0.85,
+                prefix_policy="manual",
+                manual_prefix_tokens=256,
+                local_block_radius=2,
+                dense_warmup_ratio=0.25,
             )
             output = override(
                 mock.Mock(),
@@ -317,8 +340,10 @@ class AttentionBackendsTest(unittest.TestCase):
         stable_preflight.assert_called_once_with(torch.device("cuda", 0))
         preflight.assert_called_once_with(torch.device("cuda", 0))
         self.assertEqual(sparse.call_args.kwargs["min_sequence_tokens"], 8192)
-        self.assertEqual(sparse.call_args.kwargs["dense_prefix_tokens"], 256)
-        self.assertEqual(sparse.call_args.kwargs["route_threshold"], 1.5)
+        self.assertEqual(sparse.call_args.kwargs["attention_mass_recall"], 0.85)
+        self.assertEqual(sparse.call_args.kwargs["prefix_policy"], "manual")
+        self.assertEqual(sparse.call_args.kwargs["manual_prefix_tokens"], 256)
+        self.assertEqual(sparse.call_args.kwargs["local_block_radius"], 2)
         self.assertEqual(
             override.turing_utils_attention_implementation,
             "bundled_turing_sol_sparse_experimental",

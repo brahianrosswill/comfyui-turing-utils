@@ -73,7 +73,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertNotIn("arch=compute_86,code=sm_86", flags)
         self.assertNotIn("-DCOMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS", flags)
         self.assertIn("csrc/turing/sage/sol_sparse_cuda_sm75.cu", extensions[1].kwargs["sources"])
-        self.assertEqual(setup.call_args.kwargs["version"], "0.9.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.10.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",

@@ -286,7 +286,7 @@ def validate_sparse(device: torch.device) -> None:
     v = v_centers.repeat_interleave(64, dim=2)[:, :, :sequence]
     v = (v + torch.randn_like(v) * 0.1).to(torch.bfloat16)
     output, route = sol_sparse_sageattn(
-        q, k, v, prefix_tokens=128, return_route=True
+        q, k, v, prefix_tokens=128, attention_mass_recall=0.9, return_route=True
     )
     reference = torch.nn.functional.scaled_dot_product_attention(
         q.float(), k.float(), v.float(), enable_gqa=True
@@ -338,18 +338,20 @@ def benchmark_sparse(device: torch.device, iterations: int) -> None:
         q = torch.randn((1, 4, sequence, 128), device=device, dtype=torch.float16) * 0.2
         k = torch.randn_like(q) * 0.2
         v = torch.randn_like(q) * 0.2
-        sparse = lambda: sol_sparse_sageattn(q, k, v, prefix_tokens=512)
+        sparse = lambda: sol_sparse_sageattn(q, k, v, attention_mass_recall=0.3)
         dense = lambda: sageattn(q, k, v)
         sparse_ms = _elapsed_ms(sparse, iterations)
         dense_ms = _elapsed_ms(dense, iterations)
-        _, route = sol_sparse_sageattn(q, k, v, prefix_tokens=512, return_route=True)
+        _, route = sol_sparse_sageattn(
+            q, k, v, attention_mass_recall=0.3, return_route=True
+        )
         blocks = (sequence + 63) // 64
         selected = sum(
             (int(word) & 0xFFFF).bit_count() for word in route.cpu().reshape(-1)
         )
         density = selected / (4 * blocks * blocks)
         print(
-            f"sparse HND N={sequence} H=4 D=128 density={density:.3f}: "
+            f"sparse HND N={sequence} H=4 D=128 recall=0.30 density={density:.3f}: "
             f"{sparse_ms:.3f} ms vs sage {dense_ms:.3f} ms, {dense_ms / sparse_ms:.3f}x"
         )
 

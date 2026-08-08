@@ -235,10 +235,11 @@ def sol_sparse_sageattn(
     tensor_layout: str = "HND",
     sm_scale: Optional[float] = None,
     prefix_tokens: int = 0,
-    tau: float = 1.0,
+    attention_mass_recall: float = 0.3,
+    local_block_radius: int = 1,
     return_route: bool = False,
 ):
-    """Experimental SM75 Sol-style sparse attention with centroid correction."""
+    """Experimental SM75 sparse attention with centroid top-p routing."""
     if not q.is_cuda:
         raise ValueError("Input tensors must be on CUDA")
     if tensor_layout != "HND":
@@ -263,7 +264,8 @@ def sol_sparse_sageattn(
         v,
         output,
         int(prefix_tokens),
-        float(tau),
+        float(attention_mass_recall),
+        int(local_block_radius),
         scale,
     )
     return (output, route) if return_route else output
