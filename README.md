@@ -82,7 +82,12 @@ GQA, 128-dimensional heads, and unmasked non-causal sequences; incompatible or
 short calls use bundled stable Sage. Semantic-prefix Query rows run through
 stable Sage, while sparse target Query rows keep the prefix as an exact K/V
 sink. Selected sparse blocks reuse stable Sage's INT8 Tensor Core QK path. This
-ABI requires kernel package 0.12.0. Final quality/performance testing on an
+ABI requires kernel package 0.12.1. Routing uses original FP16/BF16 Q/K
+centroids, while skipped-block score estimates are reconstructed from the same
+INT8 Q/K tensors and scales as selected blocks. Original V means remain in the
+value path. The K/V summaries are produced in one fused scan; the attention
+kernel reconstructs its summary Q tile from the existing INT8 Q buffer instead
+of rereading the original Q tensor. Final quality/performance testing on an
 actual Turing GPU remains required.
 
 See [`docs/turing-runtime.md`](docs/turing-runtime.md) for the dispatch and

@@ -1,12 +1,15 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's exact-sm75
-runtime. Version 0.12.0 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
+runtime. Version 0.12.1 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, bundled Sage attention, and an explicitly selected
 experimental model-independent sparse attention kernel with input-adaptive
 centroid threshold routing, stable-Sage INT8 QK for selected blocks, split
-semantic-prefix Query execution, and optional spatiotemporal exact neighbors.
+semantic-prefix Query execution, INT8-domain-consistent skipped-block scores,
+and optional spatiotemporal exact neighbors. Original half-precision centroids
+remain dedicated to routing and original V means remain dedicated to value
+approximation.
 It contains no model-weight format or model loader.
 
 ## Install

@@ -102,6 +102,6 @@ def sol_sparse_threshold_int8_f16_attn(
 def sol_sparse_route_selected(route):
     if not hasattr(_qattn_sm75, "sol_sparse_route_selected"):
         raise RuntimeError(
-            "route-density debug requires comfyui-turing-utils-kernel 0.12.0 or newer"
+            "route-density debug requires comfyui-turing-utils-kernel 0.12.1 or newer"
         )
     return _qattn_sm75.sol_sparse_route_selected(route)

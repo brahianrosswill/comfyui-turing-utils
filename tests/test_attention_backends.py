@@ -49,6 +49,14 @@ class AttentionBackendsTest(unittest.TestCase):
                 "comfyui_turing_utils_kernel.turing_sage": sage_module,
             },
         ):
+            self.assertFalse(attention_backends.bundled_sparse_available())
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.12.1"),
+                "comfyui_turing_utils_kernel.turing_sage": sage_module,
+            },
+        ):
             self.assertTrue(attention_backends.bundled_sparse_available())
 
     def test_backend_choices_are_stable(self):

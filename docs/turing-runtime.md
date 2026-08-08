@@ -151,21 +151,36 @@ prefix and sparse target paths. Routing is written directly from the centroid
 Tensor Core tile, so no full proxy-score matrix is materialized.
 
 On an A40 JITing only compute_75 PTX, four-head FP16 uniform synthetic tests at
-`routing_threshold=1.0` selected 19.3%, 17.6%, and 16.6% of target blocks and
-measured 2.00x, 2.87x, and 3.26x speedups over bundled Sage at 4096, 8192, and
+`routing_threshold=1.0` selected 19.7%, 17.6%, and 16.6% of target blocks and
+measured 1.92x, 2.71x, and 3.23x speedups over bundled Sage at 4096, 8192, and
 16384 tokens. A 56-head BF16 H3-shaped synthetic test with 46,773 total tokens,
 a 3,438-token semantic prefix, 405 tokens per frame, and one adjacent temporal
-frame measured 2.06x at threshold 1.0 and 2.91x at threshold 1.5. Target-query
-route densities were 22.8% and 14.4%; including the separately evaluated dense
-prefix Query work gives approximate exact-work equivalents of 28.5% and 20.7%.
-These are kernel-level compatibility results, not an H3 end-to-end or quality
-prediction. Exact-sm75 visual and performance testing remains required before
-the backend can leave experimental status.
+frame measured 2.06x at threshold 1.0 and 2.92x at threshold 1.5. Target-query
+route densities were 22.8% and 14.4%. A longer 100,483-token shape with a
+2,043-token prefix and 920 tokens per frame measured 2.41x and 4.21x at the
+same thresholds, with synthetic route densities of 17.6% and 8.8%. These are
+kernel-level compatibility results, not an H3 end-to-end or quality prediction.
+Exact-sm75 visual and performance testing remains required before the backend
+can leave experimental status.
 
-The final compute_75 cubin reports 231 BF16 / 233 FP16 registers per sparse
+Routing Q/K centroids stay in the original FP16/BF16 domain. Skipped-block
+softmax scores instead use Q and K centroids reconstructed from the exact INT8
+tensors and scales consumed by selected-block Tensor Core MMA, so both branches
+share one score domain. Original V means remain unquantized. One fused K/V scan
+produces the routing K centroid, score K centroid, and V mean. The attention CTA
+reconstructs its summary Q tile from the existing INT8 Q buffer, avoiding a
+second original-Q read. For the 100,483-token H3 shape, the additional score K
+summary is about 21.7 MiB; the measured 2.85 GiB temporary peak is dominated by
+the output and the existing Q/K INT8 buffers.
+
+The final compute_75 cubin reports 229 BF16 / 239 FP16 registers per sparse
 attention thread with zero stack and local-memory spill. The launch still uses
-48 KiB of dynamic shared memory; the INT8 selected-tile path did not raise the
-shared-memory budget to 64 KiB.
+48 KiB of dynamic shared memory; the consistent-score path did not raise the
+shared-memory budget to 64 KiB. At 46,773 tokens and threshold 1.5, a CUDA
+kernel profile attributed about 154.7 ms to sparse attention, 41.6 ms to the
+dense semantic-prefix Sage call, 5.2 ms to Q/K quantization, 3.2 ms to the fused
+K/V summaries, 1.2 ms to Q summaries, and less than 0.7 ms to routing and its
+statistics.
 
 The Sage1 and Sage2 adaptations produced severe block artefacts and black
 flicker in local Turing tests. They are unstable experiments, not production
@@ -191,7 +206,7 @@ pass. A healthy H3 W8A8 run reports 50 fused and zero fallback calls for both
 phases; these counters use no CUDA events or device synchronization.
 
 The patch node's optional `debug_route_density` switch is disabled by default.
-When enabled with kernel package 0.12.0 or newer, it launches one small CUDA
+When enabled with kernel package 0.12.1 or newer, it launches one small CUDA
 popcount reduction and synchronizes once for each distinct sparse sequence
 shape. The warning reports selected/possible target-query blocks, density,
 sampling step, layer, prefix, local radius, and temporal radius. It also reports

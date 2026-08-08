@@ -324,6 +324,7 @@ def validate_sparse(device: torch.device) -> None:
     output, route = sol_sparse_sageattn(
         q, k, v, prefix_tokens=128, threshold_sigma=1.0, return_route=True
     )
+    sage_reference = sageattn(q, k, v)
     reference = torch.nn.functional.scaled_dot_product_attention(
         q.float(), k.float(), v.float(), enable_gqa=True
     )
@@ -331,6 +332,13 @@ def validate_sparse(device: torch.device) -> None:
         "experimental sparse correlated sequence",
         output,
         reference,
+        rtol=0.02,
+        atol=0.02,
+    )
+    _assert_close(
+        "experimental sparse correlated sequence against stable Sage",
+        output,
+        sage_reference,
         rtol=0.02,
         atol=0.02,
     )

@@ -189,7 +189,7 @@ def bundled_sparse_available() -> bool:
         version_tuple = tuple(int(part) for part in version.split(".")[:3])
     except ValueError:
         return False
-    return version_tuple >= (0, 12, 0) and sparse_available()
+    return version_tuple >= (0, 12, 1) and sparse_available()
 
 
 def _sageattn(*args, **kwargs):
@@ -655,7 +655,8 @@ def turing_sol_sparse_attention(
         LOG.info(
             "Experimental Turing Sol sparse attention active: dtype=%s Q=%s K=%s "
             "min_sequence=%d prefix_policy=%s stable_prefix_q=%d sparse_target_q=%d "
-            "selected_qk=int8 threshold=%.2f local_radius=%d temporal_frames=%d "
+            "selected_qk=int8 score_domain=int8_consistent threshold=%.2f "
+            "local_radius=%d temporal_frames=%d "
             "topology=(%d,%d,%d)",
             input_dtype,
             tuple(q.shape),
@@ -839,7 +840,7 @@ def make_sparse_attention_override(
     if not bundled_sparse_available():
         raise RuntimeError(
             "The experimental Turing sparse extension is unavailable. "
-            "Rebuild comfyui-turing-utils-kernel 0.12.0 or newer with sm75 enabled."
+            "Rebuild comfyui-turing-utils-kernel 0.12.1 or newer with sm75 enabled."
         )
     preflight_bundled(device)
     preflight_bundled_sparse(device)
