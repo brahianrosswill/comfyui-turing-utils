@@ -20,11 +20,13 @@ class KernelSetupTest(unittest.TestCase):
     def _extension(*, name, **kwargs):
         return SimpleNamespace(name=name, kwargs=kwargs)
 
-    def _run_windows_setup(self, conda_prefix: Path):
+    def _run_windows_setup(self, conda_prefix: Path, max_jobs: str | None = None):
         environment = {
             "CONDA_PREFIX": str(conda_prefix),
             "COMFYUI_TURING_UTILS_ARCH_LIST": "8.6",
         }
+        if max_jobs is not None:
+            environment["MAX_JOBS"] = max_jobs
         with (
             mock.patch.object(platform, "system", return_value="Windows"),
             mock.patch.dict(os.environ, environment, clear=False),
@@ -34,8 +36,11 @@ class KernelSetupTest(unittest.TestCase):
             mock.patch("shutil.which", return_value=None),
             mock.patch("setuptools.setup") as setup,
         ):
+            if max_jobs is None:
+                os.environ.pop("MAX_JOBS", None)
             runpy.run_path(str(SETUP_PATH), run_name="__turing_utils_windows_setup_test__")
-        return setup.call_args.kwargs["ext_modules"]
+            selected_jobs = os.environ["MAX_JOBS"]
+        return setup.call_args.kwargs["ext_modules"], selected_jobs
 
     @staticmethod
     def _make_cutlass_headers(include_dir: Path) -> None:
@@ -88,13 +93,26 @@ class KernelSetupTest(unittest.TestCase):
             conda_include = prefix / "Library" / "include"
             self._make_cutlass_headers(conda_include)
 
-            extensions = self._run_windows_setup(prefix)
+            extensions, max_jobs = self._run_windows_setup(prefix)
 
         self.assertEqual([extension.name for extension in extensions], ["comfyui_turing_utils_kernel._C"])
         self.assertEqual(extensions[0].kwargs["include_dirs"][1], str(conda_include.resolve()))
         self.assertIn(str(cccl.resolve()), extensions[0].kwargs["include_dirs"])
         self.assertIn("/std:c++20", extensions[0].kwargs["extra_compile_args"]["cxx"])
         self.assertIn("-std=c++20", extensions[0].kwargs["extra_compile_args"]["nvcc"])
+        self.assertEqual(max_jobs, "1")
+
+    def test_windows_respects_explicit_build_parallelism(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prefix = Path(temp_dir)
+            cccl = prefix / "Library" / "include" / "targets" / "x64"
+            (cccl / "nv").mkdir(parents=True)
+            (cccl / "nv" / "target").touch()
+            self._make_cutlass_headers(prefix / "Library" / "include")
+
+            _, max_jobs = self._run_windows_setup(prefix, max_jobs="2")
+
+        self.assertEqual(max_jobs, "2")
 
     def test_nvidia_cutlass_python_package_is_auto_detected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -131,7 +149,7 @@ class KernelSetupTest(unittest.TestCase):
                 mock.patch.object(sys, "path", [str(temp_root / "empty-site")]),
                 mock.patch("tempfile.gettempdir", return_value=temp_dir),
             ):
-                extensions = self._run_windows_setup(prefix)
+                extensions, _ = self._run_windows_setup(prefix)
 
         core = extensions[0]
         self.assertEqual(core.kwargs["include_dirs"][1], str(cutlass_include.resolve()))
