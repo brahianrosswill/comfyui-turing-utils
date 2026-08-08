@@ -279,6 +279,13 @@ def sol_sparse_sageattn(
     return (output, route) if return_route else output
 
 
+def sol_sparse_route_selected(route: torch.Tensor) -> int:
+    """Synchronize once and return the selected-block count for debug logging."""
+    if not route.is_cuda or route.dtype != torch.int32 or route.ndim != 4:
+        raise ValueError("route must be a four-dimensional CUDA int32 tensor")
+    return int(sm75_compile.sol_sparse_route_selected(route).item())
+
+
 @_on_input_device
 def sageattn_varlen(
     q: torch.Tensor,

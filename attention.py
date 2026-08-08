@@ -204,6 +204,12 @@ def _sol_sparse_sageattn(*args, **kwargs):
     return turing_sage.sol_sparse_sageattn(*args, **kwargs)
 
 
+def _sol_sparse_route_selected(route: torch.Tensor) -> int:
+    from comfyui_turing_utils_kernel import turing_sage
+
+    return turing_sage.sol_sparse_route_selected(route)
+
+
 def preflight_bundled(device: torch.device) -> None:
     if not is_supported_turing_device(device):
         raise RuntimeError(f"unsupported Turing device {device}")
@@ -503,6 +509,10 @@ def _sparse_dense_schedule(
         sample_sigmas=sample_sigmas,
         current_sigmas=current_sigmas,
         dense=dense,
+        step=step,
+        sampling_steps=sampling_steps,
+        warmup_steps=warmup_steps,
+        tail_steps=tail_steps,
     )
     return dense
 
@@ -546,6 +556,9 @@ def turing_sol_sparse_attention(
     manual_prefix_tokens: int = 0,
     local_block_radius: int = SPARSE_LOCAL_BLOCK_RADIUS,
     temporal_neighbor_frames: int = SPARSE_TEMPORAL_NEIGHBOR_FRAMES,
+    debug_route_density: bool = False,
+    debug_route_keys: set[tuple] | None = None,
+    debug_context: dict | None = None,
     **kwargs,
 ) -> torch.Tensor:
     original_q, original_k, original_v = q, k, v
@@ -656,7 +669,9 @@ def turing_sol_sparse_attention(
         )
         _LOGGED_SPARSE_KERNELS.add(kernel_key)
 
-    output = _sol_sparse_sageattn(
+    route_keys = debug_route_keys if debug_route_keys is not None else set()
+    collect_route_stats = debug_route_density and kernel_key not in route_keys
+    sparse_result = _sol_sparse_sageattn(
         q,
         k,
         v,
@@ -669,7 +684,40 @@ def turing_sol_sparse_attention(
         topology_tokens=topology_tokens,
         tokens_per_frame=tokens_per_frame,
         temporal_neighbor_frames=temporal_neighbor_frames,
+        return_route=collect_route_stats,
     )
+    if collect_route_stats:
+        output, route = sparse_result
+        try:
+            selected_blocks = _sol_sparse_route_selected(route)
+            query_blocks = math.ceil(q.shape[2] / 64)
+            key_blocks = math.ceil(k.shape[2] / 64)
+            possible_blocks = q.shape[0] * q.shape[1] * query_blocks * key_blocks
+            LOG.warning(
+                "[Turing sparse debug] Q=%d K=%d Hq=%d Hkv=%d selected=%d/%d "
+                "density=%.4f threshold=%.2f prefix=%d local=%d temporal=%d "
+                "step=%s/%s layer=%s/%s",
+                q.shape[2],
+                k.shape[2],
+                q.shape[1],
+                k.shape[1],
+                selected_blocks,
+                possible_blocks,
+                selected_blocks / possible_blocks,
+                routing_threshold,
+                prefix_tokens,
+                local_block_radius,
+                temporal_neighbor_frames,
+                (debug_context or {}).get("step"),
+                (debug_context or {}).get("sampling_steps"),
+                (debug_context or {}).get("layer_index"),
+                (debug_context or {}).get("layer_count"),
+            )
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            LOG.warning("[Turing sparse debug] route density unavailable: %s", error)
+        route_keys.add(kernel_key)
+    else:
+        output = sparse_result
     batch, _, _, head_dim = q.shape
     result = output if skip_output_reshape else output.transpose(1, 2).reshape(
         batch, -1, heads * head_dim
@@ -748,6 +796,7 @@ def make_sparse_attention_override(
     dense_warmup_ratio: float = SPARSE_DENSE_WARMUP_RATIO,
     dense_tail_ratio: float = SPARSE_DENSE_TAIL_RATIO,
     dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
+    debug_route_density: bool = False,
 ) -> Callable:
     min_sequence_tokens = int(min_sequence_tokens)
     routing_threshold = float(routing_threshold)
@@ -758,6 +807,7 @@ def make_sparse_attention_override(
     dense_warmup_ratio = float(dense_warmup_ratio)
     dense_tail_ratio = float(dense_tail_ratio)
     dense_prefix_layers = int(dense_prefix_layers)
+    debug_route_density = bool(debug_route_density)
     if min_sequence_tokens < 0:
         raise ValueError("min_sequence_tokens must be non-negative")
     if not math.isfinite(routing_threshold):
@@ -788,19 +838,58 @@ def make_sparse_attention_override(
     preflight_bundled(device)
     preflight_bundled_sparse(device)
     warmup_state: dict[str, object] = {}
+    debug_route_keys: set[tuple] = set()
+    debug_dense_reasons: set[str] = set()
 
     def attention_override(original: Callable, *args, **kwargs):
         fallback = lambda *fallback_args, **fallback_kwargs: _dtype_compatible_fallback(
             original, *fallback_args, **fallback_kwargs
         )
         transformer_options = kwargs.get("transformer_options")
-        if _sparse_dense_schedule(
+        dense_schedule = _sparse_dense_schedule(
             transformer_options,
             dense_warmup_ratio,
             dense_tail_ratio,
             warmup_state,
-        ) or _sparse_dense_layer(transformer_options, dense_prefix_layers):
+        )
+        dense_layer = _sparse_dense_layer(transformer_options, dense_prefix_layers)
+        if debug_route_density and dense_schedule:
+            debug_key = f"schedule:{warmup_state.get('step')}"
+            if debug_key not in debug_dense_reasons:
+                LOG.warning(
+                    "[Turing sparse debug] stable Sage selected by dense schedule: "
+                    "step=%s/%s warmup_steps=%s tail_steps=%s",
+                    warmup_state.get("step"),
+                    warmup_state.get("sampling_steps"),
+                    warmup_state.get("warmup_steps"),
+                    warmup_state.get("tail_steps"),
+                )
+                debug_dense_reasons.add(debug_key)
+        if debug_route_density and dense_layer:
+            layout = transformer_options.get(SPARSE_LAYOUT_KEY, {})
+            debug_key = f"layer:{layout.get('layer_index')}"
+            if debug_key not in debug_dense_reasons:
+                LOG.warning(
+                    "[Turing sparse debug] stable Sage selected for protected layer %s/%s",
+                    layout.get("layer_index"),
+                    layout.get("layer_count"),
+                )
+                debug_dense_reasons.add(debug_key)
+        if dense_schedule or dense_layer:
             return turing_sage_attention(fallback, *args, **kwargs)
+        debug_context = None
+        if debug_route_density:
+            layout = (
+                transformer_options.get(SPARSE_LAYOUT_KEY, {})
+                if isinstance(transformer_options, dict)
+                else {}
+            )
+            debug_context = {
+                "step": warmup_state.get("step"),
+                "sampling_steps": warmup_state.get("sampling_steps"),
+                "layer_index": layout.get("layer_index"),
+                "layer_count": layout.get("layer_count"),
+            }
         return turing_sol_sparse_attention(
             fallback,
             *args,
@@ -810,6 +899,9 @@ def make_sparse_attention_override(
             manual_prefix_tokens=manual_prefix_tokens,
             local_block_radius=local_block_radius,
             temporal_neighbor_frames=temporal_neighbor_frames,
+            debug_route_density=debug_route_density,
+            debug_route_keys=debug_route_keys if debug_route_density else None,
+            debug_context=debug_context,
             **kwargs,
         )
 
@@ -829,6 +921,7 @@ def apply_sparse_attention_patch(
     dense_warmup_ratio: float = SPARSE_DENSE_WARMUP_RATIO,
     dense_tail_ratio: float = SPARSE_DENSE_TAIL_RATIO,
     dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
+    debug_route_density: bool = False,
 ):
     patched = model.clone()
     override = make_sparse_attention_override(
@@ -842,6 +935,7 @@ def apply_sparse_attention_patch(
         dense_warmup_ratio=dense_warmup_ratio,
         dense_tail_ratio=dense_tail_ratio,
         dense_prefix_layers=dense_prefix_layers,
+        debug_route_density=debug_route_density,
     )
     transformer_options = patched.model_options.setdefault("transformer_options", {})
     transformer_options["optimized_attention_override"] = override
@@ -853,7 +947,7 @@ def apply_sparse_attention_patch(
         "Sol sparse attention patch enabled: min_sequence=%s threshold=%.2f "
         "prefix_policy=%s manual_prefix=%d local_radius=%d temporal_frames=%d "
         "dense_warmup=%.2f "
-        "dense_tail=%.2f dense_prefix_layers=%d",
+        "dense_tail=%.2f dense_prefix_layers=%d debug_route_density=%s",
         min_sequence_tokens or "auto",
         routing_threshold,
         prefix_policy,
@@ -863,6 +957,7 @@ def apply_sparse_attention_patch(
         dense_warmup_ratio,
         dense_tail_ratio,
         dense_prefix_layers,
+        debug_route_density,
     )
     return patched
 

@@ -43,6 +43,12 @@ def sol_sparse_sageattn(*args, **kwargs):
     return implementation(*args, **kwargs)
 
 
+def sol_sparse_route_selected(*args, **kwargs):
+    from .core import sol_sparse_route_selected as implementation
+
+    return implementation(*args, **kwargs)
+
+
 def preflight_sparse(device: torch.device) -> None:
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError(f"Turing sparse attention requires CUDA, got {device}")

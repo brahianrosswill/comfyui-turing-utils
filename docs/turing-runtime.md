@@ -178,6 +178,15 @@ temporal neighborhoods, and resolved topology. MiniMax additionally emits one
 pass. A healthy H3 W8A8 run reports 50 fused and zero fallback calls for both
 phases; these counters use no CUDA events or device synchronization.
 
+The patch node's optional `debug_route_density` switch is disabled by default.
+When enabled with kernel package 0.11.1 or newer, it launches one small CUDA
+popcount reduction and synchronizes once for each distinct sparse sequence
+shape. The warning reports selected/possible blocks, density, sampling step,
+layer, prefix, local radius, and temporal radius. It also reports which warmup,
+tail, or protected-layer decisions selected stable Sage. No counter kernel,
+event, synchronization, or extra route allocation is used while the switch is
+off.
+
 ## Validation boundary
 
 Release builds target sm75 for bundled Sage. Static tests validate dispatch,

@@ -328,6 +328,7 @@ class AttentionBackendsTest(unittest.TestCase):
                 dense_warmup_ratio=0.25,
                 dense_tail_ratio=0.1,
                 dense_prefix_layers=3,
+                debug_route_density=True,
             )
             output = override(
                 mock.Mock(),
@@ -348,6 +349,8 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertEqual(sparse.call_args.kwargs["manual_prefix_tokens"], 256)
         self.assertEqual(sparse.call_args.kwargs["local_block_radius"], 2)
         self.assertEqual(sparse.call_args.kwargs["temporal_neighbor_frames"], 2)
+        self.assertTrue(sparse.call_args.kwargs["debug_route_density"])
+        self.assertIsInstance(sparse.call_args.kwargs["debug_route_keys"], set)
         self.assertEqual(
             override.turing_utils_attention_implementation,
             "bundled_turing_sol_sparse_experimental",

@@ -20,6 +20,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <algorithm>
 #include <type_traits>
 
 namespace {
@@ -31,6 +32,31 @@ constexpr int kRouteTile = 16;
 constexpr int kHalfPacks = kHeadDim / 8;
 constexpr int kTilePacks = kBlockTokens * kHalfPacks;
 constexpr int kTileBytes = kBlockTokens * kHeadDim * sizeof(half);
+
+__global__ void route_popcount_kernel(
+    const int32_t *__restrict__ route,
+    int64_t elements,
+    unsigned long long *__restrict__ selected)
+{
+  __shared__ unsigned long long partial[256];
+  unsigned long long count = 0;
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < elements;
+       index += static_cast<int64_t>(blockDim.x) * gridDim.x)
+  {
+    count += __popc(static_cast<uint32_t>(route[index]));
+  }
+  partial[threadIdx.x] = count;
+  __syncthreads();
+  for (int offset = blockDim.x / 2; offset > 0; offset >>= 1)
+  {
+    if (threadIdx.x < offset)
+      partial[threadIdx.x] += partial[threadIdx.x + offset];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0)
+    atomicAdd(selected, partial[0]);
+}
 
 template <typename T>
 __device__ __forceinline__ float scalar_to_float(T value);
@@ -1092,4 +1118,29 @@ at::Tensor sol_sparse_threshold_f16_attn(
       tokens_per_frame,
       temporal_neighbor_frames,
       softmax_scale);
+}
+
+at::Tensor sol_sparse_route_selected(at::Tensor route)
+{
+  CHECK_CUDA(route);
+  CHECK_DIMS(route, 4);
+  TORCH_CHECK(route.is_contiguous(), "sparse attention route must be contiguous");
+  TORCH_CHECK(
+      route.scalar_type() == at::ScalarType::Int,
+      "sparse attention route must use int32 words");
+  at::Tensor selected = at::zeros(
+      {1}, route.options().dtype(at::ScalarType::Long));
+  if (route.numel() == 0)
+    return selected;
+
+  constexpr int threads = 256;
+  const int blocks = static_cast<int>(std::min<int64_t>(
+      div_ceil(route.numel(), threads), 4096));
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  route_popcount_kernel<<<blocks, threads, 0, stream>>>(
+      route.data_ptr<int32_t>(),
+      route.numel(),
+      reinterpret_cast<unsigned long long *>(selected.data_ptr<int64_t>()));
+  check_launch("sparse route popcount");
+  return selected;
 }

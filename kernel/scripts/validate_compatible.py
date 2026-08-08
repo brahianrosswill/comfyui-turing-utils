@@ -248,7 +248,10 @@ def validate_sage(device: torch.device) -> None:
 
 
 def validate_sparse(device: torch.device) -> None:
-    from comfyui_turing_utils_kernel.turing_sage import sol_sparse_sageattn
+    from comfyui_turing_utils_kernel.turing_sage import (
+        sol_sparse_route_selected,
+        sol_sparse_sageattn,
+    )
 
     for dtype in (torch.float16, torch.bfloat16):
         q = torch.randn((1, 4, 129, 128), device=device, dtype=dtype)
@@ -301,6 +304,11 @@ def validate_sparse(device: torch.device) -> None:
     selected = sum(
         (int(word) & 0xFFFF).bit_count() for word in route.cpu().reshape(-1)
     )
+    selected_cuda = sol_sparse_route_selected(route)
+    if selected_cuda != selected:
+        raise RuntimeError(
+            f"experimental sparse route popcount mismatch: {selected_cuda} != {selected}"
+        )
     density = selected / (4 * blocks * blocks)
     if not 0.1 < density < 0.9:
         raise RuntimeError(f"experimental sparse route density is implausible: {density:.3f}")
@@ -332,7 +340,11 @@ def benchmark_sage(device: torch.device, iterations: int) -> None:
 
 
 def benchmark_sparse(device: torch.device, iterations: int) -> None:
-    from comfyui_turing_utils_kernel.turing_sage import sageattn, sol_sparse_sageattn
+    from comfyui_turing_utils_kernel.turing_sage import (
+        sageattn,
+        sol_sparse_route_selected,
+        sol_sparse_sageattn,
+    )
 
     for sequence in (4096, 8192, 16384):
         q = torch.randn((1, 4, sequence, 128), device=device, dtype=torch.float16) * 0.2
@@ -346,9 +358,7 @@ def benchmark_sparse(device: torch.device, iterations: int) -> None:
             q, k, v, threshold_sigma=1.0, return_route=True
         )
         blocks = (sequence + 63) // 64
-        selected = sum(
-            (int(word) & 0xFFFF).bit_count() for word in route.cpu().reshape(-1)
-        )
+        selected = sol_sparse_route_selected(route)
         density = selected / (4 * blocks * blocks)
         print(
             f"sparse HND N={sequence} H=4 D=128 threshold=1.0 density={density:.3f}: "

@@ -413,7 +413,7 @@ if _includes_sm75():
 
 setup(
     name="comfyui-turing-utils-kernel",
-    version="0.11.0",
+    version="0.11.1",
     packages=find_packages(where=str(ROOT)),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

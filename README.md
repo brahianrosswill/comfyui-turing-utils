@@ -79,7 +79,8 @@ Sparse attention is not a loader option and `auto` never selects it. Connect the
 model through `Patch Sol Sparse Attention (Experimental)` to enable it on any
 compatible attention call. The current kernel accepts FP16/BF16/FP32 Q/K/V,
 GQA, 128-dimensional heads, and unmasked non-causal sequences; incompatible or
-short calls use bundled stable Sage. It requires kernel package 0.11.0 and final
+short calls use bundled stable Sage. It requires kernel package 0.11.0; optional
+route-density debug logging requires 0.11.1. Final
 quality/performance testing on an actual Turing GPU.
 
 See [`docs/turing-runtime.md`](docs/turing-runtime.md) for the dispatch and

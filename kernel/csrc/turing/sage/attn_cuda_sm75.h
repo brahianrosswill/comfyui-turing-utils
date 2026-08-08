@@ -41,6 +41,8 @@ at::Tensor sol_sparse_threshold_f16_attn(at::Tensor query,
                     int temporal_neighbor_frames,
                     float softmax_scale);
 
+at::Tensor sol_sparse_route_selected(at::Tensor route);
+
 #ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
 at::Tensor qk_int8_sv_f16_accum_f16_attn(at::Tensor query,
                     at::Tensor key,

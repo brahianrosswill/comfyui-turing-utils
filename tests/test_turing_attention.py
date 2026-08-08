@@ -184,6 +184,50 @@ class TuringAttentionContractTest(unittest.TestCase):
         baseline.assert_called_once()
         sparse.assert_not_called()
 
+    def test_experimental_sparse_debug_counts_route_only_once_per_shape(self):
+        q = torch.zeros((1, 4, 4096, 128), dtype=torch.bfloat16)
+        route = torch.zeros((1, 4, 64, 4), dtype=torch.int32)
+        route_keys = set()
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch(
+                "attention._sol_sparse_sageattn",
+                side_effect=[(q, route), q],
+            ) as sparse,
+            mock.patch(
+                "attention._sol_sparse_route_selected", return_value=1024
+            ) as selected,
+            self.assertLogs("comfyui-turing-utils", level="WARNING") as captured,
+        ):
+            for _ in range(2):
+                output = turing_attention.turing_sol_sparse_attention(
+                    mock.Mock(),
+                    q,
+                    q,
+                    q,
+                    4,
+                    skip_reshape=True,
+                    skip_output_reshape=True,
+                    min_sequence_tokens=4096,
+                    debug_route_density=True,
+                    debug_route_keys=route_keys,
+                    debug_context={
+                        "step": 2,
+                        "sampling_steps": 8,
+                        "layer_index": 2,
+                        "layer_count": 50,
+                    },
+                )
+
+        self.assertIs(output, q)
+        self.assertEqual(sparse.call_count, 2)
+        self.assertTrue(sparse.call_args_list[0].kwargs["return_route"])
+        self.assertFalse(sparse.call_args_list[1].kwargs["return_route"])
+        selected.assert_called_once_with(route)
+        message = "\n".join(captured.output)
+        self.assertIn("density=0.0625", message)
+        self.assertIn("step=2/8 layer=2/50", message)
+
     def test_experimental_sparse_unreshaped_gqa_restores_output_layout(self):
         q = torch.zeros((1, 4096, 4 * 128), dtype=torch.float16)
         k = torch.zeros((1, 4096, 2 * 128), dtype=torch.float16)

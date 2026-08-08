@@ -102,7 +102,16 @@ class SolSparseAttentionPatch:
                         "tooltip": "Keep the first transformer layers dense when an adapter supplies layer metadata. Official MiniMax H3 uses 2 of 50 layers.",
                     },
                 ),
-            }
+            },
+            "optional": {
+                "debug_route_density": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Log the real selected-block density once per sparse sequence shape. Disabled by default; enabling it adds one small CUDA reduction and synchronization per shape.",
+                    },
+                ),
+            },
         }
 
     RETURN_TYPES = ("MODEL",)
@@ -123,6 +132,7 @@ class SolSparseAttentionPatch:
         dense_warmup_ratio: float = 0.25,
         dense_tail_ratio: float = 0.0,
         dense_prefix_layers: int = 2,
+        debug_route_density: bool = False,
     ):
         return (
             apply_sparse_attention_patch(
@@ -136,5 +146,6 @@ class SolSparseAttentionPatch:
                 dense_warmup_ratio=dense_warmup_ratio,
                 dense_tail_ratio=dense_tail_ratio,
                 dense_prefix_layers=dense_prefix_layers,
+                debug_route_density=debug_route_density,
             ),
         )

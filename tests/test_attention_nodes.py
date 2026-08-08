@@ -55,6 +55,9 @@ class SparseAttentionNodeTest(unittest.TestCase):
         self.assertEqual(inputs["dense_warmup_ratio"][1]["default"], 0.25)
         self.assertEqual(inputs["dense_tail_ratio"][1]["default"], 0.0)
         self.assertEqual(inputs["dense_prefix_layers"][1]["default"], 2)
+        optional = attention_nodes.SolSparseAttentionPatch.INPUT_TYPES()["optional"]
+        self.assertEqual(tuple(optional), ("debug_route_density",))
+        self.assertFalse(optional["debug_route_density"][1]["default"])
 
     def test_patch_clones_model_and_installs_generic_override(self):
         model = FakePatcher()
@@ -93,6 +96,7 @@ class SparseAttentionNodeTest(unittest.TestCase):
             dense_warmup_ratio=0.25,
             dense_tail_ratio=0.1,
             dense_prefix_layers=3,
+            debug_route_density=False,
         )
 
     def test_node_returns_the_patched_model(self):
@@ -116,6 +120,7 @@ class SparseAttentionNodeTest(unittest.TestCase):
             dense_warmup_ratio=0.25,
             dense_tail_ratio=0.1,
             dense_prefix_layers=3,
+            debug_route_density=False,
         )
 
 
