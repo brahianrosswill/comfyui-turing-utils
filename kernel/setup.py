@@ -15,9 +15,6 @@ if IS_WINDOWS:
     # Keep MSVC diagnostics in English so PyTorch's compiler probe can decode
     # cl.exe output reliably on non-English Windows installations.
     os.environ.setdefault("VSLANG", "1033")
-    # Sage translation units are large enough that concurrent NVCC frontends
-    # can be terminated without diagnostics on memory-constrained Windows hosts.
-    os.environ.setdefault("MAX_JOBS", "1")
 
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME

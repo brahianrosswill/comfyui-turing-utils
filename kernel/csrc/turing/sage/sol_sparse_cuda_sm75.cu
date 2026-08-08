@@ -11,9 +11,6 @@
 #include "attn_utils.cuh"
 #include "torch_compat.h"
 
-#include <ATen/cuda/CUDAContext.h>
-#include <c10/cuda/CUDAGuard.h>
-#include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -888,7 +885,6 @@ at::Tensor sol_sparse_f16_attn(
       "sparse attention prefix_tokens is outside the K sequence");
   TORCH_CHECK(tau >= 0.0f, "sparse attention tau must be non-negative");
 
-  const c10::cuda::CUDAGuard device_guard(query.device());
   const int batch_size = query.size(0);
   const int num_query_heads = query.size(1);
   const int num_kv_heads = key.size(1);

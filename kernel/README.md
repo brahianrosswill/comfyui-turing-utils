@@ -57,9 +57,6 @@ python kernel/scripts/validate_wan_fusions.py --device cuda:0
 On Windows, use an x64 Visual Studio Developer shell. CUDA 12.8 Conda users
 must have the CCCL directory containing `nv/target`; the build discovers
 `%CONDA_PREFIX%\Library\include\targets\x64` automatically.
-Windows builds use one compiler job by default because concurrent NVCC Sage
-frontends can consume substantial host memory. Set `MAX_JOBS` explicitly to
-override this when sufficient RAM is available.
 The extension uses C++20 by default. This is required for the bundled CUTLASS
 W4A8 templates to compile reliably with NVCC and MSVC. The host and device
 standards can be overridden with `COMFYUI_TURING_UTILS_HOST_CXX_STANDARD` and
