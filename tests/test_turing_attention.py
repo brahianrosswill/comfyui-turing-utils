@@ -277,6 +277,32 @@ class TuringAttentionContractTest(unittest.TestCase):
             )
         )
 
+    def test_sparse_dense_warmup_accepts_inference_tensors(self):
+        state = {}
+        with torch.inference_mode():
+            sample_sigmas = torch.tensor([1.0, 0.8, 0.5, 0.2, 0.0])
+            current_sigmas = sample_sigmas[0:1]
+            self.assertTrue(
+                turing_attention._sparse_dense_warmup(
+                    {
+                        "sample_sigmas": sample_sigmas,
+                        "sigmas": current_sigmas,
+                    },
+                    0.25,
+                    state,
+                )
+            )
+            self.assertTrue(
+                turing_attention._sparse_dense_warmup(
+                    {
+                        "sample_sigmas": sample_sigmas,
+                        "sigmas": current_sigmas,
+                    },
+                    0.25,
+                    state,
+                )
+            )
+
     def test_experimental_sparse_fp32_uses_bf16_boundary_and_restores_output(self):
         q = torch.zeros((1, 1, 4096, 128), dtype=torch.float32)
         kernel_output = torch.ones_like(q, dtype=torch.bfloat16)

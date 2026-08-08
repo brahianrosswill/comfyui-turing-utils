@@ -234,7 +234,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
         )
         self.assertEqual(
             options[minimax_adapter._ATTENTION_LAYOUT_KEY],
-            {"dense_prefix_tokens": 12},
+            {"dense_prefix_tokens": 16},
         )
 
     def test_memory_rows_match_packed_layout_for_multimodal_references(self):

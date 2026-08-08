@@ -461,8 +461,14 @@ def _make_block_forward(
         rope_freqs,
         transformer_options={},
     ):
-        if len(mod_segments) >= 2:
-            dense_prefix_tokens = int(mod_segments[-2][0])
+        if mod_segments:
+            # H3 packs target audio immediately before target video.  Keep the
+            # complete non-video prefix exact: target-audio queries need global
+            # video context, and video queries need exact audio keys for stable
+            # joint generation.  Sparsifying target audio into 64-token
+            # centroids produces broadband noise even when the video remains
+            # visually plausible.
+            dense_prefix_tokens = int(mod_segments[-1][0])
             layout = transformer_options.get(_ATTENTION_LAYOUT_KEY)
             if not isinstance(layout, dict) or layout.get("dense_prefix_tokens") != dense_prefix_tokens:
                 transformer_options[_ATTENTION_LAYOUT_KEY] = {

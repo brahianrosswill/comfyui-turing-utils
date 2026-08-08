@@ -131,8 +131,9 @@ once per sampler timestep rather than synchronized in every transformer block.
 The configurable local neighborhood remains exact. Prefix policy can use exact
 model-supplied semantic layout metadata, disable prefix protection, or accept a
 manual token count; `auto` does not guess a prefix for an unknown model. MiniMax
-publishes the actual packed conditioning boundary, so text and reference rows
-remain exact without tying the generic backend to H3. Other blocks are selected
+publishes the actual target-video boundary, so text, reference, and target-audio
+rows plus their cross-modal attention remain exact without tying the generic
+backend to H3. Other blocks are selected
 until their estimated centroid softmax mass reaches the requested relative
 budget. Skipped blocks retain approximate mass and output through K/V centroids
 and a K-block variance correction. The exact path uses FP16 Tensor Core QK/PV

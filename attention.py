@@ -447,20 +447,26 @@ def _sparse_dense_warmup(
         return False
     if sample_sigmas.numel() < 2 or current_sigmas.numel() == 0:
         return False
-    key = (
-        sample_sigmas.data_ptr(),
-        sample_sigmas.numel(),
-        id(current_sigmas),
-        current_sigmas.data_ptr(),
-        current_sigmas._version,
-    )
-    if state.get("key") == key:
+    # Keep strong references to the tensors used for the cached decision.  ComfyUI
+    # reuses the same transformer_options tensors for every block in one model
+    # evaluation, then installs a new current-sigma tensor for the next sampler
+    # evaluation.  Identity therefore avoids a device synchronization per block
+    # and, unlike Tensor._version, is valid for tensors created in inference mode.
+    if (
+        state.get("sample_sigmas") is sample_sigmas
+        and state.get("current_sigmas") is current_sigmas
+    ):
         return bool(state["dense"])
     current = current_sigmas.flatten()[0].to(sample_sigmas)
     step = int(torch.argmin((sample_sigmas.flatten() - current).abs()).item())
     warmup_steps = math.ceil((sample_sigmas.numel() - 1) * ratio)
     dense = step < warmup_steps
-    state.update(key=key, dense=dense)
+    state.clear()
+    state.update(
+        sample_sigmas=sample_sigmas,
+        current_sigmas=current_sigmas,
+        dense=dense,
+    )
     return dense
 
 
