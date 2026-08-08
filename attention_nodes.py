@@ -70,6 +70,35 @@ class SolSparseAttentionPatch:
                         "tooltip": "Keep matching spatial ranges in this many adjacent frames exact when a model adapter supplies video topology. Has no effect without metadata.",
                     },
                 ),
+                "skipped_residual": (
+                    ["2x32", "1x64"],
+                    {
+                        "default": "2x32",
+                        "tooltip": "Approximate each skipped 64-token block with two 32-token K/V centroids (higher quality) or one 64-token centroid (lower summary cost).",
+                    },
+                ),
+                "minimum_route_density": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.05,
+                        "round": 0.01,
+                        "tooltip": "Minimum adaptive exact-route density per 16-block routing tile. Forced prefix/local/temporal blocks can raise the actual density above this value.",
+                    },
+                ),
+                "maximum_route_density": (
+                    "FLOAT",
+                    {
+                        "default": 1.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.05,
+                        "round": 0.01,
+                        "tooltip": "Maximum adaptive exact-route density per 16-block routing tile. Forced semantic and local blocks are never removed.",
+                    },
+                ),
                 "dense_warmup_ratio": (
                     "FLOAT",
                     {
@@ -108,7 +137,7 @@ class SolSparseAttentionPatch:
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Log the real selected-block density once per sparse sequence shape. Disabled by default; enabling it adds one small CUDA reduction and synchronization per shape.",
+                        "tooltip": "Log min/mean/max route density once per denoising step. Disabled by default; enabling it adds tiny reductions and one synchronization per step.",
                     },
                 ),
             },
@@ -129,6 +158,9 @@ class SolSparseAttentionPatch:
         manual_prefix_tokens: int = 0,
         local_block_radius: int = 1,
         temporal_neighbor_frames: int = 1,
+        skipped_residual: str = "2x32",
+        minimum_route_density: float = 0.0,
+        maximum_route_density: float = 1.0,
         dense_warmup_ratio: float = 0.25,
         dense_tail_ratio: float = 0.0,
         dense_prefix_layers: int = 2,
@@ -143,6 +175,9 @@ class SolSparseAttentionPatch:
                 manual_prefix_tokens=manual_prefix_tokens,
                 local_block_radius=local_block_radius,
                 temporal_neighbor_frames=temporal_neighbor_frames,
+                skipped_residual=skipped_residual,
+                minimum_route_density=minimum_route_density,
+                maximum_route_density=maximum_route_density,
                 dense_warmup_ratio=dense_warmup_ratio,
                 dense_tail_ratio=dense_tail_ratio,
                 dense_prefix_layers=dense_prefix_layers,

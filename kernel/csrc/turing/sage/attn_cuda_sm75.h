@@ -43,6 +43,9 @@ at::Tensor sol_sparse_threshold_int8_f16_attn(at::Tensor query,
                     int topology_tokens,
                     int tokens_per_frame,
                     int temporal_neighbor_frames,
+                    int residual_subblocks,
+                    float minimum_route_density,
+                    float maximum_route_density,
                     int query_token_offset,
                     float softmax_scale);
 

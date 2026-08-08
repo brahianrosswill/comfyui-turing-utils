@@ -47,9 +47,10 @@ only after its CUDA sources or required version change.
 - `MiniMax H3 Video Frames Padding` pads to H3's `17*n+5` frame grid.
 - `Patch Sol Sparse Attention (Experimental)` applies the model-independent
   long-sequence sparse backend. It uses an input-adaptive statistical threshold,
-  keeps skipped-block centroid residuals, accepts semantic prefix/video topology
-  metadata, and exposes dense step/layer safeguards plus an automatic
-  short-sequence crossover.
+  keeps skipped-block centroid residuals (two 32-token centroids by default),
+  accepts semantic prefix/video topology metadata, and exposes stable route
+  budgets, dense step/layer safeguards, and an automatic short-sequence
+  crossover.
 
 ## Turing behavior
 
@@ -82,13 +83,17 @@ GQA, 128-dimensional heads, and unmasked non-causal sequences; incompatible or
 short calls use bundled stable Sage. Semantic-prefix Query rows run through
 stable Sage, while sparse target Query rows keep the prefix as an exact K/V
 sink. Selected sparse blocks reuse stable Sage's INT8 Tensor Core QK path. This
-ABI requires kernel package 0.12.1. Routing uses original FP16/BF16 Q/K
+ABI requires kernel package 0.13.0. Routing uses original FP16/BF16 Q/K
 centroids, while skipped-block score estimates are reconstructed from the same
 INT8 Q/K tensors and scales as selected blocks. Original V means remain in the
-value path. The K/V summaries are produced in one fused scan; the attention
-kernel reconstructs its summary Q tile from the existing INT8 Q buffer instead
-of rereading the original Q tensor. Final quality/performance testing on an
-actual Turing GPU remains required.
+value path. `skipped_residual=2x32` improves bimodal skipped-block fidelity;
+`1x64` remains available for maximum speed. Optional route-density bounds clamp
+adaptive choices per 16-key tile without removing forced prefix/local/temporal
+blocks. The K/V summaries are produced in one fused scan; the attention kernel
+reconstructs its summary Q tile from the existing INT8 Q buffer instead of
+rereading the original Q tensor. The sparse CTA uses 32 KiB of shared memory so
+SM75 can admit two CTAs when registers permit. Final quality/performance testing
+on an actual Turing GPU remains required.
 
 See [`docs/turing-runtime.md`](docs/turing-runtime.md) for the dispatch and
 validation matrix. Experimental Sage1/Sage2 sources are not installed or

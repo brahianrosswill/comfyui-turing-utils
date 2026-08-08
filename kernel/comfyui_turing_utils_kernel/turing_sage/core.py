@@ -255,6 +255,9 @@ def sol_sparse_sageattn(
     topology_tokens: int = 0,
     tokens_per_frame: int = 0,
     temporal_neighbor_frames: int = 0,
+    residual_subblocks: int = 2,
+    minimum_route_density: float = 0.0,
+    maximum_route_density: float = 1.0,
     return_route: bool = False,
 ):
     """Experimental SM75 Sol-style adaptive threshold sparse attention."""
@@ -280,6 +283,13 @@ def sol_sparse_sageattn(
         raise ValueError("prefix_tokens is outside the shared Q/K sequence")
     if prefix_tokens and q.size(2) != k.size(2):
         raise ValueError("prefix Query splitting requires equal Q/K sequence lengths")
+    residual_subblocks = int(residual_subblocks)
+    if residual_subblocks not in (1, 2):
+        raise ValueError("residual_subblocks must be 1 or 2")
+    minimum_route_density = float(minimum_route_density)
+    maximum_route_density = float(maximum_route_density)
+    if not 0.0 <= minimum_route_density <= maximum_route_density <= 1.0:
+        raise ValueError("route density bounds must satisfy 0 <= minimum <= maximum <= 1")
 
     if prefix_tokens == q.size(2):
         dense = sageattn(q, k, v, tensor_layout="HND", sm_scale=scale)
@@ -352,17 +362,25 @@ def sol_sparse_sageattn(
         int(topology_tokens),
         int(tokens_per_frame),
         int(temporal_neighbor_frames),
+        residual_subblocks,
+        minimum_route_density,
+        maximum_route_density,
         int(prefix_tokens),
         scale,
     )
     return (output, route) if return_route else output
 
 
-def sol_sparse_route_selected(route: torch.Tensor) -> int:
-    """Synchronize once and return the selected-block count for debug logging."""
+def _sol_sparse_route_selected_device(route: torch.Tensor) -> torch.Tensor:
+    """Return the asynchronous device-side selected-block count."""
     if not route.is_cuda or route.dtype != torch.int32 or route.ndim != 4:
         raise ValueError("route must be a four-dimensional CUDA int32 tensor")
-    return int(sm75_compile.sol_sparse_route_selected(route).item())
+    return sm75_compile.sol_sparse_route_selected(route)
+
+
+def sol_sparse_route_selected(route: torch.Tensor) -> int:
+    """Synchronize once and return the selected-block count for debug logging."""
+    return int(_sol_sparse_route_selected_device(route).item())
 
 
 @_on_input_device

@@ -53,7 +53,7 @@ class AttentionBackendsTest(unittest.TestCase):
         with mock.patch.dict(
             sys.modules,
             {
-                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.12.1"),
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.13.0"),
                 "comfyui_turing_utils_kernel.turing_sage": sage_module,
             },
         ):
@@ -341,6 +341,9 @@ class AttentionBackendsTest(unittest.TestCase):
                 manual_prefix_tokens=256,
                 local_block_radius=2,
                 temporal_neighbor_frames=2,
+                skipped_residual="1x64",
+                minimum_route_density=0.2,
+                maximum_route_density=0.7,
                 dense_warmup_ratio=0.25,
                 dense_tail_ratio=0.1,
                 dense_prefix_layers=3,
@@ -365,8 +368,12 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertEqual(sparse.call_args.kwargs["manual_prefix_tokens"], 256)
         self.assertEqual(sparse.call_args.kwargs["local_block_radius"], 2)
         self.assertEqual(sparse.call_args.kwargs["temporal_neighbor_frames"], 2)
+        self.assertEqual(sparse.call_args.kwargs["skipped_residual"], "1x64")
+        self.assertEqual(sparse.call_args.kwargs["minimum_route_density"], 0.2)
+        self.assertEqual(sparse.call_args.kwargs["maximum_route_density"], 0.7)
         self.assertTrue(sparse.call_args.kwargs["debug_route_density"])
         self.assertIsInstance(sparse.call_args.kwargs["debug_route_keys"], set)
+        self.assertIsInstance(sparse.call_args.kwargs["debug_route_state"], dict)
         self.assertEqual(
             override.turing_utils_attention_implementation,
             "bundled_turing_sol_sparse_experimental",

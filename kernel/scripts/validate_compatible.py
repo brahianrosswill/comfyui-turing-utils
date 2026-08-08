@@ -355,6 +355,75 @@ def validate_sparse(device: torch.device) -> None:
     if not 0.1 < density < 0.9:
         raise RuntimeError(f"experimental sparse route density is implausible: {density:.3f}")
 
+    # The budget is applied independently to every 16-key routing tile. With
+    # no semantic or temporal forcing and 16 exact key blocks, 0.25 selects
+    # exactly four keys for every Query/head row (the overlapping self block is
+    # included in that budget rather than added on top).
+    budget_sequence = 1024
+    q = torch.randn((1, 4, budget_sequence, 128), device=device, dtype=torch.float16)
+    k = torch.randn((1, 2, budget_sequence, 128), device=device, dtype=torch.float16)
+    v = torch.randn_like(k)
+    _, route = sol_sparse_sageattn(
+        q,
+        k,
+        v,
+        threshold_sigma=1000.0,
+        local_block_radius=0,
+        minimum_route_density=0.25,
+        maximum_route_density=0.25,
+        return_route=True,
+    )
+    expected = 4 * 16 * 4
+    selected = sol_sparse_route_selected(route)
+    if selected != expected:
+        raise RuntimeError(
+            f"experimental sparse route budget selected {selected}, expected {expected}"
+        )
+
+    # Two 32-token centroids must preserve a deliberately bimodal skipped
+    # block at least as well as one 64-token centroid. Exact/local routing is
+    # unchanged, so this isolates only the skipped-residual approximation.
+    sequence = 2048
+    blocks = sequence // 64
+    half_centers = torch.randn((1, 2, blocks, 2, 128), device=device)
+    k = half_centers.repeat_interleave(32, dim=3).reshape(1, 2, sequence, 128)
+    k = (k * torch.rsqrt(k.square().mean(dim=-1, keepdim=True) + 1.0e-6)).to(
+        torch.bfloat16
+    )
+    q = k.repeat_interleave(2, dim=1)
+    value_centers = torch.randn((1, 2, blocks, 2, 128), device=device)
+    v = value_centers.repeat_interleave(32, dim=3).reshape(
+        1, 2, sequence, 128
+    ).to(torch.bfloat16)
+    dense = sageattn(q, k, v)
+    residual_64 = sol_sparse_sageattn(
+        q,
+        k,
+        v,
+        threshold_sigma=1000.0,
+        local_block_radius=0,
+        residual_subblocks=1,
+    )
+    residual_32 = sol_sparse_sageattn(
+        q,
+        k,
+        v,
+        threshold_sigma=1000.0,
+        local_block_radius=0,
+        residual_subblocks=2,
+    )
+    error_64 = (residual_64.float() - dense.float()).square().mean().item()
+    error_32 = (residual_32.float() - dense.float()).square().mean().item()
+    if error_32 > error_64 * 1.01 + 1.0e-7:
+        raise RuntimeError(
+            "2x32 skipped residual regressed against 1x64: "
+            f"mse={error_32:.6g} vs {error_64:.6g}"
+        )
+    print(
+        "sparse skipped residual quality: "
+        f"2x32 mse={error_32:.6g}, 1x64 mse={error_64:.6g}"
+    )
+
 
 def _elapsed_ms(function, iterations: int) -> float:
     for _ in range(5):
@@ -392,9 +461,15 @@ def benchmark_sparse(device: torch.device, iterations: int) -> None:
         q = torch.randn((1, 4, sequence, 128), device=device, dtype=torch.float16) * 0.2
         k = torch.randn_like(q) * 0.2
         v = torch.randn_like(q) * 0.2
-        sparse = lambda: sol_sparse_sageattn(q, k, v, threshold_sigma=1.0)
+        sparse = lambda: sol_sparse_sageattn(
+            q, k, v, threshold_sigma=1.0, residual_subblocks=2
+        )
+        sparse_64 = lambda: sol_sparse_sageattn(
+            q, k, v, threshold_sigma=1.0, residual_subblocks=1
+        )
         dense = lambda: sageattn(q, k, v)
         sparse_ms = _elapsed_ms(sparse, iterations)
+        sparse_64_ms = _elapsed_ms(sparse_64, iterations)
         dense_ms = _elapsed_ms(dense, iterations)
         _, route = sol_sparse_sageattn(
             q, k, v, threshold_sigma=1.0, return_route=True
@@ -404,7 +479,8 @@ def benchmark_sparse(device: torch.device, iterations: int) -> None:
         density = selected / (4 * blocks * blocks)
         print(
             f"sparse HND N={sequence} H=4 D=128 threshold=1.0 density={density:.3f}: "
-            f"{sparse_ms:.3f} ms vs sage {dense_ms:.3f} ms, {dense_ms / sparse_ms:.3f}x"
+            f"2x32 {sparse_ms:.3f} ms, 1x64 {sparse_64_ms:.3f} ms, "
+            f"sage {dense_ms:.3f} ms, {dense_ms / sparse_ms:.3f}x"
         )
 
 

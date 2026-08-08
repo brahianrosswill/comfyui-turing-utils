@@ -125,7 +125,11 @@ metadata; unknown models remain fully generic.
 `min_sequence_tokens=0` selects the measured 4096-token crossover; a positive
 value remains a manual override. `routing_threshold=1.0` routes a block when
 its centroid score exceeds the current query row's projected mean by one
-standard deviation; lowering it evaluates more blocks exactly. The default
+standard deviation; lowering it evaluates more blocks exactly.
+`minimum_route_density` and `maximum_route_density` optionally clamp the
+adaptive selection count inside each 16-key routing tile. Defaults `0/1`
+preserve threshold-only routing with a fast path. Prefix, local, and temporal
+blocks remain forced and may exceed the requested maximum. The default
 `dense_warmup_ratio=0.25` protects one step in a four-step workflow,
 `dense_tail_ratio=0` avoids an extra dense tail by default, and
 `dense_prefix_layers=2` follows the validated H3 policy when layer metadata is
@@ -142,45 +146,49 @@ attention in both directions without paying sparse routing and output work for
 the prefix Query rows. It also publishes target-video frame geometry; the kernel can
 keep matching spatial ranges in adjacent frames exact without reordering tokens.
 Other blocks use the fused statistical threshold. Skipped blocks retain
-approximate mass and output through K/V centroids without the former K-variance
-overweighting. Selected blocks reuse stable Sage's per-16-row Q and per-64-row K
+approximate mass and output through two 32-token K/V centroids by default,
+which better preserves within-block changes than one 64-token centroid.
+`skipped_residual=1x64` keeps the previous lower-cost approximation. Selected
+blocks reuse stable Sage's per-16-row Q and per-64-row K
 INT8 scales and SM75 integer Tensor Core QK. PV, softmax, and output accumulation
-retain the established FP16/FP32 behavior and the kernel stays within the
-default 48 KiB shared-memory limit. K is quantized once and shared by the dense
+retain the established FP16/FP32 behavior. The selected and residual layouts
+overlay one 32 KiB dynamic shared-memory arena; this allows two CTAs to fit in a
+64 KiB SM75 shared-memory budget when registers permit. K is quantized once and shared by the dense
 prefix and sparse target paths. Routing is written directly from the centroid
 Tensor Core tile, so no full proxy-score matrix is materialized.
 
 On an A40 JITing only compute_75 PTX, four-head FP16 uniform synthetic tests at
-`routing_threshold=1.0` selected 19.7%, 17.6%, and 16.6% of target blocks and
-measured 1.92x, 2.71x, and 3.23x speedups over bundled Sage at 4096, 8192, and
-16384 tokens. A 56-head BF16 H3-shaped synthetic test with 46,773 total tokens,
-a 3,438-token semantic prefix, 405 tokens per frame, and one adjacent temporal
-frame measured 2.06x at threshold 1.0 and 2.92x at threshold 1.5. Target-query
-route densities were 22.8% and 14.4%. A longer 100,483-token shape with a
-2,043-token prefix and 920 tokens per frame measured 2.41x and 4.21x at the
-same thresholds, with synthetic route densities of 17.6% and 8.8%. These are
-kernel-level compatibility results, not an H3 end-to-end or quality prediction.
-Exact-sm75 visual and performance testing remains required before the backend
-can leave experimental status.
+`routing_threshold=1.0` selected 19.7%, 17.7%, and 16.7% of target blocks. The
+default 2x32 residual measured 1.68x, 2.33x, and 2.71x over bundled Sage at
+4096, 8192, and 16384 tokens; 1x64 was 7-14% faster. A 56-head BF16 H3-shaped
+synthetic test with 46,773 total tokens, a 3,438-token semantic prefix, 405
+tokens per frame, one adjacent temporal frame, and threshold 1.5 measured
+231.0 ms for 2x32, 209.9 ms for 1x64, and 601.0 ms for dense Sage (2.60x and
+2.86x). These are A40 compatibility measurements: they do not show the expected
+SM75 occupancy gain from reducing shared memory, and they are not an H3
+end-to-end or quality prediction. Exact-sm75 visual and performance testing
+remains required before the backend can leave experimental status.
 
 Routing Q/K centroids stay in the original FP16/BF16 domain. Skipped-block
 softmax scores instead use Q and K centroids reconstructed from the exact INT8
 tensors and scales consumed by selected-block Tensor Core MMA, so both branches
 share one score domain. Original V means remain unquantized. One fused K/V scan
-produces the routing K centroid, score K centroid, and V mean. The attention CTA
-reconstructs its summary Q tile from the existing INT8 Q buffer, avoiding a
-second original-Q read. For the 100,483-token H3 shape, the additional score K
-summary is about 21.7 MiB; the measured 2.85 GiB temporary peak is dominated by
-the output and the existing Q/K INT8 buffers.
+produces the routing K centroid, one or two score-K centroids, and matching V
+means. The attention CTA reconstructs its summary Q tile from the existing INT8
+Q buffer, avoiding a second original-Q read. Two centroids double only the
+compact score-K and V-summary tensors; the temporary peak remains dominated by
+output and the existing Q/K INT8 buffers.
 
-The final compute_75 cubin reports 229 BF16 / 239 FP16 registers per sparse
-attention thread with zero stack and local-memory spill. The launch still uses
-48 KiB of dynamic shared memory; the consistent-score path did not raise the
-shared-memory budget to 64 KiB. At 46,773 tokens and threshold 1.5, a CUDA
-kernel profile attributed about 154.7 ms to sparse attention, 41.6 ms to the
-dense semantic-prefix Sage call, 5.2 ms to Q/K quantization, 3.2 ms to the fused
-K/V summaries, 1.2 ms to Q summaries, and less than 0.7 ms to routing and its
-statistics.
+The final compute_75 cubin reports 228 BF16 / 235 FP16 registers per sparse
+attention thread with zero stack and local-memory spill. The launch uses 32 KiB
+of dynamic shared memory. At the 46,773-token shape above, a 2x32 CUDA profile
+attributed 180.5 ms to sparse attention, 41.9 ms to the dense semantic-prefix
+Sage call, 3.5 ms to Q/K quantization, 3.1 ms to the fused K/V summaries, 1.2 ms
+to Q summaries, and about 0.7 ms to routing and its statistics. Fusing routing
+summaries into the production quantizers was deliberately not retained: the
+maximum measured saving is under 2% of this call, while it would couple the
+experimental sparse ABI to stable Sage quantization and still could not remove
+the required V-summary scan.
 
 The Sage1 and Sage2 adaptations produced severe block artefacts and black
 flicker in local Turing tests. They are unstable experiments, not production
@@ -206,10 +214,12 @@ pass. A healthy H3 W8A8 run reports 50 fused and zero fallback calls for both
 phases; these counters use no CUDA events or device synchronization.
 
 The patch node's optional `debug_route_density` switch is disabled by default.
-When enabled with kernel package 0.12.1 or newer, it launches one small CUDA
-popcount reduction and synchronizes once for each distinct sparse sequence
-shape. The warning reports selected/possible target-query blocks, density,
-sampling step, layer, prefix, local radius, and temporal radius. It also reports
+When enabled with kernel package 0.13.0 or newer, it launches one tiny CUDA
+popcount reduction per sparse layer, keeps the scalar results on-device, and
+synchronizes once at the end of each denoising step. The warning reports total
+selected/possible target-query blocks plus min/mean/max layer density, sampling
+step and layer range, prefix, local radius, temporal radius, residual mode, and
+route budget. It also reports
 which warmup, tail, or protected-layer decisions selected stable Sage. No
 counter kernel, event, synchronization, or extra route allocation is used while
 the switch is off.
@@ -217,7 +227,7 @@ the switch is off.
 ## Validation boundary
 
 Release builds target sm75 for bundled Sage. Static tests validate dispatch,
-fallbacks, loader independence, shapes, dtypes, the 48 KiB policy, the public
+fallbacks, loader independence, shapes, dtypes, the 32 KiB sparse policy, the public
 symbol boundary, and exclusion of the retired Sage1/Sage2 variants. For compatible A40
 validation, build with:
 

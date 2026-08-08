@@ -5,10 +5,10 @@
  * threshold. The threshold comparison is fused into the FP16 Tensor Core
  * centroid tile, so no full proxy map is materialized. Selected blocks are
  * evaluated with the production per-warp/per-block INT8 Sage QK path. Skipped
- * blocks use centroids reconstructed from those same INT8 Q/K tensors, then
- * retain a centroid contribution in the shared FP32 online softmax instead of
- * being dropped. Original FP16/BF16 summaries remain isolated to routing and
- * original V means remain isolated to value approximation.
+ * blocks use one 64-token or two 32-token centroids reconstructed from those
+ * same INT8 Q/K tensors, then retain their contributions in the shared FP32
+ * online softmax instead of being dropped. Original FP16/BF16 summaries remain
+ * isolated to routing and original V means remain isolated to approximation.
  */
 
 #include "../utils.cuh"
@@ -32,11 +32,15 @@ constexpr int kBlockTokens = 64;
 constexpr int kHeadDim = 128;
 constexpr int kWarps = 4;
 constexpr int kRouteTile = 16;
+constexpr int kSummaryTileTokens = 32;
 constexpr int kHalfPacks = kHeadDim / 8;
 constexpr int kInt8Packs = kHeadDim / 16;
 constexpr int kTilePacks = kBlockTokens * kHalfPacks;
 constexpr int kInt8TilePacks = kBlockTokens * kInt8Packs;
 constexpr int kTileBytes = kBlockTokens * kHeadDim * sizeof(half);
+constexpr int kInt8TileBytes = kBlockTokens * kHeadDim * sizeof(int8_t);
+constexpr int kSummaryTileBytes = kSummaryTileTokens * kHeadDim * sizeof(half);
+constexpr int kAttentionSharedBytes = 2 * kTileBytes;
 
 __global__ void route_popcount_kernel(
     const int32_t *__restrict__ route,
@@ -142,6 +146,8 @@ __global__ void kv_block_summary_kernel(
     int num_heads,
     int sequence_length,
     int padded_blocks,
+    int residual_subblocks,
+    int padded_residual_summaries,
     int64_t stride_batch_k,
     int64_t stride_head_k,
     int64_t stride_sequence_k,
@@ -164,8 +170,8 @@ __global__ void kv_block_summary_kernel(
       ? min(kBlockTokens, sequence_length - token_start)
       : 0;
   float key_sum = 0.0f;
-  float value_sum = 0.0f;
-  int quantized_key_sum = 0;
+  float value_sum[2] = {0.0f, 0.0f};
+  int quantized_key_sum[2] = {0, 0};
   const T *head_key = key + batch * stride_batch_k + head * stride_head_k;
   const int8_t *head_key_int8 = key_int8 +
       batch * stride_batch_k_int8 + head * stride_head_k_int8;
@@ -175,9 +181,11 @@ __global__ void kv_block_summary_kernel(
     const float key_value = scalar_to_float(
         head_key[(token_start + token) * stride_sequence_k + dimension]);
     key_sum += key_value;
-    quantized_key_sum += static_cast<int>(
+    const int residual_index = token / (kBlockTokens / residual_subblocks);
+    quantized_key_sum[residual_index] += static_cast<int>(
         head_key_int8[(token_start + token) * stride_sequence_k_int8 + dimension]);
-    value_sum += scalar_to_float(head_value[(token_start + token) * stride_sequence_v + dimension]);
+    value_sum[residual_index] += scalar_to_float(
+        head_value[(token_start + token) * stride_sequence_v + dimension]);
   }
   const int64_t output_index =
       ((static_cast<int64_t>(batch) * num_heads + head) * padded_blocks + block_index) *
@@ -192,15 +200,56 @@ __global__ void kv_block_summary_kernel(
         (static_cast<int64_t>(batch) * num_heads + head) * num_key_blocks +
         block_index];
     key_summary[output_index] = __float2half_rn(key_mean);
-    key_score_summary[output_index] = __float2half_rn(
-        static_cast<float>(quantized_key_sum) * dequant_scale * reciprocal);
-    value_mean[output_index] = __float2half_rn(value_sum * reciprocal);
+    const int residual_tokens = kBlockTokens / residual_subblocks;
+#pragma unroll
+    for (int residual_index = 0; residual_index < 2; ++residual_index)
+    {
+      if (residual_index >= residual_subblocks)
+        break;
+      const int residual_start = residual_index * residual_tokens;
+      const int residual_count = max(0, min(residual_tokens, token_count - residual_start));
+      const int64_t residual_output_index =
+          ((static_cast<int64_t>(batch) * num_heads + head) *
+               padded_residual_summaries +
+           block_index * residual_subblocks + residual_index) *
+              kHeadDim +
+          dimension;
+      if (residual_count > 0)
+      {
+        const float residual_reciprocal = 1.0f / residual_count;
+        key_score_summary[residual_output_index] = __float2half_rn(
+            static_cast<float>(quantized_key_sum[residual_index]) *
+            dequant_scale * residual_reciprocal);
+        value_mean[residual_output_index] = __float2half_rn(
+            value_sum[residual_index] * residual_reciprocal);
+      }
+      else
+      {
+        key_score_summary[residual_output_index] = __float2half_rn(0.0f);
+        value_mean[residual_output_index] = __float2half_rn(0.0f);
+      }
+    }
   }
   else
   {
     key_summary[output_index] = __float2half_rn(0.0f);
-    key_score_summary[output_index] = __float2half_rn(0.0f);
-    value_mean[output_index] = __float2half_rn(0.0f);
+    if (block_index * residual_subblocks < padded_residual_summaries)
+    {
+#pragma unroll
+      for (int residual_index = 0; residual_index < 2; ++residual_index)
+      {
+        if (residual_index >= residual_subblocks)
+          break;
+        const int64_t residual_output_index =
+            ((static_cast<int64_t>(batch) * num_heads + head) *
+                 padded_residual_summaries +
+             block_index * residual_subblocks + residual_index) *
+                kHeadDim +
+            dimension;
+        key_score_summary[residual_output_index] = __float2half_rn(0.0f);
+        value_mean[residual_output_index] = __float2half_rn(0.0f);
+      }
+    }
   }
 }
 
@@ -312,7 +361,9 @@ __global__ void route_threshold_fused_kernel(
     int topology_start_tokens,
     int topology_tokens,
     int tokens_per_frame,
-    int temporal_neighbor_frames)
+    int temporal_neighbor_frames,
+    float minimum_route_density,
+    float maximum_route_density)
 {
   using namespace nvcuda;
   __shared__ float scores[kRouteTile * kRouteTile];
@@ -360,23 +411,116 @@ __global__ void route_threshold_fused_kernel(
               num_query_blocks +
           query_block];
       uint32_t selected_bits = 0;
-#pragma unroll
-      for (int local_key = 0; local_key < kRouteTile; ++local_key)
+      const bool budget_enabled =
+          minimum_route_density > 0.0f || maximum_route_density < 1.0f;
+      if (!budget_enabled)
       {
-        const int key_block = key_start + local_key;
-        if (key_block < num_key_blocks &&
-            (forced_route_block(
-                 query_block,
-                 key_block,
-                 prefix_blocks,
-                 local_block_radius,
-                 query_token_offset,
-                 topology_start_tokens,
-                 topology_tokens,
-                 tokens_per_frame,
-                 temporal_neighbor_frames) ||
-             scores[local_query * kRouteTile + local_key] > threshold))
-          selected_bits |= 1U << local_key;
+#pragma unroll
+        for (int local_key = 0; local_key < kRouteTile; ++local_key)
+        {
+          const int key_block = key_start + local_key;
+          if (key_block < num_key_blocks &&
+              (forced_route_block(
+                   query_block,
+                   key_block,
+                   prefix_blocks,
+                   local_block_radius,
+                   query_token_offset,
+                   topology_start_tokens,
+                   topology_tokens,
+                   tokens_per_frame,
+                   temporal_neighbor_frames) ||
+               scores[local_query * kRouteTile + local_key] > threshold))
+            selected_bits |= 1U << local_key;
+        }
+      }
+      else
+      {
+        const int valid_keys = min(kRouteTile, num_key_blocks - key_start);
+        int forced_count = 0;
+        int candidate_count = 0;
+#pragma unroll
+        for (int local_key = 0; local_key < kRouteTile; ++local_key)
+        {
+          if (local_key >= valid_keys)
+            break;
+          const int key_block = key_start + local_key;
+          const bool forced = forced_route_block(
+              query_block,
+              key_block,
+              prefix_blocks,
+              local_block_radius,
+              query_token_offset,
+              topology_start_tokens,
+              topology_tokens,
+              tokens_per_frame,
+              temporal_neighbor_frames);
+          forced_count += forced ? 1 : 0;
+          candidate_count += !forced &&
+                  scores[local_query * kRouteTile + local_key] > threshold
+              ? 1
+              : 0;
+        }
+        const int minimum_selected = static_cast<int>(
+            ceilf(minimum_route_density * valid_keys - 1.0e-6f));
+        const int maximum_selected = max(
+            minimum_selected,
+            static_cast<int>(
+                floorf(maximum_route_density * valid_keys + 1.0e-6f)));
+        int desired_total = forced_count + candidate_count;
+        desired_total = max(minimum_selected, min(maximum_selected, desired_total));
+        desired_total = max(forced_count, min(valid_keys, desired_total));
+        const int desired_adaptive = desired_total - forced_count;
+
+#pragma unroll
+        for (int local_key = 0; local_key < kRouteTile; ++local_key)
+        {
+          if (local_key >= valid_keys)
+            break;
+          const int key_block = key_start + local_key;
+          const bool forced = forced_route_block(
+              query_block,
+              key_block,
+              prefix_blocks,
+              local_block_radius,
+              query_token_offset,
+              topology_start_tokens,
+              topology_tokens,
+              tokens_per_frame,
+              temporal_neighbor_frames);
+          if (forced)
+          {
+            selected_bits |= 1U << local_key;
+            continue;
+          }
+          const float score = scores[local_query * kRouteTile + local_key];
+          int rank = 0;
+#pragma unroll
+          for (int other = 0; other < kRouteTile; ++other)
+          {
+            if (other >= valid_keys || other == local_key)
+              continue;
+            const int other_key_block = key_start + other;
+            if (forced_route_block(
+                    query_block,
+                    other_key_block,
+                    prefix_blocks,
+                    local_block_radius,
+                    query_token_offset,
+                    topology_start_tokens,
+                    topology_tokens,
+                    tokens_per_frame,
+                    temporal_neighbor_frames))
+              continue;
+            const float other_score =
+                scores[local_query * kRouteTile + other];
+            if (other_score > score ||
+                (other_score == score && other < local_key))
+              ++rank;
+          }
+          if (rank < desired_adaptive)
+            selected_bits |= 1U << local_key;
+        }
       }
       route[
           ((static_cast<int64_t>(batch) * num_query_heads + query_head) *
@@ -470,7 +614,7 @@ __device__ __forceinline__ float block_reduce(
   return scratch[0];
 }
 
-template <typename T>
+template <int Rows, typename T>
 __device__ __forceinline__ void load_half_tile(
     const T *__restrict__ source,
     int64_t stride_sequence,
@@ -479,7 +623,9 @@ __device__ __forceinline__ void load_half_tile(
     const smem_t<SwizzleMode::k128B, kHalfPacks> &destination)
 {
   const int linear_thread = threadIdx.y * WARP_SIZE + threadIdx.x;
-  for (int line = linear_thread; line < kTilePacks; line += kWarps * WARP_SIZE)
+  static_assert(Rows > 0 && Rows <= kBlockTokens && Rows % 16 == 0);
+  constexpr int tile_packs = Rows * kHalfPacks;
+  for (int line = linear_thread; line < tile_packs; line += kWarps * WARP_SIZE)
   {
     const int row = line / kHalfPacks;
     const int column = line % kHalfPacks;
@@ -560,11 +706,13 @@ __device__ __forceinline__ void load_dequantized_int8_tile(
   }
 }
 
+template <int KeyTiles>
 __device__ __forceinline__ void compute_fp16_qk(
     const smem_t<SwizzleMode::k128B, kHalfPacks> &query,
     const smem_t<SwizzleMode::k128B, kHalfPacks> &key,
-    float score[1][4][8])
+    float score[1][KeyTiles][8])
 {
+  static_assert(KeyTiles == 2 || KeyTiles == 4);
   uint32_t query_offset = query.get_permuted_offset(
       threadIdx.y * 16 + threadIdx.x % 16, threadIdx.x / 16);
   uint32_t key_offset = key.get_permuted_offset(
@@ -581,7 +729,7 @@ __device__ __forceinline__ void compute_fp16_qk(
         query_offset - 16 * kHalfPacks, inner);
 
 #pragma unroll
-    for (int key_tile = 0; key_tile < 4; ++key_tile)
+    for (int key_tile = 0; key_tile < KeyTiles; ++key_tile)
     {
       uint32_t key_fragment[4];
       key.ldmatrix_m8n8x4(key_offset, key_fragment);
@@ -598,7 +746,7 @@ __device__ __forceinline__ void compute_fp16_qk(
       }
     }
     key_offset = key.advance_offset_by_column<2>(
-        key_offset - 64 * kHalfPacks, inner);
+        key_offset - KeyTiles * 16 * kHalfPacks, inner);
   }
 }
 
@@ -643,7 +791,8 @@ __global__ void sparse_attention_kernel(
     int num_kv_heads,
     int num_query_blocks,
     int num_key_blocks,
-    int padded_key_blocks,
+    int residual_subblocks,
+    int padded_residual_summaries,
     int route_words,
     int64_t stride_batch_q_int8,
     int64_t stride_head_q_int8,
@@ -659,14 +808,21 @@ __global__ void sparse_attention_kernel(
     int64_t stride_sequence_o,
     float softmax_scale)
 {
-  static_assert(3 * kTileBytes <= 48 * 1024, "SM75 sparse attention must stay within 48 KiB");
+  static_assert(
+      kAttentionSharedBytes == 32 * 1024,
+      "SM75 sparse attention must stay within 32 KiB");
   extern __shared__ int8_t shared_bytes[];
   smem_t<SwizzleMode::k128B, kHalfPacks> shared_query(shared_bytes);
-  smem_t<SwizzleMode::k128B, kHalfPacks> shared_key(shared_bytes + kTileBytes);
-  smem_t<SwizzleMode::k128B, kHalfPacks> shared_value(shared_bytes + 2 * kTileBytes);
+  smem_t<SwizzleMode::k128B, kHalfPacks> shared_summary_key(
+      shared_bytes + kTileBytes);
+  smem_t<SwizzleMode::k128B, kHalfPacks> shared_summary_value(
+      shared_bytes + kTileBytes + kSummaryTileBytes);
   smem_t<SwizzleMode::k128B, kHalfPacks> shared_output(shared_bytes);
   smem_t<SwizzleMode::k128B, kInt8Packs> shared_query_int8(shared_bytes);
-  smem_t<SwizzleMode::k128B, kInt8Packs> shared_key_int8(shared_bytes + kTileBytes);
+  smem_t<SwizzleMode::k128B, kInt8Packs> shared_key_int8(
+      shared_bytes + kInt8TileBytes);
+  smem_t<SwizzleMode::k128B, kHalfPacks> shared_selected_value(
+      shared_bytes + 2 * kInt8TileBytes);
 
   const int query_block = blockIdx.x;
   const int query_head = blockIdx.y;
@@ -681,11 +837,11 @@ __global__ void sparse_attention_kernel(
   T *output_head_ptr =
       output + batch * stride_batch_o + query_head * stride_head_o;
   const half *key_score_summary_head = key_score_summary +
-      (static_cast<int64_t>(batch) * num_kv_heads + kv_head) * padded_key_blocks *
-          kHeadDim;
+      (static_cast<int64_t>(batch) * num_kv_heads + kv_head) *
+          padded_residual_summaries * kHeadDim;
   const half *value_mean_head = value_mean +
-      (static_cast<int64_t>(batch) * num_kv_heads + kv_head) * padded_key_blocks *
-          kHeadDim;
+      (static_cast<int64_t>(batch) * num_kv_heads + kv_head) *
+          padded_residual_summaries * kHeadDim;
   const int32_t *route_row = route +
       ((static_cast<int64_t>(batch) * num_query_heads + query_head) *
            num_query_blocks +
@@ -724,62 +880,72 @@ __global__ void sparse_attention_kernel(
   __syncthreads();
 
   const float scale_log2 = softmax_scale * math::log2e;
-  const uint32_t value_mma_offset = shared_value.get_permuted_offset(
+  const uint32_t value_mma_offset = shared_summary_value.get_permuted_offset(
       threadIdx.x % 16, threadIdx.x / 16);
 
-  // Evaluate all skipped blocks in groups of 64 centroids. This keeps their
+  // Evaluate skipped residual summaries in groups of 32. This keeps their
   // normalization mass and V contribution without revisiting K/V tokens.
-  for (int summary_start = 0; summary_start < num_key_blocks;
-       summary_start += kBlockTokens)
+  const int residual_tokens = kBlockTokens / residual_subblocks;
+  const int num_residual_summaries =
+      (key_length + residual_tokens - 1) / residual_tokens;
+  for (int summary_start = 0; summary_start < num_residual_summaries;
+       summary_start += kSummaryTileTokens)
   {
-    load_half_tile(
+    load_half_tile<kSummaryTileTokens>(
         key_score_summary_head,
         kHeadDim,
         summary_start,
-        num_key_blocks,
-        shared_key);
-    load_half_tile(
+        num_residual_summaries,
+        shared_summary_key);
+    load_half_tile<kSummaryTileTokens>(
         value_mean_head,
         kHeadDim,
         summary_start,
-        num_key_blocks,
-        shared_value);
+        num_residual_summaries,
+        shared_summary_value);
     __syncthreads();
 
-    float score[1][4][8];
-    compute_fp16_qk(shared_query, shared_key, score);
+    float score[1][2][8];
+    compute_fp16_qk<2>(shared_query, shared_summary_key, score);
 #pragma unroll
-    for (int key_tile = 0; key_tile < 4; ++key_tile)
+    for (int key_tile = 0; key_tile < 2; ++key_tile)
     {
 #pragma unroll
       for (int element = 0; element < 8; ++element)
       {
-        const int local_key = 2 * (threadIdx.x % 4) + key_tile * 16 +
+        const int local_summary = 2 * (threadIdx.x % 4) + key_tile * 16 +
             8 * (element / 4) + element % 2;
-        const int key_block = summary_start + local_key;
-        if (key_block >= num_key_blocks || route_selected(route_row, key_block))
+        const int residual_summary = summary_start + local_summary;
+        const int key_block = residual_summary / residual_subblocks;
+        if (residual_summary >= num_residual_summaries ||
+            route_selected(route_row, key_block))
         {
           score[0][key_tile][element] = -5000000.0f;
         }
         else
         {
-          const int remaining = key_length - key_block * kBlockTokens;
-          const int block_length = remaining < kBlockTokens ? remaining : kBlockTokens;
+          const int residual_index = residual_summary % residual_subblocks;
+          const int residual_start =
+              key_block * kBlockTokens + residual_index * residual_tokens;
+          const int remaining = key_length - residual_start;
+          const int block_length = remaining < residual_tokens
+              ? remaining
+              : residual_tokens;
           score[0][key_tile][element] =
               score[0][key_tile][element] * scale_log2 +
               math::ptx_log2(static_cast<float>(block_length));
         }
       }
     }
-    update_mdo<1, 4, 8, false, false, true>(
+    update_mdo<1, 2, 8, false, false, true>(
         score, output_fragment, row_max, denominator, 1.0f);
-    uint32_t probability[1][4][4];
-    RS_32_to_16<1, 4>(score, probability);
-    accumulate_d<1, 4, ComputeUnit::kTensorCore>(probability, denominator);
+    uint32_t probability[1][2][4];
+    RS_32_to_16<1, 2>(score, probability);
+    accumulate_d<1, 2, ComputeUnit::kTensorCore>(probability, denominator);
     uint32_t value_offset = value_mma_offset;
-    compute_fp16_sv_permuted<4, 1, 1, 4, 8,
+    compute_fp16_sv_permuted<4, 1, 1, 2, 8,
                              SwizzleMode::k128B, kHalfPacks, 4>(
-        shared_value,
+        shared_summary_value,
         probability,
         output_fragment,
         denominator,
@@ -808,12 +974,12 @@ __global__ void sparse_attention_kernel(
         key_block * kBlockTokens,
         key_length,
         shared_key_int8);
-    load_half_tile(
+    load_half_tile<kBlockTokens>(
         value_head_ptr,
         stride_sequence_v,
         key_block * kBlockTokens,
         key_length,
-        shared_value);
+        shared_selected_value);
     __syncthreads();
 
     int32_t integer_score[1][4][8];
@@ -842,7 +1008,7 @@ __global__ void sparse_attention_kernel(
     uint32_t value_offset = value_mma_offset;
     compute_fp16_sv_permuted<4, 1, 1, 4, 8,
                              SwizzleMode::k128B, kHalfPacks, 4>(
-        shared_value,
+        shared_selected_value,
         probability,
         output_fragment,
         denominator,
@@ -950,6 +1116,9 @@ void launch_sparse_threshold_attention(
     int topology_tokens,
     int tokens_per_frame,
     int temporal_neighbor_frames,
+    int residual_subblocks,
+    float minimum_route_density,
+    float maximum_route_density,
     float threshold_sigma,
     float softmax_scale)
 {
@@ -962,6 +1131,7 @@ void launch_sparse_threshold_attention(
   const int num_key_blocks = div_ceil(key_length, kBlockTokens);
   const int padded_query_blocks = query_summary.size(2);
   const int padded_key_blocks = key_summary.size(2);
+  const int padded_residual_summaries = key_score_summary.size(2);
   const int route_words = route.size(3);
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
@@ -991,6 +1161,8 @@ void launch_sparse_threshold_attention(
       num_kv_heads,
       key_length,
       padded_key_blocks,
+      residual_subblocks,
+      padded_residual_summaries,
       key.stride(0),
       key.stride(1),
       key.stride(2),
@@ -1050,7 +1222,9 @@ void launch_sparse_threshold_attention(
       topology_start_tokens,
       topology_tokens,
       tokens_per_frame,
-      temporal_neighbor_frames);
+      temporal_neighbor_frames,
+      minimum_route_density,
+      maximum_route_density);
   check_launch("sparse fused threshold route");
 
   dim3 attention_grid(num_query_blocks, num_query_heads, batch_size);
@@ -1058,7 +1232,7 @@ void launch_sparse_threshold_attention(
   sparse_attention_kernel<T><<<
       attention_grid,
       attention_block,
-      3 * kTileBytes,
+      kAttentionSharedBytes,
       stream>>>(
       query_int8.data_ptr<int8_t>(),
       key_int8.data_ptr<int8_t>(),
@@ -1075,7 +1249,8 @@ void launch_sparse_threshold_attention(
       num_kv_heads,
       num_query_blocks,
       num_key_blocks,
-      padded_key_blocks,
+      residual_subblocks,
+      padded_residual_summaries,
       route_words,
       query_int8.stride(0),
       query_int8.stride(1),
@@ -1111,6 +1286,9 @@ static at::Tensor sol_sparse_threshold_int8_f16_attn_impl(
     int topology_tokens,
     int tokens_per_frame,
     int temporal_neighbor_frames,
+    int residual_subblocks,
+    float minimum_route_density,
+    float maximum_route_density,
     int query_token_offset,
     float softmax_scale)
 {
@@ -1208,6 +1386,15 @@ static at::Tensor sol_sparse_threshold_int8_f16_attn_impl(
       local_block_radius >= 0,
       "sparse attention local_block_radius must be non-negative");
   TORCH_CHECK(
+      residual_subblocks == 1 || residual_subblocks == 2,
+      "sparse attention residual_subblocks must be 1 or 2");
+  TORCH_CHECK(
+      std::isfinite(minimum_route_density) &&
+          std::isfinite(maximum_route_density) &&
+          minimum_route_density >= 0.0f && maximum_route_density <= 1.0f &&
+          minimum_route_density <= maximum_route_density,
+      "sparse attention route density bounds must satisfy 0 <= minimum <= maximum <= 1");
+  TORCH_CHECK(
       topology_start_tokens >= 0 && topology_tokens >= 0 &&
           tokens_per_frame >= 0 && temporal_neighbor_frames >= 0,
       "sparse attention topology values must be non-negative");
@@ -1219,6 +1406,11 @@ static at::Tensor sol_sparse_threshold_int8_f16_attn_impl(
 
   const int padded_query_blocks = div_ceil(num_query_blocks, kRouteTile) * kRouteTile;
   const int padded_key_blocks = div_ceil(num_key_blocks, kRouteTile) * kRouteTile;
+  const int residual_tokens = kBlockTokens / residual_subblocks;
+  const int num_residual_summaries =
+      div_ceil(static_cast<int>(key.size(2)), residual_tokens);
+  const int padded_residual_summaries =
+      div_ceil(num_residual_summaries, kSummaryTileTokens) * kSummaryTileTokens;
   const int route_words = div_ceil(num_key_blocks, kRouteTile);
   const int prefix_blocks = div_ceil(prefix_tokens, kBlockTokens);
 
@@ -1229,8 +1421,10 @@ static at::Tensor sol_sparse_threshold_int8_f16_attn_impl(
       {batch_size, num_query_heads, padded_query_blocks, kHeadDim}, half_options);
   at::Tensor key_summary = at::empty(
       {batch_size, num_kv_heads, padded_key_blocks, kHeadDim}, half_options);
-  at::Tensor key_score_summary = at::empty_like(key_summary);
-  at::Tensor value_mean = at::empty_like(key_summary);
+  at::Tensor key_score_summary = at::empty(
+      {batch_size, num_kv_heads, padded_residual_summaries, kHeadDim},
+      half_options);
+  at::Tensor value_mean = at::empty_like(key_score_summary);
   at::Tensor route = at::empty(
       {batch_size, num_query_heads, num_query_blocks, route_words},
       int_options);
@@ -1267,6 +1461,9 @@ static at::Tensor sol_sparse_threshold_int8_f16_attn_impl(
           topology_tokens,
           tokens_per_frame,
           temporal_neighbor_frames,
+          residual_subblocks,
+          minimum_route_density,
+          maximum_route_density,
           threshold_sigma,
           softmax_scale);
     }
@@ -1296,6 +1493,9 @@ static at::Tensor sol_sparse_threshold_int8_f16_attn_impl(
           topology_tokens,
           tokens_per_frame,
           temporal_neighbor_frames,
+          residual_subblocks,
+          minimum_route_density,
+          maximum_route_density,
           threshold_sigma,
           softmax_scale);
     }
@@ -1319,6 +1519,9 @@ at::Tensor sol_sparse_threshold_int8_f16_attn(
     int topology_tokens,
     int tokens_per_frame,
     int temporal_neighbor_frames,
+    int residual_subblocks,
+    float minimum_route_density,
+    float maximum_route_density,
     int query_token_offset,
     float softmax_scale)
 {
@@ -1338,6 +1541,9 @@ at::Tensor sol_sparse_threshold_int8_f16_attn(
       topology_tokens,
       tokens_per_frame,
       temporal_neighbor_frames,
+      residual_subblocks,
+      minimum_route_density,
+      maximum_route_density,
       query_token_offset,
       softmax_scale);
 }

@@ -23,6 +23,9 @@ SPARSE_ROUTING_THRESHOLD = 1.0
 SPARSE_PREFIX_POLICY = "auto"
 SPARSE_LOCAL_BLOCK_RADIUS = 1
 SPARSE_TEMPORAL_NEIGHBOR_FRAMES = 1
+SPARSE_SKIPPED_RESIDUAL = "2x32"
+SPARSE_MINIMUM_ROUTE_DENSITY = 0.0
+SPARSE_MAXIMUM_ROUTE_DENSITY = 1.0
 SPARSE_DENSE_WARMUP_RATIO = 0.25
 SPARSE_DENSE_TAIL_RATIO = 0.0
 SPARSE_DENSE_PREFIX_LAYERS = 2
@@ -189,7 +192,7 @@ def bundled_sparse_available() -> bool:
         version_tuple = tuple(int(part) for part in version.split(".")[:3])
     except ValueError:
         return False
-    return version_tuple >= (0, 12, 1) and sparse_available()
+    return version_tuple >= (0, 13, 0) and sparse_available()
 
 
 def _sageattn(*args, **kwargs):
@@ -208,6 +211,12 @@ def _sol_sparse_route_selected(route: torch.Tensor) -> int:
     from comfyui_turing_utils_kernel import turing_sage
 
     return turing_sage.sol_sparse_route_selected(route)
+
+
+def _sol_sparse_route_selected_device(route: torch.Tensor) -> torch.Tensor:
+    from comfyui_turing_utils_kernel import turing_sage
+
+    return turing_sage._sol_sparse_route_selected_device(route)
 
 
 def preflight_bundled(device: torch.device) -> None:
@@ -474,10 +483,13 @@ def _sparse_dense_schedule(
     warmup_ratio: float,
     tail_ratio: float,
     state: dict[str, object],
+    *,
+    track_step: bool = False,
 ) -> bool:
     if (
         warmup_ratio <= 0.0
         and tail_ratio <= 0.0
+        and not track_step
     ) or not isinstance(transformer_options, dict):
         return False
     sample_sigmas = transformer_options.get("sample_sigmas")
@@ -556,8 +568,12 @@ def turing_sol_sparse_attention(
     manual_prefix_tokens: int = 0,
     local_block_radius: int = SPARSE_LOCAL_BLOCK_RADIUS,
     temporal_neighbor_frames: int = SPARSE_TEMPORAL_NEIGHBOR_FRAMES,
+    skipped_residual: str = SPARSE_SKIPPED_RESIDUAL,
+    minimum_route_density: float = SPARSE_MINIMUM_ROUTE_DENSITY,
+    maximum_route_density: float = SPARSE_MAXIMUM_ROUTE_DENSITY,
     debug_route_density: bool = False,
     debug_route_keys: set[tuple] | None = None,
+    debug_route_state: dict[tuple, list[tuple[torch.Tensor, int, int]]] | None = None,
     debug_context: dict | None = None,
     **kwargs,
 ) -> torch.Tensor:
@@ -620,6 +636,16 @@ def turing_sol_sparse_attention(
     effective_min_sequence = min_sequence_tokens or SPARSE_AUTO_MIN_SEQUENCE
     if q.shape[2] < effective_min_sequence or k.shape[2] < effective_min_sequence:
         return dense(f"sequences shorter than {effective_min_sequence} tokens")
+    skipped_residual = str(skipped_residual).strip().lower()
+    residual_subblocks = {"1x64": 1, "2x32": 2}.get(skipped_residual)
+    if residual_subblocks is None:
+        raise ValueError("skipped_residual must be 1x64 or 2x32")
+    minimum_route_density = float(minimum_route_density)
+    maximum_route_density = float(maximum_route_density)
+    if not 0.0 <= minimum_route_density <= maximum_route_density <= 1.0:
+        raise ValueError(
+            "route density bounds must satisfy 0 <= minimum <= maximum <= 1"
+        )
 
     prefix_tokens = _sparse_prefix_tokens(
         prefix_policy,
@@ -650,12 +676,16 @@ def turing_sol_sparse_attention(
         topology_tokens,
         tokens_per_frame,
         temporal_neighbor_frames,
+        residual_subblocks,
+        minimum_route_density,
+        maximum_route_density,
     )
     if kernel_key not in _LOGGED_SPARSE_KERNELS:
         LOG.info(
             "Experimental Turing Sol sparse attention active: dtype=%s Q=%s K=%s "
             "min_sequence=%d prefix_policy=%s stable_prefix_q=%d sparse_target_q=%d "
             "selected_qk=int8 score_domain=int8_consistent threshold=%.2f "
+            "skipped_residual=%s route_budget=[%.2f,%.2f] "
             "local_radius=%d temporal_frames=%d "
             "topology=(%d,%d,%d)",
             input_dtype,
@@ -666,6 +696,9 @@ def turing_sol_sparse_attention(
             prefix_tokens,
             q.shape[2] - prefix_tokens,
             routing_threshold,
+            skipped_residual,
+            minimum_route_density,
+            maximum_route_density,
             local_block_radius,
             temporal_neighbor_frames,
             topology_start,
@@ -675,7 +708,25 @@ def turing_sol_sparse_attention(
         _LOGGED_SPARSE_KERNELS.add(kernel_key)
 
     route_keys = debug_route_keys if debug_route_keys is not None else set()
-    collect_route_stats = debug_route_density and kernel_key not in route_keys
+    context = debug_context or {}
+    step = context.get("step")
+    layer_index = context.get("layer_index")
+    layer_count = context.get("layer_count")
+    aggregate_route_stats = (
+        debug_route_density
+        and debug_route_state is not None
+        and isinstance(step, int)
+        and not isinstance(step, bool)
+        and isinstance(layer_index, int)
+        and not isinstance(layer_index, bool)
+        and isinstance(layer_count, int)
+        and not isinstance(layer_count, bool)
+        and layer_count > 0
+        and 0 <= layer_index < layer_count
+    )
+    collect_route_stats = debug_route_density and (
+        aggregate_route_stats or kernel_key not in route_keys
+    )
     sparse_result = _sol_sparse_sageattn(
         q,
         k,
@@ -689,40 +740,101 @@ def turing_sol_sparse_attention(
         topology_tokens=topology_tokens,
         tokens_per_frame=tokens_per_frame,
         temporal_neighbor_frames=temporal_neighbor_frames,
+        residual_subblocks=residual_subblocks,
+        minimum_route_density=minimum_route_density,
+        maximum_route_density=maximum_route_density,
         return_route=collect_route_stats,
     )
     if collect_route_stats:
         output, route = sparse_result
         try:
-            selected_blocks = _sol_sparse_route_selected(route)
             sparse_query_tokens = q.shape[2] - prefix_tokens
             query_blocks = route.shape[2]
             key_blocks = math.ceil(k.shape[2] / 64)
             possible_blocks = route.shape[0] * route.shape[1] * query_blocks * key_blocks
-            LOG.warning(
-                "[Turing sparse debug] Q=%d Qsparse=%d K=%d Hq=%d Hkv=%d selected=%d/%d "
-                "density=%.4f threshold=%.2f prefix=%d local=%d temporal=%d "
-                "step=%s/%s layer=%s/%s",
-                q.shape[2],
-                sparse_query_tokens,
-                k.shape[2],
-                q.shape[1],
-                k.shape[1],
-                selected_blocks,
-                possible_blocks,
-                selected_blocks / possible_blocks if possible_blocks else 0.0,
-                routing_threshold,
-                prefix_tokens,
-                local_block_radius,
-                temporal_neighbor_frames,
-                (debug_context or {}).get("step"),
-                (debug_context or {}).get("sampling_steps"),
-                (debug_context or {}).get("layer_index"),
-                (debug_context or {}).get("layer_count"),
-            )
+            if aggregate_route_stats:
+                selected_device = _sol_sparse_route_selected_device(route)
+                aggregate_key = (step, context.get("sampling_steps"), kernel_key)
+                entries = debug_route_state.setdefault(aggregate_key, [])
+                entries.append((selected_device, possible_blocks, layer_index))
+                if layer_index == layer_count - 1:
+                    selected = torch.cat([entry[0] for entry in entries]).float()
+                    possible = torch.tensor(
+                        [entry[1] for entry in entries],
+                        device=selected.device,
+                        dtype=torch.float32,
+                    )
+                    density = selected / possible.clamp_min(1.0)
+                    summary = torch.stack(
+                        (
+                            selected.sum(),
+                            possible.sum(),
+                            density.min(),
+                            density.mean(),
+                            density.max(),
+                        )
+                    ).cpu().tolist()
+                    first_layer = min(entry[2] for entry in entries)
+                    last_layer = max(entry[2] for entry in entries)
+                    LOG.warning(
+                        "[Turing sparse debug] step=%s/%s layers=%d-%d calls=%d "
+                        "selected=%d/%d density[min/mean/max]=%.4f/%.4f/%.4f "
+                        "Q=%d Qsparse=%d K=%d Hq=%d Hkv=%d threshold=%.2f "
+                        "prefix=%d local=%d temporal=%d residual=%s budget=[%.2f,%.2f]",
+                        step,
+                        context.get("sampling_steps"),
+                        first_layer,
+                        last_layer,
+                        len(entries),
+                        int(summary[0]),
+                        int(summary[1]),
+                        summary[2],
+                        summary[3],
+                        summary[4],
+                        q.shape[2],
+                        sparse_query_tokens,
+                        k.shape[2],
+                        q.shape[1],
+                        k.shape[1],
+                        routing_threshold,
+                        prefix_tokens,
+                        local_block_radius,
+                        temporal_neighbor_frames,
+                        skipped_residual,
+                        minimum_route_density,
+                        maximum_route_density,
+                    )
+                    del debug_route_state[aggregate_key]
+            else:
+                selected_blocks = _sol_sparse_route_selected(route)
+                LOG.warning(
+                    "[Turing sparse debug] Q=%d Qsparse=%d K=%d Hq=%d Hkv=%d selected=%d/%d "
+                    "density=%.4f threshold=%.2f prefix=%d local=%d temporal=%d "
+                    "residual=%s budget=[%.2f,%.2f] step=%s/%s layer=%s/%s",
+                    q.shape[2],
+                    sparse_query_tokens,
+                    k.shape[2],
+                    q.shape[1],
+                    k.shape[1],
+                    selected_blocks,
+                    possible_blocks,
+                    selected_blocks / possible_blocks if possible_blocks else 0.0,
+                    routing_threshold,
+                    prefix_tokens,
+                    local_block_radius,
+                    temporal_neighbor_frames,
+                    skipped_residual,
+                    minimum_route_density,
+                    maximum_route_density,
+                    context.get("step"),
+                    context.get("sampling_steps"),
+                    layer_index,
+                    layer_count,
+                )
         except (ImportError, OSError, RuntimeError, ValueError) as error:
             LOG.warning("[Turing sparse debug] route density unavailable: %s", error)
-        route_keys.add(kernel_key)
+        if not aggregate_route_stats:
+            route_keys.add(kernel_key)
     else:
         output = sparse_result
     batch, _, _, head_dim = q.shape
@@ -800,6 +912,9 @@ def make_sparse_attention_override(
     manual_prefix_tokens: int = 0,
     local_block_radius: int = SPARSE_LOCAL_BLOCK_RADIUS,
     temporal_neighbor_frames: int = SPARSE_TEMPORAL_NEIGHBOR_FRAMES,
+    skipped_residual: str = SPARSE_SKIPPED_RESIDUAL,
+    minimum_route_density: float = SPARSE_MINIMUM_ROUTE_DENSITY,
+    maximum_route_density: float = SPARSE_MAXIMUM_ROUTE_DENSITY,
     dense_warmup_ratio: float = SPARSE_DENSE_WARMUP_RATIO,
     dense_tail_ratio: float = SPARSE_DENSE_TAIL_RATIO,
     dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
@@ -811,6 +926,9 @@ def make_sparse_attention_override(
     manual_prefix_tokens = int(manual_prefix_tokens)
     local_block_radius = int(local_block_radius)
     temporal_neighbor_frames = int(temporal_neighbor_frames)
+    skipped_residual = str(skipped_residual).strip().lower()
+    minimum_route_density = float(minimum_route_density)
+    maximum_route_density = float(maximum_route_density)
     dense_warmup_ratio = float(dense_warmup_ratio)
     dense_tail_ratio = float(dense_tail_ratio)
     dense_prefix_layers = int(dense_prefix_layers)
@@ -827,6 +945,12 @@ def make_sparse_attention_override(
         raise ValueError("local_block_radius must be non-negative")
     if temporal_neighbor_frames < 0:
         raise ValueError("temporal_neighbor_frames must be non-negative")
+    if skipped_residual not in {"1x64", "2x32"}:
+        raise ValueError("skipped_residual must be 1x64 or 2x32")
+    if not 0.0 <= minimum_route_density <= maximum_route_density <= 1.0:
+        raise ValueError(
+            "route density bounds must satisfy 0 <= minimum <= maximum <= 1"
+        )
     if not 0.0 <= dense_warmup_ratio <= 1.0:
         raise ValueError("dense_warmup_ratio must be in [0, 1]")
     if not 0.0 <= dense_tail_ratio <= 1.0:
@@ -840,12 +964,13 @@ def make_sparse_attention_override(
     if not bundled_sparse_available():
         raise RuntimeError(
             "The experimental Turing sparse extension is unavailable. "
-            "Rebuild comfyui-turing-utils-kernel 0.12.1 or newer with sm75 enabled."
+            "Rebuild comfyui-turing-utils-kernel 0.13.0 or newer with sm75 enabled."
         )
     preflight_bundled(device)
     preflight_bundled_sparse(device)
     warmup_state: dict[str, object] = {}
     debug_route_keys: set[tuple] = set()
+    debug_route_state: dict[tuple, list[tuple[torch.Tensor, int, int]]] = {}
     debug_dense_reasons: set[str] = set()
 
     def attention_override(original: Callable, *args, **kwargs):
@@ -858,6 +983,7 @@ def make_sparse_attention_override(
             dense_warmup_ratio,
             dense_tail_ratio,
             warmup_state,
+            track_step=debug_route_density,
         )
         dense_layer = _sparse_dense_layer(transformer_options, dense_prefix_layers)
         if debug_route_density and dense_schedule:
@@ -906,8 +1032,12 @@ def make_sparse_attention_override(
             manual_prefix_tokens=manual_prefix_tokens,
             local_block_radius=local_block_radius,
             temporal_neighbor_frames=temporal_neighbor_frames,
+            skipped_residual=skipped_residual,
+            minimum_route_density=minimum_route_density,
+            maximum_route_density=maximum_route_density,
             debug_route_density=debug_route_density,
             debug_route_keys=debug_route_keys if debug_route_density else None,
+            debug_route_state=debug_route_state if debug_route_density else None,
             debug_context=debug_context,
             **kwargs,
         )
@@ -925,6 +1055,9 @@ def apply_sparse_attention_patch(
     manual_prefix_tokens: int = 0,
     local_block_radius: int = SPARSE_LOCAL_BLOCK_RADIUS,
     temporal_neighbor_frames: int = SPARSE_TEMPORAL_NEIGHBOR_FRAMES,
+    skipped_residual: str = SPARSE_SKIPPED_RESIDUAL,
+    minimum_route_density: float = SPARSE_MINIMUM_ROUTE_DENSITY,
+    maximum_route_density: float = SPARSE_MAXIMUM_ROUTE_DENSITY,
     dense_warmup_ratio: float = SPARSE_DENSE_WARMUP_RATIO,
     dense_tail_ratio: float = SPARSE_DENSE_TAIL_RATIO,
     dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
@@ -939,6 +1072,9 @@ def apply_sparse_attention_patch(
         manual_prefix_tokens=manual_prefix_tokens,
         local_block_radius=local_block_radius,
         temporal_neighbor_frames=temporal_neighbor_frames,
+        skipped_residual=skipped_residual,
+        minimum_route_density=minimum_route_density,
+        maximum_route_density=maximum_route_density,
         dense_warmup_ratio=dense_warmup_ratio,
         dense_tail_ratio=dense_tail_ratio,
         dense_prefix_layers=dense_prefix_layers,
@@ -953,6 +1089,7 @@ def apply_sparse_attention_patch(
     LOG.info(
         "Sol sparse attention patch enabled: min_sequence=%s threshold=%.2f "
         "prefix_policy=%s manual_prefix=%d local_radius=%d temporal_frames=%d "
+        "skipped_residual=%s route_budget=[%.2f,%.2f] "
         "dense_warmup=%.2f "
         "dense_tail=%.2f dense_prefix_layers=%d debug_route_density=%s",
         min_sequence_tokens or "auto",
@@ -961,6 +1098,9 @@ def apply_sparse_attention_patch(
         manual_prefix_tokens,
         local_block_radius,
         temporal_neighbor_frames,
+        skipped_residual,
+        minimum_route_density,
+        maximum_route_density,
         dense_warmup_ratio,
         dense_tail_ratio,
         dense_prefix_layers,

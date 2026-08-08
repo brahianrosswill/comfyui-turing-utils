@@ -75,6 +75,9 @@ def sol_sparse_threshold_int8_f16_attn(
     topology_tokens,
     tokens_per_frame,
     temporal_neighbor_frames,
+    residual_subblocks,
+    minimum_route_density,
+    maximum_route_density,
     query_token_offset,
     sm_scale,
 ):
@@ -94,6 +97,9 @@ def sol_sparse_threshold_int8_f16_attn(
         topology_tokens,
         tokens_per_frame,
         temporal_neighbor_frames,
+        residual_subblocks,
+        minimum_route_density,
+        maximum_route_density,
         query_token_offset,
         sm_scale,
     )
@@ -102,6 +108,6 @@ def sol_sparse_threshold_int8_f16_attn(
 def sol_sparse_route_selected(route):
     if not hasattr(_qattn_sm75, "sol_sparse_route_selected"):
         raise RuntimeError(
-            "route-density debug requires comfyui-turing-utils-kernel 0.12.1 or newer"
+            "route-density debug requires comfyui-turing-utils-kernel 0.13.0 or newer"
         )
     return _qattn_sm75.sol_sparse_route_selected(route)

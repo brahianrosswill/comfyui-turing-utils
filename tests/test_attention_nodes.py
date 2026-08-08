@@ -41,6 +41,9 @@ class SparseAttentionNodeTest(unittest.TestCase):
                 "manual_prefix_tokens",
                 "local_block_radius",
                 "temporal_neighbor_frames",
+                "skipped_residual",
+                "minimum_route_density",
+                "maximum_route_density",
                 "dense_warmup_ratio",
                 "dense_tail_ratio",
                 "dense_prefix_layers",
@@ -52,6 +55,9 @@ class SparseAttentionNodeTest(unittest.TestCase):
         self.assertEqual(inputs["manual_prefix_tokens"][1]["default"], 0)
         self.assertEqual(inputs["local_block_radius"][1]["default"], 1)
         self.assertEqual(inputs["temporal_neighbor_frames"][1]["default"], 1)
+        self.assertEqual(inputs["skipped_residual"][0][0], "2x32")
+        self.assertEqual(inputs["minimum_route_density"][1]["default"], 0.0)
+        self.assertEqual(inputs["maximum_route_density"][1]["default"], 1.0)
         self.assertEqual(inputs["dense_warmup_ratio"][1]["default"], 0.25)
         self.assertEqual(inputs["dense_tail_ratio"][1]["default"], 0.0)
         self.assertEqual(inputs["dense_prefix_layers"][1]["default"], 2)
@@ -73,6 +79,9 @@ class SparseAttentionNodeTest(unittest.TestCase):
                 manual_prefix_tokens=256,
                 local_block_radius=2,
                 temporal_neighbor_frames=2,
+                skipped_residual="1x64",
+                minimum_route_density=0.2,
+                maximum_route_density=0.7,
                 dense_warmup_ratio=0.25,
                 dense_tail_ratio=0.1,
                 dense_prefix_layers=3,
@@ -93,6 +102,9 @@ class SparseAttentionNodeTest(unittest.TestCase):
             manual_prefix_tokens=256,
             local_block_radius=2,
             temporal_neighbor_frames=2,
+            skipped_residual="1x64",
+            minimum_route_density=0.2,
+            maximum_route_density=0.7,
             dense_warmup_ratio=0.25,
             dense_tail_ratio=0.1,
             dense_prefix_layers=3,
@@ -106,7 +118,19 @@ class SparseAttentionNodeTest(unittest.TestCase):
             "attention_nodes.apply_sparse_attention_patch", return_value=patched
         ) as apply_patch:
             output = attention_nodes.SolSparseAttentionPatch().patch(
-                model, 8192, 0.85, "manual", 256, 2, 2, 0.25, 0.1, 3
+                model,
+                8192,
+                0.85,
+                "manual",
+                256,
+                2,
+                2,
+                "1x64",
+                0.2,
+                0.7,
+                0.25,
+                0.1,
+                3,
             )
         self.assertEqual(output, (patched,))
         apply_patch.assert_called_once_with(
@@ -117,6 +141,9 @@ class SparseAttentionNodeTest(unittest.TestCase):
             manual_prefix_tokens=256,
             local_block_radius=2,
             temporal_neighbor_frames=2,
+            skipped_residual="1x64",
+            minimum_route_density=0.2,
+            maximum_route_density=0.7,
             dense_warmup_ratio=0.25,
             dense_tail_ratio=0.1,
             dense_prefix_layers=3,
