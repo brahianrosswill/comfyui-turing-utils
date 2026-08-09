@@ -36,6 +36,10 @@ only after its CUDA sources or required version change.
   Hubs can be chained; image/video resizing follows KJ Resize Image v2 controls,
   zero width/height defaults disable resizing, and an optional positive video
   frame count trims or pads only at the end.
+- `Optional Resize Image v2` mirrors KJ Resize Image v2's controls, defaults,
+  dimensions, mask output, and resize/crop/pad behavior. Its image socket is
+  optional; without an image it returns no image, allowing one node to feed an
+  optional first- or last-frame condition socket without fabricating a frame.
 - `Bernini Inpaint Condition` starts sampling from the source-video latent,
   supports local or global repainting, and optionally adds the source as aligned
   context tokens.
@@ -49,7 +53,9 @@ only after its CUDA sources or required version change.
   video latent to an exact independently selected width and height on the
   model's 32-pixel grid, while preserving the audio latent unchanged. It is
   intended for explicitly separated low- and high-resolution sampling stages
-  and performs no cropping, padding, re-noising, or sigma conversion.
+  and performs no cropping, padding, re-noising, or sigma conversion. An
+  optional conditioning input can resize first/last H3 keyframe latents onto
+  the same grid; independent picture/video reference latents are not changed.
 - `Patch H3 Progressive Resolution (Experimental)` keeps one final-resolution
   H3 video/audio latent but can evaluate an initial low stage and a following
   medium stage at independently configured video short edges. Stage names

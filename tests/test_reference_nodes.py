@@ -49,6 +49,72 @@ class FakeVAE:
 
 
 class ReferenceNodesTest(unittest.TestCase):
+    def test_optional_resize_v2_matches_kj_interface_defaults(self):
+        inputs = reference_nodes.OptionalResizeImageV2.INPUT_TYPES()
+        required = inputs["required"]
+        self.assertEqual(
+            tuple(required),
+            (
+                "width",
+                "height",
+                "upscale_method",
+                "keep_proportion",
+                "pad_color",
+                "crop_position",
+                "divisible_by",
+            ),
+        )
+        self.assertEqual(required["width"][1]["default"], 512)
+        self.assertEqual(required["height"][1]["default"], 512)
+        self.assertEqual(required["upscale_method"][0][0], "nearest-exact")
+        self.assertEqual(required["keep_proportion"][1]["default"], "stretch")
+        self.assertEqual(required["divisible_by"][1]["default"], 2)
+        self.assertEqual(tuple(inputs["optional"]), ("image", "mask", "device"))
+        self.assertEqual(reference_nodes.OptionalResizeImageV2.RETURN_TYPES, ("IMAGE", "INT", "INT", "MASK"))
+
+    def test_optional_resize_v2_returns_absent_image_without_input(self):
+        result = reference_nodes.OptionalResizeImageV2().resize(
+            width=512,
+            height=512,
+            upscale_method="nearest-exact",
+            keep_proportion="stretch",
+            pad_color="0, 0, 0",
+            crop_position="center",
+            divisible_by=2,
+        )
+        self.assertEqual(result, (None, 0, 0, None))
+
+    def test_optional_resize_v2_stretches_and_reports_actual_dimensions(self):
+        image = torch.rand(1, 4, 8, 3)
+        output, width, height, mask = reference_nodes.OptionalResizeImageV2().resize(
+            image=image,
+            width=14,
+            height=10,
+            upscale_method="bilinear",
+            keep_proportion="stretch",
+            pad_color="0, 0, 0",
+            crop_position="center",
+            divisible_by=2,
+        )
+        self.assertEqual(tuple(output.shape), (1, 10, 14, 3))
+        self.assertEqual((width, height), (14, 10))
+        self.assertEqual(tuple(mask.shape), (1, 64, 64))
+
+    def test_optional_resize_v2_accepts_one_zero_dimension_in_resize_mode(self):
+        image = torch.rand(1, 4, 8, 3)
+        output, width, height, _ = reference_nodes.OptionalResizeImageV2().resize(
+            image=image,
+            width=0,
+            height=10,
+            upscale_method="bilinear",
+            keep_proportion="resize",
+            pad_color="0, 0, 0",
+            crop_position="center",
+            divisible_by=2,
+        )
+        self.assertEqual(tuple(output.shape), (1, 10, 20, 3))
+        self.assertEqual((width, height), (20, 10))
+
     def test_reference_hubs_place_previous_before_ordered_autogrow_slots(self):
         cases = (
             (reference_nodes.ReferenceImageHub, "images", "image_"),

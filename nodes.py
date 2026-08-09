@@ -9,7 +9,7 @@ from .minimax_nodes import (
     MiniMaxH3ReferenceConditionHub,
     MiniMaxH3VideoFramesPadding,
 )
-from .reference_nodes import ReferenceAudioHub, ReferenceImageHub, ReferenceVideoHub
+from .reference_nodes import OptionalResizeImageV2, ReferenceAudioHub, ReferenceImageHub, ReferenceVideoHub
 from .wan_nodes import WanVideoFramesPadding
 
 
@@ -23,6 +23,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsReferenceImageHub": ReferenceImageHub,
     "TuringUtilsReferenceVideoHub": ReferenceVideoHub,
     "TuringUtilsReferenceAudioHub": ReferenceAudioHub,
+    "TuringUtilsOptionalResizeImageV2": OptionalResizeImageV2,
     "TuringUtilsMiniMaxH3ReferenceConditionHub": MiniMaxH3ReferenceConditionHub,
     "TuringUtilsMiniMaxH3LatentResize": MiniMaxH3LatentResize,
     "TuringUtilsMiniMaxH3ProgressiveResolutionPatch": MiniMaxH3ProgressiveResolutionPatch,
@@ -40,6 +41,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsReferenceImageHub": "Reference Image Hub",
     "TuringUtilsReferenceVideoHub": "Reference Video Hub",
     "TuringUtilsReferenceAudioHub": "Reference Audio Hub",
+    "TuringUtilsOptionalResizeImageV2": "Optional Resize Image v2",
     "TuringUtilsMiniMaxH3ReferenceConditionHub": "MiniMax H3 Reference Condition (Hub)",
     "TuringUtilsMiniMaxH3LatentResize": "Resize MiniMax H3 AV Latent (Experimental)",
     "TuringUtilsMiniMaxH3ProgressiveResolutionPatch": "Patch H3 Progressive Resolution (Experimental)",

@@ -186,11 +186,26 @@ class MiniMaxH3LatentResize:
                         "tooltip": "Spatial interpolation for the video latent. The audio latent is never resized.",
                     },
                 ),
+                "resize_keyframes": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "When conditioning is connected, resize its first/last H3 keyframe latents to the same spatial grid.",
+                    },
+                ),
+            },
+            "optional": {
+                "conditioning": (
+                    "CONDITIONING",
+                    {
+                        "tooltip": "Optional H3 conditioning to resize alongside the target latent. Independent references are left unchanged.",
+                    },
+                ),
             },
         }
 
-    RETURN_TYPES = ("LATENT",)
-    RETURN_NAMES = ("samples",)
+    RETURN_TYPES = ("LATENT", "CONDITIONING")
+    RETURN_NAMES = ("samples", "conditioning")
     FUNCTION = "resize"
     CATEGORY = "Turing Utils/latent"
     TITLE = "Resize MiniMax H3 AV Latent (Experimental)"
@@ -219,7 +234,69 @@ class MiniMaxH3LatentResize:
             raise ValueError("H3 video and audio latent batch sizes must match")
         return video, audio
 
-    def resize(self, samples, width: int, height: int, resize_method: str = "bilinear"):
+    @staticmethod
+    def _resize_conditioning_keyframes(conditioning, latent_width, latent_height, resize_method):
+        if conditioning is None:
+            return None
+        if not isinstance(conditioning, (list, tuple)):
+            raise ValueError("Expected ComfyUI CONDITIONING to be a list or tuple")
+
+        output = []
+        cache = {}
+        for entry in conditioning:
+            if not isinstance(entry, (list, tuple)) or len(entry) != 2 or not isinstance(entry[1], dict):
+                output.append(entry)
+                continue
+            metadata = entry[1]
+            keyframes = metadata.get("minimax_keyframes")
+            if not keyframes:
+                output.append(entry)
+                continue
+
+            resized_keyframes = []
+            for keyframe in keyframes:
+                if not isinstance(keyframe, dict) or not hasattr(keyframe.get("latent"), "shape"):
+                    resized_keyframes.append(keyframe)
+                    continue
+                latent = keyframe["latent"]
+                if latent.ndim != 5 or int(latent.shape[1]) != 24:
+                    raise ValueError(
+                        "Expected H3 keyframe latent [B,24,T,H,W], got "
+                        f"{tuple(latent.shape)}"
+                    )
+                cache_key = (id(latent), int(latent_height), int(latent_width), str(resize_method))
+                resized = cache.get(cache_key)
+                if resized is None:
+                    resized = latent
+                    if tuple(latent.shape[-2:]) != (latent_height, latent_width):
+                        resized = comfy.utils.common_upscale(
+                            latent,
+                            latent_width,
+                            latent_height,
+                            resize_method,
+                            "disabled",
+                        )
+                    cache[cache_key] = resized
+                updated_keyframe = keyframe.copy()
+                updated_keyframe["latent"] = resized
+                resized_keyframes.append(updated_keyframe)
+
+            updated_metadata = metadata.copy()
+            updated_metadata["minimax_keyframes"] = resized_keyframes
+            updated_entry = list(entry)
+            updated_entry[1] = updated_metadata
+            output.append(tuple(updated_entry) if isinstance(entry, tuple) else updated_entry)
+        return tuple(output) if isinstance(conditioning, tuple) else output
+
+    def resize(
+        self,
+        samples,
+        width: int,
+        height: int,
+        resize_method: str = "bilinear",
+        resize_keyframes: bool = True,
+        conditioning=None,
+    ):
         width = int(width)
         height = int(height)
         if width < 32 or height < 32 or width % 32 or height % 32:
@@ -249,7 +326,14 @@ class MiniMaxH3LatentResize:
 
         output = samples.copy()
         output["samples"] = comfy.nested_tensor.NestedTensor((resized_video, audio))
-        return (output,)
+        if conditioning is not None and bool(resize_keyframes):
+            conditioning = self._resize_conditioning_keyframes(
+                conditioning,
+                latent_width,
+                latent_height,
+                resize_method,
+            )
+        return (output, conditioning)
 
 
 class MiniMaxH3ProgressiveResolutionPatch:
