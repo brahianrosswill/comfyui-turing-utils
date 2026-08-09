@@ -23,13 +23,13 @@ not skip attention or quantized-kernel preflight.
 
 | Module | Scope |
 |---|---|
-| `precision.py` | BF16 selection, Kitchen contract, exact-sm75 preflight |
-| `attention.py` | generic backend selection and bundled Sage adapter |
-| `attention_nodes.py` | model-independent experimental sparse-attention patch UI |
-| `turing_ops.py` | exact-sm75 Kitchen backend and W8/W4 dispatch policy |
-| `turing_fusions.py` | model-independent fused Linear activation and segmented norm calls |
-| `minimax_adapter.py` | MiniMax packed-sequence memory planning and ModelPatcher object patches |
-| `wan_adapter.py` | Wan/Bernini context-aware memory planning hooks |
+| `comfyui_turing_utils/precision.py` | BF16 selection, Kitchen contract, exact-sm75 preflight |
+| `comfyui_turing_utils/attention/` | stable Sage, sparse policies, topology contract, and patch installation |
+| `comfyui_turing_utils/nodes/attention.py` | model-independent experimental sparse-attention patch UI |
+| `comfyui_turing_utils/quantization/` | exact-sm75 W8/W4 dispatch, ConvRot loading, and generic fusions |
+| `comfyui_turing_utils/adapters/minimax/` | MiniMax layout, packed-sequence planning, fusions, and progressive experiment |
+| `comfyui_turing_utils/adapters/wan.py` | Wan/Bernini context-aware memory planning hooks |
+| `comfyui_turing_utils/kernel_api.py` | sole lazy boundary to the independently installed kernel package |
 | `kernel/csrc/turing` | separately installed Turing kernels, including bundled Sage |
 
 ## Linear matrix

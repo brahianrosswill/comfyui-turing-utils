@@ -1,50 +1,5 @@
-from __future__ import annotations
+"""Backward-compatible ComfyUI node registration entry point."""
 
-from .attention_nodes import FrameSparseAttentionPatch, SolSparseAttentionPatch
-from .bernini_nodes import BerniniContextWindowsCore, BerniniInpaintCondition
-from .convrot_nodes import ConvRotCLIPLoader, ConvRotDiffusionModelLoader
-from .minimax_nodes import (
-    MiniMaxH3LatentResize,
-    MiniMaxH3ProgressiveResolutionPatch,
-    MiniMaxH3ReferenceConditionHub,
-    MiniMaxH3VideoFramesPadding,
-)
-from .reference_nodes import OptionalResizeImageV2, ReferenceAudioHub, ReferenceImageHub, ReferenceVideoHub
-from .wan_nodes import WanVideoFramesPadding
+from .comfyui_turing_utils.registration import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 
-
-NODE_CLASS_MAPPINGS = {
-    "TuringUtilsConvRotDiffusionModelLoader": ConvRotDiffusionModelLoader,
-    "TuringUtilsConvRotCLIPLoader": ConvRotCLIPLoader,
-    "TuringUtilsWanVideoFramesPadding": WanVideoFramesPadding,
-    "TuringUtilsMiniMaxH3VideoFramesPadding": MiniMaxH3VideoFramesPadding,
-    "TuringUtilsBerniniContextWindowsCore": BerniniContextWindowsCore,
-    "TuringUtilsBerniniInpaintCondition": BerniniInpaintCondition,
-    "TuringUtilsReferenceImageHub": ReferenceImageHub,
-    "TuringUtilsReferenceVideoHub": ReferenceVideoHub,
-    "TuringUtilsReferenceAudioHub": ReferenceAudioHub,
-    "TuringUtilsOptionalResizeImageV2": OptionalResizeImageV2,
-    "TuringUtilsMiniMaxH3ReferenceConditionHub": MiniMaxH3ReferenceConditionHub,
-    "TuringUtilsMiniMaxH3LatentResize": MiniMaxH3LatentResize,
-    "TuringUtilsMiniMaxH3ProgressiveResolutionPatch": MiniMaxH3ProgressiveResolutionPatch,
-    "TuringUtilsSolSparseAttentionPatch": SolSparseAttentionPatch,
-    "TuringUtilsFrameSparseAttentionPatch": FrameSparseAttentionPatch,
-}
-
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "TuringUtilsConvRotDiffusionModelLoader": "Load ConvRot DiT",
-    "TuringUtilsConvRotCLIPLoader": "Load ConvRot CLIP",
-    "TuringUtilsWanVideoFramesPadding": "Wan Video Frames Padding",
-    "TuringUtilsMiniMaxH3VideoFramesPadding": "MiniMax H3 Video Frames Padding",
-    "TuringUtilsBerniniContextWindowsCore": "Bernini Context Windows",
-    "TuringUtilsBerniniInpaintCondition": "Bernini Inpaint Condition",
-    "TuringUtilsReferenceImageHub": "Reference Image Hub",
-    "TuringUtilsReferenceVideoHub": "Reference Video Hub",
-    "TuringUtilsReferenceAudioHub": "Reference Audio Hub",
-    "TuringUtilsOptionalResizeImageV2": "Optional Resize Image v2",
-    "TuringUtilsMiniMaxH3ReferenceConditionHub": "MiniMax H3 Reference Condition (Hub)",
-    "TuringUtilsMiniMaxH3LatentResize": "Resize MiniMax H3 AV Latent (Experimental)",
-    "TuringUtilsMiniMaxH3ProgressiveResolutionPatch": "Patch H3 Progressive Resolution (Experimental)",
-    "TuringUtilsSolSparseAttentionPatch": "Patch Sol Sparse Attention (Experimental)",
-    "TuringUtilsFrameSparseAttentionPatch": "Patch Sage Frame Sparse Attention (Experimental)",
-}
+__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

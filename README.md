@@ -86,9 +86,10 @@ The ConvRot path reuses comfy-kitchen W8A8 and W4A4 operators and supplies a
 packed W4A8 SM75 Tensor Core kernel. Its row-buffer quantizers retain completed
 rows in BF16, use FP32 only for active rotation/reduction scratch, and stay under
 the default 48 KiB shared-memory limit. MiniMax-specific integration is isolated
-in `minimax_adapter.py`, including packed-sequence VRAM planning for text,
-keyframes, and multimodal references. Wan/Bernini integration is isolated in
-`wan_adapter.py`; it adds only batch-aware, per-reference-padded VRAM planning
+under `comfyui_turing_utils/adapters/minimax/`, including packed-sequence VRAM
+planning for text, keyframes, and multimodal references. Wan/Bernini integration
+is isolated under `comfyui_turing_utils/adapters/`; it adds only batch-aware,
+per-reference-padded VRAM planning
 and leaves Wan block normalization, projections, attention dispatch, and
 feed-forward execution to ComfyUI.
 Generic dtype, attention, and fused operators remain model-independent.
@@ -171,7 +172,8 @@ eight resident warps per SM75 but regressed the 720p-like main kernel from
 73.67 ms to 85.87 ms at eight heads, so it is not shipped.
 
 See [`docs/turing-runtime.md`](docs/turing-runtime.md) for the dispatch and
-validation matrix. Experimental Sage1/Sage2 sources are not installed or
+validation matrix and [`docs/architecture.md`](docs/architecture.md) for the
+Python/kernel layering. Experimental Sage1/Sage2 sources are not installed or
 exposed by loader nodes.
 
 ## Kernel validation

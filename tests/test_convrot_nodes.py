@@ -560,7 +560,7 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
             mock.patch("convrot_nodes.select_compute_dtype", return_value=None),
             mock.patch("convrot_nodes.normalize_turing_convrot_weight_dtypes") as normalize_dtypes,
             mock.patch("comfy.sd.load_diffusion_model_state_dict", return_value=fake_model) as load_state,
-            mock.patch("convrot_nodes.apply_minimax_adapter") as apply_fusions,
+            mock.patch("convrot_nodes.apply_model_adapters") as apply_adapters,
             mock.patch("convrot_nodes.apply_attention_backend") as apply_backend,
         ):
             loaded = load_convrot_model("model.safetensors")
@@ -572,7 +572,7 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
         self.assertEqual(load_state.call_args.kwargs["model_options"], {})
         self.assertIsNone(fake_model.compute_dtype)
         normalize_dtypes.assert_not_called()
-        apply_fusions.assert_called_once_with(fake_model, torch.device("cuda", 0))
+        apply_adapters.assert_called_once_with(fake_model, torch.device("cuda", 0))
         apply_backend.assert_called_once_with(fake_model, "auto", device=torch.device("cuda", 0))
         self.assertEqual(
             fake_model.cached_patcher_init,
@@ -601,7 +601,7 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
             mock.patch("convrot_nodes.select_compute_dtype", return_value=torch.bfloat16),
             mock.patch("convrot_nodes.normalize_turing_convrot_weight_dtypes") as normalize_dtypes,
             mock.patch("comfy.sd.load_diffusion_model_state_dict", return_value=fake_model) as load_state,
-            mock.patch("convrot_nodes.apply_minimax_adapter") as apply_fusions,
+            mock.patch("convrot_nodes.apply_model_adapters") as apply_adapters,
             mock.patch("convrot_nodes.apply_attention_backend") as apply_backend,
         ):
             loaded = load_convrot_model("model.safetensors")
@@ -615,7 +615,7 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
         normalize_dtypes.assert_called_once_with(
             fake_model, torch.device("cuda", 0), torch.bfloat16
         )
-        apply_fusions.assert_called_once_with(fake_model, torch.device("cuda", 0))
+        apply_adapters.assert_called_once_with(fake_model, torch.device("cuda", 0))
         apply_backend.assert_called_once_with(fake_model, "auto", device=torch.device("cuda", 0))
 
     def test_load_clip_forces_mixed_ops_and_preserves_activation_override(self):
