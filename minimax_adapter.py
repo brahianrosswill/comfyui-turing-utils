@@ -14,6 +14,16 @@ from dataclasses import dataclass
 import torch
 
 try:
+    from .minimax_layout import (
+        ATTENTION_LAYOUT_KEY,
+        RUNTIME_CONTEXT_ATTR,
+        RUNTIME_OUTER_WRAPPER_KEY,
+        ensure_minimax_attention_layout_provider,
+        make_minimax_runtime_context_wrapper,
+        mark_forward_as_minimax_layout_provider,
+        minimax_temporal_topology,
+        publish_minimax_attention_layout,
+    )
     from .turing_fusions import (
         convrot_weight_kind,
         is_turing_convrot_linear,
@@ -22,6 +32,16 @@ try:
     )
     from .turing_ops import is_supported_turing_device, turing_int8_workspace_bytes
 except ImportError:
+    from minimax_layout import (
+        ATTENTION_LAYOUT_KEY,
+        RUNTIME_CONTEXT_ATTR,
+        RUNTIME_OUTER_WRAPPER_KEY,
+        ensure_minimax_attention_layout_provider,
+        make_minimax_runtime_context_wrapper,
+        mark_forward_as_minimax_layout_provider,
+        minimax_temporal_topology,
+        publish_minimax_attention_layout,
+    )
     from turing_fusions import (
         convrot_weight_kind,
         is_turing_convrot_linear,
@@ -41,10 +61,10 @@ _BLOCK_FORWARD_PARAMETERS = (
     "transformer_options",
 )
 _MEMORY_SHAPE_KEY = "turing_utils_minimax_packed_sequence"
-_MEMORY_CONTEXT_ATTR = "_turing_utils_minimax_memory_context"
+_MEMORY_CONTEXT_ATTR = RUNTIME_CONTEXT_ATTR
 _MEMORY_ADAPTER_ATTR = "_turing_utils_minimax_memory_adapter"
-_OUTER_SAMPLE_WRAPPER_KEY = "turing_utils_minimax_memory_context"
-_ATTENTION_LAYOUT_KEY = "turing_utils_attention_layout"
+_OUTER_SAMPLE_WRAPPER_KEY = RUNTIME_OUTER_WRAPPER_KEY
+_ATTENTION_LAYOUT_KEY = ATTENTION_LAYOUT_KEY
 _PROGRESSIVE_OUTER_WRAPPER_KEY = "turing_utils_h3_progressive_resolution_steps"
 _PROGRESSIVE_COND_WRAPPER_KEY = "turing_utils_h3_progressive_resolution_cond"
 
@@ -269,25 +289,7 @@ def _make_memory_required(base_model, w8_output_channels: tuple[int, ...]):
     return types.MethodType(memory_required, base_model)
 
 
-def _make_outer_sample_wrapper(base_model):
-    def outer_sample_wrapper(executor, *args, **kwargs):
-        latent_shapes = kwargs.get("latent_shapes")
-        if latent_shapes is None and len(args) > 8:
-            latent_shapes = args[8]
-        previous = getattr(base_model, _MEMORY_CONTEXT_ATTR, None)
-        setattr(base_model, _MEMORY_CONTEXT_ATTR, {"latent_shapes": latent_shapes})
-        try:
-            return executor(*args, **kwargs)
-        finally:
-            if previous is None:
-                try:
-                    delattr(base_model, _MEMORY_CONTEXT_ATTR)
-                except AttributeError:
-                    pass
-            else:
-                setattr(base_model, _MEMORY_CONTEXT_ATTR, previous)
-
-    return outer_sample_wrapper
+_make_outer_sample_wrapper = make_minimax_runtime_context_wrapper
 
 
 def _w8_output_channels(root: torch.nn.Module) -> tuple[int, ...]:
@@ -323,13 +325,6 @@ def _install_memory_planning(model, base_model, diffusion_model) -> bool:
     outputs = _w8_output_channels(base_model)
     base_model.memory_required = _make_memory_required(base_model, outputs)
 
-    import comfy.patcher_extension
-
-    model.add_wrapper_with_key(
-        comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,
-        _OUTER_SAMPLE_WRAPPER_KEY,
-        _make_outer_sample_wrapper(base_model),
-    )
     setattr(base_model, _MEMORY_ADAPTER_ATTR, True)
     LOG.info(
         "Enabled MiniMax packed-sequence VRAM planning: W8 outputs=[%s]",
@@ -449,36 +444,7 @@ def _make_mlp_forward(mlp: torch.nn.Module, audit: _RuntimeDispatchAudit):
     return types.MethodType(forward, mlp)
 
 
-def _minimax_temporal_topology(base_model, diffusion_model, mod_segments):
-    """Describe only the contiguous target-video tail; the sparse kernel stays generic."""
-    if base_model is None or diffusion_model is None or not mod_segments:
-        return {}
-    context = getattr(base_model, _MEMORY_CONTEXT_ATTR, None)
-    latent_shapes = context.get("latent_shapes") if isinstance(context, dict) else None
-    if not isinstance(latent_shapes, (list, tuple)) or not latent_shapes:
-        return {}
-    video_shape = tuple(int(value) for value in latent_shapes[0])
-    if len(video_shape) != 5:
-        return {}
-    patch_size = tuple(int(value) for value in diffusion_model.patch_size)
-    if len(patch_size) != 3 or any(value <= 0 for value in patch_size):
-        return {}
-    pt, ph, pw = patch_size
-    frames = math.ceil(video_shape[2] / pt)
-    spatial_tokens_height = math.ceil(video_shape[3] / ph)
-    spatial_tokens_width = math.ceil(video_shape[4] / pw)
-    tokens_per_frame = spatial_tokens_height * spatial_tokens_width
-    topology_tokens = frames * tokens_per_frame
-    topology_start = int(mod_segments[-1][0])
-    if int(mod_segments[-1][1]) - topology_start != topology_tokens:
-        return {}
-    return {
-        "topology_start_tokens": topology_start,
-        "topology_tokens": topology_tokens,
-        "tokens_per_frame": tokens_per_frame,
-        "spatial_tokens_height": spatial_tokens_height,
-        "spatial_tokens_width": spatial_tokens_width,
-    }
+_minimax_temporal_topology = minimax_temporal_topology
 
 
 def _make_block_forward(
@@ -501,32 +467,14 @@ def _make_block_forward(
         rope_freqs,
         transformer_options={},
     ):
-        if mod_segments:
-            # H3 packs target audio immediately before target video.  Keep the
-            # complete non-video prefix exact: target-audio queries need global
-            # video context, and video queries need exact audio keys for stable
-            # joint generation.  Sparsifying target audio into 64-token
-            # centroids produces broadband noise even when the video remains
-            # visually plausible.
-            dense_prefix_tokens = int(mod_segments[-1][0])
-            layout = transformer_options.get(_ATTENTION_LAYOUT_KEY)
-            expected_layout = {
-                "dense_prefix_tokens": dense_prefix_tokens,
-                "layer_index": layer_index,
-                "layer_count": layer_count,
-                **_minimax_temporal_topology(
-                    base_model,
-                    diffusion_model,
-                    mod_segments,
-                ),
-            }
-            if not isinstance(layout, dict) or any(
-                layout.get(key) != value for key, value in expected_layout.items()
-            ):
-                transformer_options[_ATTENTION_LAYOUT_KEY] = {
-                    **(layout if isinstance(layout, dict) else {}),
-                    **expected_layout,
-                }
+        publish_minimax_attention_layout(
+            transformer_options,
+            mod_segments,
+            layer_index=layer_index,
+            layer_count=layer_count,
+            base_model=base_model,
+            diffusion_model=diffusion_model,
+        )
         blocker = _block_fusion_blocker(x, t_emb, device_index)
         audit.record("block", blocker is None, x, blocker)
         if blocker is not None:
@@ -549,7 +497,7 @@ def _make_block_forward(
         h = segmented_rms_adaln(self.norm2, x, shift_mlp, scale_mlp, mod_segments)
         return mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
 
-    return types.MethodType(forward, block)
+    return mark_forward_as_minimax_layout_provider(types.MethodType(forward, block))
 
 
 @dataclass(frozen=True)
@@ -1078,6 +1026,13 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
     ]
     if not candidates:
         return 0
+
+    layout_status = ensure_minimax_attention_layout_provider(model)
+    if layout_status.required and not layout_status.installed:
+        LOG.warning(
+            "MiniMax H3 attention layout provider could not be installed: %s",
+            layout_status.reason,
+        )
 
     diffusion_model = getattr(root, "diffusion_model", None)
     if diffusion_model is not None:

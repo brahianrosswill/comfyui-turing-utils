@@ -62,7 +62,8 @@ only after its CUDA sources or required version change.
   describe execution order rather than size; either target may be larger than
   the other. Audio stays untouched, and already-encoded first/last-frame latents
   can be resized and cached without running conditioning a second time.
-- `Patch Sol Sparse Attention (Experimental)` applies the model-independent
+- `Patch Sol Sparse Attention (Experimental)` applies the model-generic,
+  loader-independent
   long-sequence sparse backend. It uses an input-adaptive statistical threshold,
   keeps skipped-block centroid residuals (two 32-token centroids by default),
   accepts semantic prefix/video topology metadata, and exposes stable route
@@ -145,9 +146,12 @@ head-independent CSR schedule and evaluates only complete selected 64-token K/V
 blocks with the stable Sage math path. `frame_window` selects complete local,
 sink, and periodic anchor frames. `radial` keeps complete nearby frames, then
 uses exact 8x8 spatial-token neighborhoods at logarithmically increasing
-temporal strides. MiniMax H3 supplies the packed target-video boundary,
-tokens-per-frame, and exact spatial-token height/width through its adapter;
-unknown layouts fall back to stable Sage instead of guessing.
+temporal strides. On MiniMax H3 the patch automatically installs a lightweight
+runtime layout provider on the standard ComfyUI `MODEL`, independent of which
+loader created it. The provider publishes the packed target-video boundary,
+tokens-per-frame, exact spatial-token height/width, and layer index. If that
+contract cannot be installed or validated, H3 falls back to stable Sage instead
+of sparsifying the mixed text/reference/audio/video sequence by guesswork.
 
 The node defaults to `custom` plus the established `frame_window` policy, so an
 old workflow does not silently change. `conservative`, `balanced`, and `fast`

@@ -10,8 +10,22 @@ from collections.abc import Callable
 import torch
 
 try:
+    from .minimax_layout import (
+        ATTENTION_LAYOUT_KEY,
+        ATTENTION_LAYOUT_REQUIREMENT_KEY,
+        MINIMAX_H3_LAYOUT_KIND,
+        ensure_minimax_attention_layout_provider,
+        has_complete_minimax_attention_layout,
+    )
     from .turing_ops import is_supported_turing_device
 except ImportError:
+    from minimax_layout import (
+        ATTENTION_LAYOUT_KEY,
+        ATTENTION_LAYOUT_REQUIREMENT_KEY,
+        MINIMAX_H3_LAYOUT_KIND,
+        ensure_minimax_attention_layout_provider,
+        has_complete_minimax_attention_layout,
+    )
     from turing_ops import is_supported_turing_device
 
 
@@ -37,7 +51,7 @@ FRAME_SPARSE_PATTERN = "frame_window"
 FRAME_SPARSE_QUALITY_PROFILE = "custom"
 FRAME_SPARSE_RADIAL_SPATIAL_RADIUS = 1
 FRAME_SPARSE_RADIAL_MAX_TEMPORAL_STRIDE = 16
-SPARSE_LAYOUT_KEY = "turing_utils_attention_layout"
+SPARSE_LAYOUT_KEY = ATTENTION_LAYOUT_KEY
 _PREFLIGHTED_DEVICES: set[int] = set()
 _PREFLIGHTED_SPARSE_DEVICES: set[int] = set()
 _PREFLIGHTED_FRAME_SPARSE_DEVICES: set[int] = set()
@@ -540,6 +554,18 @@ def _sparse_spatial_topology(transformer_options, tokens_per_frame: int):
     return height, width
 
 
+def _required_sparse_layout_missing(transformer_options, sequence_length: int) -> bool:
+    if not isinstance(transformer_options, dict):
+        return False
+    requirement = transformer_options.get(ATTENTION_LAYOUT_REQUIREMENT_KEY)
+    if requirement != MINIMAX_H3_LAYOUT_KIND:
+        return False
+    return not has_complete_minimax_attention_layout(
+        transformer_options,
+        sequence_length,
+    )
+
+
 _FRAME_SPARSE_QUALITY_PROFILES = {
     "conservative": {
         "sparse_pattern": "frame_window",
@@ -762,6 +788,12 @@ def turing_sol_sparse_attention(
     effective_min_sequence = min_sequence_tokens or SPARSE_AUTO_MIN_SEQUENCE
     if q.shape[2] < effective_min_sequence or k.shape[2] < effective_min_sequence:
         return dense(f"sequences shorter than {effective_min_sequence} tokens")
+    transformer_options = kwargs.get("transformer_options")
+    if _required_sparse_layout_missing(
+        transformer_options,
+        min(q.shape[2], k.shape[2]),
+    ):
+        return dense("required MiniMax H3 attention layout metadata is unavailable")
     skipped_residual = str(skipped_residual).strip().lower()
     residual_subblocks = {"1x64": 1, "2x32": 2}.get(skipped_residual)
     if residual_subblocks is None:
@@ -776,13 +808,13 @@ def turing_sol_sparse_attention(
     prefix_tokens = _sparse_prefix_tokens(
         prefix_policy,
         manual_prefix_tokens,
-        kwargs.get("transformer_options"),
+        transformer_options,
         min(q.shape[2], k.shape[2]),
     )
     if prefix_tokens and q.shape[2] != k.shape[2]:
         return dense("prefix Query splitting requires equal Q/K sequence lengths")
     topology_start, topology_tokens, tokens_per_frame = _sparse_temporal_topology(
-        kwargs.get("transformer_options"),
+        transformer_options,
         min(q.shape[2], k.shape[2]),
     )
     if input_dtype == torch.float32:
@@ -1062,6 +1094,8 @@ def turing_frame_sparse_attention(
         return dense(f"sequences shorter than {SPARSE_AUTO_MIN_SEQUENCE} tokens")
 
     transformer_options = kwargs.get("transformer_options")
+    if _required_sparse_layout_missing(transformer_options, q.shape[2]):
+        return dense("required MiniMax H3 attention layout metadata is unavailable")
     topology_start, topology_tokens, tokens_per_frame = _sparse_temporal_topology(
         transformer_options,
         q.shape[2],
@@ -1426,6 +1460,7 @@ def apply_sparse_attention_patch(
     debug_route_density: bool = False,
 ):
     patched = model.clone()
+    layout_status = ensure_minimax_attention_layout_provider(patched)
     override = make_sparse_attention_override(
         patched.load_device,
         min_sequence_tokens=min_sequence_tokens,
@@ -1444,6 +1479,14 @@ def apply_sparse_attention_patch(
         debug_route_density=debug_route_density,
     )
     transformer_options = patched.model_options.setdefault("transformer_options", {})
+    if layout_status.required:
+        transformer_options[ATTENTION_LAYOUT_REQUIREMENT_KEY] = layout_status.model_kind
+        if not layout_status.installed:
+            LOG.warning(
+                "MiniMax H3 sparse attention will stay dense because its runtime "
+                "layout provider could not be installed: %s",
+                layout_status.reason,
+            )
     transformer_options["optimized_attention_override"] = override
     transformer_options["turing_utils_attention_backend"] = "sol_sparse_attn"
     transformer_options["turing_utils_attention_implementation"] = (
@@ -1661,6 +1704,7 @@ def apply_frame_sparse_attention_patch(
     debug_route_density: bool = False,
 ):
     patched = model.clone()
+    layout_status = ensure_minimax_attention_layout_provider(patched)
     override = make_frame_sparse_attention_override(
         patched.load_device,
         quality_profile=quality_profile,
@@ -1680,6 +1724,14 @@ def apply_frame_sparse_attention_patch(
         debug_route_density=debug_route_density,
     )
     transformer_options = patched.model_options.setdefault("transformer_options", {})
+    if layout_status.required:
+        transformer_options[ATTENTION_LAYOUT_REQUIREMENT_KEY] = layout_status.model_kind
+        if not layout_status.installed:
+            LOG.warning(
+                "MiniMax H3 frame-sparse attention will stay dense because its runtime "
+                "layout provider could not be installed: %s",
+                layout_status.reason,
+            )
     transformer_options["optimized_attention_override"] = override
     transformer_options["turing_utils_attention_backend"] = "frame_sparse_attn"
     transformer_options["turing_utils_attention_implementation"] = (

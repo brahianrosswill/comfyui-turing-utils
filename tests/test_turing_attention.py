@@ -171,6 +171,64 @@ class TuringAttentionContractTest(unittest.TestCase):
         self.assertEqual(sparse.call_args.kwargs["maximum_route_density"], 1.0)
         self.assertEqual(sparse.call_args.kwargs["topology_tokens"], 0)
 
+    def test_h3_sparse_stays_dense_until_complete_runtime_layout_is_available(self):
+        q = torch.zeros((1, 4, 4096, 128), dtype=torch.bfloat16)
+        baseline = mock.Mock(return_value=q)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention.turing_sage_attention", baseline),
+            mock.patch("attention._sol_sparse_sageattn") as sparse,
+        ):
+            output = turing_attention.turing_sol_sparse_attention(
+                mock.Mock(),
+                q,
+                q,
+                q,
+                4,
+                skip_reshape=True,
+                transformer_options={
+                    "turing_utils_attention_layout_required": "minimax_h3"
+                },
+            )
+
+        self.assertIs(output, q)
+        baseline.assert_called_once()
+        sparse.assert_not_called()
+
+    def test_h3_sparse_accepts_complete_loader_independent_runtime_layout(self):
+        q = torch.zeros((1, 4, 4096, 128), dtype=torch.bfloat16)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention._sol_sparse_sageattn", return_value=q) as sparse,
+        ):
+            output = turing_attention.turing_sol_sparse_attention(
+                mock.Mock(),
+                q,
+                q,
+                q,
+                4,
+                skip_reshape=True,
+                skip_output_reshape=True,
+                transformer_options={
+                    "turing_utils_attention_layout_required": "minimax_h3",
+                    "turing_utils_attention_layout": {
+                        "provider": "minimax_h3",
+                        "dense_prefix_tokens": 512,
+                        "topology_start_tokens": 512,
+                        "topology_tokens": 3584,
+                        "tokens_per_frame": 256,
+                        "spatial_tokens_height": 16,
+                        "spatial_tokens_width": 16,
+                        "layer_index": 10,
+                        "layer_count": 50,
+                    },
+                },
+            )
+
+        self.assertIs(output, q)
+        self.assertEqual(sparse.call_args.kwargs["prefix_tokens"], 512)
+        self.assertEqual(sparse.call_args.kwargs["topology_tokens"], 3584)
+
     def test_experimental_sparse_keeps_short_calls_dense(self):
         q = torch.zeros((1, 4, 256, 128), dtype=torch.bfloat16)
         baseline = mock.Mock(return_value=q)

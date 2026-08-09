@@ -136,7 +136,13 @@ blocks remain forced and may exceed the requested maximum. The default
 denoising steps that use stable Sage across every layer; both default to zero.
 `dense_prefix_layers=1` and `dense_suffix_layers=1` keep the first and last
 transformer layers dense while only the middle layers use sparse attention.
-Suffix protection requires adapter-provided layer-count metadata. Step lookup
+For MiniMax H3, the sparse patch installs a loader-independent runtime layout
+provider on the standard ComfyUI `MODEL`. It derives the target-video tail and
+spatial grid from the sampler's current nested latent shapes, H3 patch size, and
+per-block packed segments. This works with the official loader as well as the
+ConvRot loader. Missing or inconsistent required H3 layout data forces stable
+Sage instead of silently routing the complete mixed-modality sequence.
+Suffix protection uses the provider's layer-count metadata. Step lookup
 is cached once per sampler timestep rather than synchronized in every
 transformer block.
 

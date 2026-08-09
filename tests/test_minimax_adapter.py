@@ -235,6 +235,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
         self.assertEqual(
             options[minimax_adapter._ATTENTION_LAYOUT_KEY],
             {
+                "provider": "minimax_h3",
                 "dense_prefix_tokens": 16,
                 "layer_index": 0,
                 "layer_count": 0,
@@ -479,7 +480,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
         self.assertIs(cond.process_cond(1), cond)
         self.assertIn("existing", out)
 
-    def test_memory_planning_installs_once_without_new_runtime_module(self):
+    def test_memory_planning_installs_once_without_own_runtime_wrapper(self):
         class Diffusion(torch.nn.Module):
             patch_size = (1, 2, 2)
             hidden_size = 5376
@@ -521,7 +522,9 @@ class MiniMaxAdapterTest(unittest.TestCase):
             base.memory_usage_factor_conds,
             ("existing", minimax_adapter._MEMORY_SHAPE_KEY),
         )
-        self.assertEqual(len(patcher.wrappers), 1)
+        # Runtime shape publication now belongs to the loader-independent H3
+        # layout provider rather than the quantization memory planner.
+        self.assertEqual(len(patcher.wrappers), 0)
 
 
 if __name__ == "__main__":
