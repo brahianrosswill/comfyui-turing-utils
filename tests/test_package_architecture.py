@@ -79,6 +79,8 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsReferenceAudioHub",
                 "TuringUtilsOptionalResizeImageV2",
                 "TuringUtilsMiniMaxH3ReferenceConditionHub",
+                "TuringUtilsH3ConcatAVLatent",
+                "TuringUtilsH3SeparateAVLatent",
                 "TuringUtilsMiniMaxH3LatentResize",
                 "TuringUtilsMiniMaxH3ProgressiveResolutionPatch",
                 "TuringUtilsSolSparseAttentionPatch",
