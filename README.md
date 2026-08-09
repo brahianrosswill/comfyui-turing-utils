@@ -45,6 +45,11 @@ only after its CUDA sources or required version change.
   selectable absolute or official relative temporal positions.
 - `Wan Video Frames Padding` exposes Wan-compatible frame padding.
 - `MiniMax H3 Video Frames Padding` pads to H3's `17*n+5` frame grid.
+- `Resize MiniMax H3 AV Latent (Experimental)` stretches only the packed H3
+  video latent to an exact independently selected width and height on the
+  model's 32-pixel grid, while preserving the audio latent unchanged. It is
+  intended for explicitly separated low- and high-resolution sampling stages
+  and performs no cropping, padding, re-noising, or sigma conversion.
 - `Patch H3 Progressive Resolution (Experimental)` keeps one final-resolution
   H3 video/audio latent but can evaluate an initial low stage and a following
   medium stage at independently configured video short edges. Stage names

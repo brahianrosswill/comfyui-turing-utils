@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import comfy.nested_tensor
+import comfy.utils
 from comfy_api.latest import io
 from comfy_extras.nodes_minimax_h3 import MiniMaxH3ReferenceToVideo
 
@@ -147,6 +149,107 @@ class MiniMaxH3ReferenceConditionHub(io.ComfyNode):
             ref_video_audios=ref_video_audios,
             ref_audios=ref_audios,
         )
+
+
+class MiniMaxH3LatentResize:
+    SEARCH_ALIASES = ["resize h3 latent", "upscale h3 latent", "scale h3 latent"]
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "samples": ("LATENT",),
+                "width": (
+                    "INT",
+                    {
+                        "default": 1344,
+                        "min": 32,
+                        "max": 16384,
+                        "step": 32,
+                        "tooltip": "Exact output width in pixels. MiniMax H3 requires multiples of 32.",
+                    },
+                ),
+                "height": (
+                    "INT",
+                    {
+                        "default": 768,
+                        "min": 32,
+                        "max": 16384,
+                        "step": 32,
+                        "tooltip": "Exact output height in pixels. Width and height are scaled independently without cropping or padding.",
+                    },
+                ),
+                "resize_method": (
+                    ["bilinear", "bicubic", "bislerp", "nearest-exact", "area"],
+                    {
+                        "default": "bilinear",
+                        "tooltip": "Spatial interpolation for the video latent. The audio latent is never resized.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("samples",)
+    FUNCTION = "resize"
+    CATEGORY = "Turing Utils/latent"
+    TITLE = "Resize MiniMax H3 AV Latent (Experimental)"
+    EXPERIMENTAL = True
+
+    @staticmethod
+    def _streams(samples):
+        if not isinstance(samples, dict) or "samples" not in samples:
+            raise ValueError("Resize MiniMax H3 AV Latent requires a LATENT dictionary")
+        nested = samples["samples"]
+        if not getattr(nested, "is_nested", False):
+            raise ValueError("Expected a MiniMax H3 nested video/audio latent")
+        streams = list(nested.unbind())
+        if len(streams) != 2:
+            raise ValueError(f"Expected exactly two H3 latent streams, got {len(streams)}")
+        video, audio = streams
+        if video.ndim != 5 or int(video.shape[1]) != 24:
+            raise ValueError(
+                f"Expected H3 video latent [B,24,T,H,W], got {tuple(video.shape)}"
+            )
+        if audio.ndim != 4 or tuple(audio.shape[1:3]) != (32, 2):
+            raise ValueError(
+                f"Expected H3 audio latent [B,32,2,T], got {tuple(audio.shape)}"
+            )
+        if int(video.shape[0]) != int(audio.shape[0]):
+            raise ValueError("H3 video and audio latent batch sizes must match")
+        return video, audio
+
+    def resize(self, samples, width: int, height: int, resize_method: str = "bilinear"):
+        width = int(width)
+        height = int(height)
+        if width < 32 or height < 32 or width % 32 or height % 32:
+            raise ValueError(
+                f"MiniMax H3 output width and height must be positive multiples of 32; got {width}x{height}"
+            )
+        if resize_method not in ("bilinear", "bicubic", "bislerp", "nearest-exact", "area"):
+            raise ValueError(f"Unsupported H3 latent resize method: {resize_method}")
+        if "noise_mask" in samples:
+            raise ValueError(
+                "Resize MiniMax H3 AV Latent does not support attached noise masks; resize or remove the mask before this node"
+            )
+
+        video, audio = self._streams(samples)
+        latent_width = width // 16
+        latent_height = height // 16
+        if tuple(video.shape[-2:]) == (latent_height, latent_width):
+            resized_video = video
+        else:
+            resized_video = comfy.utils.common_upscale(
+                video,
+                latent_width,
+                latent_height,
+                resize_method,
+                "disabled",
+            )
+
+        output = samples.copy()
+        output["samples"] = comfy.nested_tensor.NestedTensor((resized_video, audio))
+        return (output,)
 
 
 class MiniMaxH3ProgressiveResolutionPatch:
