@@ -63,6 +63,52 @@ def _conds(shapes, payload=None):
 
 
 class MiniMaxProgressiveResolutionTest(unittest.TestCase):
+    def test_h3_rope_resize_preserves_patch_phases(self):
+        # Each H3 2x2 patch phase has a distinct value. A regular latent-space
+        # interpolation would mix these values; the patch-grid path must not.
+        video = torch.empty((1, 1, 1, 4, 4), dtype=torch.float32)
+        video[..., 0::2, 0::2] = 1.0
+        video[..., 0::2, 1::2] = 2.0
+        video[..., 1::2, 0::2] = 3.0
+        video[..., 1::2, 1::2] = 4.0
+
+        resized = minimax_adapter._resize_h3_video_patch_grid(
+            video,
+            8,
+            8,
+            "rope_bilinear",
+        )
+
+        self.assertTrue(torch.equal(resized[..., 0::2, 0::2], torch.ones_like(resized[..., 0::2, 0::2])))
+        self.assertTrue(torch.equal(resized[..., 0::2, 1::2], torch.full_like(resized[..., 0::2, 1::2], 2.0)))
+        self.assertTrue(torch.equal(resized[..., 1::2, 0::2], torch.full_like(resized[..., 1::2, 0::2], 3.0)))
+        self.assertTrue(torch.equal(resized[..., 1::2, 1::2], torch.full_like(resized[..., 1::2, 1::2], 4.0)))
+
+    def test_h3_rope_resize_uses_h3_coordinate_grid(self):
+        video = torch.zeros((1, 1, 1, 4, 4), dtype=torch.float32)
+        # Populate phase (0,0) with the 2x2 source patch-grid indices.
+        video[..., 0::2, 0::2] = torch.tensor([[0.0, 1.0], [2.0, 3.0]])
+
+        resized = minimax_adapter._resize_h3_video_patch_grid(
+            video,
+            8,
+            8,
+            "rope_bilinear",
+        )
+        phase = resized[0, 0, 0, 0::2, 0::2]
+
+        # With H3's endpoint-exclusive RoPE grid, target patch indices 0 and 2
+        # coincide exactly with source indices 0 and 1 at a 2x spatial scale.
+        self.assertTrue(torch.equal(phase[0::2, 0::2], torch.tensor([[0.0, 1.0], [2.0, 3.0]])))
+
+    def test_h3_rope_modes_are_accepted_by_patch(self):
+        patched = minimax_adapter.apply_h3_progressive_resolution_patch(
+            FakePatcher(),
+            input_downscale="h3_rope_sigma_blend",
+            output_upscale="h3_rope_bilinear",
+        )
+        self.assertIsInstance(patched, FakePatcher)
+
     def test_patch_clones_model_and_installs_only_model_wrappers(self):
         original = FakePatcher()
         patched = minimax_adapter.apply_h3_progressive_resolution_patch(original)

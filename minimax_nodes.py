@@ -176,17 +176,30 @@ class MiniMaxH3ProgressiveResolutionPatch:
                     },
                 ),
                 "input_downscale": (
-                    ["sigma_blend", "nearest-exact", "area"],
+                    [
+                        "sigma_blend",
+                        "h3_rope_sigma_blend",
+                        "h3_rope_bilinear",
+                        "h3_rope_nearest",
+                        "nearest-exact",
+                        "area",
+                    ],
                     {
                         "default": "sigma_blend",
-                        "tooltip": "Sigma blend transitions from noise-preserving nearest sampling toward area filtering across the combined low and medium stages.",
+                        "tooltip": "Sigma blend transitions from noise-preserving nearest sampling toward area filtering. h3_rope_sigma_blend performs both on H3's separated 2x2 patch phases and uses its RoPE coordinates.",
                     },
                 ),
                 "output_upscale": (
-                    ["bilinear", "bicubic", "nearest-exact"],
+                    [
+                        "bilinear",
+                        "h3_rope_bilinear",
+                        "h3_rope_nearest",
+                        "bicubic",
+                        "nearest-exact",
+                    ],
                     {
                         "default": "bilinear",
-                        "tooltip": "Interpolation used to return each staged denoised video prediction to the sampler's final resolution.",
+                        "tooltip": "Interpolation used to return each staged denoised video prediction to final resolution. h3_rope_bilinear preserves H3's 2x2 patch phases and follows its RoPE grid.",
                     },
                 ),
                 "visual_condition_policy": (

@@ -607,6 +607,12 @@ def _h3_progressive_target_hw(video_shape, low_short_edge: int) -> tuple[int, in
 def _resize_h3_video(video: torch.Tensor, height: int, width: int, method: str) -> torch.Tensor:
     if tuple(video.shape[-2:]) == (int(height), int(width)):
         return video
+    if method == "h3_rope_bilinear":
+        return _resize_h3_video_patch_grid(video, height, width, "rope_bilinear")
+    if method == "h3_rope_nearest":
+        return _resize_h3_video_patch_grid(video, height, width, "rope_nearest")
+    if method == "h3_patch_area":
+        return _resize_h3_video_patch_grid(video, height, width, "area")
     import comfy.utils
 
     return comfy.utils.common_upscale(
@@ -618,6 +624,117 @@ def _resize_h3_video(video: torch.Tensor, height: int, width: int, method: str) 
     )
 
 
+def _resize_h3_video_patch_grid(
+    video: torch.Tensor,
+    height: int,
+    width: int,
+    method: str,
+) -> torch.Tensor:
+    """Resize H3 video latents without mixing the model's four 2x2 patch phases.
+
+    H3 patchifies every spatial 2x2 group into the feature order
+    ``[channel, patch_y, patch_x]``.  Treating the latent as an ordinary image
+    blends those four feature phases together.  This helper instead resizes a
+    ``channels * 4`` feature map on the DiT patch grid.  RoPE modes sample that
+    grid at the exact area-normalized coordinates used by H3's positional
+    encoding rather than PyTorch's half-pixel convention.
+    """
+    if video.ndim != 5:
+        raise ValueError(f"Expected H3 video latent [B,C,T,H,W], got {tuple(video.shape)}")
+    height = int(height)
+    width = int(width)
+    if height < 1 or width < 1:
+        raise ValueError(f"H3 latent resize requires positive dimensions, got {height}x{width}")
+    if tuple(video.shape[-2:]) == (height, width):
+        return video
+
+    batch, channels, frames, source_h, source_w = video.shape
+    # Match H3's circular pad-to-patch behavior for uncommon odd latent sizes.
+    padded = video
+    if source_h % 2:
+        padded = torch.cat((padded, padded[..., :1, :]), dim=-2)
+    if source_w % 2:
+        padded = torch.cat((padded, padded[..., :1]), dim=-1)
+    padded_h, padded_w = int(padded.shape[-2]), int(padded.shape[-1])
+    target_h = (height + 1) // 2 * 2
+    target_w = (width + 1) // 2 * 2
+    source_patch_h, source_patch_w = padded_h // 2, padded_w // 2
+    target_patch_h, target_patch_w = target_h // 2, target_w // 2
+
+    # [B,C,T,H,2,W,2] -> [B*T,C*4,H,W], matching patchify_video.
+    patch_features = (
+        padded.reshape(
+            batch,
+            channels,
+            frames,
+            source_patch_h,
+            2,
+            source_patch_w,
+            2,
+        )
+        .permute(0, 2, 1, 4, 6, 3, 5)
+        .reshape(batch * frames, channels * 4, source_patch_h, source_patch_w)
+    )
+    original_dtype = patch_features.dtype
+    work = patch_features.float()
+
+    if method == "area":
+        resized = torch.nn.functional.interpolate(
+            work,
+            size=(target_patch_h, target_patch_w),
+            mode="area",
+        )
+    elif method in ("rope_bilinear", "rope_nearest"):
+        def rope_axis(dim: int, other: int, device) -> torch.Tensor:
+            count = dim // 2
+            sqrt_area = math.sqrt(float(dim * other))
+            ratio = float(dim) / sqrt_area
+            return (
+                torch.arange(count, device=device, dtype=torch.float32)
+                * (ratio / float(count))
+                + (1.0 - ratio) / 2.0
+            ) * 32.0
+
+        source_y = rope_axis(padded_h, padded_w, work.device)
+        source_x = rope_axis(padded_w, padded_h, work.device)
+        target_y = rope_axis(target_h, target_w, work.device)
+        target_x = rope_axis(target_w, target_h, work.device)
+
+        def normalized_source_indices(
+            target_axis: torch.Tensor,
+            source_axis: torch.Tensor,
+        ) -> torch.Tensor:
+            if source_axis.numel() <= 1:
+                return torch.zeros_like(target_axis)
+            step = source_axis[1] - source_axis[0]
+            indices = (target_axis - source_axis[0]) / step
+            return indices * (2.0 / float(source_axis.numel() - 1)) - 1.0
+
+        grid_y = normalized_source_indices(target_y, source_y)
+        grid_x = normalized_source_indices(target_x, source_x)
+        grid_y, grid_x = torch.meshgrid(grid_y, grid_x, indexing="ij")
+        grid = torch.stack((grid_x, grid_y), dim=-1).unsqueeze(0)
+        grid = grid.expand(batch * frames, -1, -1, -1)
+        resized = torch.nn.functional.grid_sample(
+            work,
+            grid,
+            mode="bilinear" if method == "rope_bilinear" else "nearest",
+            padding_mode="border",
+            align_corners=True,
+        )
+    else:
+        raise ValueError(f"Unsupported H3 patch-grid resize method: {method}")
+
+    # [B*T,C*4,H,W] -> [B,C,T,H,2,W,2], then discard only pad cells.
+    restored = (
+        resized.to(original_dtype)
+        .reshape(batch, frames, channels, 2, 2, target_patch_h, target_patch_w)
+        .permute(0, 2, 1, 5, 3, 6, 4)
+        .reshape(batch, channels, frames, target_h, target_w)
+    )
+    return restored[..., :height, :width]
+
+
 def _downsample_h3_video(
     video: torch.Tensor,
     height: int,
@@ -625,14 +742,20 @@ def _downsample_h3_video(
     config: _H3ProgressiveResolutionConfig,
     state: dict,
 ) -> torch.Tensor:
-    if config.input_downscale != "sigma_blend":
+    if config.input_downscale not in ("sigma_blend", "h3_rope_sigma_blend"):
         return _resize_h3_video(video, height, width, config.input_downscale)
 
     # Nearest-exact preserves the variance of the already-sampled high-resolution
     # noise. Area filtering preserves the emerging low-frequency composition. The
     # deterministic blend avoids injecting a second, unrelated noise trajectory.
-    nearest = _resize_h3_video(video, height, width, "nearest-exact")
-    area = _resize_h3_video(video, height, width, "area")
+    if config.input_downscale == "h3_rope_sigma_blend":
+        nearest_method = "h3_rope_nearest"
+        area_method = "h3_patch_area"
+    else:
+        nearest_method = "nearest-exact"
+        area_method = "area"
+    nearest = _resize_h3_video(video, height, width, nearest_method)
+    area = _resize_h3_video(video, height, width, area_method)
     progressive_steps = max(int(state.get("progressive_steps", 1)), 1)
     step = max(int(state.get("step", 0)), 0)
     progressive_sigmas = state.get("progressive_sigmas", ())
@@ -657,6 +780,7 @@ def _resize_h3_keyframe_payload(
     height: int,
     width: int,
     cache: dict,
+    method: str = "area",
 ):
     if not isinstance(payload, dict) or not payload.get("keyframes"):
         return payload
@@ -667,10 +791,10 @@ def _resize_h3_keyframe_payload(
             resized_keyframes.append(keyframe)
             continue
         latent = keyframe["latent"]
-        cache_key = (id(latent), int(height), int(width))
+        cache_key = (id(latent), int(height), int(width), method)
         resized = cache.get(cache_key)
         if resized is None:
-            resized = _resize_h3_video(latent, height, width, "area")
+            resized = _resize_h3_video(latent, height, width, method)
             cache[cache_key] = resized
         new_keyframe = keyframe.copy()
         new_keyframe["latent"] = resized
@@ -777,6 +901,11 @@ def _patch_h3_conds_for_shapes(
                             int(low_shapes[0][-2]),
                             int(low_shapes[0][-1]),
                             state.setdefault("condition_cache", {}),
+                            (
+                                "h3_patch_area"
+                                if config.input_downscale.startswith("h3_")
+                                else "area"
+                            ),
                         )
                         patched_payload_cond = comfy.conds.CONDConstant(patched_payload)
                         payload_memo[memo_key] = patched_payload_cond
@@ -975,8 +1104,21 @@ def apply_h3_progressive_resolution_patch(
     debug: bool = False,
 ):
     """Run early H3 DiT evaluations at lower spatial resolution while keeping one final-resolution sampler state."""
-    input_methods = ("sigma_blend", "nearest-exact", "area")
-    output_methods = ("bilinear", "bicubic", "nearest-exact")
+    input_methods = (
+        "sigma_blend",
+        "h3_rope_sigma_blend",
+        "h3_rope_bilinear",
+        "h3_rope_nearest",
+        "nearest-exact",
+        "area",
+    )
+    output_methods = (
+        "bilinear",
+        "h3_rope_bilinear",
+        "h3_rope_nearest",
+        "bicubic",
+        "nearest-exact",
+    )
     condition_policies = ("resize_keyframes", "keep_original")
     if input_downscale not in input_methods:
         raise ValueError(f"Unsupported input_downscale: {input_downscale}")

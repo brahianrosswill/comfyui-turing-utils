@@ -94,7 +94,11 @@ returning it to the sampler. A target at or above the final short edge is a
 no-op for that stage. H3 rebuilds its packed layout from the temporary latent
 shape. `sigma_blend` is the default input policy: it blends
 noise-variance-preserving nearest sampling with area filtering over the complete
-staged interval. Spatial condition areas, masks, controls, and GLIGEN are
+staged interval. The opt-in `h3_rope_sigma_blend` input and
+`h3_rope_bilinear` output modes resize the four H3 2x2 patch phases separately
+and map them on the same area-normalized spatial grid as H3's RoPE; they are
+experimental quality diagnostics and do not change the defaults. Spatial
+condition areas, masks, controls, and GLIGEN are
 currently unsupported and make that model call fall back to full resolution.
 Peak memory is still set by the later final-resolution steps, and final quality
 and speed require local workflow validation.
