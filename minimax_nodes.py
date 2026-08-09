@@ -165,6 +165,16 @@ class MiniMaxH3ProgressiveResolutionPatch:
                         "tooltip": "Early H3 DiT calls use this pixel short edge while the sampler keeps the final-resolution latent.",
                     },
                 ),
+                "medium_short_edge": (
+                    "INT",
+                    {
+                        "default": 720,
+                        "min": 32,
+                        "max": 16384,
+                        "step": 32,
+                        "tooltip": "After the low stage, H3 DiT calls use this pixel short edge. Stage names describe order; this value may be smaller than low_short_edge.",
+                    },
+                ),
                 "low_resolution_steps": (
                     "INT",
                     {
@@ -175,31 +185,28 @@ class MiniMaxH3ProgressiveResolutionPatch:
                         "tooltip": "Number of initial model evaluations to run at the low-stage short edge.",
                     },
                 ),
+                "medium_resolution_steps": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 1000,
+                        "step": 1,
+                        "tooltip": "Number of model evaluations after the low stage to run at medium_short_edge. Zero disables this stage.",
+                    },
+                ),
                 "input_downscale": (
-                    [
-                        "sigma_blend",
-                        "h3_rope_sigma_blend",
-                        "h3_rope_bilinear",
-                        "h3_rope_nearest",
-                        "nearest-exact",
-                        "area",
-                    ],
+                    ["sigma_blend", "nearest-exact", "area"],
                     {
                         "default": "sigma_blend",
-                        "tooltip": "Sigma blend transitions from noise-preserving nearest sampling toward area filtering. h3_rope_sigma_blend performs both on H3's separated 2x2 patch phases and uses its RoPE coordinates.",
+                        "tooltip": "Sigma blend transitions from noise-preserving nearest sampling toward area filtering across the combined low and medium stages.",
                     },
                 ),
                 "output_upscale": (
-                    [
-                        "bilinear",
-                        "h3_rope_bilinear",
-                        "h3_rope_nearest",
-                        "bicubic",
-                        "nearest-exact",
-                    ],
+                    ["bilinear", "bicubic", "nearest-exact"],
                     {
                         "default": "bilinear",
-                        "tooltip": "Interpolation used to return each staged denoised video prediction to final resolution. h3_rope_bilinear preserves H3's 2x2 patch phases and follows its RoPE grid.",
+                        "tooltip": "Interpolation used to transfer each staged flow prediction to the sampler's final resolution.",
                     },
                 ),
                 "visual_condition_policy": (
@@ -216,26 +223,6 @@ class MiniMaxH3ProgressiveResolutionPatch:
                     {
                         "default": False,
                         "tooltip": "Log the resolved latent geometry once for each active stage per sampling run.",
-                    },
-                ),
-                "medium_short_edge": (
-                    "INT",
-                    {
-                        "default": 720,
-                        "min": 32,
-                        "max": 16384,
-                        "step": 32,
-                        "tooltip": "After the low stage, H3 DiT calls use this pixel short edge. Stage names describe order; this value may be smaller than low_short_edge.",
-                    },
-                ),
-                "medium_resolution_steps": (
-                    "INT",
-                    {
-                        "default": 0,
-                        "min": 0,
-                        "max": 1000,
-                        "step": 1,
-                        "tooltip": "Number of model evaluations after the low stage to run at medium_short_edge. Zero disables this stage.",
                     },
                 ),
             },

@@ -63,52 +63,6 @@ def _conds(shapes, payload=None):
 
 
 class MiniMaxProgressiveResolutionTest(unittest.TestCase):
-    def test_h3_rope_resize_preserves_patch_phases(self):
-        # Each H3 2x2 patch phase has a distinct value. A regular latent-space
-        # interpolation would mix these values; the patch-grid path must not.
-        video = torch.empty((1, 1, 1, 4, 4), dtype=torch.float32)
-        video[..., 0::2, 0::2] = 1.0
-        video[..., 0::2, 1::2] = 2.0
-        video[..., 1::2, 0::2] = 3.0
-        video[..., 1::2, 1::2] = 4.0
-
-        resized = minimax_adapter._resize_h3_video_patch_grid(
-            video,
-            8,
-            8,
-            "rope_bilinear",
-        )
-
-        self.assertTrue(torch.equal(resized[..., 0::2, 0::2], torch.ones_like(resized[..., 0::2, 0::2])))
-        self.assertTrue(torch.equal(resized[..., 0::2, 1::2], torch.full_like(resized[..., 0::2, 1::2], 2.0)))
-        self.assertTrue(torch.equal(resized[..., 1::2, 0::2], torch.full_like(resized[..., 1::2, 0::2], 3.0)))
-        self.assertTrue(torch.equal(resized[..., 1::2, 1::2], torch.full_like(resized[..., 1::2, 1::2], 4.0)))
-
-    def test_h3_rope_resize_uses_h3_coordinate_grid(self):
-        video = torch.zeros((1, 1, 1, 4, 4), dtype=torch.float32)
-        # Populate phase (0,0) with the 2x2 source patch-grid indices.
-        video[..., 0::2, 0::2] = torch.tensor([[0.0, 1.0], [2.0, 3.0]])
-
-        resized = minimax_adapter._resize_h3_video_patch_grid(
-            video,
-            8,
-            8,
-            "rope_bilinear",
-        )
-        phase = resized[0, 0, 0, 0::2, 0::2]
-
-        # With H3's endpoint-exclusive RoPE grid, target patch indices 0 and 2
-        # coincide exactly with source indices 0 and 1 at a 2x spatial scale.
-        self.assertTrue(torch.equal(phase[0::2, 0::2], torch.tensor([[0.0, 1.0], [2.0, 3.0]])))
-
-    def test_h3_rope_modes_are_accepted_by_patch(self):
-        patched = minimax_adapter.apply_h3_progressive_resolution_patch(
-            FakePatcher(),
-            input_downscale="h3_rope_sigma_blend",
-            output_upscale="h3_rope_bilinear",
-        )
-        self.assertIsInstance(patched, FakePatcher)
-
     def test_patch_clones_model_and_installs_only_model_wrappers(self):
         original = FakePatcher()
         patched = minimax_adapter.apply_h3_progressive_resolution_patch(original)
@@ -158,7 +112,7 @@ class MiniMaxProgressiveResolutionTest(unittest.TestCase):
             cond_wrapper(calc_executor, base_model, conds, packed, torch.ones(1), {})
             return first
 
-        sigmas = torch.tensor([1.0, 0.5, 0.0])
+        sigmas = torch.tensor([1.0, 0.6, 0.3, 0.0])
         outer_wrapper(
             sample_executor,
             packed,
@@ -211,7 +165,7 @@ class MiniMaxProgressiveResolutionTest(unittest.TestCase):
             packed,
             packed,
             object(),
-            torch.tensor([1.0, 0.0]),
+            torch.tensor([1.0, 0.6, 0.3, 0.0]),
             None,
             None,
             True,
@@ -248,7 +202,7 @@ class MiniMaxProgressiveResolutionTest(unittest.TestCase):
         def sample_executor(noise, latent, sampler, sigmas, mask, callback, disable, seed, **kwargs):
             for step in range(3):
                 cond_wrapper(calc_executor, None, conds, packed, torch.ones(1), {})
-                callback(step, packed, packed, 3)
+                callback(step, packed, packed, 4)
             return packed
 
         outer_wrapper(
@@ -256,7 +210,7 @@ class MiniMaxProgressiveResolutionTest(unittest.TestCase):
             packed,
             packed,
             object(),
-            torch.tensor([1.0, 0.7, 0.3, 0.0]),
+            torch.tensor([1.0, 0.8, 0.6, 0.3, 0.0]),
             None,
             None,
             True,
@@ -298,7 +252,7 @@ class MiniMaxProgressiveResolutionTest(unittest.TestCase):
             packed,
             packed,
             object(),
-            torch.tensor([1.0, 0.5, 0.0]),
+            torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]),
             None,
             None,
             True,
@@ -308,6 +262,83 @@ class MiniMaxProgressiveResolutionTest(unittest.TestCase):
 
         self.assertIs(seen_x[0], packed)
         self.assertIs(result, packed)
+
+    def test_flow_transfer_preserves_high_state_when_low_velocity_is_zero(self):
+        config = minimax_adapter._H3ProgressiveResolutionConfig(
+            low_short_edge=64,
+            low_resolution_steps=1,
+            medium_short_edge=96,
+            medium_resolution_steps=0,
+            input_downscale="area",
+            output_upscale="bilinear",
+            visual_condition_policy="keep_original",
+        )
+        outer_wrapper, cond_wrapper = minimax_adapter._make_h3_progressive_wrappers(config)
+        packed, shapes, _ = _packed_h3_latent()
+        conds = _conds(shapes)
+
+        def calc_executor(model, current_conds, current_x, timestep, model_options):
+            # D_low == X_low represents a zero flow velocity.
+            return [current_x]
+
+        def sample_executor(noise, latent, sampler, sigmas, mask, callback, disable, seed, **kwargs):
+            return cond_wrapper(calc_executor, None, conds, packed, torch.ones(1), {})[0]
+
+        result = outer_wrapper(
+            sample_executor,
+            packed,
+            packed,
+            object(),
+            torch.tensor([1.0, 0.6, 0.3, 0.0]),
+            None,
+            None,
+            True,
+            1,
+            latent_shapes=shapes,
+        )
+
+        self.assertTrue(torch.equal(result, packed))
+
+    def test_all_steps_may_remain_staged_for_diagnostics(self):
+        config = minimax_adapter._H3ProgressiveResolutionConfig(
+            low_short_edge=64,
+            low_resolution_steps=6,
+            medium_short_edge=96,
+            medium_resolution_steps=0,
+            input_downscale="area",
+            output_upscale="bilinear",
+            visual_condition_policy="keep_original",
+        )
+        outer_wrapper, cond_wrapper = minimax_adapter._make_h3_progressive_wrappers(config)
+        packed, shapes, _ = _packed_h3_latent()
+        conds = _conds(shapes)
+        seen_video_shapes = []
+
+        def calc_executor(model, current_conds, current_x, timestep, model_options):
+            current_shapes = minimax_adapter._h3_latent_shapes(current_conds)
+            seen_video_shapes.append(tuple(current_shapes[0]))
+            return [current_x]
+
+        def sample_executor(noise, latent, sampler, sigmas, mask, callback, disable, seed, **kwargs):
+            for step in range(6):
+                cond_wrapper(calc_executor, None, conds, packed, torch.ones(1), {})
+                callback(step, packed, packed, 6)
+            return packed
+
+        outer_wrapper(
+            sample_executor,
+            packed,
+            packed,
+            object(),
+            torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.1, 0.0]),
+            None,
+            None,
+            True,
+            1,
+            latent_shapes=shapes,
+        )
+
+        self.assertEqual(seen_video_shapes, [(1, 24, 2, 4, 6)] * 6)
 
     def test_low_resolution_memory_plan_tracks_target_and_resized_keyframe_rows(self):
         high_shapes = _h3_shapes()
