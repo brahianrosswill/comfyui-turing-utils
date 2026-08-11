@@ -74,7 +74,7 @@ class SolSparseAttentionPatch:
                         "min": 0,
                         "max": 1000,
                         "step": 1,
-                        "tooltip": "Number of early denoising steps that use stable dense Sage across every transformer layer.",
+                        "tooltip": "Number of early denoising steps that use the selected dense backend across every transformer layer (stable Sage, or W8A8 when enabled).",
                     },
                 ),
                 "dense_suffix_steps": (
@@ -84,7 +84,7 @@ class SolSparseAttentionPatch:
                         "min": 0,
                         "max": 1000,
                         "step": 1,
-                        "tooltip": "Number of final denoising steps that use stable dense Sage across every transformer layer.",
+                        "tooltip": "Number of final denoising steps that use the selected dense backend across every transformer layer (stable Sage, or W8A8 when enabled).",
                     },
                 ),
                 "dense_prefix_layers": (
@@ -94,7 +94,7 @@ class SolSparseAttentionPatch:
                         "min": 0,
                         "max": 256,
                         "step": 1,
-                        "tooltip": "Keep this many transformer layers at the beginning of every sparse step on stable dense Sage.",
+                        "tooltip": "Keep this many transformer layers at the beginning of every sparse step on the selected dense backend.",
                     },
                 ),
                 "dense_suffix_layers": (
@@ -104,11 +104,18 @@ class SolSparseAttentionPatch:
                         "min": 0,
                         "max": 256,
                         "step": 1,
-                        "tooltip": "Keep this many transformer layers at the end of every sparse step on stable dense Sage. Requires layer-count metadata.",
+                        "tooltip": "Keep this many transformer layers at the end of every sparse step on the selected dense backend. Requires layer-count metadata.",
                     },
                 ),
             },
             "optional": {
+                "use_w8a8": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Use signed INT8 V and unsigned INT8 probability Tensor Cores for Sol exact blocks and protected dense steps/layers. Experimental; disabled keeps the stable FP16/BF16 PV path.",
+                    },
+                ),
                 "debug_route_density": (
                     "BOOLEAN",
                     {
@@ -139,6 +146,7 @@ class SolSparseAttentionPatch:
         dense_suffix_steps: int = 0,
         dense_prefix_layers: int = 2,
         dense_suffix_layers: int = 0,
+        use_w8a8: bool = False,
         debug_route_density: bool = False,
     ):
         return (
@@ -155,6 +163,7 @@ class SolSparseAttentionPatch:
                 dense_suffix_steps=dense_suffix_steps,
                 dense_prefix_layers=dense_prefix_layers,
                 dense_suffix_layers=dense_suffix_layers,
+                use_w8a8=use_w8a8,
                 debug_route_density=debug_route_density,
             ),
         )

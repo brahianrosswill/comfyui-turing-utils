@@ -22,7 +22,7 @@ _FRAME_SCHEDULE_CACHE: OrderedDict[
 _FRAME_SCHEDULE_CACHE_LOCK = Lock()
 _SOL_POLICY_CACHE_LIMIT = 64
 _SOL_POLICY_CACHE: OrderedDict[
-    tuple, tuple[torch.Tensor, torch.Tensor, int, tuple[tuple[int, int], ...]]
+    tuple, tuple[torch.Tensor, torch.Tensor, int]
 ] = OrderedDict()
 _SOL_POLICY_CACHE_LOCK = Lock()
 
@@ -49,7 +49,7 @@ def _sol_block_policy(
     key_length: int,
     dense_query_ranges,
     exact_kv_ranges,
-) -> tuple[torch.Tensor, torch.Tensor, int, tuple[tuple[int, int], ...]]:
+) -> tuple[torch.Tensor, torch.Tensor, int]:
     dense_ranges = _normalize_token_ranges(dense_query_ranges, query_length)
     exact_ranges = _normalize_token_ranges(exact_kv_ranges, key_length)
     device_index = device.index
@@ -78,21 +78,10 @@ def _sol_block_policy(
     for start, stop in exact_ranges:
         exact_kv[start // 64 : (stop + 63) // 64] = 1
     sparse_count = int(sparse_query.sum().item())
-    dense_runs = []
-    block = 0
-    while block < query_blocks:
-        if sparse_query[block]:
-            block += 1
-            continue
-        start = block
-        while block < query_blocks and not sparse_query[block]:
-            block += 1
-        dense_runs.append((start, block))
     policy = (
         sparse_query.to(device),
         exact_kv.to(device),
         sparse_count,
-        tuple(dense_runs),
     )
     with _SOL_POLICY_CACHE_LOCK:
         existing = _SOL_POLICY_CACHE.get(cache_key)
@@ -583,6 +572,51 @@ def sageattn_prequantized(
 
 
 @_on_input_device
+def w8a8attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    tensor_layout: str = "HND",
+    sm_scale: Optional[float] = None,
+):
+    """Experimental pure-INT8 QK/PV attention specialized for SM75.
+
+    Q/K use the stable Sage INT8 score domain. V is quantized channel-wise to
+    signed INT8 and softmax probabilities are packed to unsigned INT8 for the
+    second SM75 Tensor Core MMA. A route-free specialization omits all Sol
+    summaries and routing state while retaining the shared exact-token core.
+    """
+    if tensor_layout not in {"HND", "NHD"}:
+        raise ValueError(f"Unsupported tensor_layout: {tensor_layout}")
+    if tensor_layout == "NHD":
+        q_hnd = q.transpose(1, 2).contiguous()
+        k_hnd = k.transpose(1, 2).contiguous()
+        v_hnd = v.transpose(1, 2).contiguous()
+    else:
+        q_hnd, k_hnd, v_hnd = q, k, v
+    _validate_fixed_qkv(q_hnd, k_hnd, v_hnd, "HND")
+    if q_hnd.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("Turing W8A8 Q/K/V must be float16 or bfloat16")
+    if q_hnd.dtype != k_hnd.dtype or q_hnd.dtype != v_hnd.dtype:
+        raise TypeError("Turing W8A8 Q/K/V must have matching dtypes")
+    if q_hnd.size(-1) != 128:
+        raise ValueError("Turing W8A8 currently requires head_dim=128")
+    output = sol_sparse_sageattn(
+        q_hnd,
+        k_hnd,
+        v_hnd,
+        tensor_layout="HND",
+        sm_scale=sm_scale,
+        threshold_sigma=0.0,
+        residual_subblocks=1,
+        use_w8a8=True,
+        _force_dense=True,
+    )
+    return output.transpose(1, 2) if tensor_layout == "NHD" else output
+
+
+@_on_input_device
 def sol_sparse_sageattn(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -595,6 +629,8 @@ def sol_sparse_sageattn(
     threshold_sigma: float = 1.0,
     residual_subblocks: int = 1,
     return_stats: bool = False,
+    use_w8a8: bool = False,
+    _force_dense: bool = False,
 ):
     """SM75 Sol attention with online routing and modality-aware exact ranges."""
     if not q.is_cuda:
@@ -617,7 +653,7 @@ def sol_sparse_sageattn(
     residual_subblocks = int(residual_subblocks)
     if residual_subblocks not in (1, 2):
         raise ValueError("residual_subblocks must be 1 or 2")
-    sparse_query_blocks, exact_kv_blocks, sparse_block_count, dense_runs = _sol_block_policy(
+    sparse_query_blocks, exact_kv_blocks, sparse_block_count = _sol_block_policy(
         q.device,
         q.size(2),
         k.size(2),
@@ -626,19 +662,39 @@ def sol_sparse_sageattn(
     )
     key_block_count = (k.size(2) + 63) // 64
     possible_blocks = q.size(0) * q.size(1) * sparse_block_count * key_block_count
-    if sparse_block_count == 0:
+    if sparse_block_count == 0 and not use_w8a8:
         dense = sageattn(q, k, v, tensor_layout="HND", sm_scale=scale)
         if return_stats:
             return dense, torch.zeros(1, dtype=torch.int64, device=q.device), 0
         return dense
+    if sparse_block_count == 0:
+        _force_dense = True
 
     output = torch.empty_like(q)
     q_int8, q_scale = quantize_query_per_warp(q, tensor_layout="HND")
     k_int8, k_scale = quantize_key_per_block(k, tensor_layout="HND")
+    if use_w8a8:
+        padded_key_length = ((k.size(2) + 63) // 64) * 64
+        value_int8 = torch.empty(
+            (v.size(0), v.size(1), v.size(3), padded_key_length),
+            dtype=torch.int8,
+            device=v.device,
+        )
+        value_scale = torch.empty(
+            (v.size(0), v.size(1), v.size(3)),
+            dtype=torch.float32,
+            device=v.device,
+        )
+        sm75_compile.quantize_v_int8(v, value_int8, value_scale)
+    else:
+        value_int8 = torch.empty(0, dtype=torch.int8, device=v.device)
+        value_scale = torch.empty(0, dtype=torch.float32, device=v.device)
     selected = sm75_compile.sol_sparse_online_int8_f16_attn(
         q_int8,
         k_int8,
         v,
+        value_int8,
+        value_scale,
         output,
         q_scale,
         k_scale,
@@ -648,46 +704,13 @@ def sol_sparse_sageattn(
         residual_subblocks,
         scale,
         int(return_stats),
+        int(bool(use_w8a8)),
+        int(bool(_force_dense)),
     )
 
-    # Dense Query blocks are uncommon and usually contiguous modality spans. Run
-    # exact Sage on maximal block-aligned runs without requantizing Q/K.
-    for run_start, run_stop in dense_runs:
-        token_start = run_start * 64
-        token_stop = min(run_stop * 64, q.size(2))
-        run_tokens = token_stop - token_start
-        run_q_int8 = q_int8[:, :, token_start:token_stop]
-        run_q_scale = q_scale[:, :, run_start * 4 : run_stop * 4]
-        run_output = output[:, :, token_start:token_stop]
-        if run_tokens < 64:
-            padded_q = torch.nn.functional.pad(run_q_int8, (0, 0, 0, 64 - run_tokens))
-            padded_output = torch.empty(
-                (*run_output.shape[:2], 64, run_output.shape[-1]),
-                dtype=run_output.dtype,
-                device=run_output.device,
-            )
-            sageattn_prequantized(
-                padded_q,
-                run_q_scale,
-                k_int8,
-                k_scale,
-                v,
-                tensor_layout="HND",
-                sm_scale=scale,
-                output=padded_output,
-            )
-            run_output.copy_(padded_output[:, :, :run_tokens])
-        else:
-            sageattn_prequantized(
-                run_q_int8,
-                run_q_scale,
-                k_int8,
-                k_scale,
-                v,
-                tensor_layout="HND",
-                sm_scale=scale,
-                output=run_output,
-            )
+    # Dense Query blocks are handled by the same CUDA grid.  They bypass route
+    # pruning and scan every K/V block, so no Python-side sublaunch or output
+    # copy is required and Q/K/V quantization remains single-pass.
     return (output, selected, possible_blocks) if return_stats else output
 
 

@@ -314,7 +314,11 @@ def _expected_int8_sol_route_count(
 
 
 def validate_sparse(device: torch.device) -> None:
-    from comfyui_turing_utils_kernel.turing_sage import sageattn, sol_sparse_sageattn
+    from comfyui_turing_utils_kernel.turing_sage import (
+        sageattn,
+        sol_sparse_sageattn,
+        w8a8attn,
+    )
     from comfyui_turing_utils_kernel.turing_sage.quant import (
         quantize_key_per_block,
         quantize_query_per_warp,
@@ -340,6 +344,34 @@ def validate_sparse(device: torch.device) -> None:
             )
             if int(selected.item()) != possible:
                 raise RuntimeError("threshold=-1000 must select every sparse Q/K block")
+
+            dense_w8a8 = w8a8attn(q, k, v)
+            _assert_close(
+                f"W8A8 dense {dtype} Q={query_length} K={key_length}",
+                dense_w8a8,
+                reference,
+                rtol=0.12,
+                atol=0.09,
+            )
+            sol_w8a8, selected_w8a8, possible_w8a8 = sol_sparse_sageattn(
+                q,
+                k,
+                v,
+                threshold_sigma=-1000.0,
+                return_stats=True,
+                use_w8a8=True,
+            )
+            _assert_close(
+                f"Sol W8A8 exact route {dtype} Q={query_length} K={key_length}",
+                sol_w8a8,
+                dense_w8a8,
+                rtol=0.02,
+                atol=0.01,
+            )
+            if int(selected_w8a8.item()) != possible_w8a8:
+                raise RuntimeError(
+                    "Sol W8A8 threshold=-1000 must select every sparse Q/K block"
+                )
 
     # Verify the CUDA route against an independently reconstructed policy in
     # the exact quantized score domain. This catches accidental use of the
@@ -431,6 +463,49 @@ def validate_sparse(device: torch.device) -> None:
     density = int(selected.item()) / possible
     if not 0.1 < density < 0.9:
         raise RuntimeError(f"Sol route density is implausible: {density:.3f}")
+
+    # Exercise the default mixed skipped/exact path. W8A8 quantizes only exact
+    # P@V blocks; skipped blocks intentionally retain the FP16 centroid
+    # approximation. Their outputs therefore need not be bitwise close, but a
+    # probability-domain mismatch would amplify this delta by roughly 2^8.
+    residual_fp16 = sol_sparse_sageattn(
+        q,
+        k,
+        v,
+        exact_kv_ranges=((0, 128),),
+        threshold_sigma=1.0,
+        residual_subblocks=1,
+    )
+    residual_w8a8 = sol_sparse_sageattn(
+        q,
+        k,
+        v,
+        exact_kv_ranges=((0, 128),),
+        threshold_sigma=1.0,
+        residual_subblocks=1,
+        use_w8a8=True,
+    )
+    residual_delta = (
+        residual_fp16.float() - residual_w8a8.float()
+    ).abs().mean().item()
+    if residual_delta > 0.02:
+        raise RuntimeError(
+            "Sol W8A8 skipped/exact online-softmax domains diverged: "
+            f"mean_abs={residual_delta:.6g}"
+        )
+
+    dense_w8a8 = w8a8attn(q, k, v)
+    protected_dense_w8a8 = sol_sparse_sageattn(
+        q,
+        k,
+        v,
+        dense_query_ranges=((0, sequence),),
+        use_w8a8=True,
+    )
+    if not torch.equal(dense_w8a8, protected_dense_w8a8):
+        raise RuntimeError(
+            "fully protected Sol W8A8 queries did not use the route-free dense kernel"
+        )
 
     # 2x32 changes skipped-block reconstruction only; routing and exact blocks
     # are deliberately identical to the official-style 1x64 path.
@@ -756,6 +831,7 @@ def benchmark_sparse(device: torch.device, iterations: int) -> None:
     from comfyui_turing_utils_kernel.turing_sage import (
         sageattn,
         sol_sparse_sageattn,
+        w8a8attn,
     )
 
     for sequence in (4096, 8192, 16384):
@@ -768,10 +844,21 @@ def benchmark_sparse(device: torch.device, iterations: int) -> None:
         sparse_64 = lambda: sol_sparse_sageattn(
             q, k, v, threshold_sigma=1.0, residual_subblocks=1
         )
+        sparse_w8a8 = lambda: sol_sparse_sageattn(
+            q,
+            k,
+            v,
+            threshold_sigma=1.0,
+            residual_subblocks=1,
+            use_w8a8=True,
+        )
         dense = lambda: sageattn(q, k, v)
+        dense_w8a8 = lambda: w8a8attn(q, k, v)
         sparse_ms = _elapsed_ms(sparse, iterations)
         sparse_64_ms = _elapsed_ms(sparse_64, iterations)
+        sparse_w8a8_ms = _elapsed_ms(sparse_w8a8, iterations)
         dense_ms = _elapsed_ms(dense, iterations)
+        dense_w8a8_ms = _elapsed_ms(dense_w8a8, iterations)
         _, selected_tensor, possible = sol_sparse_sageattn(
             q, k, v, threshold_sigma=1.0, return_stats=True
         )
@@ -779,7 +866,9 @@ def benchmark_sparse(device: torch.device, iterations: int) -> None:
         print(
             f"sparse HND N={sequence} H=4 D=128 threshold=1.0 density={density:.3f}: "
             f"2x32 {sparse_ms:.3f} ms, 1x64 {sparse_64_ms:.3f} ms, "
-            f"sage {dense_ms:.3f} ms, {dense_ms / sparse_ms:.3f}x"
+            f"W8A8 1x64 {sparse_w8a8_ms:.3f} ms, "
+            f"sage {dense_ms:.3f} ms, dense W8A8 {dense_w8a8_ms:.3f} ms, "
+            f"{dense_ms / sparse_w8a8_ms:.3f}x sparse-W8A8 speedup"
         )
 
 

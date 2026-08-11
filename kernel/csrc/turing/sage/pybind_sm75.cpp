@@ -24,6 +24,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("qk_int8_sv_f16_varlen_accum_f32_attn", &qk_int8_sv_f16_varlen_accum_f32_attn, "Varlen QK int8 sv f16 accum f32 attn per warp");
   m.def("sol_sparse_online_int8_f16_attn", &sol_sparse_online_int8_f16_attn, "Sol online-routed sparse attention with INT8 QK and FP16/BF16 V for sm75");
   m.def("frame_sparse_int8_f16_attn", &frame_sparse_int8_f16_attn, "Experimental structured frame-sparse Sage attention for sm75");
+  m.def("quantize_v_int8_sm75", &quantize_v_int8_sm75, "Channel-wise signed INT8 V quantization for sm75 W8A8 attention");
 #ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
   m.def("qk_int8_sv_f16_accum_f16_attn", &qk_int8_sv_f16_accum_f16_attn, "Experimental QK int8/PV f16 attention");
   m.def("qk_int8_sv_f16_accum_f16_fuse_v_mean_attn", &qk_int8_sv_f16_accum_f16_fuse_v_mean_attn, "Experimental QK int8/PV f16 attention with V mean");

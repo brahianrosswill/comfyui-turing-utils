@@ -1,10 +1,11 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's exact-sm75
-runtime. Version 0.17.0 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
+runtime. Version 0.18.0 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
-and LayerNorm modulation, bundled Sage attention, and an explicitly selected
-experimental model-independent sparse attention kernel with input-adaptive
+and LayerNorm modulation, bundled Sage attention, pure-INT8 W8A8 attention,
+and an explicitly selected experimental model-independent sparse attention
+kernel with input-adaptive
 centroid threshold routing, stable-Sage INT8 QK for selected blocks, compact
 dense-Query/exact-KV modality masks, INT8-consistent routing, 32 KiB attention
 CTAs, and one-by-64 or two-by-32 skipped residuals on one shared route. The
@@ -85,6 +86,7 @@ import comfyui_turing_utils_kernel
 print("kernel:", comfyui_turing_utils_kernel.__file__)
 print("Turing Sage:", comfyui_turing_utils_kernel.turing_sage.available())
 print("Turing sparse:", comfyui_turing_utils_kernel.turing_sage.sparse_available())
+print("Turing W8A8 attention:", comfyui_turing_utils_kernel.turing_sage.w8a8_available())
 print("Turing frame sparse:", comfyui_turing_utils_kernel.turing_sage.frame_sparse_available())
 print("Turing W4A8:", callable(comfyui_turing_utils_kernel.turing_w4a8_linear))
 print("Turing SwiGLU:", callable(comfyui_turing_utils_kernel.turing_swiglu_int8_convrot_quantize))

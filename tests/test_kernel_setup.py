@@ -74,8 +74,9 @@ class KernelSetupTest(unittest.TestCase):
         self.assertNotIn("arch=compute_86,code=sm_86", flags)
         self.assertNotIn("-DCOMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS", flags)
         self.assertIn("csrc/turing/sage/sol_sparse_cuda_sm75.cu", extensions[1].kwargs["sources"])
+        self.assertIn("csrc/turing/sage/quant_v_int8_cuda_sm75.cu", extensions[1].kwargs["sources"])
         self.assertIn("csrc/turing/sage/frame_sparse_cuda_sm75.cu", extensions[1].kwargs["sources"])
-        self.assertEqual(setup.call_args.kwargs["version"], "0.17.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.18.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -85,7 +86,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.17.0")
+        self.assertEqual(metadata["project"]["version"], "0.18.0")
 
     def test_sparse_source_does_not_require_optional_cuda_library_headers(self):
         source = (
@@ -113,6 +114,9 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn("exact_kv_blocks", source)
         self.assertIn("shared_route", source)
         self.assertIn("residual_subblocks", source)
+        self.assertIn("UseW8A8", source)
+        self.assertIn("ForceDense", source)
+        self.assertIn("compute_int8_sv_permuted", source)
 
     def test_frame_sparse_source_uses_static_csr_without_optional_cuda_headers(self):
         source = (

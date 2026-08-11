@@ -357,6 +357,7 @@ def turing_sol_sparse_attention(
     debug_route_keys: set[tuple] | None = None,
     debug_route_state: dict[tuple, list[tuple[torch.Tensor, int, int]]] | None = None,
     debug_context: dict | None = None,
+    use_w8a8: bool = False,
     **kwargs,
 ) -> torch.Tensor:
     original_q, original_k, original_v = q, k, v
@@ -455,6 +456,7 @@ def turing_sol_sparse_attention(
         bool(sparse_reference_image),
         bool(sparse_reference_video),
         bool(sparse_reference_audio),
+        bool(use_w8a8),
     )
     if kernel_key not in _LOGGED_SPARSE_KERNELS:
         LOG.info(
@@ -462,7 +464,7 @@ def turing_sol_sparse_attention(
             "min_sequence=%d prefix_policy=%s protected_ranges=%s "
             "selected_qk=int8 score_domain=int8_consistent threshold=%.2f "
             "skipped_residual=%s local_radius=1 "
-            "sparse_reference=(image=%s,video=%s,audio=%s)",
+            "sparse_reference=(image=%s,video=%s,audio=%s) pv=%s",
             input_dtype,
             tuple(q.shape),
             tuple(k.shape),
@@ -474,6 +476,7 @@ def turing_sol_sparse_attention(
             bool(sparse_reference_image),
             bool(sparse_reference_video),
             bool(sparse_reference_audio),
+            "w8a8" if use_w8a8 else "fp16",
         )
         _LOGGED_SPARSE_KERNELS.add(kernel_key)
 
@@ -515,6 +518,7 @@ def turing_sol_sparse_attention(
         threshold_sigma=routing_threshold,
         residual_subblocks=residual_subblocks,
         return_stats=collect_route_stats,
+        use_w8a8=bool(use_w8a8),
     )
     if collect_route_stats:
         output, selected_device, possible_blocks = sparse_result

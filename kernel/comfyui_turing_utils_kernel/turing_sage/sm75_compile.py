@@ -63,6 +63,8 @@ def sol_sparse_online_int8_f16_attn(
     query_int8,
     key_int8,
     value,
+    value_int8,
+    value_scale,
     output,
     query_scale,
     key_scale,
@@ -72,6 +74,8 @@ def sol_sparse_online_int8_f16_attn(
     residual_subblocks,
     sm_scale,
     return_stats,
+    use_w8a8,
+    force_dense,
 ):
     if not hasattr(_qattn_sm75, "sol_sparse_online_int8_f16_attn"):
         raise RuntimeError(
@@ -81,6 +85,8 @@ def sol_sparse_online_int8_f16_attn(
         query_int8,
         key_int8,
         value,
+        value_int8,
+        value_scale,
         output,
         query_scale,
         key_scale,
@@ -90,7 +96,17 @@ def sol_sparse_online_int8_f16_attn(
         residual_subblocks,
         sm_scale,
         return_stats,
+        use_w8a8,
+        force_dense,
     )
+
+
+def quantize_v_int8(value, quantized, scale):
+    if not hasattr(_qattn_sm75, "quantize_v_int8_sm75"):
+        raise RuntimeError(
+            "W8A8 attention requires comfyui-turing-utils-kernel 0.18.0 or newer"
+        )
+    _qattn_sm75.quantize_v_int8_sm75(value, quantized, scale)
 
 
 def frame_sparse_int8_f16_attn(

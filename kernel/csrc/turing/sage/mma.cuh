@@ -35,6 +35,7 @@ namespace mma{
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 750)
 #define MMA_F16F16F32_M16N8K8_ENABLED
 #define MMA_F16F16F16_M16N8K8_ENABLED
+#define MMA_S8S8S32_M8N8K16_ENABLED
 #define MMA_S4S4S32_M8N8K32_ENABLED
 #define LDMATRIX_M8N8X2_ENABLED
 #define LDMATRIX_M8N8X4_ENABLED
@@ -528,6 +529,88 @@ __device__ __forceinline__ void mma_sync_m16n16k32_row_col_s8s8s32(int32_t* C, u
         "+r"(C[4]), "+r"(C[5]), "+r"(C[6]), "+r"(C[7])
       : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
         "r"(B[0]), "r"(B[1]), "r"(B[2]), "r"(B[3]));
+#endif
+}
+
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void mma_sync_m8n8k16_row_col_u8s8s32(
+    int32_t* C, uint32_t A, uint32_t B) {
+#ifdef MMA_S8S8S32_M8N8K16_ENABLED
+  if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
+    asm volatile(
+        "mma.sync.aligned.m8n8k16.row.col.s32.u8.s8.s32 "
+        "{%0, %1}, {%2}, {%3}, {%4, %5};\n"
+        : "=r"(C[0]), "=r"(C[1])
+        : "r"(A), "r"(B), "r"(C[0]), "r"(C[1]));
+  } else {
+    asm volatile(
+        "mma.sync.aligned.m8n8k16.row.col.s32.u8.s8.s32 "
+        "{%0, %1}, {%2}, {%3}, {%4, %5};\n"
+        : "=r"(C[0]), "=r"(C[1])
+        : "r"(A), "r"(B), "r"(0), "r"(0));
+  }
+#else
+  RUNTIME_ASSERT("Unsupported CUDA architecture for INT8 mma instruction");
+#endif
+}
+
+/*
+ * Unsigned probability x signed value INT8 Tensor Core MMA.  SM80 exposes
+ * m16n8k32 directly; SM75 composes the same logical fragment from the native
+ * m8n8k16 instructions.  Keeping the logical fragment identical lets the
+ * dense and Sol kernels share one probability/value path without increasing
+ * their shared-memory tile.
+ */
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void mma_sync_m16n8k32_row_col_u8s8s32(
+    int32_t* C, uint32_t* A, uint32_t* B) {
+#ifdef MMA_S8S8S32_M16N8K32_ENABLED
+  if constexpr (mma_mode == MMAMode::kInplaceUpdate) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%10, %11, %12, %13};\n"
+        : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
+        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+          "r"(B[0]), "r"(B[1]), "r"(C[0]), "r"(C[1]),
+          "r"(C[2]), "r"(C[3]));
+  } else {
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.s32.u8.s8.s32 "
+        "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%10, %11, %12, %13};\n"
+        : "=r"(C[0]), "=r"(C[1]), "=r"(C[2]), "=r"(C[3])
+        : "r"(A[0]), "r"(A[1]), "r"(A[2]), "r"(A[3]),
+          "r"(B[0]), "r"(B[1]), "r"(0), "r"(0), "r"(0), "r"(0));
+  }
+#elif defined(MMA_S8S8S32_M8N8K16_ENABLED)
+  if constexpr (mma_mode == MMAMode::kInit) {
+    mma_sync_m8n8k16_row_col_u8s8s32<MMAMode::kInit>(C, A[0], B[0]);
+    mma_sync_m8n8k16_row_col_u8s8s32<MMAMode::kInplaceUpdate>(C, A[2], B[1]);
+    mma_sync_m8n8k16_row_col_u8s8s32<MMAMode::kInit>(C + 2, A[1], B[0]);
+    mma_sync_m8n8k16_row_col_u8s8s32<MMAMode::kInplaceUpdate>(C + 2, A[3], B[1]);
+  } else {
+    mma_sync_m8n8k16_row_col_u8s8s32<MMAMode::kInplaceUpdate>(C, A[0], B[0]);
+    mma_sync_m8n8k16_row_col_u8s8s32<MMAMode::kInplaceUpdate>(C, A[2], B[1]);
+    mma_sync_m8n8k16_row_col_u8s8s32<MMAMode::kInplaceUpdate>(C + 2, A[1], B[0]);
+    mma_sync_m8n8k16_row_col_u8s8s32<MMAMode::kInplaceUpdate>(C + 2, A[3], B[1]);
+  }
+#else
+  RUNTIME_ASSERT("Unsupported CUDA architecture for INT8 mma instruction");
+#endif
+}
+
+template <MMAMode mma_mode = MMAMode::kInplaceUpdate>
+__device__ __forceinline__ void mma_sync_m16n16k32_row_col_u8s8s32(
+    int32_t* C, uint32_t* A, uint32_t* B) {
+#ifdef MMA_S8S8S32_M16N8K32_ENABLED
+  mma_sync_m16n8k32_row_col_u8s8s32<mma_mode>(C, A, B);
+  mma_sync_m16n8k32_row_col_u8s8s32<mma_mode>(C + 4, A, B + 2);
+#elif defined(MMA_S8S8S32_M8N8K16_ENABLED)
+  mma_sync_m16n8k32_row_col_u8s8s32<mma_mode>(C, A, B);
+  mma_sync_m16n8k32_row_col_u8s8s32<mma_mode>(C + 4, A, B + 2);
+#else
+  RUNTIME_ASSERT("Unsupported CUDA architecture for INT8 mma instruction");
 #endif
 }
 

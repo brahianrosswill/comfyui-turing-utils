@@ -31,6 +31,7 @@
 #define S_FP8_OFFSET 8.807f
 #define S_FP8_OFFSET_EXP 6680.8477f
 #define S_FP8_OFFSET_EXP_INV 0.0022326917f
+#define S_U8_OFFSET 7.9943534f
 
 #define div_ceil(M, N) (((M) + (N)-1) / (N))
 
@@ -461,7 +462,7 @@ __device__ __forceinline__ void apply_out_of_bound_mask(const uint32_t &K_idx_la
 
 // for DTypeQKAccum float
 template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v, bool use_half_o_scale, bool exp_offset, bool fuse_scale=false, typename DTypeSVAccum>
-__device__ __forceinline__ void update_mdo(float RS[][num_tiles_k][8], DTypeSVAccum RO[][num_tiles_v][8], float m[][2], float d[][2], const float &sm_scale)
+__device__ __forceinline__ void update_mdo(float RS[][num_tiles_k][8], DTypeSVAccum RO[][num_tiles_v][8], float m[][2], float d[][2], const float &sm_scale, const float exp_offset_value = S_FP8_OFFSET)
 {
   static_assert(std::is_same<DTypeSVAccum, half>::value || (!use_half_o_scale));
 #pragma unroll
@@ -485,7 +486,7 @@ __device__ __forceinline__ void update_mdo(float RS[][num_tiles_k][8], DTypeSVAc
       {
         if constexpr (exp_offset)
         {
-          m_temp = fmaf(m_temp, sm_scale, -S_FP8_OFFSET);
+          m_temp = fmaf(m_temp, sm_scale, -exp_offset_value);
         }
         else
         {
@@ -494,7 +495,7 @@ __device__ __forceinline__ void update_mdo(float RS[][num_tiles_k][8], DTypeSVAc
       }
       else if constexpr (exp_offset)
       {
-        m_temp += (-S_FP8_OFFSET);
+        m_temp += (-exp_offset_value);
       }
 
       // exchange element with the 4 threads in the row
@@ -580,6 +581,43 @@ __device__ __forceinline__ void RS_32_to_16(T RS[][num_tiles_k][8], uint32_t RS_
       ((half2*)RS_16[fq][fk])[1] = __float22half2_rn(((float2*)RS[fq][fk])[1]);
       ((half2*)RS_16[fq][fk])[2] = __float22half2_rn(((float2*)RS[fq][fk])[2]);
       ((half2*)RS_16[fq][fk])[3] = __float22half2_rn(((float2*)RS[fq][fk])[3]);
+    }
+  }
+}
+
+__device__ __forceinline__ uint32_t pack_u8x4(float a, float b, float c, float d)
+{
+  uint32_t qa, qb, qc, qd;
+  asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qa) : "f"(a));
+  asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qb) : "f"(b));
+  asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qc) : "f"(c));
+  asm volatile("cvt.rni.sat.u8.f32 %0, %1;" : "=r"(qd) : "f"(d));
+  return qa | (qb << 8) | (qc << 16) | (qd << 24);
+}
+
+template <uint32_t num_tiles_q, uint32_t num_tiles_k>
+__device__ __forceinline__ void RS_to_u8(
+    float RS[][num_tiles_k][8],
+    uint32_t RS_u8[][num_tiles_k / 2][4])
+{
+#pragma unroll
+  for (uint32_t fq = 0; fq < num_tiles_q; ++fq)
+  {
+#pragma unroll
+    for (uint32_t fk = 0; fk < num_tiles_k / 2; ++fk)
+    {
+      RS_u8[fq][fk][0] = pack_u8x4(
+          RS[fq][fk * 2][0], RS[fq][fk * 2][1],
+          RS[fq][fk * 2][4], RS[fq][fk * 2][5]);
+      RS_u8[fq][fk][1] = pack_u8x4(
+          RS[fq][fk * 2][2], RS[fq][fk * 2][3],
+          RS[fq][fk * 2][6], RS[fq][fk * 2][7]);
+      RS_u8[fq][fk][2] = pack_u8x4(
+          RS[fq][fk * 2 + 1][0], RS[fq][fk * 2 + 1][1],
+          RS[fq][fk * 2 + 1][4], RS[fq][fk * 2 + 1][5]);
+      RS_u8[fq][fk][3] = pack_u8x4(
+          RS[fq][fk * 2 + 1][2], RS[fq][fk * 2 + 1][3],
+          RS[fq][fk * 2 + 1][6], RS[fq][fk * 2 + 1][7]);
     }
   }
 }
@@ -748,6 +786,58 @@ __device__ __forceinline__ void compute_fp16_sv_permuted(const smem_t<swizzle_mo
 
   // make offset_V their original value
   offset_V -= (16 * num_tiles_k * stride);
+}
+
+template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v,
+          SwizzleMode swizzle_mode, uint32_t stride>
+__device__ __forceinline__ void compute_int8_sv_permuted(
+    const smem_t<swizzle_mode, stride> &smem_V,
+    float probability_scale[][2],
+    uint32_t probability_u8[][num_tiles_k / 2][4],
+    float output[][num_tiles_v][8])
+{
+  uint32_t value_row = get_lane_id() % 8 + (get_lane_id() / 16) * 8;
+  uint32_t value_column = (get_lane_id() / 8) % 2;
+  uint32_t offsets[num_tiles_k / 2];
+#pragma unroll
+  for (uint32_t key_pair = 0; key_pair < num_tiles_k / 2; ++key_pair)
+  {
+    offsets[key_pair] = smem_V.get_permuted_offset(
+        value_row, value_column + key_pair * 2);
+  }
+#pragma unroll
+  for (uint32_t value_tile = 0; value_tile < num_tiles_v; ++value_tile)
+  {
+    uint32_t value_fragment[num_tiles_k / 2][4];
+#pragma unroll
+    for (uint32_t key_pair = 0; key_pair < num_tiles_k / 2; ++key_pair)
+    {
+      smem_V.ldmatrix_m8n8x4(offsets[key_pair], value_fragment[key_pair]);
+      offsets[key_pair] = smem_V.advance_offset_by_row<16>(offsets[key_pair]);
+    }
+#pragma unroll
+    for (uint32_t query_tile = 0; query_tile < num_tiles_q; ++query_tile)
+    {
+      int32_t partial[8];
+      mma::mma_sync_m16n16k32_row_col_u8s8s32<mma::MMAMode::kInit>(
+          partial, probability_u8[query_tile][0], value_fragment[0]);
+#pragma unroll
+      for (uint32_t key_pair = 1; key_pair < num_tiles_k / 2; ++key_pair)
+      {
+        mma::mma_sync_m16n16k32_row_col_u8s8s32<mma::MMAMode::kInplaceUpdate>(
+            partial, probability_u8[query_tile][key_pair],
+            value_fragment[key_pair]);
+      }
+#pragma unroll
+      for (uint32_t element = 0; element < 8; ++element)
+      {
+        output[query_tile][value_tile][element] = fmaf(
+            __int2float_rn(partial[element]),
+            probability_scale[query_tile][(element % 4) / 2],
+            output[query_tile][value_tile][element]);
+      }
+    }
+  }
 }
 
 template <uint32_t num_warps_q, uint32_t num_warps_k,

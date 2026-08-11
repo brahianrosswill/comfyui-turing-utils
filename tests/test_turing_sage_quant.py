@@ -65,10 +65,13 @@ class TuringSageQuantContractTest(unittest.TestCase):
                 "preflight",
                 "preflight_frame_sparse",
                 "preflight_sparse",
+                "preflight_w8a8",
                 "sageattn",
                 "sageattn_varlen",
                 "sol_sparse_sageattn",
                 "sparse_available",
+                "w8a8attn",
+                "w8a8_available",
             ],
         )
         self.assertFalse(hasattr(turing_sage, "sageattn_sage1"))

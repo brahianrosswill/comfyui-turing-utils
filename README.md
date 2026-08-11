@@ -68,10 +68,10 @@ only after its CUDA sources or required version change.
 - `Patch Sol Sparse Attention (Experimental)` applies the model-generic,
   loader-independent
   long-sequence sparse backend. It uses an input-adaptive statistical threshold,
-  keeps skipped-block centroid residuals (two 32-token centroids by default),
-  accepts semantic prefix/video topology metadata, and exposes stable route
-  budgets, integer dense-step safeguards, dense first/last-layer protection,
-  and an internal automatic short-sequence crossover.
+  keeps one 64-token skipped-block centroid by default, accepts semantic
+  multimodal layout metadata, and exposes integer dense-step safeguards,
+  dense first/last-layer protection, an optional SM75 W8A8 PV path, and an
+  internal automatic short-sequence crossover.
 - `Patch Sage Frame Sparse Attention (Experimental)` applies a lower-overhead
   structured video path. Non-video queries remain on stable Sage; video queries
   attend the exact semantic prefix, complete local latent frames, fixed sink
@@ -126,20 +126,37 @@ callers use BF16 boundary storage and receive FP32 output. On non-Turing GPUs,
 the plugin prefers an installed SageAttention backend and then follows ComfyUI's
 normal fallback order.
 
+The explicit experimental `w8a8` attention backend is exact-sm75-only and is
+never selected by `auto`. It retains stable Sage's INT8 Q/K score domain,
+quantizes V channel-wise to signed INT8, packs online-softmax probabilities to
+unsigned INT8, and evaluates both QK and PV with Turing Tensor Cores. It is
+currently specialized for unmasked, non-causal, 128-dimensional heads with
+FP16/BF16 storage, GQA, unequal sequence lengths, and HND/NHD layouts. The
+dense kernel uses a route-free specialization of the Sol exact-token core;
+unsupported calls fall back through the pre-existing attention override.
+
 Sparse attention is not a loader option and `auto` never selects it. Connect
 the model through the experimental Sol patch node to enable it explicitly. The
 kernel accepts FP16/BF16/FP32 Q/K/V, GQA, 128-dimensional heads, and unmasked
 non-causal sequences; incompatible or short calls use bundled stable Sage.
 
-Online Sol routing requires kernel package 0.17.0. Adapter-protected Query
-blocks run through exact stable Sage, while every sparse Query keeps protected
-modality blocks as exact K/V sinks. Selected blocks reuse stable Sage's INT8
+Online Sol routing requires kernel package 0.17.0; its optional W8A8 mode and
+the explicit dense W8A8 backend require 0.18.0. Adapter-protected Query
+blocks run through the selected exact dense backend, while every sparse Query
+keeps protected modality blocks as exact K/V sinks. Selected blocks reuse stable Sage's INT8
 Tensor Core QK path. Routing and exact selected-block QK both derive from the
 same prequantized INT8 Q/K tensors and scales. Each Q-to-K-centroid Tensor Core
 score is reused for route selection and skipped-block online-softmax
 correction, while original V means remain in the value approximation.
 Official-style `1x64` is the default; optional `2x32` improves bimodal
 skipped-block fidelity without changing routing.
+
+Sol's `use_w8a8` switch is disabled by default for backward-compatible quality.
+When enabled, selected exact blocks and protected dense steps/layers use the
+same signed-V/unsigned-probability Tensor Core path. Skipped-block correction
+keeps original V centroids and FP32 online state, so the switch changes exact
+PV throughput rather than the routing policy. Both variants keep the same
+64-query/64-key tile and 32 KiB dynamic shared-memory budget.
 
 The threshold and fixed +/- one-block local neighborhood execute inside each
 attention CTA. Only compact, head-independent dense-Query and exact-KV policy

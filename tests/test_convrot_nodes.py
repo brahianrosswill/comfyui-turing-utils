@@ -791,7 +791,7 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
         self.assertNotIn("activation_dtype", inputs["required"])
         self.assertEqual(
             inputs["optional"]["patch_attention"][0],
-            ("auto", "sage_attn", "flash_attn", "sdpa"),
+            ("auto", "sage_attn", "w8a8", "flash_attn", "sdpa"),
         )
         self.assertEqual(inputs["optional"]["patch_attention"][1]["default"], "auto")
         self.assertNotIn("turing_bf16_mode", inputs["optional"])

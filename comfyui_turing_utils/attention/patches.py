@@ -35,18 +35,22 @@ from .stable import (
     SPARSE_REFERENCE_VIDEO,
     SPARSE_ROUTING_THRESHOLD,
     SPARSE_SKIPPED_RESIDUAL,
+    SPARSE_USE_W8A8,
     _BACKENDS,
     _comfy_attention_function,
     _select_attention_backend,
     bundled_available,
     bundled_frame_sparse_available,
     bundled_sparse_available,
+    bundled_w8a8_available,
     is_supported_turing_device,
     normalize_attention_backend,
     preflight_bundled,
     preflight_bundled_frame_sparse,
     preflight_bundled_sparse,
+    preflight_bundled_w8a8,
     turing_sage_attention,
+    turing_w8a8_attention,
 )
 
 
@@ -55,7 +59,7 @@ def _uses_bundled_turing_sage(option: str, device: torch.device | None) -> bool:
     return bool(
         device is not None
         and is_supported_turing_device(device)
-        and option in {"auto", "sage_attn"}
+        and option in {"auto", "sage_attn", "w8a8"}
     )
 
 
@@ -76,16 +80,33 @@ def _dtype_compatible_fallback(original: Callable, *args, **kwargs):
 def make_attention_override(option: str, device: torch.device | None = None) -> Callable:
     option = normalize_attention_backend(option)
     bundled_turing = _uses_bundled_turing_sage(option, device)
+    if option == "w8a8" and not bundled_turing:
+        raise RuntimeError(
+            "The W8A8 attention backend is an experimental exact-sm75 kernel; "
+            "select sage_attn, flash_attn, or sdpa on other GPUs."
+        )
     if bundled_turing:
+        if option == "w8a8" and not bundled_w8a8_available():
+            raise RuntimeError(
+                "The bundled Turing W8A8 extension is unavailable. "
+                "Rebuild comfyui-turing-utils-kernel 0.18.0 or newer with sm75 enabled."
+            )
         if not bundled_available():
             raise RuntimeError(
                 "The bundled Turing Sage extensions are unavailable. "
                 "Rebuild comfyui-turing-utils-kernel with COMFYUI_TURING_UTILS_ARCH_LIST including 7.5."
             )
-        preflight_bundled(device)
-        backend = _BACKENDS["sage_attn"]
-        target = turing_sage_attention
-        implementation = "bundled_turing_sage"
+        if option == "w8a8":
+            preflight_bundled_w8a8(device)
+        else:
+            preflight_bundled(device)
+        backend = _BACKENDS[option if option == "w8a8" else "sage_attn"]
+        target = turing_w8a8_attention if option == "w8a8" else turing_sage_attention
+        implementation = (
+            "bundled_turing_w8a8_experimental"
+            if option == "w8a8"
+            else "bundled_turing_sage"
+        )
     else:
         backend, target = _select_attention_backend(option)
         implementation = f"comfy:{backend.attention_function}"
@@ -125,6 +146,7 @@ def make_sparse_attention_override(
     dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
     dense_suffix_layers: int = SPARSE_DENSE_SUFFIX_LAYERS,
     debug_route_density: bool = False,
+    use_w8a8: bool = SPARSE_USE_W8A8,
 ) -> Callable:
     min_sequence_tokens = int(min_sequence_tokens)
     routing_threshold = float(routing_threshold)
@@ -139,6 +161,7 @@ def make_sparse_attention_override(
     dense_prefix_layers = int(dense_prefix_layers)
     dense_suffix_layers = int(dense_suffix_layers)
     debug_route_density = bool(debug_route_density)
+    use_w8a8 = bool(use_w8a8)
     if min_sequence_tokens < 0:
         raise ValueError("min_sequence_tokens must be non-negative")
     if not math.isfinite(routing_threshold):
@@ -166,6 +189,12 @@ def make_sparse_attention_override(
         )
     preflight_bundled(device)
     preflight_bundled_sparse(device)
+    if use_w8a8:
+        if not bundled_w8a8_available():
+            raise RuntimeError(
+                "Sol W8A8 requires comfyui-turing-utils-kernel 0.18.0 or newer"
+            )
+        preflight_bundled_w8a8(device)
     schedule_state: dict[str, object] = {}
     debug_route_keys: set[tuple] = set()
     debug_route_state: dict[tuple, list[tuple[torch.Tensor, int, int]]] = {}
@@ -210,7 +239,8 @@ def make_sparse_attention_override(
                 )
                 debug_dense_reasons.add(debug_key)
         if dense_schedule or dense_layer:
-            return turing_sage_attention(fallback, *args, **kwargs)
+            dense_attention = turing_w8a8_attention if use_w8a8 else turing_sage_attention
+            return dense_attention(fallback, *args, **kwargs)
         debug_context = None
         if debug_route_density:
             layout = (
@@ -245,6 +275,7 @@ def make_sparse_attention_override(
             debug_route_keys=debug_route_keys if debug_route_density else None,
             debug_route_state=debug_route_state if debug_route_density else None,
             debug_context=debug_context,
+            use_w8a8=use_w8a8,
             **kwargs,
         )
 
@@ -268,6 +299,7 @@ def apply_sparse_attention_patch(
     dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
     dense_suffix_layers: int = SPARSE_DENSE_SUFFIX_LAYERS,
     debug_route_density: bool = False,
+    use_w8a8: bool = SPARSE_USE_W8A8,
 ):
     patched = model.clone()
     layout_status = ensure_attention_layout_provider(patched)
@@ -286,6 +318,7 @@ def apply_sparse_attention_patch(
         dense_prefix_layers=dense_prefix_layers,
         dense_suffix_layers=dense_suffix_layers,
         debug_route_density=debug_route_density,
+        use_w8a8=use_w8a8,
     )
     transformer_options = patched.model_options.setdefault("transformer_options", {})
     if layout_status.required:
@@ -308,7 +341,7 @@ def apply_sparse_attention_patch(
         "skipped_residual=%s sparse_reference=(image=%s,video=%s,audio=%s) "
         "dense_prefix_steps=%d dense_suffix_steps=%d "
         "dense_prefix_layers=%d dense_suffix_layers=%d "
-        "dense_backend=bundled_turing_sage debug_route_density=%s",
+        "dense_backend=%s pv_backend=%s debug_route_density=%s",
         routing_threshold,
         prefix_policy,
         manual_prefix_tokens,
@@ -320,6 +353,8 @@ def apply_sparse_attention_patch(
         dense_suffix_steps,
         dense_prefix_layers,
         dense_suffix_layers,
+        "bundled_turing_w8a8" if use_w8a8 else "bundled_turing_sage",
+        "u8xs8_tensorcore" if use_w8a8 else "fp16_tensorcore",
         debug_route_density,
     )
     return patched

@@ -62,7 +62,8 @@ class SparseAttentionNodeTest(unittest.TestCase):
         self.assertEqual(inputs["dense_prefix_layers"][1]["default"], 2)
         self.assertEqual(inputs["dense_suffix_layers"][1]["default"], 0)
         optional = attention_nodes.SolSparseAttentionPatch.INPUT_TYPES()["optional"]
-        self.assertEqual(tuple(optional), ("debug_route_density",))
+        self.assertEqual(tuple(optional), ("use_w8a8", "debug_route_density"))
+        self.assertFalse(optional["use_w8a8"][1]["default"])
         self.assertFalse(optional["debug_route_density"][1]["default"])
 
     def test_patch_clones_model_and_installs_generic_override(self):
@@ -109,6 +110,7 @@ class SparseAttentionNodeTest(unittest.TestCase):
             dense_prefix_layers=3,
             dense_suffix_layers=4,
             debug_route_density=False,
+            use_w8a8=False,
         )
 
     def test_node_returns_the_patched_model(self):
@@ -145,6 +147,7 @@ class SparseAttentionNodeTest(unittest.TestCase):
             dense_suffix_steps=1,
             dense_prefix_layers=3,
             dense_suffix_layers=4,
+            use_w8a8=False,
             debug_route_density=False,
         )
 

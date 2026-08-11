@@ -29,6 +29,7 @@ SPARSE_SKIPPED_RESIDUAL = "1x64"
 SPARSE_REFERENCE_IMAGE = False
 SPARSE_REFERENCE_VIDEO = True
 SPARSE_REFERENCE_AUDIO = False
+SPARSE_USE_W8A8 = False
 SPARSE_DENSE_PREFIX_STEPS = 0
 SPARSE_DENSE_SUFFIX_STEPS = 0
 SPARSE_DENSE_PREFIX_LAYERS = 2
@@ -44,6 +45,7 @@ SPARSE_LAYOUT_KEY = ATTENTION_LAYOUT_KEY
 _PREFLIGHTED_DEVICES: set[int] = set()
 _PREFLIGHTED_SPARSE_DEVICES: set[int] = set()
 _PREFLIGHTED_FRAME_SPARSE_DEVICES: set[int] = set()
+_PREFLIGHTED_W8A8_DEVICES: set[int] = set()
 _LOGGED_FP32_COMPAT = False
 _LOGGED_TURING_KERNELS: set[tuple] = set()
 _LOGGED_TURING_FALLBACKS: set[str] = set()
@@ -112,6 +114,14 @@ register_attention_backend(
             "turing_sage",
             "turing_sage_hybrid",
         ),
+    )
+)
+register_attention_backend(
+    AttentionBackend(
+        option="w8a8",
+        attention_function=None,
+        label="w8a8",
+        aliases=("int8_attention", "turing_w8a8"),
     )
 )
 register_attention_backend(
@@ -220,8 +230,24 @@ def bundled_frame_sparse_available() -> bool:
     return version_tuple >= (0, 15, 0) and turing_sage.frame_sparse_available()
 
 
+def bundled_w8a8_available() -> bool:
+    try:
+        turing_sage = load_turing_sage()
+    except (ImportError, OSError):
+        return False
+    try:
+        version_tuple = tuple(int(part) for part in kernel_version().split(".")[:3])
+    except ValueError:
+        return False
+    return version_tuple >= (0, 18, 0) and turing_sage.w8a8_available()
+
+
 def _sageattn(*args, **kwargs):
     return load_turing_sage().sageattn(*args, **kwargs)
+
+
+def _w8a8attn(*args, **kwargs):
+    return load_turing_sage().w8a8attn(*args, **kwargs)
 
 
 def _sol_sparse_sageattn(*args, **kwargs):
@@ -260,6 +286,16 @@ def preflight_bundled_frame_sparse(device: torch.device) -> None:
         return
     load_turing_sage().preflight_frame_sparse(device)
     _PREFLIGHTED_FRAME_SPARSE_DEVICES.add(index)
+
+
+def preflight_bundled_w8a8(device: torch.device) -> None:
+    if not is_supported_turing_device(device):
+        raise RuntimeError(f"unsupported Turing device {device}")
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index in _PREFLIGHTED_W8A8_DEVICES:
+        return
+    load_turing_sage().preflight_w8a8(device)
+    _PREFLIGHTED_W8A8_DEVICES.add(index)
 
 
 def _reshape_qkv(q, k, v, heads: int, enable_gqa: bool):
@@ -308,6 +344,10 @@ def turing_sage_attention(
 ) -> torch.Tensor:
     global _LOGGED_FP32_COMPAT
 
+    turing_kernel = kwargs.pop("_turing_kernel", "sage")
+    if turing_kernel not in {"sage", "w8a8"}:
+        raise ValueError(f"unsupported bundled Turing attention kernel: {turing_kernel}")
+
     fallback_args = (q, k, v, heads)
     fallback_kwargs = {
         "mask": mask,
@@ -334,6 +374,13 @@ def turing_sage_attention(
         return _bundled_fallback(
             fallback,
             "low_precision_attention=False",
+            fallback_args,
+            fallback_kwargs,
+        )
+    if turing_kernel == "w8a8" and bool(kwargs.get("is_causal", False)):
+        return _bundled_fallback(
+            fallback,
+            "causal attention is not supported by Turing W8A8",
             fallback_args,
             fallback_kwargs,
         )
@@ -370,10 +417,10 @@ def turing_sage_attention(
             )
         tensor_layout = "NHD"
 
-    if head_dim <= 0 or head_dim > 128:
+    if head_dim <= 0 or head_dim > 128 or (turing_kernel == "w8a8" and head_dim != 128):
         return _bundled_fallback(
             fallback,
-            f"head_dim={head_dim} is outside the supported range",
+            f"head_dim={head_dim} is unsupported by Turing {turing_kernel}",
             fallback_args,
             fallback_kwargs,
         )
@@ -382,6 +429,7 @@ def turing_sage_attention(
     sequence_axis = 2 if tensor_layout == "HND" else 1
     head_axis = 1 if tensor_layout == "HND" else 2
     kernel_key = (
+        turing_kernel,
         index,
         input_dtype,
         tensor_layout,
@@ -392,9 +440,15 @@ def turing_sage_attention(
         k.shape[head_axis],
     )
     if kernel_key not in _LOGGED_TURING_KERNELS:
+        message = (
+            "Bundled Turing W8A8 active: device=%s dtype=%s layout=%s "
+            "Q=%s K=%s V=%s heads=%d"
+            if turing_kernel == "w8a8"
+            else "Bundled Turing Sage active: device=%s dtype=%s layout=%s "
+            "Q=%s K=%s V=%s heads=%d"
+        )
         LOG.info(
-            "Bundled Turing Sage active: device=%s dtype=%s layout=%s "
-            "Q=%s K=%s V=%s heads=%d",
+            message,
             q.device,
             input_dtype,
             tensor_layout,
@@ -408,21 +462,28 @@ def turing_sage_attention(
     if input_dtype == torch.float32:
         if not _LOGGED_FP32_COMPAT:
             LOG.info(
-                "Turing Sage FP32 compatibility uses BF16 Q/K/V storage and restores FP32 output"
+                "Turing attention FP32 compatibility uses BF16 Q/K/V storage and restores FP32 output"
             )
             _LOGGED_FP32_COMPAT = True
         q = q.to(torch.bfloat16)
         k = k.to(torch.bfloat16)
         v = v.to(torch.bfloat16)
 
-    output = _sageattn(
+    attention_kernel = _w8a8attn if turing_kernel == "w8a8" else _sageattn
+    output = attention_kernel(
         q,
         k,
         v,
         tensor_layout=tensor_layout,
-        is_causal=bool(kwargs.get("is_causal", False)),
         sm_scale=kwargs.get("scale"),
-        smooth_k=False,
+        **(
+            {}
+            if turing_kernel == "w8a8"
+            else {
+                "is_causal": bool(kwargs.get("is_causal", False)),
+                "smooth_k": False,
+            }
+        ),
     )
     if tensor_layout == "HND":
         result = output if skip_output_reshape else output.transpose(1, 2).reshape(batch, -1, heads * head_dim)
@@ -431,3 +492,8 @@ def turing_sage_attention(
     else:
         result = output.reshape(batch, -1, heads * head_dim)
     return result.to(input_dtype) if input_dtype == torch.float32 else result
+
+
+def turing_w8a8_attention(*args, **kwargs) -> torch.Tensor:
+    kwargs["_turing_kernel"] = "w8a8"
+    return turing_sage_attention(*args, **kwargs)

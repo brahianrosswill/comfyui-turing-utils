@@ -100,6 +100,7 @@ normalize invisibly to `sage_attn` and are not displayed by either loader.
 | Option | Q/K path | Smoothing | PV path |
 |---|---|---|---|
 | `sage_attn` on Turing | INT8, per-16-token Q-warp scales | disabled | FP16 V tiles with direct FP32 accumulation |
+| explicit `w8a8` on Turing | stable-Sage INT8 score domain | disabled | channel-wise signed INT8 V and unsigned INT8 probabilities, INT32 Tensor Core PV, FP32 online state |
 | `Patch Sol Sparse Attention` | fused 64-token centroid routing; selected tiles reuse stable Sage INT8 QK | input-adaptive `mean + tau * std` threshold | exact FP16 V tiles plus skipped-block V centroids, FP32 online accumulation |
 | `Patch Sage Frame Sparse Attention` | cached head-independent frame schedule; selected tiles reuse stable Sage INT8 QK | fixed local/sink/rotating-anchor structure | exact selected FP16 V tiles, FP32 online accumulation |
 
@@ -123,6 +124,17 @@ blocks are supported. Other calls use bundled stable Sage without model-family,
 sampling-step checks. A model adapter may publish semantic layer and topology
 metadata; unknown models remain fully generic.
 
+The explicit `w8a8` backend and Sol's `use_w8a8` option require kernel 0.18.0.
+They are specialized for exact sm75, head dimension 128, and unmasked
+non-causal attention. `auto` continues to select stable Sage. The W8A8 path
+keeps the same Q64/K64 and 32 KiB shared-memory shape as Sol: V is quantized
+once per call into a channel-major, 16-token-permuted signed-INT8 tensor;
+softmax probabilities are packed to unsigned INT8; PV uses SM75 U8xS8 Tensor
+Core MMA and the output remains FP32 until normalization and dtype writeback.
+The route-free dense specialization omits centroid summaries and route state.
+Short calls can lose to stable Sage because the extra V scan is not amortized,
+which is why W8A8 remains explicit.
+
 The node keeps the measured 4096-token crossover internally; shorter calls use
 stable Sage. `routing_threshold=1.0` matches the official mean-plus-one-standard-
 deviation policy. Lower values preserve more exact blocks. The local safeguard
@@ -134,8 +146,8 @@ path.
 the skipped-block reconstruction; it deliberately shares the identical route.
 `dense_prefix_steps=0`, `dense_suffix_steps=0`, `dense_prefix_layers=2`, and
 `dense_suffix_layers=0` match the default protection policy. Every dense step or
-layer calls stable bundled Sage directly rather than executing Sol with a full
-route.
+layer calls the selected protected backend directly: stable bundled Sage by
+default, or the route-free bundled W8A8 kernel when `use_w8a8` is enabled.
 
 The common layout contract contains contiguous semantic segments. MiniMax H3's
 adapter publishes text, keyframe/reference image, reference video, reference
@@ -192,9 +204,11 @@ Sol derives Q/K centroids from the same prequantized INT8 tensors and scales as
 selected-block Sage. The K/V preprocessing scan produces one or two such K
 centroids and matching original V means for skipped-block reconstruction.
 Selected blocks use stable Sage's per-16-row Q and per-64-row K INT8 scales and
-SM75 integer Tensor Core QK. PV, softmax, and output accumulation retain the
-established FP16/FP32 behavior. K is quantized once and shared by sparse and
-dense-Query calls.
+SM75 integer Tensor Core QK. By default PV retains the established FP16/FP32
+behavior. Optional W8A8 uses signed INT8 V, unsigned INT8 probabilities, INT32
+Tensor Core PV, and FP32 online state; skipped residual V centroids remain
+original-value FP16. K and, when enabled, V are quantized once per call and
+shared by sparse and dense Query blocks.
 
 The Query CTA loads its INT8 Q tile once, derives the route threshold directly
 from it, and expands it into resident FP16 shared storage for skipped-block
@@ -202,10 +216,18 @@ correction. One Q-to-K-centroid Tensor Core traversal supplies both the routing
 score and the online-softmax correction, with conflict-free per-warp shared
 partials instead of shared atomics. The compact route is then copied into four
 32-bit registers per lane before the arena is reused for exact K/V tiles. The
-compute_75 cubin reports 226 BF16 / 233 FP16 registers per main thread, a
+FP16-PV compute_75 cubin reports 221 BF16 / 233 FP16 registers per main thread, a
 16-byte stack frame, zero local-memory spill, and 32 KiB dynamic shared memory.
 Register and shared-memory limits permit two 128-thread CTAs per SM75; actual
 occupancy and bank behavior still need Nsight confirmation on Turing.
+
+The W8A8 sparse specialization reaches the SM75 compiler's 255-register limit
+with a 16-byte stack frame but reports zero local-memory spill; 128 threads use
+32768 registers per CTA, so the 32 KiB shared-memory and register budgets still
+permit two CTAs on a 64 KiB/65536-register Turing SM. The route-free dense W8A8
+specialization uses about 180 registers and no stack/local spill. These resource
+figures are static compute_75 reports; resident-CTA throughput still requires a
+real Turing profile.
 
 On an A40 JITing compute_75 PTX, four-head FP16 synthetic tests at threshold 1.0
 selected 20.0%, 17.6%, and 16.7% of blocks at 4096, 8192, and 16384 tokens.
@@ -215,6 +237,14 @@ Official-style `1x64` measured 0.186, 0.483, and 1.553 ms versus dense Sage at
 measured 279.8 ms at 15.9% route density versus 769.3 ms for dense Sage (2.75x
 attention speedup). These are directional A40 compute_75/PTX compatibility
 results, not Turing end-to-end or visual-quality measurements.
+
+For the new W8A8 path, an H3-like BF16 shape (`N=52,842`, 56 heads,
+`threshold=1.0`, 15.9% route density) measured 715.5 ms for route-free dense
+W8A8 versus 765.2 ms for stable Sage, and 220.9 ms for Sol-W8A8 versus 282.8 ms
+for Sol with FP16 PV. Thus V quantization is amortized at the intended long
+sequence: dense W8A8 was 1.07x faster and Sol-W8A8 was 1.28x faster than its
+FP16-PV counterpart. At 4k--16k tokens the extra V scan can instead make W8A8
+slower; this reinforces explicit opt-in and does not justify changing `auto`.
 
 The Sage1 and Sage2 adaptations produced severe block artefacts and black
 flicker in local Turing tests. They are unstable experiments, not production

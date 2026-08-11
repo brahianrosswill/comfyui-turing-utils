@@ -31,6 +31,8 @@ at::Tensor qk_int8_sv_f16_accum_f32_attn(at::Tensor query,
 at::Tensor sol_sparse_online_int8_f16_attn(at::Tensor query_int8,
                     at::Tensor key_int8,
                     at::Tensor value,
+                    at::Tensor value_int8,
+                    at::Tensor value_scale,
                     at::Tensor output,
                     at::Tensor query_scale,
                     at::Tensor key_scale,
@@ -39,7 +41,9 @@ at::Tensor sol_sparse_online_int8_f16_attn(at::Tensor query_int8,
                     float threshold_sigma,
                     int residual_subblocks,
                     float softmax_scale,
-                    int return_stats);
+                    int return_stats,
+                    int use_w8a8,
+                    int force_dense);
 
 at::Tensor frame_sparse_int8_f16_attn(at::Tensor query_int8,
                     at::Tensor key_int8,
@@ -50,6 +54,10 @@ at::Tensor frame_sparse_int8_f16_attn(at::Tensor query_int8,
                     at::Tensor row_offsets,
                     at::Tensor key_blocks,
                     float softmax_scale);
+
+void quantize_v_int8_sm75(at::Tensor value,
+                    at::Tensor quantized,
+                    at::Tensor scale);
 
 #ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
 at::Tensor qk_int8_sv_f16_accum_f16_attn(at::Tensor query,

@@ -102,10 +102,29 @@ class AttentionBackendsTest(unittest.TestCase):
         ):
             self.assertTrue(attention_backends.bundled_frame_sparse_available())
 
+    def test_w8a8_backend_requires_018_kernel_abi(self):
+        sage_module = SimpleNamespace(w8a8_available=lambda: True)
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.17.0"),
+                "comfyui_turing_utils_kernel.turing_sage": sage_module,
+            },
+        ):
+            self.assertFalse(attention_backends.bundled_w8a8_available())
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.18.0"),
+                "comfyui_turing_utils_kernel.turing_sage": sage_module,
+            },
+        ):
+            self.assertTrue(attention_backends.bundled_w8a8_available())
+
     def test_backend_choices_are_stable(self):
         self.assertEqual(
             attention_backends.attention_backend_choices(),
-            ("auto", "sage_attn", "flash_attn", "sdpa"),
+            ("auto", "sage_attn", "w8a8", "flash_attn", "sdpa"),
         )
 
     def test_aliases_normalize_to_node_options(self):
@@ -340,6 +359,48 @@ class AttentionBackendsTest(unittest.TestCase):
         preflight.assert_called_once_with(torch.device("cuda", 0))
         self.assertNotIn("variant", kernel.call_args.kwargs)
 
+    def test_turing_explicit_w8a8_selects_experimental_bundled_backend(self):
+        model = FakeModel()
+        q = torch.randn(1, 2, 4, 128, dtype=torch.bfloat16)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention.bundled_available", return_value=True),
+            mock.patch("attention.bundled_w8a8_available", return_value=True),
+            mock.patch("attention.preflight_bundled_w8a8") as preflight,
+            mock.patch("attention.turing_w8a8_attention", return_value=q) as kernel,
+        ):
+            attention_backends.apply_attention_backend(
+                model, "w8a8", device=torch.device("cuda", 0)
+            )
+            transformer_options = model.model_options["transformer_options"]
+            override = transformer_options["optimized_attention_override"]
+            output = override(
+                lambda *args, **kwargs: None,
+                q,
+                q,
+                q,
+                2,
+                skip_reshape=True,
+            )
+
+        self.assertIs(output, q)
+        kernel.assert_called_once()
+        preflight.assert_called_once_with(torch.device("cuda", 0))
+        self.assertEqual(transformer_options["turing_utils_attention_backend"], "w8a8")
+        self.assertEqual(
+            transformer_options["turing_utils_attention_implementation"],
+            "bundled_turing_w8a8_experimental",
+        )
+
+    def test_explicit_w8a8_rejects_non_turing_device(self):
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=False),
+            self.assertRaisesRegex(RuntimeError, "exact-sm75"),
+        ):
+            attention_backends.make_attention_override(
+                "w8a8", device=torch.device("cuda", 0)
+            )
+
     def test_legacy_sage_alias_uses_external_sage_on_non_turing_device(self):
         sage = mock.Mock(return_value="sage")
         with (
@@ -414,6 +475,7 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertFalse(sparse.call_args.kwargs["sparse_reference_video"])
         self.assertTrue(sparse.call_args.kwargs["sparse_reference_audio"])
         self.assertTrue(sparse.call_args.kwargs["debug_route_density"])
+        self.assertFalse(sparse.call_args.kwargs["use_w8a8"])
         self.assertIsInstance(sparse.call_args.kwargs["debug_route_keys"], set)
         self.assertIsInstance(sparse.call_args.kwargs["debug_route_state"], dict)
         self.assertEqual(
@@ -455,6 +517,55 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertEqual(
             sparse.call_args.kwargs["debug_context"]["last_sparse_layer"], 49
         )
+
+    def test_sparse_w8a8_preflights_and_uses_w8a8_for_protected_layers(self):
+        q = torch.zeros((1, 2, 4096, 128), dtype=torch.bfloat16)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention.bundled_sparse_available", return_value=True),
+            mock.patch("attention.bundled_w8a8_available", return_value=True),
+            mock.patch("attention.preflight_bundled"),
+            mock.patch("attention.preflight_bundled_sparse"),
+            mock.patch("attention.preflight_bundled_w8a8") as w8a8_preflight,
+            mock.patch("attention.turing_w8a8_attention", return_value=q) as dense,
+            mock.patch("attention.turing_sol_sparse_attention", return_value=q) as sparse,
+        ):
+            override = attention_backends.make_sparse_attention_override(
+                torch.device("cuda", 0), use_w8a8=True
+            )
+            override(
+                mock.Mock(),
+                q,
+                q,
+                q,
+                2,
+                skip_reshape=True,
+                transformer_options={
+                    "turing_utils_attention_layout": {
+                        "layer_index": 0,
+                        "layer_count": 50,
+                    }
+                },
+            )
+            override(
+                mock.Mock(),
+                q,
+                q,
+                q,
+                2,
+                skip_reshape=True,
+                transformer_options={
+                    "turing_utils_attention_layout": {
+                        "layer_index": 2,
+                        "layer_count": 50,
+                    }
+                },
+            )
+
+        w8a8_preflight.assert_called_once_with(torch.device("cuda", 0))
+        dense.assert_called_once()
+        sparse.assert_called_once()
+        self.assertTrue(sparse.call_args.kwargs["use_w8a8"])
 
     def test_experimental_sparse_rejects_non_turing_device(self):
         with (
