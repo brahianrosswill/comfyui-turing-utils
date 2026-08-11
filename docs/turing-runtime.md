@@ -188,29 +188,33 @@ the 480p-like dense component. This does not make the complete 720p transformer
 step equal to 480p: projections and MLPs still process roughly the full token
 ratio. Exact-sm75 end-to-end quality and occupancy testing remains required.
 
-Sol uses one original-domain Q/K centroid per 64-token block for routing. The
-K/V preprocessing scan also produces one or two INT8-domain-consistent K
+Sol derives Q/K centroids from the same prequantized INT8 tensors and scales as
+selected-block Sage. The K/V preprocessing scan produces one or two such K
 centroids and matching original V means for skipped-block reconstruction.
 Selected blocks use stable Sage's per-16-row Q and per-64-row K INT8 scales and
 SM75 integer Tensor Core QK. PV, softmax, and output accumulation retain the
 established FP16/FP32 behavior. K is quantized once and shared by sparse and
 dense-Query calls.
 
-The route is computed inside the Query CTA, stored briefly in the unused half
-of its 32 KiB arena, then duplicated into four 32-bit registers per lane before
-that shared memory is reused for summary and exact K/V tiles. `1x64` and `2x32`
-therefore cannot diverge in selected blocks. The compute_75 cubin reports 212
-BF16 / 222 FP16 registers per main thread, a 16-byte stack frame, zero local
-memory, and 32 KiB dynamic shared memory. Register and shared-memory limits
-permit two 128-thread CTAs per SM75; actual occupancy and bank behavior still
-need Nsight confirmation on Turing.
+The Query CTA loads its INT8 Q tile once, derives the route threshold directly
+from it, and expands it into resident FP16 shared storage for skipped-block
+correction. One Q-to-K-centroid Tensor Core traversal supplies both the routing
+score and the online-softmax correction, with conflict-free per-warp shared
+partials instead of shared atomics. The compact route is then copied into four
+32-bit registers per lane before the arena is reused for exact K/V tiles. The
+compute_75 cubin reports 226 BF16 / 233 FP16 registers per main thread, a
+16-byte stack frame, zero local-memory spill, and 32 KiB dynamic shared memory.
+Register and shared-memory limits permit two 128-thread CTAs per SM75; actual
+occupancy and bank behavior still need Nsight confirmation on Turing.
 
 On an A40 JITing compute_75 PTX, four-head FP16 synthetic tests at threshold 1.0
 selected 20.0%, 17.6%, and 16.7% of blocks at 4096, 8192, and 16384 tokens.
-Official-style `1x64` measured 0.239, 0.572, and 1.744 ms versus dense Sage at
-0.400, 1.371, and 5.012 ms (1.67x, 2.40x, and 2.87x). `2x32` measured 0.260,
-0.652, and 2.010 ms. These are directional compatibility results, not Turing
-end-to-end or visual-quality measurements.
+Official-style `1x64` measured 0.186, 0.483, and 1.553 ms versus dense Sage at
+0.388, 1.385, and 5.138 ms (2.09x, 2.87x, and 3.31x). `2x32` measured 0.209,
+0.566, and 1.888 ms. An H3-like BF16 shape with 56 heads and 52,860 tokens
+measured 279.8 ms at 15.9% route density versus 769.3 ms for dense Sage (2.75x
+attention speedup). These are directional A40 compute_75/PTX compatibility
+results, not Turing end-to-end or visual-quality measurements.
 
 The Sage1 and Sage2 adaptations produced severe block artefacts and black
 flicker in local Turing tests. They are unstable experiments, not production
@@ -228,7 +232,7 @@ The loader log reports `sage_attn via bundled_turing_sage` when `auto` or
 ranges, three reference switches, threshold, residual profile, and fixed local
 radius. MiniMax additionally emits its fused block/MLP dispatch counters.
 
-`debug_route_density` is disabled by default. With kernel package 0.16.0 or
+`debug_route_density` is disabled by default. With kernel package 0.17.0 or
 newer, the already-running sparse CTA accumulates one selected-block counter;
 there is no route allocation or popcount kernel. Counts remain on-device across
 layers and synchronize once for the end-of-step log. The log reports selected

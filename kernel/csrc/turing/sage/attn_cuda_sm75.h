@@ -28,9 +28,7 @@ at::Tensor qk_int8_sv_f16_accum_f32_attn(at::Tensor query,
                     float sm_scale,
                     int return_lse);
 
-at::Tensor sol_sparse_online_int8_f16_attn(at::Tensor query,
-                    at::Tensor key,
-                    at::Tensor query_int8,
+at::Tensor sol_sparse_online_int8_f16_attn(at::Tensor query_int8,
                     at::Tensor key_int8,
                     at::Tensor value,
                     at::Tensor output,

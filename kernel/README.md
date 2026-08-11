@@ -1,17 +1,17 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's exact-sm75
-runtime. Version 0.16.0 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
+runtime. Version 0.17.0 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, bundled Sage attention, and an explicitly selected
 experimental model-independent sparse attention kernel with input-adaptive
 centroid threshold routing, stable-Sage INT8 QK for selected blocks, compact
-dense-Query/exact-KV modality masks, INT8-domain-consistent skipped-block
-scores, 32 KiB attention CTAs, and one-by-64 or two-by-32 skipped residuals on
-one shared route. Routing is CTA-local and no full global route map is
-materialized. The local neighborhood is fixed to the official +/- one block.
-Original half-precision centroids remain dedicated to routing and original V
-means remain dedicated to value approximation.
+dense-Query/exact-KV modality masks, INT8-consistent routing, 32 KiB attention
+CTAs, and one-by-64 or two-by-32 skipped residuals on one shared route. The
+Q-to-K-centroid Tensor Core pass now drives both routing and skipped-block
+online-softmax correction, so no duplicate Q/K centroid scan or full global
+route map is materialized. The local neighborhood is fixed to the official
++/- one block. Original V means remain dedicated to value approximation.
 It also adds an experimental static frame-sparse Sage path. Cached
 head-independent CSR schedules provide complete-frame windows or a radial
 policy with 8x8 spatial-token locality and logarithmic temporal sampling,

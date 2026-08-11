@@ -5,11 +5,12 @@
  * threshold. Each Query CTA performs routing directly before its FP32 online
  * softmax and keeps the route in CTA-local shared memory/registers, so no full
  * global proxy or route map is materialized. Selected blocks are
- * evaluated with the production per-warp/per-block INT8 Sage QK path. Skipped
- * blocks use one 64-token or two 32-token centroids reconstructed from those
- * same INT8 Q/K tensors, then retain their contributions in the shared FP32
- * online softmax instead of being dropped. Original FP16/BF16 summaries remain
- * isolated to routing and original V means remain isolated to approximation.
+ * evaluated with the production per-warp/per-block INT8 Sage QK path. Routing
+ * and skipped-block correction use centroids reconstructed from those same
+ * INT8 Q/K tensors and scales, so block selection matches the score domain
+ * actually evaluated by Sage. Query summary, thresholding, and routing are
+ * fused into the attention CTA; original V means remain isolated to the
+ * skipped-block approximation.
  * The official local neighborhood is fixed to +/- one 64-token block. Optional
  * exact-KV and dense-Query block masks carry model-independent modality policy.
  */
@@ -39,7 +40,7 @@ constexpr int kRouteWordBits = 32;
 constexpr int kMaxKeyBlocks = 4096;
 constexpr int kMaxRouteWords = kMaxKeyBlocks / kRouteWordBits;
 constexpr int kRouteWordsPerLane = kMaxRouteWords / WARP_SIZE;
-constexpr int kSummaryTileTokens = 32;
+constexpr int kSummaryTileTokens = 16;
 constexpr int kHalfPacks = kHeadDim / 8;
 constexpr int kInt8Packs = kHeadDim / 16;
 constexpr int kTilePacks = kBlockTokens * kHalfPacks;
@@ -48,6 +49,15 @@ constexpr int kTileBytes = kBlockTokens * kHeadDim * sizeof(half);
 constexpr int kInt8TileBytes = kBlockTokens * kHeadDim * sizeof(int8_t);
 constexpr int kSummaryTileBytes = kSummaryTileTokens * kHeadDim * sizeof(half);
 constexpr int kAttentionSharedBytes = 2 * kTileBytes;
+constexpr int kMaxRouteBytes = kMaxRouteWords * sizeof(uint32_t);
+constexpr int kRouteStorageOffset = kTileBytes + 2 * kSummaryTileBytes;
+constexpr int kProxyScratchBytes =
+    kWarps * kSummaryTileTokens * sizeof(float);
+
+static_assert(
+    kRouteStorageOffset + kMaxRouteBytes + kProxyScratchBytes <=
+        kAttentionSharedBytes,
+    "SM75 fused routing metadata must fit beside the 16-block summaries");
 
 template <typename T>
 __device__ __forceinline__ float scalar_to_float(T value);
@@ -80,44 +90,7 @@ __device__ __forceinline__ b128_t pack_to_half<nv_bfloat16>(const nv_bfloat16 *s
 }
 
 template <typename T>
-__global__ void block_summary_kernel(
-    const T *__restrict__ input,
-    half *__restrict__ summary,
-    int batch_size,
-    int num_heads,
-    int sequence_length,
-    int padded_blocks,
-    int64_t stride_batch,
-    int64_t stride_head,
-    int64_t stride_sequence)
-{
-  const int block_index = blockIdx.x;
-  const int head = blockIdx.y;
-  const int batch = blockIdx.z;
-  const int dimension = threadIdx.x;
-  if (dimension >= kHeadDim)
-    return;
-
-  const int token_start = block_index * kBlockTokens;
-  const int token_count = token_start < sequence_length
-      ? min(kBlockTokens, sequence_length - token_start)
-      : 0;
-  float sum = 0.0f;
-  const T *head_input = input + batch * stride_batch + head * stride_head;
-  for (int token = 0; token < token_count; ++token)
-  {
-    sum += scalar_to_float(head_input[(token_start + token) * stride_sequence + dimension]);
-  }
-  const int64_t output_index =
-      ((static_cast<int64_t>(batch) * num_heads + head) * padded_blocks + block_index) *
-          kHeadDim +
-      dimension;
-  summary[output_index] = token_count ? __float2half_rn(sum / token_count) : __float2half_rn(0.0f);
-}
-
-template <typename T>
 __global__ void kv_block_summary_kernel(
-    const T *__restrict__ key,
     const int8_t *__restrict__ key_int8,
     const float *__restrict__ key_scale,
     const T *__restrict__ value,
@@ -130,9 +103,6 @@ __global__ void kv_block_summary_kernel(
     int padded_blocks,
     int residual_subblocks,
     int padded_residual_summaries,
-    int64_t stride_batch_k,
-    int64_t stride_head_k,
-    int64_t stride_sequence_k,
     int64_t stride_batch_k_int8,
     int64_t stride_head_k_int8,
     int64_t stride_sequence_k_int8,
@@ -151,18 +121,13 @@ __global__ void kv_block_summary_kernel(
   const int token_count = token_start < sequence_length
       ? min(kBlockTokens, sequence_length - token_start)
       : 0;
-  float key_sum = 0.0f;
   float value_sum[2] = {0.0f, 0.0f};
   int quantized_key_sum[2] = {0, 0};
-  const T *head_key = key + batch * stride_batch_k + head * stride_head_k;
   const int8_t *head_key_int8 = key_int8 +
       batch * stride_batch_k_int8 + head * stride_head_k_int8;
   const T *head_value = value + batch * stride_batch_v + head * stride_head_v;
   for (int token = 0; token < token_count; ++token)
   {
-    const float key_value = scalar_to_float(
-        head_key[(token_start + token) * stride_sequence_k + dimension]);
-    key_sum += key_value;
     const int residual_index = token / (kBlockTokens / residual_subblocks);
     quantized_key_sum[residual_index] += static_cast<int>(
         head_key_int8[(token_start + token) * stride_sequence_k_int8 + dimension]);
@@ -175,13 +140,15 @@ __global__ void kv_block_summary_kernel(
       dimension;
   if (token_count)
   {
-    const float reciprocal = 1.0f / token_count;
-    const float key_mean = key_sum * reciprocal;
     const int num_key_blocks = (sequence_length + kBlockTokens - 1) / kBlockTokens;
     const float dequant_scale = key_scale[
         (static_cast<int64_t>(batch) * num_heads + head) * num_key_blocks +
         block_index];
-    key_summary[output_index] = __float2half_rn(key_mean);
+    const int total_quantized_key_sum = quantized_key_sum[0] +
+        (residual_subblocks == 2 ? quantized_key_sum[1] : 0);
+    key_summary[output_index] = __float2half_rn(
+        static_cast<float>(total_quantized_key_sum) * dequant_scale /
+        static_cast<float>(token_count));
     const int residual_tokens = kBlockTokens / residual_subblocks;
 #pragma unroll
     for (int residual_index = 0; residual_index < 2; ++residual_index)
@@ -199,15 +166,19 @@ __global__ void kv_block_summary_kernel(
       if (residual_count > 0)
       {
         const float residual_reciprocal = 1.0f / residual_count;
-        key_score_summary[residual_output_index] = __float2half_rn(
-            static_cast<float>(quantized_key_sum[residual_index]) *
-            dequant_scale * residual_reciprocal);
+        if (key_score_summary != key_summary || residual_subblocks != 1)
+        {
+          key_score_summary[residual_output_index] = __float2half_rn(
+              static_cast<float>(quantized_key_sum[residual_index]) *
+              dequant_scale * residual_reciprocal);
+        }
         value_mean[residual_output_index] = __float2half_rn(
             value_sum[residual_index] * residual_reciprocal);
       }
       else
       {
-        key_score_summary[residual_output_index] = __float2half_rn(0.0f);
+        if (key_score_summary != key_summary || residual_subblocks != 1)
+          key_score_summary[residual_output_index] = __float2half_rn(0.0f);
         value_mean[residual_output_index] = __float2half_rn(0.0f);
       }
     }
@@ -228,17 +199,13 @@ __global__ void kv_block_summary_kernel(
              block_index * residual_subblocks + residual_index) *
                 kHeadDim +
             dimension;
-        key_score_summary[residual_output_index] = __float2half_rn(0.0f);
+        if (key_score_summary != key_summary || residual_subblocks != 1)
+          key_score_summary[residual_output_index] = __float2half_rn(0.0f);
         value_mean[residual_output_index] = __float2half_rn(0.0f);
       }
     }
   }
 }
-
-__device__ __forceinline__ float block_reduce(
-    float value,
-    float *__restrict__ scratch,
-    bool maximum);
 
 __global__ void key_summary_stats_kernel(
     const half *__restrict__ key_summary,
@@ -272,79 +239,45 @@ __global__ void key_summary_stats_kernel(
       fmaxf(square_sum * reciprocal - mean * mean, 0.0f);
 }
 
-__global__ void query_threshold_kernel(
-    const half *__restrict__ query_summary,
-    const float *__restrict__ key_summary_mean,
-    const float *__restrict__ key_summary_variance,
-    float *__restrict__ thresholds,
-    int num_query_heads,
-    int num_kv_heads,
-    int num_query_blocks,
-    int padded_query_blocks,
-    float threshold_sigma)
+__device__ __forceinline__ void block_reduce_pair(
+    float &first,
+    float &second,
+    float *__restrict__ scratch)
 {
-  __shared__ float reduction[kHeadDim];
-  const int query_block = blockIdx.x;
-  const int query_head = blockIdx.y;
-  const int batch = blockIdx.z;
-  const int kv_head = query_head / (num_query_heads / num_kv_heads);
-  const int dimension = threadIdx.x;
-
-  const half *query_block_summary = query_summary +
-      ((static_cast<int64_t>(batch) * num_query_heads + query_head) *
-           padded_query_blocks +
-       query_block) *
-          kHeadDim;
-  const float *mean = key_summary_mean +
-      (static_cast<int64_t>(batch) * num_kv_heads + kv_head) * kHeadDim;
-  const float *variance = key_summary_variance +
-      (static_cast<int64_t>(batch) * num_kv_heads + kv_head) * kHeadDim;
-  const float q_value = __half2float(query_block_summary[dimension]);
-  const float projected_mean = block_reduce(q_value * mean[dimension], reduction, false);
-  const float projected_variance = block_reduce(
-      q_value * q_value * variance[dimension], reduction, false);
-  if (dimension == 0)
-  {
-    thresholds[
-        (static_cast<int64_t>(batch) * num_query_heads + query_head) *
-            num_query_blocks +
-        query_block] = projected_mean +
-        threshold_sigma * sqrtf(fmaxf(projected_variance, 0.0f) + 1.0e-6f);
-  }
-}
-
-__device__ __forceinline__ float block_reduce(
-    float value,
-    float *__restrict__ scratch,
-    bool maximum)
-{
-  const int lane = threadIdx.x % WARP_SIZE;
-  const int warp = threadIdx.x / WARP_SIZE;
+  const int linear_thread = threadIdx.y * blockDim.x + threadIdx.x;
+  const int lane = linear_thread % WARP_SIZE;
+  const int warp = linear_thread / WARP_SIZE;
 #pragma unroll
   for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
   {
-    const float other = __shfl_down_sync(0xffffffff, value, offset);
-    value = maximum ? fmaxf(value, other) : value + other;
+    first += __shfl_down_sync(0xffffffff, first, offset);
+    second += __shfl_down_sync(0xffffffff, second, offset);
   }
   if (lane == 0)
-    scratch[warp] = value;
+  {
+    scratch[warp] = first;
+    scratch[kWarps + warp] = second;
+  }
   __syncthreads();
   if (warp == 0)
   {
-    value = lane < kHeadDim / WARP_SIZE
-        ? scratch[lane]
-        : (maximum ? -3.402823466e+38F : 0.0f);
+    first = lane < kWarps ? scratch[lane] : 0.0f;
+    second = lane < kWarps ? scratch[kWarps + lane] : 0.0f;
 #pragma unroll
     for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
     {
-      const float other = __shfl_down_sync(0xffffffff, value, offset);
-      value = maximum ? fmaxf(value, other) : value + other;
+      first += __shfl_down_sync(0xffffffff, first, offset);
+      second += __shfl_down_sync(0xffffffff, second, offset);
     }
     if (lane == 0)
-      scratch[0] = value;
+    {
+      scratch[0] = first;
+      scratch[1] = second;
+    }
   }
   __syncthreads();
-  return scratch[0];
+  first = scratch[0];
+  second = scratch[1];
 }
 
 template <int Rows, typename T>
@@ -402,9 +335,8 @@ __device__ __forceinline__ void load_int8_tile(
   }
 }
 
-__device__ __forceinline__ void load_dequantized_int8_tile(
-    const int8_t *__restrict__ source,
-    int64_t stride_sequence,
+__device__ __forceinline__ void dequantize_int8_tile(
+    const smem_t<SwizzleMode::k128B, kInt8Packs> &source,
     const float *__restrict__ scale,
     int row_start,
     int row_limit,
@@ -428,9 +360,11 @@ __device__ __forceinline__ void load_dequantized_int8_tile(
 #pragma unroll
       for (int element = 0; element < 8; ++element)
       {
-        const int8_t quantized = source[
-            static_cast<int64_t>(global_row) * stride_sequence +
-            column * 8 + element];
+        const int dimension = column * 8 + element;
+        const uint32_t source_offset = source.get_permuted_offset(
+            row, dimension / 16);
+        const int8_t quantized = reinterpret_cast<const int8_t *>(
+            source.base + source_offset)[dimension % 16];
         packed_half[element] = __float2half_rn(
             static_cast<float>(quantized) * dequant_scale);
       }
@@ -445,7 +379,7 @@ __device__ __forceinline__ void compute_fp16_qk(
     const smem_t<SwizzleMode::k128B, kHalfPacks> &key,
     float score[1][KeyTiles][8])
 {
-  static_assert(KeyTiles == 2 || KeyTiles == 4);
+  static_assert(KeyTiles == 1 || KeyTiles == 2 || KeyTiles == 4);
   uint32_t query_offset = query.get_permuted_offset(
       threadIdx.y * 16 + threadIdx.x % 16, threadIdx.x / 16);
   uint32_t key_offset = key.get_permuted_offset(
@@ -518,11 +452,10 @@ __global__ void sparse_attention_kernel(
     T *__restrict__ output,
     const float *__restrict__ query_scale,
     const float *__restrict__ key_scale,
-    const half *__restrict__ query_summary,
-    const half *__restrict__ key_summary,
     const half *__restrict__ key_score_summary,
     const half *__restrict__ value_mean,
-    const float *__restrict__ thresholds,
+    const float *__restrict__ key_summary_mean,
+    const float *__restrict__ key_summary_variance,
     const uint8_t *__restrict__ sparse_query_blocks,
     const uint8_t *__restrict__ exact_kv_blocks,
     unsigned long long *__restrict__ selected_count,
@@ -533,8 +466,6 @@ __global__ void sparse_attention_kernel(
     int num_query_blocks,
     int num_key_blocks,
     int residual_subblocks,
-    int padded_query_blocks,
-    int padded_key_blocks,
     int padded_residual_summaries,
     int64_t stride_batch_q_int8,
     int64_t stride_head_q_int8,
@@ -548,19 +479,22 @@ __global__ void sparse_attention_kernel(
     int64_t stride_batch_o,
     int64_t stride_head_o,
     int64_t stride_sequence_o,
+    float threshold_sigma,
     float softmax_scale)
 {
   static_assert(
       kAttentionSharedBytes == 32 * 1024,
       "SM75 sparse attention must stay within 32 KiB");
   extern __shared__ int8_t shared_bytes[];
-  smem_t<SwizzleMode::k128B, kHalfPacks> shared_query(shared_bytes);
+  smem_t<SwizzleMode::k128B, kHalfPacks> shared_correction_query(shared_bytes);
   smem_t<SwizzleMode::k128B, kHalfPacks> shared_summary_key(
       shared_bytes + kTileBytes);
   smem_t<SwizzleMode::k128B, kHalfPacks> shared_summary_value(
       shared_bytes + kTileBytes + kSummaryTileBytes);
   smem_t<SwizzleMode::k128B, kHalfPacks> shared_output(shared_bytes);
   smem_t<SwizzleMode::k128B, kInt8Packs> shared_query_int8(shared_bytes);
+  smem_t<SwizzleMode::k128B, kInt8Packs> shared_initial_query_int8(
+      shared_bytes + kTileBytes);
   smem_t<SwizzleMode::k128B, kInt8Packs> shared_key_int8(
       shared_bytes + kInt8TileBytes);
   smem_t<SwizzleMode::k128B, kHalfPacks> shared_selected_value(
@@ -573,54 +507,259 @@ __global__ void sparse_attention_kernel(
   if (!sparse_query_blocks[query_block])
     return;
   const int linear_thread = threadIdx.y * WARP_SIZE + threadIdx.x;
+  const int8_t *query_int8_head_ptr = query_int8 +
+      batch * stride_batch_q_int8 + query_head * stride_head_q_int8;
+  const int8_t *key_int8_head_ptr = key_int8 +
+      batch * stride_batch_k_int8 + kv_head * stride_head_k_int8;
+  const T *value_head_ptr =
+      value + batch * stride_batch_v + kv_head * stride_head_v;
+  T *output_head_ptr =
+      output + batch * stride_batch_o + query_head * stride_head_o;
+  const float *query_scale_head = query_scale +
+      (static_cast<int64_t>(batch) * num_query_heads + query_head) *
+          num_query_blocks * kWarps;
+  const float *key_scale_head = key_scale +
+      (static_cast<int64_t>(batch) * num_kv_heads + kv_head) * num_key_blocks;
+
+  // Route from the same INT8 Q and per-16-token scales consumed by exact Sage.
+  // Keeping this tile in shared memory also avoids another global Q read when
+  // constructing the correction operand below.
+  load_int8_tile(
+      query_int8_head_ptr,
+      stride_sequence_q_int8,
+      query_block * kBlockTokens,
+      query_length,
+      shared_initial_query_int8);
+  __syncthreads();
+
+  const int query_token_start = query_block * kBlockTokens;
+  const int query_token_count = min(kBlockTokens, query_length - query_token_start);
+  const int dimension = linear_thread;
+  float query_sum = 0.0f;
+#pragma unroll
+  for (int warp_group = 0; warp_group < kWarps; ++warp_group)
+  {
+    int quantized_sum = 0;
+#pragma unroll
+    for (int row = 0; row < kBlockTokens / kWarps; ++row)
+    {
+      const int token = warp_group * (kBlockTokens / kWarps) + row;
+      if (token < query_token_count)
+      {
+        const uint32_t source_offset = shared_initial_query_int8.get_permuted_offset(
+            token, dimension / 16);
+        quantized_sum += static_cast<int>(reinterpret_cast<const int8_t *>(
+            shared_initial_query_int8.base + source_offset)[dimension % 16]);
+      }
+    }
+    const float dequant_scale = query_scale_head[
+        query_block * kWarps + warp_group];
+    query_sum = fmaf(static_cast<float>(quantized_sum), dequant_scale, query_sum);
+  }
+  const float query_mean = query_sum / static_cast<float>(query_token_count);
+
+  float *reduction_scratch = reinterpret_cast<float *>(
+      shared_bytes + kRouteStorageOffset);
+  uint32_t *shared_route = reinterpret_cast<uint32_t *>(
+      shared_bytes + kRouteStorageOffset);
+
+  const float *key_mean = key_summary_mean +
+      (static_cast<int64_t>(batch) * num_kv_heads + kv_head) * kHeadDim;
+  const float *key_variance = key_summary_variance +
+      (static_cast<int64_t>(batch) * num_kv_heads + kv_head) * kHeadDim;
+  float projected_mean = query_mean * key_mean[dimension];
+  float projected_variance =
+      query_mean * query_mean * key_variance[dimension];
+  block_reduce_pair(projected_mean, projected_variance, reduction_scratch);
+  const float threshold = projected_mean + threshold_sigma *
+      sqrtf(fmaxf(projected_variance, 0.0f) + 1.0e-6f);
+
   const int route_word_count = (num_key_blocks + kRouteWordBits - 1) / kRouteWordBits;
-  uint32_t *shared_route = reinterpret_cast<uint32_t *>(shared_bytes + kTileBytes);
   if (linear_thread < route_word_count)
     shared_route[linear_thread] = 0;
   __syncthreads();
 
-  const half *query_block_summary = query_summary +
-      ((static_cast<int64_t>(batch) * num_query_heads + query_head) *
-           padded_query_blocks +
-       query_block) *
-          kHeadDim;
-  const half *key_head_summary = key_summary +
+  const half *key_score_summary_head = key_score_summary +
       (static_cast<int64_t>(batch) * num_kv_heads + kv_head) *
-          padded_key_blocks * kHeadDim;
-  const float threshold = thresholds[
-      (static_cast<int64_t>(batch) * num_query_heads + query_head) *
-          num_query_blocks +
-      query_block];
-  for (int key_block = threadIdx.y; key_block < num_key_blocks;
-       key_block += kWarps)
+          padded_residual_summaries * kHeadDim;
+  const half *value_mean_head = value_mean +
+      (static_cast<int64_t>(batch) * num_kv_heads + kv_head) *
+          padded_residual_summaries * kHeadDim;
+  const float q_dequant_scale =
+      query_scale_head[query_block * kWarps + threadIdx.y];
+
+  float output_fragment[1][8][8];
+  float row_max[1][2];
+  float denominator[1][2];
+#pragma unroll
+  for (int value_tile = 0; value_tile < 8; ++value_tile)
   {
-    float proxy_score = 0.0f;
 #pragma unroll
-    for (int dimension = threadIdx.x; dimension < kHeadDim; dimension += WARP_SIZE)
+    for (int element = 0; element < 8; ++element)
+      output_fragment[0][value_tile][element] = 0.0f;
+  }
+  row_max[0][0] = -5000000.0f;
+  row_max[0][1] = -5000000.0f;
+  denominator[0][0] = 1.0f;
+  denominator[0][1] = 1.0f;
+
+  // The initial INT8 Q tile lives in the second half of shared memory. Expand
+  // it once into the first 16 KiB, which remains resident while routing and
+  // skipped-block correction share the same Tensor Core scores.
+  dequantize_int8_tile(
+      shared_initial_query_int8,
+      query_scale_head,
+      query_block * kBlockTokens,
+      query_length,
+      shared_correction_query);
+  __syncthreads();
+
+  const float scale_log2 = softmax_scale * math::log2e;
+  const uint32_t value_mma_offset = shared_summary_value.get_permuted_offset(
+      threadIdx.x % 16, threadIdx.x / 16);
+
+  // Route and approximate correction in one pass over 16 summaries. The
+  // Tensor Core Q*K-centroid score supplies both per-token correction and the
+  // centroid route score, eliminating a separate scalar scan of every K block.
+  const int residual_tokens = kBlockTokens / residual_subblocks;
+  const int num_residual_summaries =
+      (key_length + residual_tokens - 1) / residual_tokens;
+  float *shared_proxy_partials = reinterpret_cast<float *>(
+      shared_bytes + kRouteStorageOffset + kMaxRouteBytes);
+  for (int summary_start = 0; summary_start < num_residual_summaries;
+       summary_start += kSummaryTileTokens)
+  {
+    load_half_tile<kSummaryTileTokens>(
+        key_score_summary_head,
+        kHeadDim,
+        summary_start,
+        num_residual_summaries,
+        shared_summary_key);
+    load_half_tile<kSummaryTileTokens>(
+        value_mean_head,
+        kHeadDim,
+        summary_start,
+        num_residual_summaries,
+        shared_summary_value);
+    __syncthreads();
+
+    float score[1][1][8];
+    compute_fp16_qk<1>(shared_correction_query, shared_summary_key, score);
+
+    float proxy0 = score[0][0][0] + score[0][0][2];
+    float proxy1 = score[0][0][1] + score[0][0][3];
+    float proxy2 = score[0][0][4] + score[0][0][6];
+    float proxy3 = score[0][0][5] + score[0][0][7];
+#pragma unroll
+    for (int offset = WARP_SIZE / 2; offset >= 4; offset >>= 1)
     {
-      proxy_score = fmaf(
-          __half2float(query_block_summary[dimension]),
-          __half2float(key_head_summary[
-              static_cast<int64_t>(key_block) * kHeadDim + dimension]),
-          proxy_score);
+      proxy0 += __shfl_down_sync(0xffffffff, proxy0, offset);
+      proxy1 += __shfl_down_sync(0xffffffff, proxy1, offset);
+      proxy2 += __shfl_down_sync(0xffffffff, proxy2, offset);
+      proxy3 += __shfl_down_sync(0xffffffff, proxy3, offset);
     }
-#pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-      proxy_score += __shfl_down_sync(0xffffffff, proxy_score, offset);
-    if (threadIdx.x == 0)
+    if (threadIdx.x < 4)
     {
-      const int distance = query_block > key_block
-          ? query_block - key_block
-          : key_block - query_block;
-      if (exact_kv_blocks[key_block] || distance <= 1 || proxy_score > threshold)
+      const int column_base = 2 * threadIdx.x;
+      float *warp_proxy =
+          shared_proxy_partials + threadIdx.y * kSummaryTileTokens;
+      warp_proxy[column_base] = proxy0;
+      warp_proxy[column_base + 1] = proxy1;
+      warp_proxy[column_base + 8] = proxy2;
+      warp_proxy[column_base + 9] = proxy3;
+    }
+    __syncthreads();
+
+    const int routed_blocks = kSummaryTileTokens / residual_subblocks;
+    if (linear_thread < routed_blocks)
+    {
+      const int key_block = summary_start / residual_subblocks + linear_thread;
+      if (key_block < num_key_blocks)
       {
-        atomicOr(
-            shared_route + key_block / kRouteWordBits,
-            1U << (key_block % kRouteWordBits));
+        float proxy_sum = 0.0f;
+        int key_token_count = 0;
+#pragma unroll
+        for (int residual_index = 0; residual_index < 2; ++residual_index)
+        {
+          if (residual_index >= residual_subblocks)
+            break;
+          const int residual_summary =
+              linear_thread * residual_subblocks + residual_index;
+          const int residual_start =
+              key_block * kBlockTokens + residual_index * residual_tokens;
+          const int residual_count =
+              max(0, min(residual_tokens, key_length - residual_start));
+          float residual_proxy = 0.0f;
+#pragma unroll
+          for (int warp = 0; warp < kWarps; ++warp)
+          {
+            residual_proxy += shared_proxy_partials[
+                warp * kSummaryTileTokens + residual_summary];
+          }
+          proxy_sum = fmaf(
+              residual_proxy,
+              static_cast<float>(residual_count),
+              proxy_sum);
+          key_token_count += residual_count;
+        }
+        const float proxy_score = proxy_sum /
+            (static_cast<float>(query_token_count) * key_token_count);
+        const int distance = query_block > key_block
+            ? query_block - key_block
+            : key_block - query_block;
+        if (exact_kv_blocks[key_block] || distance <= 1 || proxy_score > threshold)
+        {
+          atomicOr(
+              shared_route + key_block / kRouteWordBits,
+              1U << (key_block % kRouteWordBits));
+        }
       }
     }
+    __syncthreads();
+
+#pragma unroll
+    for (int element = 0; element < 8; ++element)
+    {
+      const int local_summary = 2 * (threadIdx.x % 4) +
+          8 * (element / 4) + element % 2;
+      const int residual_summary = summary_start + local_summary;
+      const int key_block = residual_summary / residual_subblocks;
+      const bool selected = key_block < num_key_blocks &&
+          ((shared_route[key_block / kRouteWordBits] >>
+            (key_block % kRouteWordBits)) & 1U);
+      if (residual_summary >= num_residual_summaries || selected)
+      {
+        score[0][0][element] = -5000000.0f;
+      }
+      else
+      {
+        const int residual_index = residual_summary % residual_subblocks;
+        const int residual_start =
+            key_block * kBlockTokens + residual_index * residual_tokens;
+        const int remaining = key_length - residual_start;
+        const int block_length = remaining < residual_tokens
+            ? remaining
+            : residual_tokens;
+        score[0][0][element] =
+            score[0][0][element] * scale_log2 +
+            math::ptx_log2(static_cast<float>(block_length));
+      }
+    }
+    update_mdo<1, 1, 8, false, false, true>(
+        score, output_fragment, row_max, denominator, 1.0f);
+    uint32_t probability[1][1][4];
+    RS_32_to_16<1, 1>(score, probability);
+    accumulate_d<1, 1, ComputeUnit::kTensorCore>(probability, denominator);
+    uint32_t value_offset = value_mma_offset;
+    compute_fp16_sv_permuted<4, 1, 1, 1, 8,
+                             SwizzleMode::k128B, kHalfPacks, 4>(
+        shared_summary_value,
+        probability,
+        output_fragment,
+        denominator,
+        value_offset);
+    __syncthreads();
   }
-  __syncthreads();
 
   uint32_t local_route[kRouteWordsPerLane];
 #pragma unroll
@@ -642,128 +781,6 @@ __global__ void sparse_attention_kernel(
       atomicAdd(selected_count, static_cast<unsigned long long>(count));
   }
   __syncthreads();
-
-  const int8_t *query_int8_head_ptr = query_int8 +
-      batch * stride_batch_q_int8 + query_head * stride_head_q_int8;
-  const int8_t *key_int8_head_ptr = key_int8 +
-      batch * stride_batch_k_int8 + kv_head * stride_head_k_int8;
-  const T *value_head_ptr =
-      value + batch * stride_batch_v + kv_head * stride_head_v;
-  T *output_head_ptr =
-      output + batch * stride_batch_o + query_head * stride_head_o;
-  const half *key_score_summary_head = key_score_summary +
-      (static_cast<int64_t>(batch) * num_kv_heads + kv_head) *
-          padded_residual_summaries * kHeadDim;
-  const half *value_mean_head = value_mean +
-      (static_cast<int64_t>(batch) * num_kv_heads + kv_head) *
-          padded_residual_summaries * kHeadDim;
-  const float *query_scale_head = query_scale +
-      (static_cast<int64_t>(batch) * num_query_heads + query_head) *
-          num_query_blocks * kWarps;
-  const float q_dequant_scale =
-      query_scale_head[query_block * kWarps + threadIdx.y];
-  const float *key_scale_head = key_scale +
-      (static_cast<int64_t>(batch) * num_kv_heads + kv_head) * num_key_blocks;
-
-  float output_fragment[1][8][8];
-  float row_max[1][2];
-  float denominator[1][2];
-#pragma unroll
-  for (int value_tile = 0; value_tile < 8; ++value_tile)
-  {
-#pragma unroll
-    for (int element = 0; element < 8; ++element)
-      output_fragment[0][value_tile][element] = 0.0f;
-  }
-  row_max[0][0] = -5000000.0f;
-  row_max[0][1] = -5000000.0f;
-  denominator[0][0] = 1.0f;
-  denominator[0][1] = 1.0f;
-
-  load_dequantized_int8_tile(
-      query_int8_head_ptr,
-      stride_sequence_q_int8,
-      query_scale_head,
-      query_block * kBlockTokens,
-      query_length,
-      shared_query);
-  __syncthreads();
-
-  const float scale_log2 = softmax_scale * math::log2e;
-  const uint32_t value_mma_offset = shared_summary_value.get_permuted_offset(
-      threadIdx.x % 16, threadIdx.x / 16);
-
-  // Evaluate skipped residual summaries in groups of 32. This keeps their
-  // normalization mass and V contribution without revisiting K/V tokens.
-  const int residual_tokens = kBlockTokens / residual_subblocks;
-  const int num_residual_summaries =
-      (key_length + residual_tokens - 1) / residual_tokens;
-  for (int summary_start = 0; summary_start < num_residual_summaries;
-       summary_start += kSummaryTileTokens)
-  {
-    load_half_tile<kSummaryTileTokens>(
-        key_score_summary_head,
-        kHeadDim,
-        summary_start,
-        num_residual_summaries,
-        shared_summary_key);
-    load_half_tile<kSummaryTileTokens>(
-        value_mean_head,
-        kHeadDim,
-        summary_start,
-        num_residual_summaries,
-        shared_summary_value);
-    __syncthreads();
-
-    float score[1][2][8];
-    compute_fp16_qk<2>(shared_query, shared_summary_key, score);
-#pragma unroll
-    for (int key_tile = 0; key_tile < 2; ++key_tile)
-    {
-#pragma unroll
-      for (int element = 0; element < 8; ++element)
-      {
-        const int local_summary = 2 * (threadIdx.x % 4) + key_tile * 16 +
-            8 * (element / 4) + element % 2;
-        const int residual_summary = summary_start + local_summary;
-        const int key_block = residual_summary / residual_subblocks;
-        const bool selected = route_selected(
-            local_route, min(key_block, num_key_blocks - 1));
-        if (residual_summary >= num_residual_summaries ||
-            selected)
-        {
-          score[0][key_tile][element] = -5000000.0f;
-        }
-        else
-        {
-          const int residual_index = residual_summary % residual_subblocks;
-          const int residual_start =
-              key_block * kBlockTokens + residual_index * residual_tokens;
-          const int remaining = key_length - residual_start;
-          const int block_length = remaining < residual_tokens
-              ? remaining
-              : residual_tokens;
-          score[0][key_tile][element] =
-              score[0][key_tile][element] * scale_log2 +
-              math::ptx_log2(static_cast<float>(block_length));
-        }
-      }
-    }
-    update_mdo<1, 2, 8, false, false, true>(
-        score, output_fragment, row_max, denominator, 1.0f);
-    uint32_t probability[1][2][4];
-    RS_32_to_16<1, 2>(score, probability);
-    accumulate_d<1, 2, ComputeUnit::kTensorCore>(probability, denominator);
-    uint32_t value_offset = value_mma_offset;
-    compute_fp16_sv_permuted<4, 1, 1, 2, 8,
-                             SwizzleMode::k128B, kHalfPacks, 4>(
-        shared_summary_value,
-        probability,
-        output_fragment,
-        denominator,
-        value_offset);
-    __syncthreads();
-  }
 
   // Selected blocks retain exact token-level attention. Q/K are quantized once
   // with the production Sage per-16-row Q and per-64-row K scales, then use the
@@ -905,21 +922,17 @@ void check_launch(const char *name)
 
 template <typename T>
 void launch_sparse_threshold_attention(
-    at::Tensor query,
-    at::Tensor key,
     at::Tensor query_int8,
     at::Tensor key_int8,
     at::Tensor value,
     at::Tensor output,
     at::Tensor query_scale,
     at::Tensor key_scale,
-    at::Tensor query_summary,
     at::Tensor key_summary,
     at::Tensor key_score_summary,
     at::Tensor value_mean,
     at::Tensor key_summary_mean,
     at::Tensor key_summary_variance,
-    at::Tensor thresholds,
     at::Tensor sparse_query_blocks,
     at::Tensor exact_kv_blocks,
     at::Tensor selected_count,
@@ -927,34 +940,19 @@ void launch_sparse_threshold_attention(
     float threshold_sigma,
     float softmax_scale)
 {
-  const int batch_size = query.size(0);
-  const int num_query_heads = query.size(1);
-  const int num_kv_heads = key.size(1);
-  const int query_length = query.size(2);
-  const int key_length = key.size(2);
+  const int batch_size = query_int8.size(0);
+  const int num_query_heads = query_int8.size(1);
+  const int num_kv_heads = key_int8.size(1);
+  const int query_length = query_int8.size(2);
+  const int key_length = key_int8.size(2);
   const int num_query_blocks = div_ceil(query_length, kBlockTokens);
   const int num_key_blocks = div_ceil(key_length, kBlockTokens);
-  const int padded_query_blocks = query_summary.size(2);
   const int padded_key_blocks = key_summary.size(2);
   const int padded_residual_summaries = key_score_summary.size(2);
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-  dim3 query_summary_grid(padded_query_blocks, num_query_heads, batch_size);
-  block_summary_kernel<T><<<query_summary_grid, kHeadDim, 0, stream>>>(
-      reinterpret_cast<const T *>(query.data_ptr()),
-      reinterpret_cast<half *>(query_summary.data_ptr()),
-      batch_size,
-      num_query_heads,
-      query_length,
-      padded_query_blocks,
-      query.stride(0),
-      query.stride(1),
-      query.stride(2));
-  check_launch("sparse query summary");
-
-  dim3 key_summary_grid(padded_key_blocks, num_kv_heads, batch_size);
+  dim3 key_summary_grid(num_key_blocks, num_kv_heads, batch_size);
   kv_block_summary_kernel<T><<<key_summary_grid, kHeadDim, 0, stream>>>(
-      reinterpret_cast<const T *>(key.data_ptr()),
       key_int8.data_ptr<int8_t>(),
       key_scale.data_ptr<float>(),
       reinterpret_cast<const T *>(value.data_ptr()),
@@ -967,9 +965,6 @@ void launch_sparse_threshold_attention(
       padded_key_blocks,
       residual_subblocks,
       padded_residual_summaries,
-      key.stride(0),
-      key.stride(1),
-      key.stride(2),
       key_int8.stride(0),
       key_int8.stride(1),
       key_int8.stride(2),
@@ -990,19 +985,6 @@ void launch_sparse_threshold_attention(
       padded_key_blocks);
   check_launch("sparse key summary statistics");
 
-  dim3 threshold_grid(num_query_blocks, num_query_heads, batch_size);
-  query_threshold_kernel<<<threshold_grid, kHeadDim, 0, stream>>>(
-      reinterpret_cast<const half *>(query_summary.data_ptr()),
-      key_summary_mean.data_ptr<float>(),
-      key_summary_variance.data_ptr<float>(),
-      thresholds.data_ptr<float>(),
-      num_query_heads,
-      num_kv_heads,
-      num_query_blocks,
-      padded_query_blocks,
-      threshold_sigma);
-  check_launch("sparse query thresholds");
-
   dim3 attention_grid(num_query_blocks, num_query_heads, batch_size);
   dim3 attention_block(WARP_SIZE, kWarps);
   sparse_attention_kernel<T><<<
@@ -1016,11 +998,10 @@ void launch_sparse_threshold_attention(
       reinterpret_cast<T *>(output.data_ptr()),
       query_scale.data_ptr<float>(),
       key_scale.data_ptr<float>(),
-      reinterpret_cast<const half *>(query_summary.data_ptr()),
-      reinterpret_cast<const half *>(key_summary.data_ptr()),
       reinterpret_cast<const half *>(key_score_summary.data_ptr()),
       reinterpret_cast<const half *>(value_mean.data_ptr()),
-      thresholds.data_ptr<float>(),
+      key_summary_mean.data_ptr<float>(),
+      key_summary_variance.data_ptr<float>(),
       sparse_query_blocks.data_ptr<uint8_t>(),
       exact_kv_blocks.data_ptr<uint8_t>(),
       selected_count.numel()
@@ -1033,8 +1014,6 @@ void launch_sparse_threshold_attention(
       num_query_blocks,
       num_key_blocks,
       residual_subblocks,
-      padded_query_blocks,
-      padded_key_blocks,
       padded_residual_summaries,
       query_int8.stride(0),
       query_int8.stride(1),
@@ -1048,6 +1027,7 @@ void launch_sparse_threshold_attention(
       output.stride(0),
       output.stride(1),
       output.stride(2),
+      threshold_sigma,
       softmax_scale);
   check_launch("sparse attention");
 }
@@ -1055,8 +1035,6 @@ void launch_sparse_threshold_attention(
 } // namespace
 
 at::Tensor sol_sparse_online_int8_f16_attn(
-    at::Tensor query,
-    at::Tensor key,
     at::Tensor query_int8,
     at::Tensor key_int8,
     at::Tensor value,
@@ -1070,8 +1048,6 @@ at::Tensor sol_sparse_online_int8_f16_attn(
     float softmax_scale,
     int return_stats)
 {
-  CHECK_CUDA(query);
-  CHECK_CUDA(key);
   CHECK_CUDA(query_int8);
   CHECK_CUDA(key_int8);
   CHECK_CUDA(value);
@@ -1080,8 +1056,6 @@ at::Tensor sol_sparse_online_int8_f16_attn(
   CHECK_CUDA(key_scale);
   CHECK_CUDA(sparse_query_blocks);
   CHECK_CUDA(exact_kv_blocks);
-  CHECK_LASTDIM_CONTIGUOUS(query);
-  CHECK_LASTDIM_CONTIGUOUS(key);
   CHECK_LASTDIM_CONTIGUOUS(query_int8);
   CHECK_LASTDIM_CONTIGUOUS(key_int8);
   CHECK_LASTDIM_CONTIGUOUS(value);
@@ -1090,8 +1064,6 @@ at::Tensor sol_sparse_online_int8_f16_attn(
   CHECK_CONTIGUOUS(key_scale);
   CHECK_CONTIGUOUS(sparse_query_blocks);
   CHECK_CONTIGUOUS(exact_kv_blocks);
-  CHECK_DIMS(query, 4);
-  CHECK_DIMS(key, 4);
   CHECK_DIMS(query_int8, 4);
   CHECK_DIMS(key_int8, 4);
   CHECK_DIMS(value, 4);
@@ -1101,14 +1073,12 @@ at::Tensor sol_sparse_online_int8_f16_attn(
   CHECK_DIMS(sparse_query_blocks, 1);
   CHECK_DIMS(exact_kv_blocks, 1);
   TORCH_CHECK(
-      query.scalar_type() == at::ScalarType::Half ||
-          query.scalar_type() == at::ScalarType::BFloat16,
-      "Sol attention Q/K/V must be float16 or bfloat16");
+      value.scalar_type() == at::ScalarType::Half ||
+          value.scalar_type() == at::ScalarType::BFloat16,
+      "Sol attention V/output must be float16 or bfloat16");
   TORCH_CHECK(
-      key.scalar_type() == query.scalar_type() &&
-          value.scalar_type() == query.scalar_type() &&
-          output.scalar_type() == query.scalar_type(),
-      "Sol attention Q/K/V/output dtypes must match");
+      output.scalar_type() == value.scalar_type(),
+      "Sol attention V/output dtypes must match");
   CHECK_DTYPE(query_int8, at::ScalarType::Char);
   CHECK_DTYPE(key_int8, at::ScalarType::Char);
   CHECK_DTYPE(query_scale, at::ScalarType::Float);
@@ -1116,43 +1086,46 @@ at::Tensor sol_sparse_online_int8_f16_attn(
   CHECK_DTYPE(sparse_query_blocks, at::ScalarType::Byte);
   CHECK_DTYPE(exact_kv_blocks, at::ScalarType::Byte);
   TORCH_CHECK(
-      query.device() == key.device() && query.device() == value.device() &&
-          query.device() == output.device() &&
-          query.device() == query_int8.device() &&
-          query.device() == key_int8.device() &&
-          query.device() == query_scale.device() &&
-          query.device() == key_scale.device() &&
-          query.device() == sparse_query_blocks.device() &&
-          query.device() == exact_kv_blocks.device(),
+      value.device() == output.device() &&
+          value.device() == query_int8.device() &&
+          value.device() == key_int8.device() &&
+          value.device() == query_scale.device() &&
+          value.device() == key_scale.device() &&
+          value.device() == sparse_query_blocks.device() &&
+          value.device() == exact_kv_blocks.device(),
       "Sol attention tensors must share one CUDA device");
   TORCH_CHECK(
-      query.size(0) == key.size(0) && query.size(0) == value.size(0),
+      query_int8.size(0) == key_int8.size(0) &&
+          query_int8.size(0) == value.size(0),
       "Sol attention batch sizes must match");
   TORCH_CHECK(
-      key.size(1) == value.size(1) && key.size(2) == value.size(2),
+      key_int8.size(1) == value.size(1) &&
+          key_int8.size(2) == value.size(2),
       "Sol attention K/V shapes must match");
   TORCH_CHECK(
-      query_int8.sizes() == query.sizes() && key_int8.sizes() == key.sizes(),
-      "Sol attention INT8 Q/K must match the original Q/K shapes");
-  TORCH_CHECK(
-      query.size(3) == kHeadDim && key.size(3) == kHeadDim &&
+      query_int8.size(3) == kHeadDim && key_int8.size(3) == kHeadDim &&
           value.size(3) == kHeadDim,
       "Sol attention requires head_dim=128");
   TORCH_CHECK(
-      key.size(1) > 0 && query.size(1) % key.size(1) == 0,
+      key_int8.size(1) > 0 &&
+          query_int8.size(1) % key_int8.size(1) == 0,
       "Sol attention Q heads must be divisible by KV heads");
-  TORCH_CHECK(query.size(2) > 0 && key.size(2) > 0, "empty attention is unsupported");
-  TORCH_CHECK(output.sizes() == query.sizes(), "Sol attention output must match Q shape");
+  TORCH_CHECK(
+      query_int8.size(2) > 0 && key_int8.size(2) > 0,
+      "empty attention is unsupported");
+  TORCH_CHECK(
+      output.sizes() == query_int8.sizes(),
+      "Sol attention output must match INT8 Q shape");
   TORCH_CHECK(std::isfinite(threshold_sigma), "Sol threshold_sigma must be finite");
   TORCH_CHECK(
       residual_subblocks == 1 || residual_subblocks == 2,
       "Sol residual_subblocks must be 1 or 2");
 
-  const int batch_size = query.size(0);
-  const int num_query_heads = query.size(1);
-  const int num_kv_heads = key.size(1);
-  const int num_query_blocks = div_ceil(query.size(2), kBlockTokens);
-  const int num_key_blocks = div_ceil(key.size(2), kBlockTokens);
+  const int batch_size = query_int8.size(0);
+  const int num_query_heads = query_int8.size(1);
+  const int num_kv_heads = key_int8.size(1);
+  const int num_query_blocks = div_ceil(query_int8.size(2), kBlockTokens);
+  const int num_key_blocks = div_ceil(key_int8.size(2), kBlockTokens);
   TORCH_CHECK(
       num_key_blocks <= kMaxKeyBlocks,
       "Sol attention supports at most ", kMaxKeyBlocks * kBlockTokens,
@@ -1174,45 +1147,43 @@ at::Tensor sol_sparse_online_int8_f16_attn(
           key_scale.size(2) == num_key_blocks,
       "Sol K scale must have shape [B, Hkv, ceil(K/64)]");
 
-  const int padded_query_blocks = div_ceil(num_query_blocks, kRouteTile) * kRouteTile;
   const int padded_key_blocks = div_ceil(num_key_blocks, kRouteTile) * kRouteTile;
   const int residual_tokens = kBlockTokens / residual_subblocks;
-  const int num_residual_summaries = div_ceil(static_cast<int>(key.size(2)), residual_tokens);
+  const int num_residual_summaries =
+      div_ceil(static_cast<int>(key_int8.size(2)), residual_tokens);
   const int padded_residual_summaries =
       div_ceil(num_residual_summaries, kSummaryTileTokens) * kSummaryTileTokens;
-  const auto half_options = query.options().dtype(at::ScalarType::Half);
-  const auto float_options = query.options().dtype(at::ScalarType::Float);
-  at::Tensor query_summary = at::empty(
-      {batch_size, num_query_heads, padded_query_blocks, kHeadDim}, half_options);
-  at::Tensor key_summary = at::empty(
-      {batch_size, num_kv_heads, padded_key_blocks, kHeadDim}, half_options);
+  const auto half_options = value.options().dtype(at::ScalarType::Half);
+  const auto float_options = value.options().dtype(at::ScalarType::Float);
   at::Tensor key_score_summary = at::empty(
       {batch_size, num_kv_heads, padded_residual_summaries, kHeadDim}, half_options);
+  at::Tensor key_summary = residual_subblocks == 1
+      ? key_score_summary
+      : at::empty(
+          {batch_size, num_kv_heads, padded_key_blocks, kHeadDim}, half_options);
   at::Tensor value_mean = at::empty_like(key_score_summary);
   at::Tensor key_summary_mean = at::empty(
       {batch_size, num_kv_heads, kHeadDim}, float_options);
   at::Tensor key_summary_variance = at::empty_like(key_summary_mean);
-  at::Tensor thresholds = at::empty(
-      {batch_size, num_query_heads, num_query_blocks}, float_options);
   at::Tensor selected_count = return_stats
-      ? at::zeros({1}, query.options().dtype(at::ScalarType::Long))
-      : at::empty({0}, query.options().dtype(at::ScalarType::Long));
+      ? at::zeros({1}, value.options().dtype(at::ScalarType::Long))
+      : at::empty({0}, value.options().dtype(at::ScalarType::Long));
 
-  if (query.scalar_type() == at::ScalarType::Half)
+  if (value.scalar_type() == at::ScalarType::Half)
   {
     launch_sparse_threshold_attention<half>(
-        query, key, query_int8, key_int8, value, output, query_scale, key_scale,
-        query_summary, key_summary, key_score_summary, value_mean,
-        key_summary_mean, key_summary_variance, thresholds,
+        query_int8, key_int8, value, output, query_scale, key_scale,
+        key_summary, key_score_summary, value_mean,
+        key_summary_mean, key_summary_variance,
         sparse_query_blocks, exact_kv_blocks, selected_count,
         residual_subblocks, threshold_sigma, softmax_scale);
   }
   else
   {
     launch_sparse_threshold_attention<nv_bfloat16>(
-        query, key, query_int8, key_int8, value, output, query_scale, key_scale,
-        query_summary, key_summary, key_score_summary, value_mean,
-        key_summary_mean, key_summary_variance, thresholds,
+        query_int8, key_int8, value, output, query_scale, key_scale,
+        key_summary, key_score_summary, value_mean,
+        key_summary_mean, key_summary_variance,
         sparse_query_blocks, exact_kv_blocks, selected_count,
         residual_subblocks, threshold_sigma, softmax_scale);
   }

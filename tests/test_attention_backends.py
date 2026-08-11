@@ -24,7 +24,7 @@ class FakeModel:
 
 
 class AttentionBackendsTest(unittest.TestCase):
-    def test_sparse_backend_requires_the_threshold_kernel_abi(self):
+    def test_sparse_backend_requires_the_fused_routing_abi(self):
         sage_module = SimpleNamespace(sparse_available=lambda: True)
         with mock.patch.dict(
             sys.modules,
@@ -62,6 +62,14 @@ class AttentionBackendsTest(unittest.TestCase):
             sys.modules,
             {
                 "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.16.0"),
+                "comfyui_turing_utils_kernel.turing_sage": sage_module,
+            },
+        ):
+            self.assertFalse(attention_backends.bundled_sparse_available())
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.17.0"),
                 "comfyui_turing_utils_kernel.turing_sage": sage_module,
             },
         ):

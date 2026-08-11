@@ -131,14 +131,15 @@ the model through the experimental Sol patch node to enable it explicitly. The
 kernel accepts FP16/BF16/FP32 Q/K/V, GQA, 128-dimensional heads, and unmasked
 non-causal sequences; incompatible or short calls use bundled stable Sage.
 
-Online Sol routing requires kernel package 0.16.0. Adapter-protected Query
+Online Sol routing requires kernel package 0.17.0. Adapter-protected Query
 blocks run through exact stable Sage, while every sparse Query keeps protected
 modality blocks as exact K/V sinks. Selected blocks reuse stable Sage's INT8
-Tensor Core QK path. Routing uses original FP16/BF16 Q/K centroids; skipped-
-block scores use the same quantized-Q/K domain as selected blocks, and original
-V means remain in the value approximation. Official-style `1x64` is the
-default; optional `2x32` improves bimodal skipped-block fidelity without
-changing routing.
+Tensor Core QK path. Routing and exact selected-block QK both derive from the
+same prequantized INT8 Q/K tensors and scales. Each Q-to-K-centroid Tensor Core
+score is reused for route selection and skipped-block online-softmax
+correction, while original V means remain in the value approximation.
+Official-style `1x64` is the default; optional `2x32` improves bimodal
+skipped-block fidelity without changing routing.
 
 The threshold and fixed +/- one-block local neighborhood execute inside each
 attention CTA. Only compact, head-independent dense-Query and exact-KV policy

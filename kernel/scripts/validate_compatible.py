@@ -247,8 +247,78 @@ def validate_sage(device: torch.device) -> None:
     _validate_varlen_batches(output, q, k, v, cu_q, cu_k, q_lengths, k_lengths)
 
 
+def _expected_int8_sol_route_count(
+    q_int8: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_int8: torch.Tensor,
+    k_scale: torch.Tensor,
+    threshold_sigma: float,
+) -> int:
+    """Reconstruct the fused kernel's INT8-consistent 1x64 routing policy."""
+    _, query_heads, query_length, head_dim = q_int8.shape
+    _, kv_heads, key_length, _ = k_int8.shape
+    query_blocks = (query_length + 63) // 64
+    key_blocks = (key_length + 63) // 64
+    heads_per_kv = query_heads // kv_heads
+
+    key_centroids = torch.empty(
+        (kv_heads, key_blocks, head_dim), device=q_int8.device, dtype=torch.float32
+    )
+    for kv_head in range(kv_heads):
+        for key_block in range(key_blocks):
+            start = key_block * 64
+            stop = min(start + 64, key_length)
+            centroid = (
+                k_int8[0, kv_head, start:stop].float().sum(dim=0)
+                * k_scale[0, kv_head, key_block]
+                / (stop - start)
+            )
+            # Routing's Tensor Core operand and its threshold statistics both
+            # consume the FP16 centroid emitted by kv_block_summary_kernel.
+            key_centroids[kv_head, key_block] = centroid.half().float()
+
+    key_means = key_centroids.mean(dim=1)
+    key_variances = key_centroids.square().mean(dim=1) - key_means.square()
+    key_variances.clamp_min_(0.0)
+
+    selected = 0
+    for query_head in range(query_heads):
+        kv_head = query_head // heads_per_kv
+        for query_block in range(query_blocks):
+            start = query_block * 64
+            stop = min(start + 64, query_length)
+            rows = q_int8[0, query_head, start:stop].float()
+            row_scales = q_scale[
+                0,
+                query_head,
+                query_block * 4 : query_block * 4 + 4,
+            ].repeat_interleave(16)[: stop - start]
+            dequantized = rows * row_scales[:, None]
+            query_mean = dequantized.mean(dim=0)
+            threshold = (
+                torch.dot(query_mean, key_means[kv_head])
+                + threshold_sigma
+                * torch.sqrt(
+                    torch.dot(query_mean.square(), key_variances[kv_head]) + 1.0e-6
+                )
+            )
+            # The correction/routing MMA consumes Q after the same explicit
+            # FP16 conversion used in shared memory by the CUDA kernel.
+            score_query_mean = dequantized.half().float().mean(dim=0)
+            proxy_scores = key_centroids[kv_head] @ score_query_mean
+            block_indices = torch.arange(key_blocks, device=q_int8.device)
+            route = (block_indices - query_block).abs() <= 1
+            route |= proxy_scores > threshold
+            selected += int(route.sum().item())
+    return selected
+
+
 def validate_sparse(device: torch.device) -> None:
     from comfyui_turing_utils_kernel.turing_sage import sageattn, sol_sparse_sageattn
+    from comfyui_turing_utils_kernel.turing_sage.quant import (
+        quantize_key_per_block,
+        quantize_query_per_warp,
+    )
 
     for dtype in (torch.float16, torch.bfloat16):
         for query_length, key_length in ((129, 151), (151, 129)):
@@ -270,6 +340,47 @@ def validate_sparse(device: torch.device) -> None:
             )
             if int(selected.item()) != possible:
                 raise RuntimeError("threshold=-1000 must select every sparse Q/K block")
+
+    # Verify the CUDA route against an independently reconstructed policy in
+    # the exact quantized score domain. This catches accidental use of the
+    # original BF16/FP16 tensors or a scale/partial-block indexing mismatch.
+    generator = torch.Generator(device=device).manual_seed(20260812)
+    q = torch.randn(
+        (1, 4, 1025, 128), generator=generator, device=device, dtype=torch.bfloat16
+    ) * 0.4
+    k = torch.randn(
+        (1, 2, 1025, 128), generator=generator, device=device, dtype=torch.bfloat16
+    ) * 0.4
+    v = torch.randn(
+        (1, 2, 1025, 128), generator=generator, device=device, dtype=torch.bfloat16
+    )
+    q_int8, q_scale = quantize_query_per_warp(q)
+    k_int8, k_scale = quantize_key_per_block(k)
+    expected_selected = _expected_int8_sol_route_count(
+        q_int8, q_scale, k_int8, k_scale, threshold_sigma=1.0
+    )
+    selected_profiles = []
+    for residual_subblocks in (1, 2):
+        _, selected, possible = sol_sparse_sageattn(
+            q,
+            k,
+            v,
+            threshold_sigma=1.0,
+            residual_subblocks=residual_subblocks,
+            return_stats=True,
+        )
+        actual_selected = int(selected.item())
+        if actual_selected != expected_selected:
+            raise RuntimeError(
+                "INT8-consistent Sol route mismatch: "
+                f"profile={residual_subblocks} selected={actual_selected}, "
+                f"expected={expected_selected}"
+            )
+        selected_profiles.append(actual_selected)
+    print(
+        "Sol INT8 route oracle: "
+        f"selected={expected_selected}/{possible}, profiles={selected_profiles}"
+    )
 
     # Non-aligned protected spans round outward to blocks. Those Query blocks
     # use exact Sage; the same K/V blocks are exact sinks for every sparse Query.

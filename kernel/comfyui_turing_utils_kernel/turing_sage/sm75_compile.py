@@ -60,8 +60,6 @@ def qk_int8_sv_f16_varlen_accum_f32_attn(
 
 
 def sol_sparse_online_int8_f16_attn(
-    query,
-    key,
     query_int8,
     key_int8,
     value,
@@ -77,11 +75,9 @@ def sol_sparse_online_int8_f16_attn(
 ):
     if not hasattr(_qattn_sm75, "sol_sparse_online_int8_f16_attn"):
         raise RuntimeError(
-            "online Sol routing requires comfyui-turing-utils-kernel 0.16.0 or newer"
+            "online Sol routing requires comfyui-turing-utils-kernel 0.17.0 or newer"
         )
     return _qattn_sm75.sol_sparse_online_int8_f16_attn(
-        query,
-        key,
         query_int8,
         key_int8,
         value,

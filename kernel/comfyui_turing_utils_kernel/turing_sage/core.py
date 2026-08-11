@@ -636,8 +636,6 @@ def sol_sparse_sageattn(
     q_int8, q_scale = quantize_query_per_warp(q, tensor_layout="HND")
     k_int8, k_scale = quantize_key_per_block(k, tensor_layout="HND")
     selected = sm75_compile.sol_sparse_online_int8_f16_attn(
-        q,
-        k,
         q_int8,
         k_int8,
         v,

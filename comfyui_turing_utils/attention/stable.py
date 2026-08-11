@@ -204,7 +204,7 @@ def bundled_sparse_available() -> bool:
         version_tuple = tuple(int(part) for part in version.split(".")[:3])
     except ValueError:
         return False
-    return version_tuple >= (0, 16, 0) and turing_sage.sparse_available()
+    return version_tuple >= (0, 17, 0) and turing_sage.sparse_available()
 
 
 def bundled_frame_sparse_available() -> bool:
