@@ -26,7 +26,9 @@ MINIMAX_H3_LAYOUT_KIND = "minimax_h3"
 RUNTIME_CONTEXT_ATTR = "_turing_utils_minimax_runtime_context"
 RUNTIME_PROVIDER_ATTR = "_turing_utils_minimax_layout_provider"
 RUNTIME_OUTER_WRAPPER_KEY = "turing_utils_minimax_runtime_layout"
+RUNTIME_FORWARD_PATCH_KEY = "diffusion_model.forward"
 _FORWARD_PROVIDER_ATTR = "_turing_utils_minimax_layout_forward"
+_MODEL_FORWARD_PROVIDER_ATTR = "_turing_utils_minimax_layout_model_forward"
 _BLOCK_FORWARD_PARAMETERS = (
     "x",
     "t_emb",
@@ -42,6 +44,7 @@ _LAYOUT_FIELDS = {
     "tokens_per_frame",
     "spatial_tokens_height",
     "spatial_tokens_width",
+    "segments",
     "layer_index",
     "layer_count",
 }
@@ -105,6 +108,105 @@ def _runtime_latent_shapes(base_model):
     return latent_shapes
 
 
+def _runtime_packed_layout(base_model):
+    context = getattr(base_model, RUNTIME_CONTEXT_ATTR, None)
+    return context.get("packed_layout") if isinstance(context, dict) else None
+
+
+def _resolve_packed_layout(diffusion_model, x, context, payload):
+    if (
+        not isinstance(x, (tuple, list))
+        or len(x) < 2
+        or not hasattr(x[0], "shape")
+        or not hasattr(x[1], "shape")
+        or not hasattr(context, "shape")
+    ):
+        return None
+    try:
+        from comfy.ldm.minimax.model import PackedLayout
+
+        patch_size = tuple(int(value) for value in diffusion_model.patch_size)
+        latent_t, latent_h, latent_w = (
+            math.ceil(int(size) / patch) * patch
+            for size, patch in zip(x[0].shape[2:5], patch_size)
+        )
+        signature = (
+            int(context.shape[1]),
+            latent_t,
+            latent_h,
+            latent_w,
+            int(x[1].shape[-1]),
+        )
+        layout = payload.get("layout")
+        if layout is not None and getattr(layout, "signature", None) == signature:
+            return layout
+        return PackedLayout(
+            signature[0],
+            latent_t,
+            latent_h,
+            latent_w,
+            signature[4],
+            keyframes=payload.get("keyframes"),
+            refs=payload.get("refs"),
+            frame_count=payload.get("frame_count"),
+        )
+    except (AttributeError, ImportError, TypeError, ValueError):
+        return None
+
+
+def _reference_roles(refs):
+    roles = []
+    for reference in refs or ():
+        kind = reference.get("kind")
+        if kind == "image":
+            roles.append("reference_image")
+        elif kind == "audio":
+            if int(reference.get("ref_audio_t", 0)) > 0:
+                roles.append("reference_audio")
+        elif kind in ("video", "video_audio"):
+            if int(reference.get("ref_audio_t", 0)) > 0:
+                roles.append("reference_audio")
+            roles.append("reference_video")
+    return roles
+
+
+def minimax_attention_segments(base_model):
+    """Translate H3's PackedLayout into model-independent modality spans."""
+    packed_layout = _runtime_packed_layout(base_model)
+    packed_segments = getattr(packed_layout, "segments", None)
+    if not isinstance(packed_segments, (list, tuple)) or not packed_segments:
+        return ()
+    context = getattr(base_model, RUNTIME_CONTEXT_ATTR, None)
+    references = context.get("refs") if isinstance(context, dict) else None
+    reference_roles = iter(_reference_roles(references))
+    translated = []
+    for start, stop, kind in packed_segments:
+        if kind == "text":
+            role = "text"
+        elif kind == "cond":
+            role = "reference_image"
+        elif kind in ("ref_img", "ref_audio"):
+            role = next(reference_roles, None)
+            expected = "reference_audio" if kind == "ref_audio" else None
+            if role is None or (expected is not None and role != expected):
+                return ()
+            if kind == "ref_img" and role not in {
+                "reference_image",
+                "reference_video",
+            }:
+                return ()
+        elif kind == "audio":
+            role = "target_audio"
+        elif kind == "video":
+            role = "target_video"
+        else:
+            return ()
+        translated.append((int(start), int(stop), role))
+    if next(reference_roles, None) is not None:
+        return ()
+    return tuple(translated)
+
+
 def minimax_temporal_topology(base_model, diffusion_model, mod_segments):
     """Describe the contiguous target-video tail of the current H3 sequence."""
     if base_model is None or diffusion_model is None or not mod_segments:
@@ -151,13 +253,16 @@ def publish_minimax_attention_layout(
     expected_layout = {
         "provider": MINIMAX_H3_LAYOUT_KIND,
         # H3's current PackedLayout ends in target audio then target video.
-        # Keeping the entire non-video prefix dense preserves text, references,
-        # and joint audio/video generation.
+        # This legacy boundary remains useful to the independent frame-sparse
+        # backend; Sol consumes the complete semantic segment table below.
         "dense_prefix_tokens": int(mod_segments[-1][0]),
         "layer_index": int(layer_index),
         "layer_count": int(layer_count),
         **minimax_temporal_topology(base_model, diffusion_model, mod_segments),
     }
+    segments = minimax_attention_segments(base_model)
+    if segments:
+        expected_layout["segments"] = segments
     layout = transformer_options.get(ATTENTION_LAYOUT_KEY)
     # Never retain topology from an earlier prompt/window when current shapes
     # cannot be validated. Unknown extension fields may compose, but every
@@ -187,6 +292,53 @@ def has_complete_minimax_attention_layout(
 def _forward_has_provider(forward) -> bool:
     function = getattr(forward, "__func__", forward)
     return bool(getattr(function, _FORWARD_PROVIDER_ATTR, False))
+
+
+def _model_forward_has_provider(forward) -> bool:
+    function = getattr(forward, "__func__", forward)
+    return bool(getattr(function, _MODEL_FORWARD_PROVIDER_ATTR, False))
+
+
+def _make_model_forward(base_model, diffusion_model, original):
+    def forward(
+        self,
+        x,
+        timestep,
+        context,
+        transformer_options={},
+        minimax_payload=None,
+        **kwargs,
+    ):
+        previous = getattr(base_model, RUNTIME_CONTEXT_ATTR, None)
+        runtime = dict(previous) if isinstance(previous, dict) else {}
+        payload = minimax_payload if isinstance(minimax_payload, dict) else {}
+        runtime.update(
+            packed_layout=_resolve_packed_layout(
+                diffusion_model, x, context, payload
+            ),
+            refs=payload.get("refs"),
+        )
+        setattr(base_model, RUNTIME_CONTEXT_ATTR, runtime)
+        try:
+            return original(
+                x,
+                timestep,
+                context,
+                transformer_options=transformer_options,
+                minimax_payload=minimax_payload,
+                **kwargs,
+            )
+        finally:
+            if previous is None:
+                try:
+                    delattr(base_model, RUNTIME_CONTEXT_ATTR)
+                except AttributeError:
+                    pass
+            else:
+                setattr(base_model, RUNTIME_CONTEXT_ATTR, previous)
+
+    setattr(forward, _MODEL_FORWARD_PROVIDER_ATTR, True)
+    return types.MethodType(forward, diffusion_model)
 
 
 def _make_layout_forward(
@@ -265,6 +417,15 @@ def ensure_minimax_attention_layout_provider(model) -> LayoutProviderStatus:
         make_minimax_runtime_context_wrapper(base_model),
     )
     object_patches = getattr(model, "object_patches", {})
+    current_model_forward = object_patches.get(
+        RUNTIME_FORWARD_PATCH_KEY,
+        diffusion_model.forward,
+    )
+    if not _model_forward_has_provider(current_model_forward):
+        model.add_object_patch(
+            RUNTIME_FORWARD_PATCH_KEY,
+            _make_model_forward(base_model, diffusion_model, current_model_forward),
+        )
     for layer_index, block in enumerate(blocks):
         key = f"diffusion_model.blocks.{layer_index}.forward"
         current = object_patches.get(key, block.forward)

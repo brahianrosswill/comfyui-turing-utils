@@ -162,14 +162,10 @@ class TuringAttentionContractTest(unittest.TestCase):
                 min_sequence_tokens=4096,
             )
         self.assertIs(output, q)
-        self.assertEqual(sparse.call_args.kwargs["prefix_tokens"], 0)
+        self.assertEqual(sparse.call_args.kwargs["dense_query_ranges"], ())
+        self.assertEqual(sparse.call_args.kwargs["exact_kv_ranges"], ())
         self.assertEqual(sparse.call_args.kwargs["threshold_sigma"], 1.0)
-        self.assertEqual(sparse.call_args.kwargs["local_block_radius"], 1)
-        self.assertEqual(sparse.call_args.kwargs["temporal_neighbor_frames"], 1)
-        self.assertEqual(sparse.call_args.kwargs["residual_subblocks"], 2)
-        self.assertEqual(sparse.call_args.kwargs["minimum_route_density"], 0.0)
-        self.assertEqual(sparse.call_args.kwargs["maximum_route_density"], 1.0)
-        self.assertEqual(sparse.call_args.kwargs["topology_tokens"], 0)
+        self.assertEqual(sparse.call_args.kwargs["residual_subblocks"], 1)
 
     def test_h3_sparse_stays_dense_until_complete_runtime_layout_is_available(self):
         q = torch.zeros((1, 4, 4096, 128), dtype=torch.bfloat16)
@@ -219,6 +215,11 @@ class TuringAttentionContractTest(unittest.TestCase):
                         "tokens_per_frame": 256,
                         "spatial_tokens_height": 16,
                         "spatial_tokens_width": 16,
+                        "segments": (
+                            (0, 256, "text"),
+                            (256, 512, "reference_video"),
+                            (512, 4096, "target_video"),
+                        ),
                         "layer_index": 10,
                         "layer_count": 50,
                     },
@@ -226,8 +227,8 @@ class TuringAttentionContractTest(unittest.TestCase):
             )
 
         self.assertIs(output, q)
-        self.assertEqual(sparse.call_args.kwargs["prefix_tokens"], 512)
-        self.assertEqual(sparse.call_args.kwargs["topology_tokens"], 3584)
+        self.assertEqual(sparse.call_args.kwargs["dense_query_ranges"], ((0, 256),))
+        self.assertEqual(sparse.call_args.kwargs["exact_kv_ranges"], ((0, 256),))
 
     def test_experimental_sparse_keeps_short_calls_dense(self):
         q = torch.zeros((1, 4, 256, 128), dtype=torch.bfloat16)
@@ -417,17 +418,13 @@ class TuringAttentionContractTest(unittest.TestCase):
 
     def test_experimental_sparse_debug_counts_route_only_once_per_shape(self):
         q = torch.zeros((1, 4, 4096, 128), dtype=torch.bfloat16)
-        route = torch.zeros((1, 4, 64, 4), dtype=torch.int32)
         route_keys = set()
         with (
             mock.patch("attention.is_supported_turing_device", return_value=True),
             mock.patch(
                 "attention._sol_sparse_sageattn",
-                side_effect=[(q, route), q],
+                side_effect=[(q, torch.tensor([1024]), 16384), q],
             ) as sparse,
-            mock.patch(
-                "attention._sol_sparse_route_selected", return_value=1024
-            ) as selected,
             self.assertLogs("comfyui-turing-utils", level="WARNING") as captured,
         ):
             for _ in range(2):
@@ -446,27 +443,24 @@ class TuringAttentionContractTest(unittest.TestCase):
 
         self.assertIs(output, q)
         self.assertEqual(sparse.call_count, 2)
-        self.assertTrue(sparse.call_args_list[0].kwargs["return_route"])
-        self.assertFalse(sparse.call_args_list[1].kwargs["return_route"])
-        selected.assert_called_once_with(route)
+        self.assertTrue(sparse.call_args_list[0].kwargs["return_stats"])
+        self.assertFalse(sparse.call_args_list[1].kwargs["return_stats"])
         message = "\n".join(captured.output)
         self.assertIn("density=0.0625", message)
         self.assertIn("step=None/None layer=None/None", message)
 
     def test_experimental_sparse_debug_aggregates_once_per_step(self):
         q = torch.zeros((1, 4, 4096, 128), dtype=torch.bfloat16)
-        route = torch.zeros((1, 4, 64, 4), dtype=torch.int32)
         route_state = {}
         with (
             mock.patch("attention.is_supported_turing_device", return_value=True),
             mock.patch(
                 "attention._sol_sparse_sageattn",
-                side_effect=[(q, route), (q, route)],
+                side_effect=[
+                    (q, torch.tensor([1024]), 16384),
+                    (q, torch.tensor([2048]), 16384),
+                ],
             ) as sparse,
-            mock.patch(
-                "attention._sol_sparse_route_selected_device",
-                side_effect=[torch.tensor([1024]), torch.tensor([2048])],
-            ) as selected,
             self.assertLogs("comfyui-turing-utils", level="WARNING") as captured,
         ):
             for layer_index in (2, 3):
@@ -491,8 +485,7 @@ class TuringAttentionContractTest(unittest.TestCase):
 
         self.assertIs(output, q)
         self.assertEqual(sparse.call_count, 2)
-        self.assertTrue(all(call.kwargs["return_route"] for call in sparse.call_args_list))
-        self.assertEqual(selected.call_count, 2)
+        self.assertTrue(all(call.kwargs["return_stats"] for call in sparse.call_args_list))
         self.assertFalse(route_state)
         message = "\n".join(captured.output)
         self.assertIn("step=2/8 layers=2-3 calls=2", message)
@@ -544,10 +537,10 @@ class TuringAttentionContractTest(unittest.TestCase):
                 routing_threshold=0.82,
                 prefix_policy="auto",
                 manual_prefix_tokens=192,
-                local_block_radius=3,
                 skipped_residual="1x64",
-                minimum_route_density=0.2,
-                maximum_route_density=0.6,
+                sparse_reference_image=True,
+                sparse_reference_video=False,
+                sparse_reference_audio=True,
                 min_sequence_tokens=8000,
                 transformer_options={
                     "turing_utils_attention_layout": {
@@ -555,18 +548,27 @@ class TuringAttentionContractTest(unittest.TestCase):
                         "topology_start_tokens": 320,
                         "topology_tokens": 7680,
                         "tokens_per_frame": 960,
+                        "segments": (
+                            (0, 128, "text"),
+                            (128, 256, "reference_image"),
+                            (256, 320, "reference_video"),
+                            (320, 384, "reference_audio"),
+                            (384, 512, "target_audio"),
+                            (512, 8192, "target_video"),
+                        ),
                     }
                 },
             )
-        self.assertEqual(sparse.call_args.kwargs["prefix_tokens"], 320)
+        self.assertEqual(
+            sparse.call_args.kwargs["dense_query_ranges"],
+            ((0, 128), (256, 320), (384, 512)),
+        )
+        self.assertEqual(
+            sparse.call_args.kwargs["exact_kv_ranges"],
+            ((0, 128), (256, 320), (384, 512)),
+        )
         self.assertEqual(sparse.call_args.kwargs["threshold_sigma"], 0.82)
-        self.assertEqual(sparse.call_args.kwargs["local_block_radius"], 3)
         self.assertEqual(sparse.call_args.kwargs["residual_subblocks"], 1)
-        self.assertEqual(sparse.call_args.kwargs["minimum_route_density"], 0.2)
-        self.assertEqual(sparse.call_args.kwargs["maximum_route_density"], 0.6)
-        self.assertEqual(sparse.call_args.kwargs["topology_start_tokens"], 320)
-        self.assertEqual(sparse.call_args.kwargs["topology_tokens"], 7680)
-        self.assertEqual(sparse.call_args.kwargs["tokens_per_frame"], 960)
 
     def test_sparse_prefix_policy_never_guesses_a_generic_layout(self):
         options = {
@@ -588,6 +590,71 @@ class TuringAttentionContractTest(unittest.TestCase):
             turing_attention._sparse_prefix_tokens("auto", 128, {}, 4096),
             0,
         )
+
+    def test_sparse_modality_policy_handles_long_and_mixed_references(self):
+        options = {
+            "turing_utils_attention_layout": {
+                "segments": (
+                    (0, 64, "text"),
+                    (64, 128, "reference_image"),
+                    (128, 64000, "reference_video"),
+                    (64000, 64128, "reference_audio"),
+                    (64128, 64256, "target_audio"),
+                    (64256, 100000, "target_video"),
+                )
+            }
+        }
+        default_ranges = turing_attention._sparse_protected_ranges(
+            "auto",
+            0,
+            options,
+            100000,
+            sparse_reference_image=False,
+            sparse_reference_video=True,
+            sparse_reference_audio=False,
+        )
+        self.assertEqual(default_ranges, ((0, 128), (64000, 64256)))
+        all_reference_sparse = turing_attention._sparse_protected_ranges(
+            "auto",
+            0,
+            options,
+            100000,
+            sparse_reference_image=True,
+            sparse_reference_video=True,
+            sparse_reference_audio=True,
+        )
+        self.assertEqual(all_reference_sparse, ((0, 64), (64128, 64256)))
+        no_reference_sparse = turing_attention._sparse_protected_ranges(
+            "auto",
+            0,
+            options,
+            100000,
+            sparse_reference_image=False,
+            sparse_reference_video=False,
+            sparse_reference_audio=False,
+        )
+        self.assertEqual(no_reference_sparse, ((0, 64256),))
+
+    def test_sparse_modality_policy_without_references_protects_text_and_audio(self):
+        options = {
+            "turing_utils_attention_layout": {
+                "segments": (
+                    (0, 64, "text"),
+                    (64, 128, "target_audio"),
+                    (128, 4096, "target_video"),
+                )
+            }
+        }
+        ranges = turing_attention._sparse_protected_ranges(
+            "auto",
+            0,
+            options,
+            4096,
+            sparse_reference_image=False,
+            sparse_reference_video=True,
+            sparse_reference_audio=False,
+        )
+        self.assertEqual(ranges, ((0, 128),))
 
     def test_sparse_dense_prefix_steps_use_sampling_progress(self):
         sample_sigmas = torch.tensor([1.0, 0.8, 0.5, 0.2, 0.0])

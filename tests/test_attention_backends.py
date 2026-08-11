@@ -53,7 +53,15 @@ class AttentionBackendsTest(unittest.TestCase):
         with mock.patch.dict(
             sys.modules,
             {
-                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.13.0"),
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.15.0"),
+                "comfyui_turing_utils_kernel.turing_sage": sage_module,
+            },
+        ):
+            self.assertFalse(attention_backends.bundled_sparse_available())
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.16.0"),
                 "comfyui_turing_utils_kernel.turing_sage": sage_module,
             },
         ):
@@ -366,11 +374,10 @@ class AttentionBackendsTest(unittest.TestCase):
                 routing_threshold=0.85,
                 prefix_policy="manual",
                 manual_prefix_tokens=256,
-                local_block_radius=2,
-                temporal_neighbor_frames=2,
                 skipped_residual="1x64",
-                minimum_route_density=0.2,
-                maximum_route_density=0.7,
+                sparse_reference_image=True,
+                sparse_reference_video=False,
+                sparse_reference_audio=True,
                 dense_prefix_steps=2,
                 dense_suffix_steps=1,
                 dense_prefix_layers=3,
@@ -394,11 +401,10 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertEqual(sparse.call_args.kwargs["routing_threshold"], 0.85)
         self.assertEqual(sparse.call_args.kwargs["prefix_policy"], "manual")
         self.assertEqual(sparse.call_args.kwargs["manual_prefix_tokens"], 256)
-        self.assertEqual(sparse.call_args.kwargs["local_block_radius"], 2)
-        self.assertEqual(sparse.call_args.kwargs["temporal_neighbor_frames"], 2)
         self.assertEqual(sparse.call_args.kwargs["skipped_residual"], "1x64")
-        self.assertEqual(sparse.call_args.kwargs["minimum_route_density"], 0.2)
-        self.assertEqual(sparse.call_args.kwargs["maximum_route_density"], 0.7)
+        self.assertTrue(sparse.call_args.kwargs["sparse_reference_image"])
+        self.assertFalse(sparse.call_args.kwargs["sparse_reference_video"])
+        self.assertTrue(sparse.call_args.kwargs["sparse_reference_audio"])
         self.assertTrue(sparse.call_args.kwargs["debug_route_density"])
         self.assertIsInstance(sparse.call_args.kwargs["debug_route_keys"], set)
         self.assertIsInstance(sparse.call_args.kwargs["debug_route_state"], dict)
@@ -439,7 +445,7 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertEqual(stable.call_count, 2)
         self.assertEqual(sparse.call_count, 1)
         self.assertEqual(
-            sparse.call_args.kwargs["debug_context"]["last_sparse_layer"], 48
+            sparse.call_args.kwargs["debug_context"]["last_sparse_layer"], 49
         )
 
     def test_experimental_sparse_rejects_non_turing_device(self):

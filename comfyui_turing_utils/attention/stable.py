@@ -25,15 +25,14 @@ SUPPORTED_INPUT_DTYPES = (*SUPPORTED_KERNEL_DTYPES, torch.float32)
 SPARSE_AUTO_MIN_SEQUENCE = 4096
 SPARSE_ROUTING_THRESHOLD = 1.0
 SPARSE_PREFIX_POLICY = "auto"
-SPARSE_LOCAL_BLOCK_RADIUS = 1
-SPARSE_TEMPORAL_NEIGHBOR_FRAMES = 1
-SPARSE_SKIPPED_RESIDUAL = "2x32"
-SPARSE_MINIMUM_ROUTE_DENSITY = 0.0
-SPARSE_MAXIMUM_ROUTE_DENSITY = 1.0
+SPARSE_SKIPPED_RESIDUAL = "1x64"
+SPARSE_REFERENCE_IMAGE = False
+SPARSE_REFERENCE_VIDEO = True
+SPARSE_REFERENCE_AUDIO = False
 SPARSE_DENSE_PREFIX_STEPS = 0
 SPARSE_DENSE_SUFFIX_STEPS = 0
-SPARSE_DENSE_PREFIX_LAYERS = 1
-SPARSE_DENSE_SUFFIX_LAYERS = 1
+SPARSE_DENSE_PREFIX_LAYERS = 2
+SPARSE_DENSE_SUFFIX_LAYERS = 0
 FRAME_SPARSE_TEMPORAL_WINDOW_FRAMES = 2
 FRAME_SPARSE_GLOBAL_ANCHOR_STRIDE = 12
 FRAME_SPARSE_SINK_FRAMES = 1
@@ -205,7 +204,7 @@ def bundled_sparse_available() -> bool:
         version_tuple = tuple(int(part) for part in version.split(".")[:3])
     except ValueError:
         return False
-    return version_tuple >= (0, 13, 0) and turing_sage.sparse_available()
+    return version_tuple >= (0, 16, 0) and turing_sage.sparse_available()
 
 
 def bundled_frame_sparse_available() -> bool:
@@ -231,14 +230,6 @@ def _sol_sparse_sageattn(*args, **kwargs):
 
 def _frame_sparse_sageattn(*args, **kwargs):
     return load_turing_sage().frame_sparse_sageattn(*args, **kwargs)
-
-
-def _sol_sparse_route_selected(route: torch.Tensor) -> int:
-    return load_turing_sage().sol_sparse_route_selected(route)
-
-
-def _sol_sparse_route_selected_device(route: torch.Tensor) -> torch.Tensor:
-    return load_turing_sage()._sol_sparse_route_selected_device(route)
 
 
 def preflight_bundled(device: torch.device) -> None:

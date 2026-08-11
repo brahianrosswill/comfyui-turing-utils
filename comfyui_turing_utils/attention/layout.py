@@ -8,6 +8,16 @@ from dataclasses import dataclass
 
 ATTENTION_LAYOUT_KEY = "turing_utils_attention_layout"
 ATTENTION_LAYOUT_REQUIREMENT_KEY = "turing_utils_attention_layout_required"
+ATTENTION_SEGMENT_ROLES = frozenset(
+    {
+        "text",
+        "reference_image",
+        "reference_video",
+        "reference_audio",
+        "target_audio",
+        "target_video",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -52,7 +62,7 @@ def has_complete_attention_layout(
     *,
     provider: str | None = None,
 ) -> bool:
-    """Validate the common packed-video topology consumed by sparse backends."""
+    """Validate the common packed multimodal layout consumed by sparse backends."""
     if not isinstance(transformer_options, dict):
         return False
     layout = transformer_options.get(ATTENTION_LAYOUT_KEY)
@@ -98,12 +108,34 @@ def has_complete_attention_layout(
         or layer_index >= layer_count
     ):
         return False
-    return sequence_length is None or start + tokens == int(sequence_length)
+    if sequence_length is not None and start + tokens != int(sequence_length):
+        return False
+    segments = layout.get("segments")
+    if not isinstance(segments, tuple) or not segments:
+        return False
+    cursor = 0
+    for segment in segments:
+        if (
+            not isinstance(segment, tuple)
+            or len(segment) != 3
+            or not isinstance(segment[0], int)
+            or isinstance(segment[0], bool)
+            or not isinstance(segment[1], int)
+            or isinstance(segment[1], bool)
+            or segment[2] not in ATTENTION_SEGMENT_ROLES
+            or segment[0] != cursor
+            or segment[1] <= segment[0]
+        ):
+            return False
+        cursor = segment[1]
+    expected_length = start + tokens
+    return cursor == expected_length
 
 
 __all__ = [
     "ATTENTION_LAYOUT_KEY",
     "ATTENTION_LAYOUT_REQUIREMENT_KEY",
+    "ATTENTION_SEGMENT_ROLES",
     "LayoutProviderStatus",
     "ensure_attention_layout_provider",
     "has_complete_attention_layout",

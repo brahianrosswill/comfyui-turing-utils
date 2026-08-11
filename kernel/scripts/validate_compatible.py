@@ -248,63 +248,46 @@ def validate_sage(device: torch.device) -> None:
 
 
 def validate_sparse(device: torch.device) -> None:
-    from comfyui_turing_utils_kernel.turing_sage import (
-        sageattn,
-        sol_sparse_route_selected,
-        sol_sparse_sageattn,
-    )
+    from comfyui_turing_utils_kernel.turing_sage import sageattn, sol_sparse_sageattn
 
     for dtype in (torch.float16, torch.bfloat16):
         for query_length, key_length in ((129, 151), (151, 129)):
             q = torch.randn((1, 4, query_length, 128), device=device, dtype=dtype)
             k = torch.randn((1, 2, key_length, 128), device=device, dtype=dtype)
             v = torch.randn_like(k)
-            output, route = sol_sparse_sageattn(
-                q, k, v, threshold_sigma=-1000.0, return_route=True
+            output, selected, possible = sol_sparse_sageattn(
+                q, k, v, threshold_sigma=-1000.0, return_stats=True
             )
             reference = torch.nn.functional.scaled_dot_product_attention(
                 q.float(), k.float(), v.float(), enable_gqa=True
             )
             _assert_close(
-                f"experimental sparse exact route {dtype} Q={query_length} K={key_length}",
+                f"Sol exact route {dtype} Q={query_length} K={key_length}",
                 output,
                 reference,
                 rtol=0.08,
                 atol=0.06,
             )
-            expected_query_blocks = (query_length + 63) // 64
-            if (
-                route.dtype != torch.int32
-                or route.shape[:3] != (1, 4, expected_query_blocks)
-            ):
-                raise RuntimeError("experimental sparse route shape is incompatible")
+            if int(selected.item()) != possible:
+                raise RuntimeError("threshold=-1000 must select every sparse Q/K block")
 
-    # A non-block-aligned semantic prefix is evaluated by stable Sage while
-    # only target-video Query blocks enter sparse routing. K quantization is
-    # shared by both paths, including GQA head mapping.
+    # Non-aligned protected spans round outward to blocks. Those Query blocks
+    # use exact Sage; the same K/V blocks are exact sinks for every sparse Query.
     sequence = 321
-    prefix = 77
+    protected = ((0, 77), (130, 181))
     q = torch.randn((1, 4, sequence, 128), device=device, dtype=torch.bfloat16)
     k = torch.randn((1, 2, sequence, 128), device=device, dtype=torch.bfloat16)
     v = torch.randn_like(k)
-    output, route = sol_sparse_sageattn(
+    output = sol_sparse_sageattn(
         q,
         k,
         v,
-        prefix_tokens=prefix,
+        dense_query_ranges=protected,
+        exact_kv_ranges=protected,
         threshold_sigma=-1000.0,
-        return_route=True,
     )
     dense = sageattn(q, k, v)
-    _assert_close(
-        "experimental sparse split prefix full route",
-        output,
-        dense,
-        rtol=0.02,
-        atol=0.01,
-    )
-    if route.shape[:3] != (1, 4, (sequence - prefix + 63) // 64):
-        raise RuntimeError("sparse route must contain target-video Query blocks only")
+    _assert_close("Sol protected modality ranges", output, dense, rtol=0.02, atol=0.01)
 
     sequence = 1025
     blocks = (sequence + 63) // 64
@@ -321,68 +304,25 @@ def validate_sparse(device: torch.device) -> None:
     v_centers = torch.randn((1, 2, blocks, 128), device=device)
     v = v_centers.repeat_interleave(64, dim=2)[:, :, :sequence]
     v = (v + torch.randn_like(v) * 0.1).to(torch.bfloat16)
-    output, route = sol_sparse_sageattn(
-        q, k, v, prefix_tokens=128, threshold_sigma=1.0, return_route=True
-    )
-    sage_reference = sageattn(q, k, v)
-    reference = torch.nn.functional.scaled_dot_product_attention(
-        q.float(), k.float(), v.float(), enable_gqa=True
-    )
-    _assert_close(
-        "experimental sparse correlated sequence",
-        output,
-        reference,
-        rtol=0.02,
-        atol=0.02,
-    )
-    _assert_close(
-        "experimental sparse correlated sequence against stable Sage",
-        output,
-        sage_reference,
-        rtol=0.02,
-        atol=0.02,
-    )
-    selected = sum(
-        (int(word) & 0xFFFF).bit_count() for word in route.cpu().reshape(-1)
-    )
-    selected_cuda = sol_sparse_route_selected(route)
-    if selected_cuda != selected:
-        raise RuntimeError(
-            f"experimental sparse route popcount mismatch: {selected_cuda} != {selected}"
-        )
-    possible = route.shape[0] * route.shape[1] * route.shape[2] * blocks
-    density = selected / possible
-    if not 0.1 < density < 0.9:
-        raise RuntimeError(f"experimental sparse route density is implausible: {density:.3f}")
-
-    # The budget is applied independently to every 16-key routing tile. With
-    # no semantic or temporal forcing and 16 exact key blocks, 0.25 selects
-    # exactly four keys for every Query/head row (the overlapping self block is
-    # included in that budget rather than added on top).
-    budget_sequence = 1024
-    q = torch.randn((1, 4, budget_sequence, 128), device=device, dtype=torch.float16)
-    k = torch.randn((1, 2, budget_sequence, 128), device=device, dtype=torch.float16)
-    v = torch.randn_like(k)
-    _, route = sol_sparse_sageattn(
+    output, selected, possible = sol_sparse_sageattn(
         q,
         k,
         v,
-        threshold_sigma=1000.0,
-        local_block_radius=0,
-        minimum_route_density=0.25,
-        maximum_route_density=0.25,
-        return_route=True,
+        dense_query_ranges=((0, 128),),
+        exact_kv_ranges=((0, 128),),
+        threshold_sigma=1.0,
+        return_stats=True,
     )
-    expected = 4 * 16 * 4
-    selected = sol_sparse_route_selected(route)
-    if selected != expected:
-        raise RuntimeError(
-            f"experimental sparse route budget selected {selected}, expected {expected}"
-        )
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.float(), k.float(), v.float(), enable_gqa=True
+    )
+    _assert_close("Sol correlated sequence", output, reference, rtol=0.02, atol=0.02)
+    density = int(selected.item()) / possible
+    if not 0.1 < density < 0.9:
+        raise RuntimeError(f"Sol route density is implausible: {density:.3f}")
 
-    # Two 32-token centroids must preserve a deliberately bimodal skipped
-    # block at least as well as one 64-token centroid. Exact/local routing is
-    # unchanged, so this isolates only the skipped-residual approximation.
+    # 2x32 changes skipped-block reconstruction only; routing and exact blocks
+    # are deliberately identical to the official-style 1x64 path.
     sequence = 2048
     blocks = sequence // 64
     half_centers = torch.randn((1, 2, blocks, 2, 128), device=device)
@@ -397,20 +337,10 @@ def validate_sparse(device: torch.device) -> None:
     ).to(torch.bfloat16)
     dense = sageattn(q, k, v)
     residual_64 = sol_sparse_sageattn(
-        q,
-        k,
-        v,
-        threshold_sigma=1000.0,
-        local_block_radius=0,
-        residual_subblocks=1,
+        q, k, v, threshold_sigma=1000.0, residual_subblocks=1
     )
     residual_32 = sol_sparse_sageattn(
-        q,
-        k,
-        v,
-        threshold_sigma=1000.0,
-        local_block_radius=0,
-        residual_subblocks=2,
+        q, k, v, threshold_sigma=1000.0, residual_subblocks=2
     )
     error_64 = (residual_64.float() - dense.float()).square().mean().item()
     error_32 = (residual_32.float() - dense.float()).square().mean().item()
@@ -420,7 +350,7 @@ def validate_sparse(device: torch.device) -> None:
             f"mse={error_32:.6g} vs {error_64:.6g}"
         )
     print(
-        "sparse skipped residual quality: "
+        "Sol skipped residual quality: "
         f"2x32 mse={error_32:.6g}, 1x64 mse={error_64:.6g}"
     )
 
@@ -714,7 +644,6 @@ def benchmark_sage(device: torch.device, iterations: int) -> None:
 def benchmark_sparse(device: torch.device, iterations: int) -> None:
     from comfyui_turing_utils_kernel.turing_sage import (
         sageattn,
-        sol_sparse_route_selected,
         sol_sparse_sageattn,
     )
 
@@ -732,12 +661,10 @@ def benchmark_sparse(device: torch.device, iterations: int) -> None:
         sparse_ms = _elapsed_ms(sparse, iterations)
         sparse_64_ms = _elapsed_ms(sparse_64, iterations)
         dense_ms = _elapsed_ms(dense, iterations)
-        _, route = sol_sparse_sageattn(
-            q, k, v, threshold_sigma=1.0, return_route=True
+        _, selected_tensor, possible = sol_sparse_sageattn(
+            q, k, v, threshold_sigma=1.0, return_stats=True
         )
-        blocks = (sequence + 63) // 64
-        selected = sol_sparse_route_selected(route)
-        density = selected / (4 * blocks * blocks)
+        density = int(selected_tensor.item()) / possible
         print(
             f"sparse HND N={sequence} H=4 D=128 threshold=1.0 density={density:.3f}: "
             f"2x32 {sparse_ms:.3f} ms, 1x64 {sparse_64_ms:.3f} ms, "

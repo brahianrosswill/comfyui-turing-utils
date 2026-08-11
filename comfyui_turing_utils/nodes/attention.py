@@ -26,7 +26,7 @@ class SolSparseAttentionPatch:
                     ["auto", "none", "manual"],
                     {
                         "default": "auto",
-                        "tooltip": "Auto uses semantic token-layout metadata when the model supplies it; none protects no prefix; manual uses the token count below.",
+                        "tooltip": "Auto applies the model's semantic segments and the three reference switches; none protects no modality ranges; manual protects only the leading token count below.",
                     },
                 ),
                 "manual_prefix_tokens": (
@@ -36,56 +36,35 @@ class SolSparseAttentionPatch:
                         "min": 0,
                         "max": 262144,
                         "step": 64,
-                        "tooltip": "Leading Q/K tokens kept exact only when prefix_policy is manual. Rounded up to 64-token blocks.",
-                    },
-                ),
-                "local_block_radius": (
-                    "INT",
-                    {
-                        "default": 1,
-                        "min": 0,
-                        "max": 16,
-                        "step": 1,
-                        "tooltip": "Always evaluate this many neighboring 64-token blocks on each side exactly.",
-                    },
-                ),
-                "temporal_neighbor_frames": (
-                    "INT",
-                    {
-                        "default": 1,
-                        "min": 0,
-                        "max": 8,
-                        "step": 1,
-                        "tooltip": "Keep matching spatial ranges in this many adjacent frames exact when a model adapter supplies video topology. Has no effect without metadata.",
+                        "tooltip": "Leading Query tokens kept dense and leading K/V tokens kept exact only for manual policy. Boundaries round outward to 64-token blocks.",
                     },
                 ),
                 "skipped_residual": (
-                    ["2x32", "1x64"],
+                    ["1x64", "2x32"],
                     {
-                        "default": "2x32",
-                        "tooltip": "Approximate each skipped 64-token block with two 32-token K/V centroids (higher quality) or one 64-token centroid (lower summary cost).",
+                        "default": "1x64",
+                        "tooltip": "Official-style 1x64 uses one K/V centroid per skipped block. 2x32 keeps two residual centroids for higher approximation quality without changing routing.",
                     },
                 ),
-                "minimum_route_density": (
-                    "FLOAT",
+                "sparse_reference_image": (
+                    "BOOLEAN",
                     {
-                        "default": 0.0,
-                        "min": 0.0,
-                        "max": 1.0,
-                        "step": 0.05,
-                        "round": 0.01,
-                        "tooltip": "Minimum adaptive exact-route density per 16-block routing tile. Forced prefix/local/temporal blocks can raise the actual density above this value.",
+                        "default": False,
+                        "tooltip": "Allow reference-image Query/KV interactions to use Sol routing. Disabled protects keyframes and reference images with dense Query and exact KV blocks.",
                     },
                 ),
-                "maximum_route_density": (
-                    "FLOAT",
+                "sparse_reference_video": (
+                    "BOOLEAN",
                     {
-                        "default": 1.0,
-                        "min": 0.0,
-                        "max": 1.0,
-                        "step": 0.05,
-                        "round": 0.01,
-                        "tooltip": "Maximum adaptive exact-route density per 16-block routing tile. Forced semantic and local blocks are never removed.",
+                        "default": True,
+                        "tooltip": "Allow long reference-video Query/KV interactions to use Sol routing instead of protecting the complete reference video.",
+                    },
+                ),
+                "sparse_reference_audio": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Allow reference-audio Query/KV interactions to use Sol routing. Disabled preserves reference audio and dialogue conditioning exactly.",
                     },
                 ),
                 "dense_prefix_steps": (
@@ -111,7 +90,7 @@ class SolSparseAttentionPatch:
                 "dense_prefix_layers": (
                     "INT",
                     {
-                        "default": 1,
+                        "default": 2,
                         "min": 0,
                         "max": 256,
                         "step": 1,
@@ -121,7 +100,7 @@ class SolSparseAttentionPatch:
                 "dense_suffix_layers": (
                     "INT",
                     {
-                        "default": 1,
+                        "default": 0,
                         "min": 0,
                         "max": 256,
                         "step": 1,
@@ -152,15 +131,14 @@ class SolSparseAttentionPatch:
         routing_threshold: float = 1.0,
         prefix_policy: str = "auto",
         manual_prefix_tokens: int = 0,
-        local_block_radius: int = 1,
-        temporal_neighbor_frames: int = 1,
-        skipped_residual: str = "2x32",
-        minimum_route_density: float = 0.0,
-        maximum_route_density: float = 1.0,
+        skipped_residual: str = "1x64",
+        sparse_reference_image: bool = False,
+        sparse_reference_video: bool = True,
+        sparse_reference_audio: bool = False,
         dense_prefix_steps: int = 0,
         dense_suffix_steps: int = 0,
-        dense_prefix_layers: int = 1,
-        dense_suffix_layers: int = 1,
+        dense_prefix_layers: int = 2,
+        dense_suffix_layers: int = 0,
         debug_route_density: bool = False,
     ):
         return (
@@ -169,11 +147,10 @@ class SolSparseAttentionPatch:
                 routing_threshold=routing_threshold,
                 prefix_policy=prefix_policy,
                 manual_prefix_tokens=manual_prefix_tokens,
-                local_block_radius=local_block_radius,
-                temporal_neighbor_frames=temporal_neighbor_frames,
                 skipped_residual=skipped_residual,
-                minimum_route_density=minimum_route_density,
-                maximum_route_density=maximum_route_density,
+                sparse_reference_image=sparse_reference_image,
+                sparse_reference_video=sparse_reference_video,
+                sparse_reference_audio=sparse_reference_audio,
                 dense_prefix_steps=dense_prefix_steps,
                 dense_suffix_steps=dense_suffix_steps,
                 dense_prefix_layers=dense_prefix_layers,

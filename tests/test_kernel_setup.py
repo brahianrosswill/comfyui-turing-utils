@@ -75,7 +75,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertNotIn("-DCOMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS", flags)
         self.assertIn("csrc/turing/sage/sol_sparse_cuda_sm75.cu", extensions[1].kwargs["sources"])
         self.assertIn("csrc/turing/sage/frame_sparse_cuda_sm75.cu", extensions[1].kwargs["sources"])
-        self.assertEqual(setup.call_args.kwargs["version"], "0.15.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.16.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -85,7 +85,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.15.0")
+        self.assertEqual(metadata["project"]["version"], "0.16.0")
 
     def test_sparse_source_does_not_require_optional_cuda_library_headers(self):
         source = (
@@ -98,7 +98,11 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn("key_score_summary", source)
         self.assertIn("load_dequantized_int8_tile", source)
         self.assertIn("kAttentionSharedBytes == 32 * 1024", source)
-        self.assertIn("minimum_route_density", source)
+        self.assertNotIn("minimum_route_density", source)
+        self.assertNotIn("temporal_neighbor_frames", source)
+        self.assertIn("sparse_query_blocks", source)
+        self.assertIn("exact_kv_blocks", source)
+        self.assertIn("shared_route", source)
         self.assertIn("residual_subblocks", source)
 
     def test_frame_sparse_source_uses_static_csr_without_optional_cuda_headers(self):

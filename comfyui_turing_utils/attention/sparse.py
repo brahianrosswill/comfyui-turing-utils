@@ -23,21 +23,18 @@ from .stable import (
     LOG,
     SPARSE_AUTO_MIN_SEQUENCE,
     SPARSE_LAYOUT_KEY,
-    SPARSE_LOCAL_BLOCK_RADIUS,
-    SPARSE_MAXIMUM_ROUTE_DENSITY,
-    SPARSE_MINIMUM_ROUTE_DENSITY,
     SPARSE_PREFIX_POLICY,
+    SPARSE_REFERENCE_AUDIO,
+    SPARSE_REFERENCE_IMAGE,
+    SPARSE_REFERENCE_VIDEO,
     SPARSE_ROUTING_THRESHOLD,
     SPARSE_SKIPPED_RESIDUAL,
-    SPARSE_TEMPORAL_NEIGHBOR_FRAMES,
     SUPPORTED_INPUT_DTYPES,
     _LOGGED_FRAME_SPARSE_KERNELS,
     _LOGGED_SPARSE_DENSE_REASONS,
     _LOGGED_SPARSE_KERNELS,
     _frame_sparse_sageattn,
     _reshape_qkv,
-    _sol_sparse_route_selected,
-    _sol_sparse_route_selected_device,
     _sol_sparse_sageattn,
     is_supported_turing_device,
     turing_sage_attention,
@@ -80,6 +77,65 @@ def _sparse_prefix_tokens(
     if not isinstance(prefix_tokens, int) or isinstance(prefix_tokens, bool):
         return 0
     return min(max(prefix_tokens, 0), sequence_limit)
+
+
+def _coalesce_token_ranges(ranges, sequence_limit: int) -> tuple[tuple[int, int], ...]:
+    normalized = sorted(
+        (max(0, int(start)), min(sequence_limit, int(stop)))
+        for start, stop in ranges
+        if int(stop) > 0 and int(start) < sequence_limit and int(stop) > int(start)
+    )
+    merged: list[list[int]] = []
+    for start, stop in normalized:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], stop)
+        else:
+            merged.append([start, stop])
+    return tuple((start, stop) for start, stop in merged)
+
+
+def _sparse_protected_ranges(
+    policy: str,
+    manual_tokens: int,
+    transformer_options,
+    sequence_limit: int,
+    *,
+    sparse_reference_image: bool,
+    sparse_reference_video: bool,
+    sparse_reference_audio: bool,
+) -> tuple[tuple[int, int], ...]:
+    """Return token spans whose Query stays dense and whose KV stays exact."""
+    if policy == "none":
+        return ()
+    if policy == "manual":
+        stop = min(max(int(manual_tokens), 0), sequence_limit)
+        return ((0, stop),) if stop else ()
+    layout = (
+        transformer_options.get(SPARSE_LAYOUT_KEY)
+        if isinstance(transformer_options, dict)
+        else None
+    )
+    segments = layout.get("segments") if isinstance(layout, dict) else None
+    if not isinstance(segments, tuple):
+        prefix = _sparse_prefix_tokens(
+            policy, manual_tokens, transformer_options, sequence_limit
+        )
+        return ((0, prefix),) if prefix else ()
+    sparse_roles = {"target_video"}
+    if sparse_reference_image:
+        sparse_roles.add("reference_image")
+    if sparse_reference_video:
+        sparse_roles.add("reference_video")
+    if sparse_reference_audio:
+        sparse_roles.add("reference_audio")
+    return _coalesce_token_ranges(
+        (
+            (start, stop)
+            for start, stop, role in segments
+            if role not in sparse_roles
+        ),
+        sequence_limit,
+    )
 
 
 def _sparse_temporal_topology(transformer_options, sequence_limit: int):
@@ -293,11 +349,10 @@ def turing_sol_sparse_attention(
     routing_threshold: float = SPARSE_ROUTING_THRESHOLD,
     prefix_policy: str = SPARSE_PREFIX_POLICY,
     manual_prefix_tokens: int = 0,
-    local_block_radius: int = SPARSE_LOCAL_BLOCK_RADIUS,
-    temporal_neighbor_frames: int = SPARSE_TEMPORAL_NEIGHBOR_FRAMES,
     skipped_residual: str = SPARSE_SKIPPED_RESIDUAL,
-    minimum_route_density: float = SPARSE_MINIMUM_ROUTE_DENSITY,
-    maximum_route_density: float = SPARSE_MAXIMUM_ROUTE_DENSITY,
+    sparse_reference_image: bool = SPARSE_REFERENCE_IMAGE,
+    sparse_reference_video: bool = SPARSE_REFERENCE_VIDEO,
+    sparse_reference_audio: bool = SPARSE_REFERENCE_AUDIO,
     debug_route_density: bool = False,
     debug_route_keys: set[tuple] | None = None,
     debug_route_state: dict[tuple, list[tuple[torch.Tensor, int, int]]] | None = None,
@@ -373,25 +428,17 @@ def turing_sol_sparse_attention(
     residual_subblocks = {"1x64": 1, "2x32": 2}.get(skipped_residual)
     if residual_subblocks is None:
         raise ValueError("skipped_residual must be 1x64 or 2x32")
-    minimum_route_density = float(minimum_route_density)
-    maximum_route_density = float(maximum_route_density)
-    if not 0.0 <= minimum_route_density <= maximum_route_density <= 1.0:
-        raise ValueError(
-            "route density bounds must satisfy 0 <= minimum <= maximum <= 1"
-        )
-
-    prefix_tokens = _sparse_prefix_tokens(
+    protected_ranges = _sparse_protected_ranges(
         prefix_policy,
         manual_prefix_tokens,
         transformer_options,
         min(q.shape[2], k.shape[2]),
+        sparse_reference_image=bool(sparse_reference_image),
+        sparse_reference_video=bool(sparse_reference_video),
+        sparse_reference_audio=bool(sparse_reference_audio),
     )
-    if prefix_tokens and q.shape[2] != k.shape[2]:
-        return dense("prefix Query splitting requires equal Q/K sequence lengths")
-    topology_start, topology_tokens, tokens_per_frame = _sparse_temporal_topology(
-        transformer_options,
-        min(q.shape[2], k.shape[2]),
-    )
+    if protected_ranges and q.shape[2] != k.shape[2]:
+        return dense("protected Query/KV ranges require equal Q/K sequence lengths")
     if input_dtype == torch.float32:
         q = q.to(torch.bfloat16)
         k = k.to(torch.bfloat16)
@@ -402,41 +449,31 @@ def turing_sol_sparse_attention(
         tuple(q.shape),
         tuple(k.shape),
         effective_min_sequence,
-        prefix_tokens,
+        protected_ranges,
         routing_threshold,
-        local_block_radius,
-        topology_start,
-        topology_tokens,
-        tokens_per_frame,
-        temporal_neighbor_frames,
         residual_subblocks,
-        minimum_route_density,
-        maximum_route_density,
+        bool(sparse_reference_image),
+        bool(sparse_reference_video),
+        bool(sparse_reference_audio),
     )
     if kernel_key not in _LOGGED_SPARSE_KERNELS:
         LOG.info(
             "Experimental Turing Sol sparse attention active: dtype=%s Q=%s K=%s "
-            "min_sequence=%d prefix_policy=%s stable_prefix_q=%d sparse_target_q=%d "
+            "min_sequence=%d prefix_policy=%s protected_ranges=%s "
             "selected_qk=int8 score_domain=int8_consistent threshold=%.2f "
-            "skipped_residual=%s route_budget=[%.2f,%.2f] "
-            "local_radius=%d temporal_frames=%d "
-            "topology=(%d,%d,%d)",
+            "skipped_residual=%s local_radius=1 "
+            "sparse_reference=(image=%s,video=%s,audio=%s)",
             input_dtype,
             tuple(q.shape),
             tuple(k.shape),
             effective_min_sequence,
             prefix_policy,
-            prefix_tokens,
-            q.shape[2] - prefix_tokens,
+            protected_ranges,
             routing_threshold,
             skipped_residual,
-            minimum_route_density,
-            maximum_route_density,
-            local_block_radius,
-            temporal_neighbor_frames,
-            topology_start,
-            topology_tokens,
-            tokens_per_frame,
+            bool(sparse_reference_image),
+            bool(sparse_reference_video),
+            bool(sparse_reference_audio),
         )
         _LOGGED_SPARSE_KERNELS.add(kernel_key)
 
@@ -473,27 +510,18 @@ def turing_sol_sparse_attention(
         v,
         tensor_layout="HND",
         sm_scale=kwargs.get("scale"),
-        prefix_tokens=prefix_tokens,
+        dense_query_ranges=protected_ranges,
+        exact_kv_ranges=protected_ranges,
         threshold_sigma=routing_threshold,
-        local_block_radius=local_block_radius,
-        topology_start_tokens=topology_start,
-        topology_tokens=topology_tokens,
-        tokens_per_frame=tokens_per_frame,
-        temporal_neighbor_frames=temporal_neighbor_frames,
         residual_subblocks=residual_subblocks,
-        minimum_route_density=minimum_route_density,
-        maximum_route_density=maximum_route_density,
-        return_route=collect_route_stats,
+        return_stats=collect_route_stats,
     )
     if collect_route_stats:
-        output, route = sparse_result
+        output, selected_device, possible_blocks = sparse_result
         try:
-            sparse_query_tokens = q.shape[2] - prefix_tokens
-            query_blocks = route.shape[2]
-            key_blocks = math.ceil(k.shape[2] / 64)
-            possible_blocks = route.shape[0] * route.shape[1] * query_blocks * key_blocks
+            protected_query_tokens = sum(stop - start for start, stop in protected_ranges)
+            sparse_query_tokens = q.shape[2] - protected_query_tokens
             if aggregate_route_stats:
-                selected_device = _sol_sparse_route_selected_device(route)
                 aggregate_key = (step, context.get("sampling_steps"), kernel_key)
                 entries = debug_route_state.setdefault(aggregate_key, [])
                 entries.append((selected_device, possible_blocks, layer_index))
@@ -520,7 +548,7 @@ def turing_sol_sparse_attention(
                         "[Turing sparse debug] step=%s/%s layers=%d-%d calls=%d "
                         "selected=%d/%d density[min/mean/max]=%.4f/%.4f/%.4f "
                         "Q=%d Qsparse=%d K=%d Hq=%d Hkv=%d threshold=%.2f "
-                        "prefix=%d local=%d temporal=%d residual=%s budget=[%.2f,%.2f]",
+                        "protected_q=%d local=1 residual=%s",
                         step,
                         context.get("sampling_steps"),
                         first_layer,
@@ -537,20 +565,16 @@ def turing_sol_sparse_attention(
                         q.shape[1],
                         k.shape[1],
                         routing_threshold,
-                        prefix_tokens,
-                        local_block_radius,
-                        temporal_neighbor_frames,
+                        protected_query_tokens,
                         skipped_residual,
-                        minimum_route_density,
-                        maximum_route_density,
                     )
                     del debug_route_state[aggregate_key]
             else:
-                selected_blocks = _sol_sparse_route_selected(route)
+                selected_blocks = int(selected_device.item())
                 LOG.warning(
                     "[Turing sparse debug] Q=%d Qsparse=%d K=%d Hq=%d Hkv=%d selected=%d/%d "
-                    "density=%.4f threshold=%.2f prefix=%d local=%d temporal=%d "
-                    "residual=%s budget=[%.2f,%.2f] step=%s/%s layer=%s/%s",
+                    "density=%.4f threshold=%.2f protected_q=%d local=1 "
+                    "residual=%s step=%s/%s layer=%s/%s",
                     q.shape[2],
                     sparse_query_tokens,
                     k.shape[2],
@@ -560,12 +584,8 @@ def turing_sol_sparse_attention(
                     possible_blocks,
                     selected_blocks / possible_blocks if possible_blocks else 0.0,
                     routing_threshold,
-                    prefix_tokens,
-                    local_block_radius,
-                    temporal_neighbor_frames,
+                    protected_query_tokens,
                     skipped_residual,
-                    minimum_route_density,
-                    maximum_route_density,
                     context.get("step"),
                     context.get("sampling_steps"),
                     layer_index,

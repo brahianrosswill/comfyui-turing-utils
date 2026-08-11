@@ -20,6 +20,88 @@ _FRAME_SCHEDULE_CACHE: OrderedDict[
     tuple, tuple[torch.Tensor, torch.Tensor, float]
 ] = OrderedDict()
 _FRAME_SCHEDULE_CACHE_LOCK = Lock()
+_SOL_POLICY_CACHE_LIMIT = 64
+_SOL_POLICY_CACHE: OrderedDict[
+    tuple, tuple[torch.Tensor, torch.Tensor, int, tuple[tuple[int, int], ...]]
+] = OrderedDict()
+_SOL_POLICY_CACHE_LOCK = Lock()
+
+
+def _normalize_token_ranges(ranges, sequence_length: int) -> tuple[tuple[int, int], ...]:
+    normalized = []
+    for item in ranges or ():
+        if not isinstance(item, (tuple, list)) or len(item) != 2:
+            raise ValueError("Sol policy ranges must contain (start, stop) pairs")
+        start, stop = (int(item[0]), int(item[1]))
+        if start < 0 or stop <= start or stop > sequence_length:
+            raise ValueError("Sol policy range is outside the attention sequence")
+        normalized.append((start, stop))
+    normalized.sort()
+    for previous, current in zip(normalized, normalized[1:]):
+        if current[0] < previous[1]:
+            raise ValueError("Sol policy ranges must not overlap")
+    return tuple(normalized)
+
+
+def _sol_block_policy(
+    device: torch.device,
+    query_length: int,
+    key_length: int,
+    dense_query_ranges,
+    exact_kv_ranges,
+) -> tuple[torch.Tensor, torch.Tensor, int, tuple[tuple[int, int], ...]]:
+    dense_ranges = _normalize_token_ranges(dense_query_ranges, query_length)
+    exact_ranges = _normalize_token_ranges(exact_kv_ranges, key_length)
+    device_index = device.index
+    if device.type == "cuda" and device_index is None:
+        device_index = torch.cuda.current_device()
+    cache_key = (
+        device.type,
+        device_index,
+        query_length,
+        key_length,
+        dense_ranges,
+        exact_ranges,
+    )
+    with _SOL_POLICY_CACHE_LOCK:
+        cached = _SOL_POLICY_CACHE.get(cache_key)
+        if cached is not None:
+            _SOL_POLICY_CACHE.move_to_end(cache_key)
+            return cached
+
+    query_blocks = (query_length + 63) // 64
+    key_blocks = (key_length + 63) // 64
+    sparse_query = torch.ones(query_blocks, dtype=torch.uint8)
+    exact_kv = torch.zeros(key_blocks, dtype=torch.uint8)
+    for start, stop in dense_ranges:
+        sparse_query[start // 64 : (stop + 63) // 64] = 0
+    for start, stop in exact_ranges:
+        exact_kv[start // 64 : (stop + 63) // 64] = 1
+    sparse_count = int(sparse_query.sum().item())
+    dense_runs = []
+    block = 0
+    while block < query_blocks:
+        if sparse_query[block]:
+            block += 1
+            continue
+        start = block
+        while block < query_blocks and not sparse_query[block]:
+            block += 1
+        dense_runs.append((start, block))
+    policy = (
+        sparse_query.to(device),
+        exact_kv.to(device),
+        sparse_count,
+        tuple(dense_runs),
+    )
+    with _SOL_POLICY_CACHE_LOCK:
+        existing = _SOL_POLICY_CACHE.get(cache_key)
+        if existing is not None:
+            return existing
+        _SOL_POLICY_CACHE[cache_key] = policy
+        while len(_SOL_POLICY_CACHE) > _SOL_POLICY_CACHE_LIMIT:
+            _SOL_POLICY_CACHE.popitem(last=False)
+    return policy
 
 
 def _frame_sparse_schedule_cpu(
@@ -508,19 +590,13 @@ def sol_sparse_sageattn(
     *,
     tensor_layout: str = "HND",
     sm_scale: Optional[float] = None,
-    prefix_tokens: int = 0,
+    dense_query_ranges=(),
+    exact_kv_ranges=(),
     threshold_sigma: float = 1.0,
-    local_block_radius: int = 1,
-    topology_start_tokens: int = 0,
-    topology_tokens: int = 0,
-    tokens_per_frame: int = 0,
-    temporal_neighbor_frames: int = 0,
-    residual_subblocks: int = 2,
-    minimum_route_density: float = 0.0,
-    maximum_route_density: float = 1.0,
-    return_route: bool = False,
+    residual_subblocks: int = 1,
+    return_stats: bool = False,
 ):
-    """Experimental SM75 Sol-style adaptive threshold sparse attention."""
+    """SM75 Sol attention with online routing and modality-aware exact ranges."""
     if not q.is_cuda:
         raise ValueError("Input tensors must be on CUDA")
     if tensor_layout != "HND":
@@ -538,109 +614,83 @@ def sol_sparse_sageattn(
         raise ValueError("the last Q/K/V dimension must be contiguous")
 
     scale = float(sm_scale) if sm_scale is not None else 128**-0.5
-    prefix_tokens = int(prefix_tokens)
-    if prefix_tokens < 0 or prefix_tokens > min(q.size(2), k.size(2)):
-        raise ValueError("prefix_tokens is outside the shared Q/K sequence")
-    if prefix_tokens and q.size(2) != k.size(2):
-        raise ValueError("prefix Query splitting requires equal Q/K sequence lengths")
     residual_subblocks = int(residual_subblocks)
     if residual_subblocks not in (1, 2):
         raise ValueError("residual_subblocks must be 1 or 2")
-    minimum_route_density = float(minimum_route_density)
-    maximum_route_density = float(maximum_route_density)
-    if not 0.0 <= minimum_route_density <= maximum_route_density <= 1.0:
-        raise ValueError("route density bounds must satisfy 0 <= minimum <= maximum <= 1")
-
-    if prefix_tokens == q.size(2):
+    sparse_query_blocks, exact_kv_blocks, sparse_block_count, dense_runs = _sol_block_policy(
+        q.device,
+        q.size(2),
+        k.size(2),
+        dense_query_ranges,
+        exact_kv_ranges,
+    )
+    key_block_count = (k.size(2) + 63) // 64
+    possible_blocks = q.size(0) * q.size(1) * sparse_block_count * key_block_count
+    if sparse_block_count == 0:
         dense = sageattn(q, k, v, tensor_layout="HND", sm_scale=scale)
-        if not return_route:
-            return dense
-        key_blocks = (k.size(2) + 63) // 64
-        route_words = (key_blocks + 15) // 16
-        route = torch.empty(
-            (q.size(0), q.size(1), 0, route_words),
-            dtype=torch.int32,
-            device=q.device,
-        )
-        return dense, route
+        if return_stats:
+            return dense, torch.zeros(1, dtype=torch.int64, device=q.device), 0
+        return dense
 
     output = torch.empty_like(q)
+    q_int8, q_scale = quantize_query_per_warp(q, tensor_layout="HND")
     k_int8, k_scale = quantize_key_per_block(k, tensor_layout="HND")
-    if prefix_tokens:
-        q_prefix = q[:, :, :prefix_tokens]
-        prefix_output = output[:, :, :prefix_tokens]
-        if prefix_tokens < 64:
-            q_prefix = torch.nn.functional.pad(
-                q_prefix, (0, 0, 0, 64 - prefix_tokens)
-            )
-        q_prefix_int8, q_prefix_scale = quantize_query_per_warp(
-            q_prefix, tensor_layout="HND"
-        )
-        if prefix_tokens < 64:
-            padded_prefix_output = torch.empty_like(q_prefix)
-            sageattn_prequantized(
-                q_prefix_int8,
-                q_prefix_scale,
-                k_int8,
-                k_scale,
-                v,
-                tensor_layout="HND",
-                sm_scale=scale,
-                output=padded_prefix_output,
-            )
-            prefix_output.copy_(padded_prefix_output[:, :, :prefix_tokens])
-            del padded_prefix_output
-        else:
-            sageattn_prequantized(
-                q_prefix_int8,
-                q_prefix_scale,
-                k_int8,
-                k_scale,
-                v,
-                tensor_layout="HND",
-                sm_scale=scale,
-                output=prefix_output,
-            )
-        del q_prefix_int8, q_prefix_scale
-
-    q_sparse = q[:, :, prefix_tokens:]
-    sparse_output = output[:, :, prefix_tokens:]
-    q_int8, q_scale = quantize_query_per_warp(q_sparse, tensor_layout="HND")
-    route = sm75_compile.sol_sparse_threshold_int8_f16_attn(
-        q_sparse,
+    selected = sm75_compile.sol_sparse_online_int8_f16_attn(
+        q,
         k,
         q_int8,
         k_int8,
         v,
-        sparse_output,
+        output,
         q_scale,
         k_scale,
-        int(prefix_tokens),
+        sparse_query_blocks,
+        exact_kv_blocks,
         float(threshold_sigma),
-        int(local_block_radius),
-        int(topology_start_tokens),
-        int(topology_tokens),
-        int(tokens_per_frame),
-        int(temporal_neighbor_frames),
         residual_subblocks,
-        minimum_route_density,
-        maximum_route_density,
-        int(prefix_tokens),
         scale,
+        int(return_stats),
     )
-    return (output, route) if return_route else output
 
-
-def _sol_sparse_route_selected_device(route: torch.Tensor) -> torch.Tensor:
-    """Return the asynchronous device-side selected-block count."""
-    if not route.is_cuda or route.dtype != torch.int32 or route.ndim != 4:
-        raise ValueError("route must be a four-dimensional CUDA int32 tensor")
-    return sm75_compile.sol_sparse_route_selected(route)
-
-
-def sol_sparse_route_selected(route: torch.Tensor) -> int:
-    """Synchronize once and return the selected-block count for debug logging."""
-    return int(_sol_sparse_route_selected_device(route).item())
+    # Dense Query blocks are uncommon and usually contiguous modality spans. Run
+    # exact Sage on maximal block-aligned runs without requantizing Q/K.
+    for run_start, run_stop in dense_runs:
+        token_start = run_start * 64
+        token_stop = min(run_stop * 64, q.size(2))
+        run_tokens = token_stop - token_start
+        run_q_int8 = q_int8[:, :, token_start:token_stop]
+        run_q_scale = q_scale[:, :, run_start * 4 : run_stop * 4]
+        run_output = output[:, :, token_start:token_stop]
+        if run_tokens < 64:
+            padded_q = torch.nn.functional.pad(run_q_int8, (0, 0, 0, 64 - run_tokens))
+            padded_output = torch.empty(
+                (*run_output.shape[:2], 64, run_output.shape[-1]),
+                dtype=run_output.dtype,
+                device=run_output.device,
+            )
+            sageattn_prequantized(
+                padded_q,
+                run_q_scale,
+                k_int8,
+                k_scale,
+                v,
+                tensor_layout="HND",
+                sm_scale=scale,
+                output=padded_output,
+            )
+            run_output.copy_(padded_output[:, :, :run_tokens])
+        else:
+            sageattn_prequantized(
+                run_q_int8,
+                run_q_scale,
+                k_int8,
+                k_scale,
+                v,
+                tensor_layout="HND",
+                sm_scale=scale,
+                output=run_output,
+            )
+    return (output, selected, possible_blocks) if return_stats else output
 
 
 @_on_input_device

@@ -21,7 +21,7 @@ def sparse_available() -> bool:
         module = importlib.import_module("comfyui_turing_utils_kernel._sage_qattn_sm75")
     except (ImportError, OSError):
         return False
-    return hasattr(module, "sol_sparse_threshold_int8_f16_attn")
+    return hasattr(module, "sol_sparse_online_int8_f16_attn")
 
 
 def frame_sparse_available() -> bool:
@@ -55,18 +55,6 @@ def sol_sparse_sageattn(*args, **kwargs):
 
 def frame_sparse_sageattn(*args, **kwargs):
     from .core import frame_sparse_sageattn as implementation
-
-    return implementation(*args, **kwargs)
-
-
-def sol_sparse_route_selected(*args, **kwargs):
-    from .core import sol_sparse_route_selected as implementation
-
-    return implementation(*args, **kwargs)
-
-
-def _sol_sparse_route_selected_device(*args, **kwargs):
-    from .core import _sol_sparse_route_selected_device as implementation
 
     return implementation(*args, **kwargs)
 

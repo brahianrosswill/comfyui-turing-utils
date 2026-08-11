@@ -59,7 +59,7 @@ def qk_int8_sv_f16_varlen_accum_f32_attn(
     )
 
 
-def sol_sparse_threshold_int8_f16_attn(
+def sol_sparse_online_int8_f16_attn(
     query,
     key,
     query_int8,
@@ -68,20 +68,18 @@ def sol_sparse_threshold_int8_f16_attn(
     output,
     query_scale,
     key_scale,
-    prefix_tokens,
+    sparse_query_blocks,
+    exact_kv_blocks,
     threshold_sigma,
-    local_block_radius,
-    topology_start_tokens,
-    topology_tokens,
-    tokens_per_frame,
-    temporal_neighbor_frames,
     residual_subblocks,
-    minimum_route_density,
-    maximum_route_density,
-    query_token_offset,
     sm_scale,
+    return_stats,
 ):
-    return _qattn_sm75.sol_sparse_threshold_int8_f16_attn(
+    if not hasattr(_qattn_sm75, "sol_sparse_online_int8_f16_attn"):
+        raise RuntimeError(
+            "online Sol routing requires comfyui-turing-utils-kernel 0.16.0 or newer"
+        )
+    return _qattn_sm75.sol_sparse_online_int8_f16_attn(
         query,
         key,
         query_int8,
@@ -90,27 +88,13 @@ def sol_sparse_threshold_int8_f16_attn(
         output,
         query_scale,
         key_scale,
-        prefix_tokens,
+        sparse_query_blocks,
+        exact_kv_blocks,
         threshold_sigma,
-        local_block_radius,
-        topology_start_tokens,
-        topology_tokens,
-        tokens_per_frame,
-        temporal_neighbor_frames,
         residual_subblocks,
-        minimum_route_density,
-        maximum_route_density,
-        query_token_offset,
         sm_scale,
+        return_stats,
     )
-
-
-def sol_sparse_route_selected(route):
-    if not hasattr(_qattn_sm75, "sol_sparse_route_selected"):
-        raise RuntimeError(
-            "route-density debug requires comfyui-turing-utils-kernel 0.13.0 or newer"
-        )
-    return _qattn_sm75.sol_sparse_route_selected(route)
 
 
 def frame_sparse_int8_f16_attn(

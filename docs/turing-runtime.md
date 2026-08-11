@@ -123,35 +123,38 @@ blocks are supported. Other calls use bundled stable Sage without model-family,
 sampling-step checks. A model adapter may publish semantic layer and topology
 metadata; unknown models remain fully generic.
 
-The patch node keeps the measured 4096-token crossover internally; shorter
-calls use stable Sage and no manual sequence-length control is exposed.
-`routing_threshold=1.0` routes a block when its centroid score exceeds the
-current query row's projected mean by one
-standard deviation; lowering it evaluates more blocks exactly.
-`minimum_route_density` and `maximum_route_density` optionally clamp the
-adaptive selection count inside each 16-key routing tile. Defaults `0/1`
-preserve threshold-only routing with a fast path. Prefix, local, and temporal
-blocks remain forced and may exceed the requested maximum. The default
-`dense_prefix_steps` and `dense_suffix_steps` are explicit counts of whole
-denoising steps that use stable Sage across every layer; both default to zero.
-`dense_prefix_layers=1` and `dense_suffix_layers=1` keep the first and last
-transformer layers dense while only the middle layers use sparse attention.
-For MiniMax H3, the sparse patch installs a loader-independent runtime layout
-provider on the standard ComfyUI `MODEL`. It derives the target-video tail and
-spatial grid from the sampler's current nested latent shapes, H3 patch size, and
-per-block packed segments. This works with the official loader as well as the
-ConvRot loader. Missing or inconsistent required H3 layout data forces stable
-Sage instead of silently routing the complete mixed-modality sequence.
-Suffix protection uses the provider's layer-count metadata. Step lookup
-is cached once per sampler timestep rather than synchronized in every
-transformer block.
+The node keeps the measured 4096-token crossover internally; shorter calls use
+stable Sage. `routing_threshold=1.0` matches the official mean-plus-one-standard-
+deviation policy. Lower values preserve more exact blocks. The local safeguard
+is fixed to +/- one 64-token block and is no longer exposed. Density bounds and
+frame-distance temporal protection were removed from the complete Python/CUDA
+path.
 
-All dense schedule and protected-layer calls go directly through the bundled
-stable Turing Sage backend. They do not run Sol with a 100% route and therefore
-do not allocate Sol summaries or execute its routing kernels. A previously
-installed model attention override is replaced by the Sol patch; unsupported
-calls can still reach ComfyUI's original attention through stable Sage's normal
-fallback handling.
+`skipped_residual=1x64` is the official-style fast default. `2x32` changes only
+the skipped-block reconstruction; it deliberately shares the identical route.
+`dense_prefix_steps=0`, `dense_suffix_steps=0`, `dense_prefix_layers=2`, and
+`dense_suffix_layers=0` match the default protection policy. Every dense step or
+layer calls stable bundled Sage directly rather than executing Sol with a full
+route.
+
+The common layout contract contains contiguous semantic segments. MiniMax H3's
+adapter publishes text, keyframe/reference image, reference video, reference
+audio, target audio, and target video ranges from the runtime `PackedLayout`.
+The three reference switches independently decide whether those reference
+Query and KV blocks may be sparse. Defaults are image=false, video=true, and
+audio=false. A disabled switch makes that modality's Query block exact and its
+KV block an exact sink for every sparse Query. Target video is sparse; text and
+target audio remain protected. Non-aligned boundaries conservatively round
+outward to complete 64-token blocks. Missing or inconsistent required H3 layout
+metadata selects stable Sage.
+
+The CUDA kernel builds no global route map. Query/key/value summaries remain
+separate compact preprocessing tensors, while threshold routing executes inside
+each sparse Query CTA immediately before skipped-residual and selected-block
+online-softmax updates. The temporary route occupies CTA-local shared memory and
+four route words per lane, then survives in registers while the normal 32 KiB
+shared-memory tiles are reused. The kernel accepts at most 4096 K/V blocks
+(262144 tokens) per call.
 
 The independent `Patch Sage Frame Sparse Attention (Experimental)` node uses the
 same integer dense-step and first/last-layer safeguards, but removes Sol's
@@ -185,59 +188,29 @@ the 480p-like dense component. This does not make the complete 720p transformer
 step equal to 480p: projections and MLPs still process roughly the full token
 ratio. Exact-sm75 end-to-end quality and occupancy testing remains required.
 
-The configurable local neighborhood remains exact. Prefix policy can use exact
-model-supplied semantic layout metadata, disable prefix protection, or accept a
-manual token count; `auto` does not guess a prefix for an unknown model. MiniMax
-publishes the actual target-video boundary, so text, reference, and target-audio
-Query rows run once through stable Sage, while target-video Query rows retain
-the semantic prefix as an exact K/V sink. This preserves exact cross-modal
-attention in both directions without paying sparse routing and output work for
-the prefix Query rows. It also publishes target-video frame geometry; the kernel can
-keep matching spatial ranges in adjacent frames exact without reordering tokens.
-Other blocks use the fused statistical threshold. Skipped blocks retain
-approximate mass and output through two 32-token K/V centroids by default,
-which better preserves within-block changes than one 64-token centroid.
-`skipped_residual=1x64` keeps the previous lower-cost approximation. Selected
-blocks reuse stable Sage's per-16-row Q and per-64-row K
-INT8 scales and SM75 integer Tensor Core QK. PV, softmax, and output accumulation
-retain the established FP16/FP32 behavior. The selected and residual layouts
-overlay one 32 KiB dynamic shared-memory arena; this allows two CTAs to fit in a
-64 KiB SM75 shared-memory budget when registers permit. K is quantized once and shared by the dense
-prefix and sparse target paths. Routing is written directly from the centroid
-Tensor Core tile, so no full proxy-score matrix is materialized.
+Sol uses one original-domain Q/K centroid per 64-token block for routing. The
+K/V preprocessing scan also produces one or two INT8-domain-consistent K
+centroids and matching original V means for skipped-block reconstruction.
+Selected blocks use stable Sage's per-16-row Q and per-64-row K INT8 scales and
+SM75 integer Tensor Core QK. PV, softmax, and output accumulation retain the
+established FP16/FP32 behavior. K is quantized once and shared by sparse and
+dense-Query calls.
 
-On an A40 JITing only compute_75 PTX, four-head FP16 uniform synthetic tests at
-`routing_threshold=1.0` selected 19.7%, 17.7%, and 16.7% of target blocks. The
-default 2x32 residual measured 1.68x, 2.33x, and 2.71x over bundled Sage at
-4096, 8192, and 16384 tokens; 1x64 was 7-14% faster. A 56-head BF16 H3-shaped
-synthetic test with 46,773 total tokens, a 3,438-token semantic prefix, 405
-tokens per frame, one adjacent temporal frame, and threshold 1.5 measured
-231.0 ms for 2x32, 209.9 ms for 1x64, and 601.0 ms for dense Sage (2.60x and
-2.86x). These are A40 compatibility measurements: they do not show the expected
-SM75 occupancy gain from reducing shared memory, and they are not an H3
-end-to-end or quality prediction. Exact-sm75 visual and performance testing
-remains required before the backend can leave experimental status.
+The route is computed inside the Query CTA, stored briefly in the unused half
+of its 32 KiB arena, then duplicated into four 32-bit registers per lane before
+that shared memory is reused for summary and exact K/V tiles. `1x64` and `2x32`
+therefore cannot diverge in selected blocks. The compute_75 cubin reports 212
+BF16 / 222 FP16 registers per main thread, a 16-byte stack frame, zero local
+memory, and 32 KiB dynamic shared memory. Register and shared-memory limits
+permit two 128-thread CTAs per SM75; actual occupancy and bank behavior still
+need Nsight confirmation on Turing.
 
-Routing Q/K centroids stay in the original FP16/BF16 domain. Skipped-block
-softmax scores instead use Q and K centroids reconstructed from the exact INT8
-tensors and scales consumed by selected-block Tensor Core MMA, so both branches
-share one score domain. Original V means remain unquantized. One fused K/V scan
-produces the routing K centroid, one or two score-K centroids, and matching V
-means. The attention CTA reconstructs its summary Q tile from the existing INT8
-Q buffer, avoiding a second original-Q read. Two centroids double only the
-compact score-K and V-summary tensors; the temporary peak remains dominated by
-output and the existing Q/K INT8 buffers.
-
-The final compute_75 cubin reports 228 BF16 / 235 FP16 registers per sparse
-attention thread with zero stack and local-memory spill. The launch uses 32 KiB
-of dynamic shared memory. At the 46,773-token shape above, a 2x32 CUDA profile
-attributed 180.5 ms to sparse attention, 41.9 ms to the dense semantic-prefix
-Sage call, 3.5 ms to Q/K quantization, 3.1 ms to the fused K/V summaries, 1.2 ms
-to Q summaries, and about 0.7 ms to routing and its statistics. Fusing routing
-summaries into the production quantizers was deliberately not retained: the
-maximum measured saving is under 2% of this call, while it would couple the
-experimental sparse ABI to stable Sage quantization and still could not remove
-the required V-summary scan.
+On an A40 JITing compute_75 PTX, four-head FP16 synthetic tests at threshold 1.0
+selected 20.0%, 17.6%, and 16.7% of blocks at 4096, 8192, and 16384 tokens.
+Official-style `1x64` measured 0.239, 0.572, and 1.744 ms versus dense Sage at
+0.400, 1.371, and 5.012 ms (1.67x, 2.40x, and 2.87x). `2x32` measured 0.260,
+0.652, and 2.010 ms. These are directional compatibility results, not Turing
+end-to-end or visual-quality measurements.
 
 The Sage1 and Sage2 adaptations produced severe block artefacts and black
 flicker in local Turing tests. They are unstable experiments, not production
@@ -251,27 +224,17 @@ Attention and PyTorch SDPA. An all-FP32 call that cannot enter external Sage
 uses ComfyUI's PyTorch attention implementation deterministically.
 
 The loader log reports `sage_attn via bundled_turing_sage` when `auto` or
-`sage_attn` is bound to the local sm75 implementation. The first real bundled
-call for each distinct sequence shape also reports dtype, layout, and Q/K/V
-shapes. Any unsupported call reports its fallback reason once, so a masked,
-disabled-low-precision, or incompatible shape can no longer turn a performance
-regression into an invisible backend change. The sparse patch logs its selected
-minimum length, prefix policy and resolved prefix, routing threshold, local and
-temporal neighborhoods, and resolved topology. MiniMax additionally emits one
-`phase=block` and one `phase=mlp` runtime-dispatch line after the first complete
-pass. A healthy H3 W8A8 run reports 50 fused and zero fallback calls for both
-phases; these counters use no CUDA events or device synchronization.
+`sage_attn` binds the local SM75 implementation. Sol logs the resolved protected
+ranges, three reference switches, threshold, residual profile, and fixed local
+radius. MiniMax additionally emits its fused block/MLP dispatch counters.
 
-The patch node's optional `debug_route_density` switch is disabled by default.
-When enabled with kernel package 0.13.0 or newer, it launches one tiny CUDA
-popcount reduction per sparse layer, keeps the scalar results on-device, and
-synchronizes once at the end of each denoising step. The warning reports total
-selected/possible target-query blocks plus min/mean/max layer density, sampling
-step and layer range, prefix, local radius, temporal radius, residual mode, and
-route budget. It also reports
-which warmup, tail, or protected-layer decisions selected stable Sage. No
-counter kernel, event, synchronization, or extra route allocation is used while
-the switch is off.
+`debug_route_density` is disabled by default. With kernel package 0.16.0 or
+newer, the already-running sparse CTA accumulates one selected-block counter;
+there is no route allocation or popcount kernel. Counts remain on-device across
+layers and synchronize once for the end-of-step log. The log reports selected
+and possible blocks, min/mean/max layer density, sampling step, layer range,
+protected Query count, and residual profile. Debug-off adds no counter atomic,
+event, synchronization, or allocation.
 
 The independent frame-sparse patch uses a different debug path: its route is a
 cached CPU-built CSR schedule, so density is already a host scalar. Enabling

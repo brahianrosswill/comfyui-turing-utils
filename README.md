@@ -126,24 +126,29 @@ callers use BF16 boundary storage and receive FP32 output. On non-Turing GPUs,
 the plugin prefers an installed SageAttention backend and then follows ComfyUI's
 normal fallback order.
 
-Sparse attention is not a loader option and `auto` never selects it. Connect the
-model through one of the experimental patch nodes to enable it explicitly. The
-current kernels accept FP16/BF16/FP32 Q/K/V,
-GQA, 128-dimensional heads, and unmasked non-causal sequences; incompatible or
-short calls use bundled stable Sage. Semantic-prefix Query rows run through
-stable Sage, while sparse target Query rows keep the prefix as an exact K/V
-sink. Selected sparse blocks reuse stable Sage's INT8 Tensor Core QK path. Sol
-routing requires kernel package 0.13.0. Routing uses original FP16/BF16 Q/K
-centroids, while skipped-block score estimates are reconstructed from the same
-INT8 Q/K tensors and scales as selected blocks. Original V means remain in the
-value path. `skipped_residual=2x32` improves bimodal skipped-block fidelity;
-`1x64` remains available for maximum speed. Optional route-density bounds clamp
-adaptive choices per 16-key tile without removing forced prefix/local/temporal
-blocks. The K/V summaries are produced in one fused scan; the attention kernel
-reconstructs its summary Q tile from the existing INT8 Q buffer instead of
-rereading the original Q tensor. The sparse CTA uses 32 KiB of shared memory so
-SM75 can admit two CTAs when registers permit. Final quality/performance testing
-on an actual Turing GPU remains required.
+Sparse attention is not a loader option and `auto` never selects it. Connect
+the model through the experimental Sol patch node to enable it explicitly. The
+kernel accepts FP16/BF16/FP32 Q/K/V, GQA, 128-dimensional heads, and unmasked
+non-causal sequences; incompatible or short calls use bundled stable Sage.
+
+Online Sol routing requires kernel package 0.16.0. Adapter-protected Query
+blocks run through exact stable Sage, while every sparse Query keeps protected
+modality blocks as exact K/V sinks. Selected blocks reuse stable Sage's INT8
+Tensor Core QK path. Routing uses original FP16/BF16 Q/K centroids; skipped-
+block scores use the same quantized-Q/K domain as selected blocks, and original
+V means remain in the value approximation. Official-style `1x64` is the
+default; optional `2x32` improves bimodal skipped-block fidelity without
+changing routing.
+
+The threshold and fixed +/- one-block local neighborhood execute inside each
+attention CTA. Only compact, head-independent dense-Query and exact-KV policy
+masks are stored globally; no full route map or follow-up popcount kernel is
+materialized. MiniMax H3 publishes complete text, reference-image, reference-
+video, reference-audio, target-audio, and target-video spans. Reference
+sparsity defaults to image=false, video=true, audio=false and is independently
+configurable. The CTA remains at 32 KiB shared memory. A40 compute_75 direction
+tests validate numerical behavior and speed; final quality, occupancy, and
+throughput still require an actual Turing GPU.
 
 The frame-sparse ABI requires kernel package 0.15.0. It consumes a cached,
 head-independent CSR schedule and evaluates only complete selected 64-token K/V

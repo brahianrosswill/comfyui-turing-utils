@@ -29,13 +29,12 @@ from .stable import (
     SPARSE_DENSE_SUFFIX_LAYERS,
     SPARSE_DENSE_SUFFIX_STEPS,
     SPARSE_LAYOUT_KEY,
-    SPARSE_LOCAL_BLOCK_RADIUS,
-    SPARSE_MAXIMUM_ROUTE_DENSITY,
-    SPARSE_MINIMUM_ROUTE_DENSITY,
     SPARSE_PREFIX_POLICY,
+    SPARSE_REFERENCE_AUDIO,
+    SPARSE_REFERENCE_IMAGE,
+    SPARSE_REFERENCE_VIDEO,
     SPARSE_ROUTING_THRESHOLD,
     SPARSE_SKIPPED_RESIDUAL,
-    SPARSE_TEMPORAL_NEIGHBOR_FRAMES,
     _BACKENDS,
     _comfy_attention_function,
     _select_attention_backend,
@@ -117,11 +116,10 @@ def make_sparse_attention_override(
     routing_threshold: float = SPARSE_ROUTING_THRESHOLD,
     prefix_policy: str = SPARSE_PREFIX_POLICY,
     manual_prefix_tokens: int = 0,
-    local_block_radius: int = SPARSE_LOCAL_BLOCK_RADIUS,
-    temporal_neighbor_frames: int = SPARSE_TEMPORAL_NEIGHBOR_FRAMES,
     skipped_residual: str = SPARSE_SKIPPED_RESIDUAL,
-    minimum_route_density: float = SPARSE_MINIMUM_ROUTE_DENSITY,
-    maximum_route_density: float = SPARSE_MAXIMUM_ROUTE_DENSITY,
+    sparse_reference_image: bool = SPARSE_REFERENCE_IMAGE,
+    sparse_reference_video: bool = SPARSE_REFERENCE_VIDEO,
+    sparse_reference_audio: bool = SPARSE_REFERENCE_AUDIO,
     dense_prefix_steps: int = SPARSE_DENSE_PREFIX_STEPS,
     dense_suffix_steps: int = SPARSE_DENSE_SUFFIX_STEPS,
     dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
@@ -132,11 +130,10 @@ def make_sparse_attention_override(
     routing_threshold = float(routing_threshold)
     prefix_policy = str(prefix_policy).strip().lower()
     manual_prefix_tokens = int(manual_prefix_tokens)
-    local_block_radius = int(local_block_radius)
-    temporal_neighbor_frames = int(temporal_neighbor_frames)
     skipped_residual = str(skipped_residual).strip().lower()
-    minimum_route_density = float(minimum_route_density)
-    maximum_route_density = float(maximum_route_density)
+    sparse_reference_image = bool(sparse_reference_image)
+    sparse_reference_video = bool(sparse_reference_video)
+    sparse_reference_audio = bool(sparse_reference_audio)
     dense_prefix_steps = int(dense_prefix_steps)
     dense_suffix_steps = int(dense_suffix_steps)
     dense_prefix_layers = int(dense_prefix_layers)
@@ -150,16 +147,8 @@ def make_sparse_attention_override(
         raise ValueError("prefix_policy must be auto, none, or manual")
     if manual_prefix_tokens < 0:
         raise ValueError("manual_prefix_tokens must be non-negative")
-    if local_block_radius < 0:
-        raise ValueError("local_block_radius must be non-negative")
-    if temporal_neighbor_frames < 0:
-        raise ValueError("temporal_neighbor_frames must be non-negative")
     if skipped_residual not in {"1x64", "2x32"}:
         raise ValueError("skipped_residual must be 1x64 or 2x32")
-    if not 0.0 <= minimum_route_density <= maximum_route_density <= 1.0:
-        raise ValueError(
-            "route density bounds must satisfy 0 <= minimum <= maximum <= 1"
-        )
     if dense_prefix_steps < 0:
         raise ValueError("dense_prefix_steps must be non-negative")
     if dense_suffix_steps < 0:
@@ -173,7 +162,7 @@ def make_sparse_attention_override(
     if not bundled_sparse_available():
         raise RuntimeError(
             "The experimental Turing sparse extension is unavailable. "
-            "Rebuild comfyui-turing-utils-kernel 0.13.0 or newer with sm75 enabled."
+            "Rebuild comfyui-turing-utils-kernel 0.16.0 or newer with sm75 enabled."
         )
     preflight_bundled(device)
     preflight_bundled_sparse(device)
@@ -248,11 +237,10 @@ def make_sparse_attention_override(
             routing_threshold=routing_threshold,
             prefix_policy=prefix_policy,
             manual_prefix_tokens=manual_prefix_tokens,
-            local_block_radius=local_block_radius,
-            temporal_neighbor_frames=temporal_neighbor_frames,
             skipped_residual=skipped_residual,
-            minimum_route_density=minimum_route_density,
-            maximum_route_density=maximum_route_density,
+            sparse_reference_image=sparse_reference_image,
+            sparse_reference_video=sparse_reference_video,
+            sparse_reference_audio=sparse_reference_audio,
             debug_route_density=debug_route_density,
             debug_route_keys=debug_route_keys if debug_route_density else None,
             debug_route_state=debug_route_state if debug_route_density else None,
@@ -271,11 +259,10 @@ def apply_sparse_attention_patch(
     routing_threshold: float = SPARSE_ROUTING_THRESHOLD,
     prefix_policy: str = SPARSE_PREFIX_POLICY,
     manual_prefix_tokens: int = 0,
-    local_block_radius: int = SPARSE_LOCAL_BLOCK_RADIUS,
-    temporal_neighbor_frames: int = SPARSE_TEMPORAL_NEIGHBOR_FRAMES,
     skipped_residual: str = SPARSE_SKIPPED_RESIDUAL,
-    minimum_route_density: float = SPARSE_MINIMUM_ROUTE_DENSITY,
-    maximum_route_density: float = SPARSE_MAXIMUM_ROUTE_DENSITY,
+    sparse_reference_image: bool = SPARSE_REFERENCE_IMAGE,
+    sparse_reference_video: bool = SPARSE_REFERENCE_VIDEO,
+    sparse_reference_audio: bool = SPARSE_REFERENCE_AUDIO,
     dense_prefix_steps: int = SPARSE_DENSE_PREFIX_STEPS,
     dense_suffix_steps: int = SPARSE_DENSE_SUFFIX_STEPS,
     dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
@@ -290,11 +277,10 @@ def apply_sparse_attention_patch(
         routing_threshold=routing_threshold,
         prefix_policy=prefix_policy,
         manual_prefix_tokens=manual_prefix_tokens,
-        local_block_radius=local_block_radius,
-        temporal_neighbor_frames=temporal_neighbor_frames,
         skipped_residual=skipped_residual,
-        minimum_route_density=minimum_route_density,
-        maximum_route_density=maximum_route_density,
+        sparse_reference_image=sparse_reference_image,
+        sparse_reference_video=sparse_reference_video,
+        sparse_reference_audio=sparse_reference_audio,
         dense_prefix_steps=dense_prefix_steps,
         dense_suffix_steps=dense_suffix_steps,
         dense_prefix_layers=dense_prefix_layers,
@@ -318,19 +304,18 @@ def apply_sparse_attention_patch(
     )
     LOG.info(
         "Sol sparse attention patch enabled: threshold=%.2f "
-        "prefix_policy=%s manual_prefix=%d local_radius=%d temporal_frames=%d "
-        "skipped_residual=%s route_budget=[%.2f,%.2f] "
+        "prefix_policy=%s manual_prefix=%d local_radius=1 "
+        "skipped_residual=%s sparse_reference=(image=%s,video=%s,audio=%s) "
         "dense_prefix_steps=%d dense_suffix_steps=%d "
         "dense_prefix_layers=%d dense_suffix_layers=%d "
         "dense_backend=bundled_turing_sage debug_route_density=%s",
         routing_threshold,
         prefix_policy,
         manual_prefix_tokens,
-        local_block_radius,
-        temporal_neighbor_frames,
         skipped_residual,
-        minimum_route_density,
-        maximum_route_density,
+        sparse_reference_image,
+        sparse_reference_video,
+        sparse_reference_audio,
         dense_prefix_steps,
         dense_suffix_steps,
         dense_prefix_layers,

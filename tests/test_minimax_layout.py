@@ -34,6 +34,20 @@ class FakeMiniMaxDiffusion(torch.nn.Module):
     def __init__(self, blocks=2):
         super().__init__()
         self.blocks = torch.nn.ModuleList(FakeBlock() for _ in range(blocks))
+        self.forward_callback = None
+
+    def forward(
+        self,
+        x,
+        timestep,
+        context,
+        transformer_options={},
+        minimax_payload=None,
+        **kwargs,
+    ):
+        if self.forward_callback is not None:
+            return self.forward_callback()
+        return x
 
 
 class FakeBase(torch.nn.Module):
@@ -91,21 +105,36 @@ class MiniMaxLayoutProviderTest(unittest.TestCase):
 
         self.assertTrue(status.installed)
         self.assertEqual(status.model_kind, minimax_layout.MINIMAX_H3_LAYOUT_KIND)
-        self.assertEqual(len(patcher.object_patches), 2)
+        self.assertEqual(len(patcher.object_patches), 3)
         self.assertEqual(len(patcher.wrappers), 1)
 
         runtime_wrapper = next(iter(patcher.wrappers.values()))
         block_forward = patcher.object_patches["diffusion_model.blocks.1.forward"]
+        model_forward = patcher.object_patches["diffusion_model.forward"]
         options = {}
         x = torch.zeros((228, 8), dtype=torch.bfloat16)
+        model_input = [
+            torch.zeros((1, 24, 7, 8, 10), dtype=torch.bfloat16),
+            torch.zeros((1, 32, 2, 12), dtype=torch.bfloat16),
+        ]
+        context = torch.zeros((1, 64, 8), dtype=torch.bfloat16)
 
         def executor(*args, **kwargs):
-            return block_forward(
-                x,
-                x,
-                [(0, 64, 0), (64, 88, 2), (88, 228, 3)],
-                None,
+            patcher.model.diffusion_model.forward_callback = lambda: block_forward(
+                x, x, [(0, 64, 0), (64, 88, 2), (88, 228, 3)], None,
                 transformer_options=options,
+            )
+            packed_layout = SimpleNamespace(
+                signature=(64, 7, 8, 10, 12),
+                segments=[
+                    (0, 64, "text"),
+                    (64, 88, "audio"),
+                    (88, 228, "video"),
+                ]
+            )
+            return model_forward(
+                model_input, None, context, transformer_options=options,
+                minimax_payload={"layout": packed_layout, "refs": []},
             )
 
         output = runtime_wrapper(
@@ -134,6 +163,11 @@ class MiniMaxLayoutProviderTest(unittest.TestCase):
                 "tokens_per_frame": 20,
                 "spatial_tokens_height": 4,
                 "spatial_tokens_width": 5,
+                "segments": (
+                    (0, 64, "text"),
+                    (64, 88, "target_audio"),
+                    (88, 228, "target_video"),
+                ),
             },
         )
         self.assertTrue(
@@ -157,6 +191,38 @@ class MiniMaxLayoutProviderTest(unittest.TestCase):
         self.assertEqual(set(patcher.wrappers), set(first_wrappers))
         for key, value in first_forwards.items():
             self.assertIs(patcher.object_patches[key], value)
+
+    def test_runtime_layout_rebuilds_stale_progressive_resolution_payload(self):
+        import comfy.ldm.minimax.model as minimax_model
+
+        diffusion = FakeMiniMaxDiffusion()
+        video = torch.zeros((1, 24, 7, 9, 11), dtype=torch.bfloat16)
+        audio = torch.zeros((1, 32, 2, 13), dtype=torch.bfloat16)
+        context = torch.zeros((1, 48, 8), dtype=torch.bfloat16)
+        stale = SimpleNamespace(signature=(48, 7, 8, 10, 13))
+        rebuilt = object()
+
+        with mock.patch.object(
+            minimax_model, "PackedLayout", return_value=rebuilt
+        ) as constructor:
+            result = minimax_layout._resolve_packed_layout(
+                diffusion,
+                [video, audio],
+                context,
+                {"layout": stale, "refs": [], "keyframes": None},
+            )
+
+        self.assertIs(result, rebuilt)
+        constructor.assert_called_once_with(
+            48,
+            7,
+            10,
+            12,
+            13,
+            keyframes=None,
+            refs=[],
+            frame_count=None,
+        )
 
     def test_publisher_drops_stale_topology_when_current_shapes_do_not_validate(self):
         options = {
@@ -194,6 +260,46 @@ class MiniMaxLayoutProviderTest(unittest.TestCase):
             minimax_layout.has_complete_minimax_attention_layout(options, 200)
         )
 
+    def test_full_modality_segments_cover_multiple_references(self):
+        base = FakeBase()
+        setattr(
+            base,
+            minimax_layout.RUNTIME_CONTEXT_ATTR,
+            {
+                "packed_layout": SimpleNamespace(
+                    segments=[
+                        (0, 32, "text"),
+                        (32, 48, "cond"),
+                        (48, 64, "ref_img"),
+                        (64, 72, "ref_audio"),
+                        (72, 112, "ref_img"),
+                        (112, 118, "ref_audio"),
+                        (118, 130, "audio"),
+                        (130, 258, "video"),
+                    ]
+                ),
+                "refs": [
+                    {"kind": "image"},
+                    {"kind": "video_audio", "ref_audio_t": 4},
+                    {"kind": "audio", "ref_audio_t": 3},
+                ],
+            },
+        )
+
+        self.assertEqual(
+            minimax_layout.minimax_attention_segments(base),
+            (
+                (0, 32, "text"),
+                (32, 48, "reference_image"),
+                (48, 64, "reference_image"),
+                (64, 72, "reference_audio"),
+                (72, 112, "reference_video"),
+                (112, 118, "reference_audio"),
+                (118, 130, "target_audio"),
+                (130, 258, "target_video"),
+            ),
+        )
+
     def test_sparse_patch_installs_layout_provider_on_official_loader_model(self):
         model = FakePatcher()
         override = object()
@@ -209,7 +315,7 @@ class MiniMaxLayoutProviderTest(unittest.TestCase):
             minimax_layout.MINIMAX_H3_LAYOUT_KIND,
         )
         self.assertIs(options["optimized_attention_override"], override)
-        self.assertEqual(len(patched.object_patches), 2)
+        self.assertEqual(len(patched.object_patches), 3)
         self.assertEqual(len(patched.wrappers), 1)
         self.assertFalse(model.object_patches)
         self.assertFalse(model.wrappers)
@@ -245,7 +351,7 @@ class MiniMaxLayoutProviderTest(unittest.TestCase):
             minimax_layout.MINIMAX_H3_LAYOUT_KIND,
         )
         self.assertIs(options["optimized_attention_override"], override)
-        self.assertEqual(len(patched.object_patches), 2)
+        self.assertEqual(len(patched.object_patches), 3)
         self.assertEqual(len(patched.wrappers), 1)
 
 
