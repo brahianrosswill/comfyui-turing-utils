@@ -160,11 +160,13 @@ layer calls the selected protected backend directly: stable bundled Sage by
 default, or the route-free bundled W8A8 kernel when `use_w8a8` is enabled.
 
 The common layout contract contains contiguous semantic segments. MiniMax H3's
-adapter publishes text, keyframe/reference image, reference video, reference
-audio, target audio, and target video ranges from the runtime `PackedLayout`.
+adapter publishes text, keyframe/reference image, reference-video first/last
+latent-frame anchors, reference-video interior, reference audio, target audio,
+and target video ranges from the runtime `PackedLayout`.
 The three reference switches independently decide whether those reference
 Query and KV blocks may be sparse. Defaults are image=false, video=true, and
-audio=false. A disabled switch makes that modality's Query block exact and its
+audio=false. Reference-video anchors follow the image switch, while the clip
+interior follows the video switch. A disabled switch makes that modality's Query block exact and its
 KV block an exact sink for every sparse Query. Target video is sparse; text and
 target audio remain protected. Non-aligned boundaries conservatively round
 outward to complete 64-token blocks. Missing or inconsistent required H3 layout

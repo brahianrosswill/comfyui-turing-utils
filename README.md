@@ -168,9 +168,10 @@ The threshold and fixed +/- one-block local neighborhood execute inside each
 attention CTA. Only compact, head-independent dense-Query and exact-KV policy
 masks are stored globally; no full route map or follow-up popcount kernel is
 materialized. MiniMax H3 publishes complete text, reference-image, reference-
-video, reference-audio, target-audio, and target-video spans. Reference
-sparsity defaults to image=false, video=true, audio=false and is independently
-configurable. The CTA remains at 32 KiB shared memory. A40 compute_75 direction
+video-anchor, reference-video-interior, reference-audio, target-audio, and
+target-video spans. Reference-video first/last latent frames follow the image
+sparsity switch; its interior follows the video switch. Defaults remain
+image=false, video=true, audio=false. The CTA remains at 32 KiB shared memory. A40 compute_75 direction
 tests validate numerical behavior and speed; final quality, occupancy, and
 throughput still require an actual Turing GPU.
 

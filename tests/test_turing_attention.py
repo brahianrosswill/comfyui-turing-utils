@@ -453,7 +453,9 @@ class TuringAttentionContractTest(unittest.TestCase):
                 "segments": (
                     (0, 64, "text"),
                     (64, 128, "reference_image"),
-                    (128, 64000, "reference_video"),
+                    (128, 1048, "reference_video_anchor"),
+                    (1048, 63080, "reference_video"),
+                    (63080, 64000, "reference_video_anchor"),
                     (64000, 64128, "reference_audio"),
                     (64128, 64256, "target_audio"),
                     (64256, 100000, "target_video"),
@@ -469,7 +471,23 @@ class TuringAttentionContractTest(unittest.TestCase):
             sparse_reference_video=True,
             sparse_reference_audio=False,
         )
-        self.assertEqual(default_ranges, ((0, 128), (64000, 64256)))
+        self.assertEqual(
+            default_ranges,
+            ((0, 1048), (63080, 64256)),
+        )
+        image_sparse_video_exact = turing_attention._sparse_protected_ranges(
+            "auto",
+            0,
+            options,
+            100000,
+            sparse_reference_image=True,
+            sparse_reference_video=False,
+            sparse_reference_audio=False,
+        )
+        self.assertEqual(
+            image_sparse_video_exact,
+            ((0, 64), (1048, 63080), (64000, 64256)),
+        )
         all_reference_sparse = turing_attention._sparse_protected_ranges(
             "auto",
             0,

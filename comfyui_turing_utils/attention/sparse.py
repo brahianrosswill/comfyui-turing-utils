@@ -127,6 +127,7 @@ def _sparse_protected_ranges(
     sparse_roles = {"target_video"}
     if sparse_reference_image:
         sparse_roles.add("reference_image")
+        sparse_roles.add("reference_video_anchor")
     if sparse_reference_video:
         sparse_roles.add("reference_video")
     if sparse_reference_audio:

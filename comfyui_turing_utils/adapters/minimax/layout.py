@@ -154,20 +154,38 @@ def _resolve_packed_layout(diffusion_model, x, context, payload):
         return None
 
 
-def _reference_roles(refs):
-    roles = []
+def _reference_descriptors(refs):
+    """Return PackedLayout reference segments and their temporal metadata."""
+    descriptors = []
     for reference in refs or ():
         kind = reference.get("kind")
         if kind == "image":
-            roles.append("reference_image")
+            descriptors.append(("reference_image", 1))
         elif kind == "audio":
             if int(reference.get("ref_audio_t", 0)) > 0:
-                roles.append("reference_audio")
+                descriptors.append(("reference_audio", None))
         elif kind in ("video", "video_audio"):
             if int(reference.get("ref_audio_t", 0)) > 0:
-                roles.append("reference_audio")
-            roles.append("reference_video")
-    return roles
+                descriptors.append(("reference_audio", None))
+            descriptors.append(
+                ("reference_video", int(reference.get("latent_t", 0) or 0))
+            )
+    return descriptors
+
+
+def _append_reference_video_segments(translated, start: int, stop: int, frames: int):
+    """Split a reference clip's first/last latent frames from its interior."""
+    tokens = stop - start
+    if frames <= 0 or tokens % frames:
+        translated.append((start, stop, "reference_video"))
+        return
+    tokens_per_frame = tokens // frames
+    first_stop = start + tokens_per_frame
+    translated.append((start, first_stop, "reference_video_anchor"))
+    if frames > 2:
+        translated.append((first_stop, stop - tokens_per_frame, "reference_video"))
+    if frames > 1:
+        translated.append((stop - tokens_per_frame, stop, "reference_video_anchor"))
 
 
 def minimax_attention_segments(base_model):
@@ -178,15 +196,17 @@ def minimax_attention_segments(base_model):
         return ()
     context = getattr(base_model, RUNTIME_CONTEXT_ATTR, None)
     references = context.get("refs") if isinstance(context, dict) else None
-    reference_roles = iter(_reference_roles(references))
+    reference_descriptors = iter(_reference_descriptors(references))
     translated = []
     for start, stop, kind in packed_segments:
+        start, stop = int(start), int(stop)
         if kind == "text":
             role = "text"
         elif kind == "cond":
             role = "reference_image"
         elif kind in ("ref_img", "ref_audio"):
-            role = next(reference_roles, None)
+            descriptor = next(reference_descriptors, None)
+            role = descriptor[0] if descriptor is not None else None
             expected = "reference_audio" if kind == "ref_audio" else None
             if role is None or (expected is not None and role != expected):
                 return ()
@@ -195,14 +215,19 @@ def minimax_attention_segments(base_model):
                 "reference_video",
             }:
                 return ()
+            if role == "reference_video":
+                _append_reference_video_segments(
+                    translated, start, stop, descriptor[1]
+                )
+                continue
         elif kind == "audio":
             role = "target_audio"
         elif kind == "video":
             role = "target_video"
         else:
             return ()
-        translated.append((int(start), int(stop), role))
-    if next(reference_roles, None) is not None:
+        translated.append((start, stop, role))
+    if next(reference_descriptors, None) is not None:
         return ()
     return tuple(translated)
 

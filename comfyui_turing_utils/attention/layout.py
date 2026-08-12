@@ -12,6 +12,7 @@ ATTENTION_SEGMENT_ROLES = frozenset(
     {
         "text",
         "reference_image",
+        "reference_video_anchor",
         "reference_video",
         "reference_audio",
         "target_audio",
