@@ -8,11 +8,13 @@ from collections.abc import Callable
 import torch
 
 from .layout import ATTENTION_LAYOUT_REQUIREMENT_KEY, ensure_attention_layout_provider
+from .preprocessing import QK_PREPROCESSOR_KEY, QKPreprocessSpec
 from .sparse import (
     _sparse_dense_layer,
     _sparse_dense_schedule,
     inspect_sol_attention_call,
     prequantize_turing_sol_attention,
+    prequantize_turing_sol_attention_from_qk,
     turing_sol_attention_from_prequantized,
     turing_sol_sparse_attention,
 )
@@ -36,10 +38,13 @@ from .stable import (
     bundled_available,
     bundled_sparse_available,
     bundled_w8a8_available,
+    fused_qk_preprocessing_available,
     is_supported_turing_device,
     inspect_turing_attention_call,
     normalize_attention_backend,
     prequantize_turing_attention,
+    prequantize_turing_attention_from_qk,
+    prequantize_turing_qk,
     preflight_bundled,
     preflight_bundled_sparse,
     preflight_bundled_w8a8,
@@ -48,6 +53,80 @@ from .stable import (
     turing_sage_attention,
     turing_w8a8_attention,
 )
+from ..profiling import CUDA_PHASE_PROFILER
+
+
+def _profiled(phase: str, function: Callable, /, *args, **kwargs):
+    if CUDA_PHASE_PROFILER.enabled:
+        return CUDA_PHASE_PROFILER.call(phase, function, *args, **kwargs)
+    return function(*args, **kwargs)
+
+
+def _consume_qkv(q, k, v):
+    query = q.take()
+    key = k.take()
+    value = v.take()
+    return query, key, value
+
+
+def _make_dense_qk_preprocessor(kernel: str) -> Callable:
+    def processor(
+        q,
+        k,
+        v,
+        heads: int,
+        spec: QKPreprocessSpec,
+        *,
+        transformer_options=None,
+    ):
+        call, reason = inspect_turing_attention_call(
+            q.peek(),
+            k.peek(),
+            v.peek(),
+            heads,
+            mask=None,
+            skip_reshape=True,
+            skip_output_reshape=False,
+            low_precision_attention=True,
+            is_causal=False,
+            kernel=kernel,
+            require_long_sequence=True,
+        )
+        if reason is not None or call.head_dim not in (64, 128):
+            raise RuntimeError(
+                "adapter selected unsupported fused Q/K attention input: "
+                f"{reason or f'head_dim={call.head_dim}'}"
+            )
+        query, key, value = _consume_qkv(q, k, v)
+        qk = _profiled(
+            "attention.qk_norm_rope_quant",
+            prequantize_turing_qk,
+            query,
+            key,
+            spec,
+            kernel=kernel,
+            transformer_options=transformer_options,
+        )
+        del query, key
+        quantized = _profiled(
+            "attention.value_prepare",
+            prequantize_turing_attention_from_qk,
+            qk,
+            value,
+            call,
+            kernel=kernel,
+            scale=None,
+            transformer_options=transformer_options,
+        )
+        del qk, value
+        return _profiled(
+            "attention.execute",
+            turing_attention_from_prequantized,
+            quantized,
+            kernel=kernel,
+        )
+
+    return processor
 
 
 def _default_attention_fallback() -> Callable:
@@ -206,6 +285,10 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
         attention_override.container_function = _make_dense_container_function(
             "w8a8" if option == "w8a8" else "sage"
         )
+    if bundled_turing and fused_qk_preprocessing_available():
+        attention_override.qk_preprocessor = _make_dense_qk_preprocessor(
+            "w8a8" if option == "w8a8" else "sage"
+        )
     return attention_override
 
 
@@ -277,6 +360,127 @@ def make_sparse_attention_override(
     debug_route_keys: set[tuple] = set()
     debug_route_state: dict[tuple, list[tuple[torch.Tensor, int, int]]] = {}
     debug_dense_reasons: set[str] = set()
+    dense_qk_preprocessor = _make_dense_qk_preprocessor(
+        "w8a8" if use_w8a8 else "sage"
+    )
+
+    def qk_preprocessor(
+        q,
+        k,
+        v,
+        heads: int,
+        spec: QKPreprocessSpec,
+        *,
+        transformer_options=None,
+    ):
+        if _sparse_dense_schedule(
+            transformer_options,
+            dense_prefix_steps,
+            dense_suffix_steps,
+            schedule_state,
+        ) or _sparse_dense_layer(
+            transformer_options,
+            dense_prefix_layers,
+            dense_suffix_layers,
+        ):
+            return dense_qk_preprocessor(
+                q,
+                k,
+                v,
+                heads,
+                spec,
+                transformer_options=transformer_options,
+            )
+
+        sol_call, reason = inspect_sol_attention_call(
+            q.peek(),
+            k.peek(),
+            v.peek(),
+            heads,
+            mask=None,
+            skip_reshape=True,
+            skip_output_reshape=False,
+            min_sequence_tokens=min_sequence_tokens,
+            prefix_policy=prefix_policy,
+            manual_prefix_tokens=manual_prefix_tokens,
+            skipped_residual=skipped_residual,
+            sparse_reference_image=sparse_reference_image,
+            sparse_reference_video=sparse_reference_video,
+            sparse_reference_audio=sparse_reference_audio,
+            transformer_options=transformer_options,
+            kwargs={},
+        )
+        if reason is not None:
+            return dense_qk_preprocessor(
+                q,
+                k,
+                v,
+                heads,
+                spec,
+                transformer_options=transformer_options,
+            )
+        if sol_call.attention.head_dim not in (64, 128):
+            raise RuntimeError(
+                "fused Sol Q/K preprocessing requires head_dim 64 or 128"
+            )
+
+        query, key, value = _consume_qkv(q, k, v)
+        qk = _profiled(
+            "attention.qk_norm_rope_quant",
+            prequantize_turing_qk,
+            query,
+            key,
+            spec,
+            kernel="sol",
+            transformer_options=transformer_options,
+        )
+        del query, key
+        quantized = _profiled(
+            "attention.value_route_prepare",
+            prequantize_turing_sol_attention_from_qk,
+            qk,
+            value,
+            sol_call,
+            routing_threshold=routing_threshold,
+            scale=None,
+            use_w8a8=use_w8a8,
+            transformer_options=transformer_options,
+        )
+        del qk, value
+        debug_key = (
+            sol_call.attention.input_dtype,
+            sol_call.attention.query_tokens,
+            sol_call.attention.key_tokens,
+            sol_call.dense_query_ranges,
+            sol_call.exact_kv_ranges,
+            routing_threshold,
+            sol_call.residual_subblocks,
+            use_w8a8,
+        )
+        collect_stats = debug_route_density and debug_key not in debug_route_keys
+        result = _profiled(
+            "attention.execute",
+            turing_sol_attention_from_prequantized,
+            quantized,
+            return_stats=collect_stats,
+        )
+        if not collect_stats:
+            return result
+        output, selected, possible = result
+        selected_blocks = int(selected.item())
+        LOG.warning(
+            "[Turing sparse debug] selected=%d/%d density=%.4f Q=%d K=%d "
+            "threshold=%.2f residual=%s",
+            selected_blocks,
+            possible,
+            selected_blocks / possible if possible else 0.0,
+            sol_call.attention.query_tokens,
+            sol_call.attention.key_tokens,
+            routing_threshold,
+            skipped_residual,
+        )
+        debug_route_keys.add(debug_key)
+        return output
 
     def attention_override(original: Callable, *args, **kwargs):
         fallback = lambda *fallback_args, **fallback_kwargs: _dtype_compatible_fallback(
@@ -475,6 +679,8 @@ def make_sparse_attention_override(
 
     attention_override.turing_utils_attention_backend = "sol_sparse_attn"
     attention_override.turing_utils_attention_implementation = "bundled_turing_sol_sparse_experimental"
+    if fused_qk_preprocessing_available():
+        attention_override.qk_preprocessor = qk_preprocessor
     return attention_override
 
 
@@ -525,6 +731,11 @@ def apply_sparse_attention_patch(
                 layout_status.reason,
             )
     transformer_options["optimized_attention_override"] = override
+    qk_processor = getattr(override, "qk_preprocessor", None)
+    if callable(qk_processor):
+        transformer_options[QK_PREPROCESSOR_KEY] = qk_processor
+    else:
+        transformer_options.pop(QK_PREPROCESSOR_KEY, None)
     transformer_options["turing_utils_attention_backend"] = "sol_sparse_attn"
     transformer_options["turing_utils_attention_implementation"] = (
         "bundled_turing_sol_sparse_experimental"
@@ -561,6 +772,11 @@ def apply_attention_backend(model, option: str, device: torch.device | None = No
     selected = override.turing_utils_attention_backend
     implementation = override.turing_utils_attention_implementation
     transformer_options["optimized_attention_override"] = override
+    qk_processor = getattr(override, "qk_preprocessor", None)
+    if callable(qk_processor):
+        transformer_options[QK_PREPROCESSOR_KEY] = qk_processor
+    else:
+        transformer_options.pop(QK_PREPROCESSOR_KEY, None)
     transformer_options["turing_utils_attention_backend"] = selected
     transformer_options["turing_utils_attention_implementation"] = implementation
     LOG.info(

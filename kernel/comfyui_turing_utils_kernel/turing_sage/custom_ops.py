@@ -3,6 +3,80 @@ from __future__ import annotations
 import torch
 
 
+@torch.library.custom_op("turing_utils::qk_rms_rope_int8", mutates_args=())
+def qk_rms_rope_int8(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    query_norm: torch.Tensor,
+    key_norm: torch.Tensor,
+    freqs: torch.Tensor,
+    epsilon: float,
+    rot_dim: int,
+    tensor_layout: str,
+    norm_scope: str,
+    split_half: bool,
+    rotate_qk: bool,
+    stabilize_k: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from .quant import rms_rope_per_warp_int8
+
+    return rms_rope_per_warp_int8(
+        query,
+        key,
+        query_norm,
+        key_norm,
+        freqs if freqs.numel() else None,
+        epsilon=epsilon,
+        rot_dim=rot_dim,
+        tensor_layout=tensor_layout,
+        norm_scope=norm_scope,
+        split_half=split_half,
+        rotate_qk=rotate_qk,
+        stabilize_k=stabilize_k,
+    )
+
+
+@qk_rms_rope_int8.register_fake
+def _qk_rms_rope_int8_fake(
+    query,
+    key,
+    query_norm,
+    key_norm,
+    freqs,
+    epsilon,
+    rot_dim,
+    tensor_layout,
+    norm_scope,
+    split_half,
+    rotate_qk,
+    stabilize_k,
+):
+    if tensor_layout == "HND":
+        batch, query_heads, query_tokens, _ = query.shape
+        _, key_heads, key_tokens, _ = key.shape
+    elif tensor_layout == "NHD":
+        batch, query_tokens, query_heads, _ = query.shape
+        _, key_tokens, key_heads, _ = key.shape
+    else:
+        raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+    query_scale = torch.empty(
+        (batch, query_heads, ((query_tokens + 63) // 64) * 4),
+        dtype=torch.float32,
+        device=query.device,
+    )
+    key_scale = torch.empty(
+        (batch, key_heads, (key_tokens + 63) // 64),
+        dtype=torch.float32,
+        device=key.device,
+    )
+    return (
+        torch.empty_like(query, dtype=torch.int8),
+        query_scale,
+        torch.empty_like(key, dtype=torch.int8),
+        key_scale,
+    )
+
+
 @torch.library.custom_op("turing_utils::sage_attention", mutates_args=())
 def sage_attention(
     query: torch.Tensor,

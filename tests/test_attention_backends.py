@@ -26,6 +26,162 @@ class FakeModel:
 
 
 class AttentionBackendsTest(unittest.TestCase):
+    def test_fused_qk_preprocessing_requires_022_kernel_abi(self):
+        sage_module = SimpleNamespace(fused_qk_preprocessing_available=lambda: True)
+        for version, expected in (("0.21.0", False), ("0.22.0", True)):
+            with self.subTest(version=version), mock.patch.dict(
+                sys.modules,
+                {
+                    "comfyui_turing_utils_kernel": SimpleNamespace(__version__=version),
+                    "comfyui_turing_utils_kernel.turing_sage": sage_module,
+                },
+            ):
+                self.assertEqual(
+                    attention_backends.fused_qk_preprocessing_available(), expected
+                )
+
+    def test_adapter_qk_preprocessor_consumes_inputs_before_attention(self):
+        tensors = [
+            torch.zeros((1, 2, 64, 128), dtype=torch.bfloat16)
+            for _ in range(3)
+        ]
+        references = [weakref.ref(tensor) for tensor in tensors]
+        q, k, v = (
+            comfy_attention.AttentionTensorContainer(tensor) for tensor in tensors
+        )
+        del tensors
+        call = SimpleNamespace(head_dim=128)
+        spec = attention_backends.QKPreprocessSpec(
+            query_norm=torch.ones(128, dtype=torch.bfloat16),
+            key_norm=torch.ones(128, dtype=torch.bfloat16),
+            freqs=None,
+            epsilon=1e-6,
+            rot_dim=0,
+            norm_scope="head",
+            split_half=True,
+        )
+
+        qk_calls = []
+
+        def quantize(query, key, received_spec, **kwargs):
+            qk_calls.append((received_spec, kwargs))
+            return "qk"
+
+        def finish(qk, value, inspected, **kwargs):
+            self.assertEqual(qk, "qk")
+            self.assertIs(inspected, call)
+            return "packed"
+
+        def execute(packed, *, kernel):
+            gc.collect()
+            self.assertEqual((packed, kernel), ("packed", "sage"))
+            self.assertTrue(all(reference() is None for reference in references))
+            return "output"
+
+        def inspect(*args, **kwargs):
+            return call, None
+
+        with (
+            mock.patch(
+                "attention.inspect_turing_attention_call",
+                new=inspect,
+            ),
+            mock.patch("attention.prequantize_turing_qk", new=quantize),
+            mock.patch(
+                "attention.prequantize_turing_attention_from_qk",
+                new=finish,
+            ),
+            mock.patch(
+                "attention.turing_attention_from_prequantized",
+                new=execute,
+            ),
+        ):
+            processor = attention_backends._make_dense_qk_preprocessor("sage")
+            output = processor(q, k, v, 2, spec, transformer_options={})
+
+        self.assertEqual(output, "output")
+        self.assertEqual(len(qk_calls), 1)
+        self.assertIsNone(q.tensor)
+        self.assertIsNone(k.tensor)
+        self.assertIsNone(v.tensor)
+
+    def test_sol_adapter_preprocessor_reuses_fused_qk_and_releases_inputs(self):
+        tensors = [
+            torch.zeros((1, 2, 4096, 128), dtype=torch.bfloat16)
+            for _ in range(3)
+        ]
+        references = [weakref.ref(tensor) for tensor in tensors]
+        q, k, v = (
+            comfy_attention.AttentionTensorContainer(tensor) for tensor in tensors
+        )
+        del tensors
+        attention_call = SimpleNamespace(
+            head_dim=128,
+            input_dtype=torch.bfloat16,
+            query_tokens=4096,
+            key_tokens=4096,
+        )
+        sol_call = SimpleNamespace(
+            attention=attention_call,
+            dense_query_ranges=(),
+            exact_kv_ranges=(),
+            residual_subblocks=1,
+        )
+        spec = attention_backends.QKPreprocessSpec(
+            query_norm=torch.ones(128, dtype=torch.bfloat16),
+            key_norm=torch.ones(128, dtype=torch.bfloat16),
+            freqs=None,
+            epsilon=1e-6,
+            rot_dim=0,
+            norm_scope="head",
+            split_half=True,
+        )
+
+        def finish(qk, value, inspected, **kwargs):
+            self.assertEqual(qk, "qk")
+            self.assertIs(inspected, sol_call)
+            return "packed-sol"
+
+        def inspect(*args, **kwargs):
+            return sol_call, None
+
+        def quantize(*args, **kwargs):
+            return "qk"
+
+        def execute(packed, *, return_stats):
+            gc.collect()
+            self.assertEqual((packed, return_stats), ("packed-sol", False))
+            self.assertTrue(all(reference() is None for reference in references))
+            return "sol-output"
+
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention.bundled_sparse_available", return_value=True),
+            mock.patch("attention.preflight_bundled"),
+            mock.patch("attention.preflight_bundled_sparse"),
+            mock.patch("attention.fused_qk_preprocessing_available", return_value=True),
+            mock.patch("attention.inspect_sol_attention_call", new=inspect),
+            mock.patch("attention.prequantize_turing_qk", new=quantize),
+            mock.patch(
+                "attention.prequantize_turing_sol_attention_from_qk", new=finish
+            ),
+            mock.patch(
+                "attention.turing_sol_attention_from_prequantized", new=execute
+            ),
+        ):
+            override = attention_backends.make_sparse_attention_override(
+                torch.device("cuda", 0),
+                dense_prefix_layers=0,
+            )
+            output = override.qk_preprocessor(
+                q, k, v, 2, spec, transformer_options={}
+            )
+
+        self.assertEqual(output, "sol-output")
+        self.assertIsNone(q.tensor)
+        self.assertIsNone(k.tensor)
+        self.assertIsNone(v.tensor)
+
     def test_split_prequantization_requires_020_kernel_abi(self):
         sage_module = SimpleNamespace(split_prequantization_available=lambda: True)
         for version, expected in (("0.19.0", False), ("0.20.0", True)):

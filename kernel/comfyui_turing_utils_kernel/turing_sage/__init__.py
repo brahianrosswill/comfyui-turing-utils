@@ -50,6 +50,18 @@ def split_prequantization_available() -> bool:
     )
 
 
+def fused_qk_preprocessing_available() -> bool:
+    if not available():
+        return False
+    try:
+        module = importlib.import_module(
+            "comfyui_turing_utils_kernel._sage_fused_sm75"
+        )
+    except (ImportError, OSError):
+        return False
+    return hasattr(module, "quant_qk_rms_rope_int8_cuda")
+
+
 def sageattn(*args, **kwargs):
     """Run the stable bundled SM75 Sage attention implementation."""
     from .core import sageattn as implementation
@@ -191,6 +203,18 @@ def prequantize_sageattn(*args, **kwargs):
     return implementation(*args, **kwargs)
 
 
+def prequantize_rms_rope_qk(*args, **kwargs):
+    from .core import prequantize_rms_rope_qk as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def prequantize_sageattn_from_qk(*args, **kwargs):
+    from .core import prequantize_sageattn_from_qk as implementation
+
+    return implementation(*args, **kwargs)
+
+
 def sageattn_from_prequantized(*args, **kwargs):
     from .core import sageattn_from_prequantized as implementation
 
@@ -199,6 +223,12 @@ def sageattn_from_prequantized(*args, **kwargs):
 
 def prequantize_sol_sageattn(*args, **kwargs):
     from .core import prequantize_sol_sageattn as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def prequantize_sol_sageattn_from_qk(*args, **kwargs):
+    from .core import prequantize_sol_sageattn_from_qk as implementation
 
     return implementation(*args, **kwargs)
 
@@ -354,6 +384,7 @@ def run_attention_correctness_gate(*args, **kwargs):
 
 __all__ = [
     "available",
+    "fused_qk_preprocessing_available",
     "prequantize_sageattn",
     "prequantize_sol_sageattn",
     "preflight",

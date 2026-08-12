@@ -35,6 +35,7 @@ implementation.
 | Activation quantization | `bf16_gelu_int8_convrot_quantize`, `bf16_gelu_int4_convrot_quantize` | BF16 row-buffer GELU and ConvRot quantization |
 | Normalization | `segmented_rms_adaln` | RMSNorm plus segmented AdaLN modulation |
 | Normalization | `layer_norm_adaln` | LayerNorm plus AdaLN modulation |
+| Attention preprocessing | `qk_rms_rope_int8` | Fused RMSNorm, RoPE and production Q/K INT8 quantization |
 | Attention | `sage_attention` | Stable dense INT8-QK, FP16/BF16-PV SM75 attention |
 | Attention | `sage_attention_varlen` | Packed variable-length stable Sage attention |
 | Attention | `w8a8_attention` | Dense INT8-QK and INT8-PV SM75 attention |
@@ -92,12 +93,16 @@ runtime.
 
 - MiniMax H3 publishes packed text/image/video/audio token ranges, estimates
   packed dynamic-VRAM allocations, fuses segmented RMSNorm+AdaLN, and fuses
-  fc1 -> SwiGLU -> fc2-input quantization. Progressive resolution remains an
-  explicit experiment.
-- Wan publishes packed-context memory estimates and uses the generic ConvRot
-  and normalization services.
+  fc1 -> SwiGLU -> fc2-input quantization. Supported attention calls also fuse
+  per-head RMSNorm+split-half RoPE directly into INT8 Q/K. Progressive
+  resolution remains an explicit experiment.
+- Wan publishes packed-context memory estimates and fuses its whole-row Q/K
+  RMSNorm plus interleaved RoPE into Sage/W8A8/Sol Q/K quantization.
 - Bernini provides conditioning, context-window memory estimation, and
-  absolute-position integration. It does not own quantized CUDA kernels.
+  absolute-position integration. Its Wan self-attention inherits the same
+  generic fused preprocessing and tensor-lifetime path, including explicitly
+  selected Sol; it does not own
+  quantized CUDA kernels.
 - Reference hubs, padding, resizing, and H3 AV latent utilities are media or
   conditioning operations, not CUDA kernel families.
 
@@ -106,7 +111,7 @@ runtime.
 | Work item | Status | Decision |
 |---|---|---|
 | AttentionTensorContainer lifetime | complete | Dense Sage, dense W8A8, and Sol consume containers only after preflight; quantized Q/K replace floating Q/K before output allocation, W8A8 also releases floating V, while FP16-PV correctly retains V until the attention CTA consumes it |
-| Fused H3 RMSNorm + RoPE + Q/K quantization | not implemented | high-value H3 adapter experiment; keep out of the generic attention API |
+| Fused Q/K RMSNorm + RoPE + INT8 quantization | complete | H3, Wan and Bernini publish model semantics through one adapter contract; dense Sage/W8A8 and explicit Sol share the same D64/D128 custom op |
 | fc2/out_proj gate + residual epilogue | not implemented | high-value H3 adapter work, but requires a contraction-owned epilogue rather than another post-GEMM kernel |
 | Head/layer/step-specific Sol policy | not implemented | useful only behind calibration and visual/audio gates; do not replace the stable global policy without H3 data |
 | Route reuse and hysteresis | not implemented | potentially useful, but must justify route-state memory and avoid cross-prompt state leakage |
@@ -114,8 +119,8 @@ runtime.
 | First-block or trajectory cache | not integrated | not a default fit for 6--8-step H3; leave to dedicated high-step nodes |
 | Spectrum-style transformer skipping | not integrated | replay memory and audio workflow cost conflict with the Turing/dynamic-VRAM target |
 
-The next production-oriented order is: fused H3 Q/K preprocessing, gated
-fc2/out-projection epilogues, calibration tooling for head/layer/step Sol
+The next production-oriented order is: gated fc2/out-projection epilogues,
+calibration tooling for head/layer/step Sol
 budgets, then real-Turing backend A/B. The first two target tensor traffic in
 the MLP/projection-heavy part of H3 and therefore have a higher whole-model
 ceiling than another dense attention variant.

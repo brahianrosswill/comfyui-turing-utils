@@ -1,7 +1,7 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's exact-sm75
-runtime. Version 0.21.0 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
+runtime. Version 0.22.0 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, bundled Sage attention, pure-INT8 W8A8 attention,
 and an explicitly selected experimental model-independent sparse attention
@@ -18,7 +18,8 @@ It contains no model-weight format or model loader.
 Every stable public tensor operator is registered through
 `torch.library.custom_op` with a fake/meta implementation: W4A8 GEMM, BF16
 epilogue, ConvRot activation fusions, normalization fusions, fixed and varlen
-Sage, dense W8A8, and Sol. Prequantized Python state objects deliberately stay
+Sage, dense W8A8, Sol, and fused Q/K RMSNorm+RoPE+INT8 preprocessing.
+Prequantized Python state objects deliberately stay
 outside this boundary because they are ComfyUI tensor-lifetime coordination,
 not graph-level tensor operators.
 
@@ -42,7 +43,7 @@ csrc/
     convrot_quant.cu                      staged/row-buffer W8 and W4 ConvRot quantizers
     segmented_rms_adaln.cu                RMSNorm/LayerNorm + AdaLN kernels
     w4a8.cu                               packed W4-to-S8 SM75 Tensor Core GEMM
-    sage/                                 bundled stable and experimental sparse SM75 attention
+    sage/                                 bundled dense/sparse attention and fused Q/K preprocessing
 comfyui_turing_utils_kernel/
   ops.py                                  stable Turing operator API
   turing_sage/                            lazy production Sage facade
@@ -83,7 +84,7 @@ toolchain on Linux and Windows. The standards can be overridden with
 `COMFYUI_TURING_UTILS_HOST_CXX_STANDARD` and
 `COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD` when diagnosing a toolchain issue.
 
-Version 0.21 retains the split prequantize/execute attention ABI used by current
+Version 0.22 retains the split prequantize/execute attention ABI used by current
 ComfyUI attention tensor containers. It releases the original Q/K/V storage
 before allocating the output (W8A8 keeps no floating-point V copy), while the
 one-call APIs remain available for older ComfyUI/plugin combinations. All
@@ -94,6 +95,10 @@ reusing the same shared tile. Native D64 uses 16 KiB dynamic shared memory and
 native D128 uses 32 KiB; inputs below either width pad only to the next native
 specialization. Fused Hadamard Q/K rotation and adaptive K anchoring can be
 disabled only through the explicit experimental tuning patch.
+The new Q/K preprocessing operator accepts FP16/BF16 D64/D128 HND/NHD tensors.
+Its largest D128 rotated/anchored specialization uses about 21.1 KiB static
+shared memory with no local spill in the compute_75 cubin, while D64 uses about
+10.6 KiB. Model semantics remain in plugin adapters rather than the kernel API.
 
 ## Check
 
@@ -105,6 +110,7 @@ print("kernel:", comfyui_turing_utils_kernel.__file__)
 print("Turing Sage:", comfyui_turing_utils_kernel.turing_sage.available())
 print("Turing sparse:", comfyui_turing_utils_kernel.turing_sage.sparse_available())
 print("Turing W8A8 attention:", comfyui_turing_utils_kernel.turing_sage.w8a8_available())
+print("Fused Q/K preprocessing:", comfyui_turing_utils_kernel.turing_sage.fused_qk_preprocessing_available())
 print("Turing W4A8:", callable(comfyui_turing_utils_kernel.turing_w4a8_linear))
 print("Turing SwiGLU:", callable(comfyui_turing_utils_kernel.turing_swiglu_int8_convrot_quantize))
 print("Turing norm:", callable(comfyui_turing_utils_kernel.turing_segmented_rms_adaln))

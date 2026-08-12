@@ -3,6 +3,95 @@ import torch
 from .. import _sage_fused_sm75 as _fused
 
 
+def rms_rope_per_warp_int8(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: torch.Tensor,
+    k_norm: torch.Tensor,
+    freqs: torch.Tensor | None,
+    *,
+    epsilon: float,
+    rot_dim: int,
+    tensor_layout: str,
+    norm_scope: str,
+    split_half: bool,
+    rotate_qk: bool,
+    stabilize_k: bool,
+):
+    """Fuse Q/K normalization and RoPE into the production INT8 contract."""
+    if tensor_layout == "HND":
+        batch, q_heads, q_tokens, head_dim = q.shape
+        _, k_heads, k_tokens, _ = k.shape
+        layout_id = 1
+    elif tensor_layout == "NHD":
+        batch, q_tokens, q_heads, head_dim = q.shape
+        _, k_tokens, k_heads, _ = k.shape
+        layout_id = 0
+    else:
+        raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+    if head_dim not in (64, 128):
+        raise ValueError("fused RMSNorm+RoPE Q/K quantization requires head_dim 64 or 128")
+    if norm_scope not in {"head", "row"}:
+        raise ValueError("norm_scope must be head or row")
+
+    q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
+    k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
+    q_scale = torch.empty(
+        (batch, q_heads, ((q_tokens + 63) // 64) * 4),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    k_scale = torch.empty(
+        (batch, k_heads, (k_tokens + 63) // 64),
+        dtype=torch.float32,
+        device=k.device,
+    )
+    if norm_scope == "row":
+        q_rrms = torch.empty((batch, q_tokens), dtype=torch.float32, device=q.device)
+        k_rrms = torch.empty((batch, k_tokens), dtype=torch.float32, device=k.device)
+        norm_scope_id = 1
+    else:
+        q_rrms = torch.empty(0, dtype=torch.float32, device=q.device)
+        k_rrms = torch.empty(0, dtype=torch.float32, device=k.device)
+        norm_scope_id = 0
+    if stabilize_k and rotate_qk:
+        anchor_indices = torch.empty((batch, k_heads), dtype=torch.int32, device=k.device)
+        anchor_values = torch.empty(
+            (batch, k_heads, head_dim), dtype=torch.float32, device=k.device
+        )
+    else:
+        anchor_indices = torch.empty(0, dtype=torch.int32, device=k.device)
+        anchor_values = torch.empty(0, dtype=torch.float32, device=k.device)
+    if freqs is None:
+        freqs = torch.empty(0, dtype=q.dtype, device=q.device)
+
+    _fused.quant_qk_rms_rope_int8_cuda(
+        q,
+        k,
+        q_int8,
+        k_int8,
+        q_scale,
+        k_scale,
+        q_norm,
+        k_norm,
+        freqs,
+        q_rrms,
+        k_rrms,
+        anchor_indices,
+        anchor_values,
+        float(epsilon),
+        int(rot_dim),
+        64,
+        16,
+        64,
+        layout_id,
+        norm_scope_id,
+        bool(split_half),
+        bool(rotate_qk),
+    )
+    return q_int8, q_scale, k_int8, k_scale
+
+
 def quantize_query_per_warp(
     q: torch.Tensor,
     BLKQ: int = 64,

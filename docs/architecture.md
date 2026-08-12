@@ -22,6 +22,7 @@ comfyui-turing-utils/
 │   ├── hardware.py
 │   ├── kernel_api.py            # independent-kernel boundary
 │   ├── precision.py
+│   ├── profiling.py             # disabled-by-default bounded CUDA timing
 │   └── registration.py          # sole node mapping table
 ├── kernel/
 │   ├── comfyui_turing_utils_kernel/
@@ -61,13 +62,14 @@ built-in adapters without importing ComfyUI node definitions.
 | `attention/stable.py` | backend registry, stable bundled Sage/W8A8, dtype/layout facade |
 | `attention/sparse.py` | explicit experimental Sol policy, including optional W8A8 PV dispatch |
 | `attention/layout.py` | model-independent packed-video topology contract and provider registry |
+| `attention/preprocessing.py` | adapter-owned Q/K normalization and RoPE semantic contract |
 | `attention/patches.py` | attention overrides and loader-independent ModelPatcher installation |
 | `attention/tuning.py` | explicit experimental SM75 launch/quantization policy metadata |
 | `quantization/convrot.py` | ConvRot metadata parsing and model/CLIP loading services |
 | `quantization/dispatch.py` | W8A8/W4A8/W4A4 activation quantization and GEMM dispatch |
 | `quantization/fusions.py` | model-independent fused activation and normalization operations |
 | `adapters/minimax/` | H3 layout publication, VRAM planning, block fusions, and explicit progressive experiment |
-| `adapters/wan.py` | Wan/Bernini packed-context memory planning |
+| `adapters/wan.py` | Wan/Bernini packed-context planning and supported self-attention preprocessing |
 | `adapters/bernini.py` | Bernini context-window and absolute-RoPE integration |
 | `media/` | reference sets, resizing transforms, and shared video padding |
 | `nodes/` | thin ComfyUI schemas and calls into the implementation packages |

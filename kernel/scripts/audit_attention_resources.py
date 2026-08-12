@@ -27,18 +27,31 @@ def _cuobjdump() -> str:
     raise RuntimeError("cuobjdump was not found; add the CUDA bin directory to PATH")
 
 
-def main() -> None:
-    package = KERNEL / "comfyui_turing_utils_kernel"
-    suffix = sysconfig.get_config_var("EXT_SUFFIX")
-    extensions = [package / f"_sage_qattn_sm75{suffix}"] if suffix else []
-    extensions = [path for path in extensions if path.is_file()]
-    if len(extensions) != 1:
-        raise RuntimeError(f"the current Python Sage extension is not built: suffix={suffix}")
-    output = subprocess.check_output(
-        [_cuobjdump(), "--dump-resource-usage", str(extensions[0])],
+def _resource_output(path: Path) -> str:
+    return subprocess.check_output(
+        [_cuobjdump(), "--dump-resource-usage", str(path)],
         text=True,
         stderr=subprocess.STDOUT,
     )
+
+
+def _metrics(line: str) -> dict[str, int]:
+    return {
+        name: int(value)
+        for name, value in re.findall(r"\b(REG|STACK|SHARED|LOCAL):(\d+)", line)
+    }
+
+
+def main() -> None:
+    package = KERNEL / "comfyui_turing_utils_kernel"
+    suffix = sysconfig.get_config_var("EXT_SUFFIX")
+    qattn = package / f"_sage_qattn_sm75{suffix}" if suffix else None
+    fused = package / f"_sage_fused_sm75{suffix}" if suffix else None
+    if qattn is None or not qattn.is_file():
+        raise RuntimeError(f"the current Python Sage extension is not built: suffix={suffix}")
+    if fused is None or not fused.is_file():
+        raise RuntimeError(f"the current Python Sage fused extension is not built: suffix={suffix}")
+    output = _resource_output(qattn)
     records: list[tuple[int, dict[str, int]]] = []
     lines = output.splitlines()
     for index, line in enumerate(lines):
@@ -47,12 +60,7 @@ def main() -> None:
         dimension = re.search(r"sparse_attention_kernelILi(64|128)E", line)
         if dimension is None:
             raise RuntimeError(f"cannot identify attention head dimension: {line}")
-        metrics = {
-            name: int(value)
-            for name, value in re.findall(
-                r"\b(REG|STACK|SHARED|LOCAL):(\d+)", lines[index + 1]
-            )
-        }
+        metrics = _metrics(lines[index + 1])
         if metrics:
             records.append((int(dimension.group(1)), metrics))
     dimensions = {64: [], 128: []}
@@ -77,6 +85,44 @@ def main() -> None:
         f"registers=D64:{sorted({item['REG'] for item in dimensions[64]})}/"
         f"D128:{sorted({item['REG'] for item in dimensions[128]})} "
         "local=0 dynamic_shared=D64:16384/D128:32768(source-gated)"
+    )
+
+    preprocessing_output = _resource_output(fused)
+    preprocessing_lines = preprocessing_output.splitlines()
+    preprocessing_records: list[dict[str, int]] = []
+    preprocessing_dimensions = {64: [], 128: []}
+    for index, line in enumerate(preprocessing_lines):
+        if "qk_preprocess" not in line or index + 1 >= len(preprocessing_lines):
+            continue
+        metrics = _metrics(preprocessing_lines[index + 1])
+        if not metrics:
+            continue
+        preprocessing_records.append(metrics)
+        if "quantize_qk_kernel" in line:
+            dimension = re.search(r"quantize_qk_kernel.*Li(64|128)E", line)
+            if dimension is None:
+                raise RuntimeError(f"cannot identify preprocessing head dimension: {line}")
+            preprocessing_dimensions[int(dimension.group(1))].append(metrics)
+    if any(len(variants) < 12 for variants in preprocessing_dimensions.values()):
+        raise RuntimeError(
+            "expected twelve FP16/BF16 Q/K preprocessing variants per head dimension, "
+            f"found D64={len(preprocessing_dimensions[64])}, "
+            f"D128={len(preprocessing_dimensions[128])}"
+        )
+    for metrics in preprocessing_records:
+        if metrics.get("LOCAL", 1) != 0 or metrics.get("STACK", 1) != 0:
+            raise RuntimeError(f"Q/K preprocessing spilled to local/stack memory: {metrics}")
+        if metrics.get("SHARED", 32769) > 32 * 1024:
+            raise RuntimeError(f"Q/K preprocessing exceeds the 32 KiB shared budget: {metrics}")
+        if metrics.get("REG", 256) > 96:
+            raise RuntimeError(f"Q/K preprocessing register regression: {metrics}")
+    print(
+        "Q/K preprocessing resource audit passed: "
+        f"variants=D64:{len(preprocessing_dimensions[64])}/"
+        f"D128:{len(preprocessing_dimensions[128])} "
+        f"registers<={max(item['REG'] for item in preprocessing_records)} "
+        f"static_shared<={max(item['SHARED'] for item in preprocessing_records)} "
+        "local=0 stack=0"
     )
 
 

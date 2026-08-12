@@ -25,6 +25,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("quant_qk_per_warp_int8_cuda", &quant_qk_per_warp_int8_cuda, "quant_qk_per_warp_int8_cuda");
   m.def("quant_qk_per_warp_int8_rotated_cuda", &quant_qk_per_warp_int8_rotated_cuda, "Fused randomized Hadamard Q/K INT8 quantization");
   m.def("quant_qk_per_warp_int8_rotated_anchored_cuda", &quant_qk_per_warp_int8_rotated_anchored_cuda, "Fused randomized Hadamard Q/K INT8 quantization with conditional K anchoring");
+  m.def("quant_qk_rms_rope_int8_cuda", &quant_qk_rms_rope_int8_cuda, "Fused RMSNorm, RoPE, optional Hadamard/anchor stabilization, and Q/K INT8 quantization");
   m.def("quant_per_warp_int8_varlen_cuda", &quant_per_warp_int8_varlen_cuda, "quant_per_warp_int8_varlen_cuda");
 
   m.def("varlen_attention_fwd_cuda", &varlen_attention_fwd_cuda, "varlen_attention_fwd_cuda");

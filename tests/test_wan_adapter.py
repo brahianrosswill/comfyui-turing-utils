@@ -19,6 +19,67 @@ from comfyui_turing_utils.adapters import wan as wan_adapter  # noqa: E402
 
 
 class WanMemoryPlanningTest(unittest.TestCase):
+    def test_self_attention_forward_uses_row_norm_fused_preprocessor(self):
+        from comfy.ldm.modules.attention import AttentionTensorContainer
+
+        class FakeAttention(torch.nn.Module):
+            num_heads = 2
+            head_dim = 64
+            qk_norm = True
+            eps = 1e-6
+
+            def __init__(self):
+                super().__init__()
+                self.q = torch.nn.Linear(128, 128, bias=False, dtype=torch.bfloat16)
+                self.k = torch.nn.Linear(128, 128, bias=False, dtype=torch.bfloat16)
+                self.v = torch.nn.Linear(128, 128, bias=False, dtype=torch.bfloat16)
+                self.o = torch.nn.Linear(128, 128, bias=False, dtype=torch.bfloat16)
+                self.norm_q = torch.nn.RMSNorm(128, eps=1e-6, dtype=torch.bfloat16)
+                self.norm_k = torch.nn.RMSNorm(128, eps=1e-6, dtype=torch.bfloat16)
+
+            def forward(self, x, freqs, transformer_options={}):
+                raise AssertionError("the unfused forward should not run")
+
+        attention = FakeAttention()
+        seen = {}
+
+        def processor(q, k, v, heads, spec, *, transformer_options):
+            seen["shapes"] = (q.peek().shape, k.peek().shape, v.peek().shape)
+            seen["heads"] = heads
+            seen["spec"] = spec
+            q.take()
+            k.take()
+            v.take()
+            return torch.zeros((1, 64, 128), dtype=torch.bfloat16)
+
+        patched = wan_adapter._make_self_attention_forward(
+            attention, AttentionTensorContainer
+        )
+        x = torch.randn(1, 64, 128, dtype=torch.bfloat16)
+        freqs = torch.randn(1, 64, 1, 32, 2, 2, dtype=torch.bfloat16)
+        with (
+            torch.inference_mode(),
+            mock.patch(
+                "comfyui_turing_utils.adapters.wan.qk_preprocessor",
+                return_value=processor,
+            ),
+        ):
+            output = patched(x, freqs, transformer_options={})
+
+        self.assertEqual(output.shape, (1, 64, 128))
+        self.assertEqual(
+            seen["shapes"],
+            (
+                torch.Size((1, 2, 64, 64)),
+                torch.Size((1, 2, 64, 64)),
+                torch.Size((1, 2, 64, 64)),
+            ),
+        )
+        self.assertEqual(seen["heads"], 2)
+        self.assertEqual(seen["spec"].norm_scope, "row")
+        self.assertFalse(seen["spec"].split_half)
+        self.assertEqual(seen["spec"].rot_dim, 64)
+
     @staticmethod
     def _w4_weight(dtype: torch.dtype, linear_dtype: str):
         from comfy.quant_ops import QuantizedTensor, TensorCoreConvRotW4A4Layout

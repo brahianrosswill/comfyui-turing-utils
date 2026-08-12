@@ -69,6 +69,63 @@ class FakePatcher:
 
 
 class MiniMaxAdapterTest(unittest.TestCase):
+    def test_attention_forward_hands_raw_qk_to_fused_preprocessor(self):
+        from comfy.ldm.modules.attention import AttentionTensorContainer
+
+        class FakeAttention(torch.nn.Module):
+            heads = 2
+            head_dim = 64
+
+            def __init__(self):
+                super().__init__()
+                self.qkv_proj = torch.nn.Linear(128, 384, bias=False, dtype=torch.bfloat16)
+                self.out_proj = torch.nn.Linear(128, 128, bias=False, dtype=torch.bfloat16)
+                self.q_norm = torch.nn.RMSNorm(64, eps=1e-6, dtype=torch.bfloat16)
+                self.k_norm = torch.nn.RMSNorm(64, eps=1e-6, dtype=torch.bfloat16)
+
+            def forward(self, x, rope_freqs=None, transformer_options={}):
+                raise AssertionError("the unfused forward should not run")
+
+        attention = FakeAttention()
+        seen = {}
+
+        def processor(q, k, v, heads, spec, *, transformer_options):
+            seen["shapes"] = (q.peek().shape, k.peek().shape, v.peek().shape)
+            seen["heads"] = heads
+            seen["spec"] = spec
+            q.take()
+            k.take()
+            v.take()
+            return torch.zeros((1, 64, 128), dtype=torch.bfloat16)
+
+        patched = minimax_adapter._make_attention_forward(
+            attention, AttentionTensorContainer
+        )
+        x = torch.randn(64, 128, dtype=torch.bfloat16)
+        freqs = torch.randn(1, 64, 1, 32, 2, 2, dtype=torch.bfloat16)
+        with (
+            torch.inference_mode(),
+            mock.patch(
+                "comfyui_turing_utils.adapters.minimax.acceleration.qk_preprocessor",
+                return_value=processor,
+            ),
+        ):
+            output = patched(x, rope_freqs=freqs, transformer_options={})
+
+        self.assertEqual(output.shape, (64, 128))
+        self.assertEqual(
+            seen["shapes"],
+            (
+                torch.Size((1, 2, 64, 64)),
+                torch.Size((1, 2, 64, 64)),
+                torch.Size((1, 2, 64, 64)),
+            ),
+        )
+        self.assertEqual(seen["heads"], 2)
+        self.assertEqual(seen["spec"].norm_scope, "head")
+        self.assertTrue(seen["spec"].split_half)
+        self.assertEqual(seen["spec"].rot_dim, 64)
+
     @staticmethod
     def _diffusion_spec():
         return SimpleNamespace(

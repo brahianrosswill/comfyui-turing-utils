@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import logging
 import math
+import inspect
 import types
 from collections import Counter
 
 import torch
 
+from ..attention.preprocessing import QKPreprocessSpec, qk_preprocessor
+from ..attention.stable import fused_qk_preprocessing_available
+from ..profiling import CUDA_PHASE_PROFILER
 from ..quantization.dispatch import is_supported_turing_device, turing_int8_workspace_bytes
 
 
@@ -18,6 +22,98 @@ _MEMORY_CONTEXT_ATTR = "_turing_utils_wan_memory_context"
 _OUTER_SAMPLE_WRAPPER_KEY = "turing_utils_wan_memory_context"
 _W4_LAYOUT = "TensorCoreConvRotW4A4Layout"
 _W8_LAYOUT = "TensorWiseINT8Layout"
+_SELF_ATTENTION_FORWARD_PARAMETERS = (
+    "x",
+    "freqs",
+    "transformer_options",
+)
+
+
+def _compatible_self_attention_forward(attention_type) -> bool:
+    parameters = tuple(inspect.signature(attention_type.forward).parameters)
+    return parameters == ("self", *_SELF_ATTENTION_FORWARD_PARAMETERS)
+
+
+def _make_self_attention_forward(attention, attention_container):
+    original = attention.forward
+
+    def forward(self, x, freqs, transformer_options={}):
+        processor = qk_preprocessor(transformer_options)
+        patches = (
+            transformer_options.get("patches", {})
+            if isinstance(transformer_options, dict)
+            else {}
+        )
+        if (
+            processor is None
+            or "attn1_patch" in patches
+            or not self.qk_norm
+            or x.ndim != 3
+            or x.shape[1] < 64
+            or x.dtype not in (torch.float16, torch.bfloat16)
+            or self.head_dim not in (64, 128)
+            or not torch.is_tensor(freqs)
+            or freqs.ndim != 6
+            or (
+                torch.is_grad_enabled()
+                and (
+                    x.requires_grad
+                    or any(parameter.requires_grad for parameter in self.parameters())
+                )
+            )
+        ):
+            return original(x, freqs, transformer_options=transformer_options)
+
+        import comfy.model_management
+
+        profiling = CUDA_PHASE_PROFILER.enabled
+        if profiling:
+            query = CUDA_PHASE_PROFILER.call("wan.q_projection", self.q, x)
+            key = CUDA_PHASE_PROFILER.call("wan.k_projection", self.k, x)
+            value = CUDA_PHASE_PROFILER.call("wan.v_projection", self.v, x)
+        else:
+            query = self.q(x)
+            key = self.k(x)
+            value = self.v(x)
+        batch, sequence = x.shape[:2]
+        query = query.view(batch, sequence, self.num_heads, self.head_dim)
+        key = key.view(batch, sequence, self.num_heads, self.head_dim)
+        value = value.view(batch, sequence, self.num_heads, self.head_dim)
+        query_norm = comfy.model_management.cast_to(
+            self.norm_q.weight, device=x.device, dtype=query.dtype
+        )
+        key_norm = comfy.model_management.cast_to(
+            self.norm_k.weight, device=x.device, dtype=key.dtype
+        )
+        spec = QKPreprocessSpec(
+            query_norm=query_norm,
+            key_norm=key_norm,
+            freqs=freqs,
+            epsilon=float(self.eps),
+            rot_dim=self.head_dim,
+            norm_scope="row",
+            split_half=False,
+        )
+        query = attention_container(query.transpose(1, 2))
+        key = attention_container(key.transpose(1, 2))
+        value = attention_container(value.transpose(1, 2))
+        output = processor(
+            query,
+            key,
+            value,
+            self.num_heads,
+            spec,
+            transformer_options=transformer_options,
+        )
+        if profiling:
+            output = CUDA_PHASE_PROFILER.call("wan.out_projection", self.o, output)
+            CUDA_PHASE_PROFILER.complete_attention(
+                (batch, self.num_heads, sequence, self.head_dim)
+            )
+            return output
+        return self.o(output)
+
+    return types.MethodType(forward, attention)
 
 
 def _context_latents_from_kwargs(kwargs):
@@ -237,7 +333,8 @@ def apply_wan_adapter(model, device: torch.device) -> int:
         return 0
 
     try:
-        from comfy.ldm.wan.model import WanModel
+        from comfy.ldm.modules.attention import AttentionTensorContainer
+        from comfy.ldm.wan.model import WanModel, WanSelfAttention
     except ImportError:
         return 0
 
@@ -263,6 +360,20 @@ def apply_wan_adapter(model, device: torch.device) -> int:
     )
     base_model._turing_utils_wan_adapter = True
 
+    attention_fusions = 0
+    if (
+        hasattr(model, "add_object_patch")
+        and fused_qk_preprocessing_available()
+        and _compatible_self_attention_forward(WanSelfAttention)
+    ):
+        for name, module in base_model.named_modules():
+            if name and type(module) is WanSelfAttention:
+                model.add_object_patch(
+                    f"{name}.forward",
+                    _make_self_attention_forward(module, AttentionTensorContainer),
+                )
+                attention_fusions += 1
+
     if hasattr(model, "add_wrapper_with_key"):
         import comfy.patcher_extension
 
@@ -274,8 +385,9 @@ def apply_wan_adapter(model, device: torch.device) -> int:
 
     LOG.info(
         "Enabled Wan Turing adapter: formats=[%s], context-aware VRAM planning, "
-        "w8_outputs=[%s]",
+        "w8_outputs=[%s], fused_qk_attention=%d",
         ",".join(f"{kind}:{count}" for kind, count in sorted(formats.items())),
         ",".join(map(str, w8_output_channels)) or "none",
+        attention_fusions,
     )
-    return sum(formats.values())
+    return max(sum(formats.values()), attention_fusions)

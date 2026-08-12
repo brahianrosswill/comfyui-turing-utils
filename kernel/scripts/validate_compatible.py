@@ -148,6 +148,189 @@ def validate_segmented_norm(device: torch.device) -> None:
         _assert_close(f"segmented norm {dtype}", output, reference, rtol=0.01, atol=0.02)
 
 
+def _reference_qk_preprocessing(
+    value: torch.Tensor,
+    weight: torch.Tensor,
+    freqs: torch.Tensor,
+    *,
+    epsilon: float,
+    rot_dim: int,
+    norm_scope: str,
+    split_half: bool,
+) -> torch.Tensor:
+    batch, heads, sequence, head_dim = value.shape
+    if norm_scope == "head":
+        rrms = torch.rsqrt(value.float().square().mean(dim=-1, keepdim=True) + epsilon)
+        normalized = (value.float() * rrms * weight.float()).to(value.dtype)
+    else:
+        rows = value.transpose(1, 2).reshape(batch, sequence, heads * head_dim)
+        rrms = torch.rsqrt(rows.float().square().mean(dim=-1, keepdim=True) + epsilon)
+        normalized = (rows.float() * rrms * weight.float()).to(value.dtype)
+        normalized = normalized.view(batch, sequence, heads, head_dim).transpose(1, 2)
+    if rot_dim == 0:
+        return normalized
+
+    pairs = rot_dim // 2
+    prefix = normalized[..., :rot_dim]
+    if split_half:
+        first, second = prefix[..., :pairs], prefix[..., pairs:]
+    else:
+        paired = prefix.reshape(batch, heads, sequence, pairs, 2)
+        first, second = paired[..., 0], paired[..., 1]
+    matrix = freqs[:, :sequence, 0]
+    out0 = (
+        matrix[..., 0, 0].unsqueeze(1) * first
+        + matrix[..., 0, 1].unsqueeze(1) * second
+    ).to(value.dtype)
+    out1 = (
+        matrix[..., 1, 0].unsqueeze(1) * first
+        + matrix[..., 1, 1].unsqueeze(1) * second
+    ).to(value.dtype)
+    rotated = (
+        torch.cat((out0, out1), dim=-1)
+        if split_half
+        else torch.stack((out0, out1), dim=-1).reshape_as(prefix)
+    )
+    if rot_dim == head_dim:
+        return rotated
+    return torch.cat((rotated, normalized[..., rot_dim:]), dim=-1)
+
+
+def validate_qk_preprocessing(device: torch.device) -> None:
+    from comfyui_turing_utils_kernel.turing_sage.core import prequantize_rms_rope_qk
+    from comfyui_turing_utils_kernel.turing_sage.quant import (
+        per_warp_int8,
+        per_warp_int8_hadamard,
+    )
+
+    for dtype in (torch.float16, torch.bfloat16):
+        for head_dim, norm_scope, split_half in (
+            (64, "head", True),
+            (128, "head", True),
+            (64, "row", False),
+            (128, "row", False),
+        ):
+            batch, heads, sequence = 1, 3, 129
+            generator = torch.Generator(device=device).manual_seed(
+                4700 + head_dim + (100 if norm_scope == "row" else 0)
+            )
+            query = torch.randn(
+                (batch, heads, sequence, head_dim),
+                generator=generator,
+                device=device,
+                dtype=dtype,
+            )
+            key = torch.randn(
+                query.shape,
+                generator=generator,
+                device=device,
+                dtype=dtype,
+            )
+            norm_size = head_dim if norm_scope == "head" else heads * head_dim
+            query_norm = torch.randn(
+                norm_size, generator=generator, device=device, dtype=dtype
+            )
+            key_norm = torch.randn(
+                norm_size, generator=generator, device=device, dtype=dtype
+            )
+            rot_dim = head_dim if norm_scope == "row" else head_dim - 32
+            freqs = torch.randn(
+                (batch, sequence, 1, rot_dim // 2, 2, 2),
+                generator=generator,
+                device=device,
+                dtype=dtype,
+            )
+            reference_query = _reference_qk_preprocessing(
+                query,
+                query_norm,
+                freqs,
+                epsilon=1.0e-6,
+                rot_dim=rot_dim,
+                norm_scope=norm_scope,
+                split_half=split_half,
+            )
+            reference_key = _reference_qk_preprocessing(
+                key,
+                key_norm,
+                freqs,
+                epsilon=1.0e-6,
+                rot_dim=rot_dim,
+                norm_scope=norm_scope,
+                split_half=split_half,
+            )
+            reference = per_warp_int8(reference_query, reference_key)
+            fused = prequantize_rms_rope_qk(
+                query,
+                key,
+                query_norm,
+                key_norm,
+                freqs,
+                epsilon=1.0e-6,
+                rot_dim=rot_dim,
+                norm_scope=norm_scope,
+                split_half=split_half,
+            )
+            actual = (
+                fused.query_int8,
+                fused.query_scale,
+                fused.key_int8,
+                fused.key_scale,
+            )
+            for index, (expected, result) in enumerate(zip(reference, actual)):
+                if expected.dtype == torch.int8:
+                    max_lsb = int(
+                        (expected.to(torch.int16) - result.to(torch.int16))
+                        .abs()
+                        .max()
+                        .item()
+                    )
+                    if max_lsb > 2:
+                        raise RuntimeError(
+                            f"fused Q/K preprocessing INT8 mismatch: {dtype=} "
+                            f"{head_dim=} {norm_scope=} tensor={index} max_lsb={max_lsb}"
+                        )
+                else:
+                    _assert_close(
+                        "fused Q/K preprocessing scale",
+                        result,
+                        expected,
+                        rtol=0.015,
+                        atol=0.0011,
+                    )
+
+            rotated_reference = per_warp_int8_hadamard(
+                reference_query, reference_key, stabilize_k=True
+            )
+            rotated = prequantize_rms_rope_qk(
+                query,
+                key,
+                query_norm,
+                key_norm,
+                freqs,
+                epsilon=1.0e-6,
+                rot_dim=rot_dim,
+                norm_scope=norm_scope,
+                split_half=split_half,
+                rotate_qk=True,
+                stabilize_k=True,
+            )
+            for expected, result in zip(
+                rotated_reference,
+                (rotated.query_int8, rotated.query_scale, rotated.key_int8, rotated.key_scale),
+            ):
+                if expected.dtype == torch.int8:
+                    if int((expected.to(torch.int16) - result.to(torch.int16)).abs().max()) > 2:
+                        raise RuntimeError("rotated fused Q/K preprocessing exceeds 2 INT8 LSB")
+                else:
+                    _assert_close(
+                        "rotated fused Q/K preprocessing scale",
+                        result,
+                        expected,
+                        rtol=0.015,
+                        atol=0.0011,
+                    )
+
+
 def _validate_varlen_batches(
     output: torch.Tensor,
     q: torch.Tensor,
@@ -717,6 +900,7 @@ def main() -> None:
         validate_convrot(device)
         validate_w4a8(device)
         validate_segmented_norm(device)
+        validate_qk_preprocessing(device)
         validate_sage(device)
         if args.experimental_sparse:
             validate_sparse(device)

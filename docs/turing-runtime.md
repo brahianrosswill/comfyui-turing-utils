@@ -147,6 +147,28 @@ capture. It also exposes logical CTA-K64/128 scheduling and fused
 Hadamard/adaptive-anchor quality controls through a separate experimental
 tuning patch. Logical K128 processes two K64 stages using the same shared tile.
 
+Kernel 0.22 extends that lifetime contract upstream into model-owned Q/K
+preprocessing. MiniMax H3 passes raw projected Q/K together with per-head
+RMSNorm and partial split-half RoPE semantics; Wan and Bernini pass whole-row
+RMSNorm and full interleaved RoPE semantics. One custom op reads each raw Q/K
+tile once, keeps it in CTA shared memory, and emits the exact INT8/scales layout
+consumed by dense Sage, dense W8A8, Sol FP16-PV, and Sol W8A8 for supported H3
+and Wan/Bernini self-attention calls. It therefore
+avoids materializing normalized/rotated BF16 Q/K. Protected Sol steps and layers
+use the corresponding dense finalizer without repeating preprocessing.
+
+The compute_75 cubin reports at most 21,128 bytes static shared memory and 76
+registers/thread for D128 preprocessing, or 10,632 bytes and 59
+registers/thread for D64, with no local spill. An A40 PTX direction test at
+BF16 B1/H8/N8192/D128 measured 0.25 ms and about 16 MiB peak allocation for the
+fused path versus 2.44 ms and 112 MiB for an unfused PyTorch reference. This is
+not a comparison against Kitchen's fused model op and does not replace an
+exact-SM75 end-to-end profile.
+
+Optional phase timing is process-local and disabled unless
+`COMFYUI_TURING_UTILS_PROFILE_CALLS` is a positive integer. The disabled path
+creates no CUDA events and performs no synchronization.
+
 The node keeps the measured 4096-token crossover internally; shorter calls use
 stable Sage. `routing_threshold=1.0` matches the official mean-plus-one-standard-
 deviation policy. Lower values preserve more exact blocks. The local safeguard

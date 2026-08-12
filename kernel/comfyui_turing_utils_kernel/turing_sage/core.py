@@ -36,6 +36,17 @@ class PrequantizedSageAttention:
 
 
 @dataclass(frozen=True, slots=True)
+class PrequantizedQK:
+    query_int8: torch.Tensor
+    query_scale: torch.Tensor
+    key_int8: torch.Tensor
+    key_scale: torch.Tensor
+    tensor_layout: str
+    input_dtype: torch.dtype
+    original_head_dim: int
+
+
+@dataclass(frozen=True, slots=True)
 class PrequantizedSolAttention:
     query_int8: torch.Tensor
     query_scale: torch.Tensor
@@ -131,6 +142,76 @@ def _on_input_device(function):
             return function(q, *args, **kwargs)
 
     return wrapped
+
+
+@_on_input_device
+def prequantize_rms_rope_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: torch.Tensor,
+    k_norm: torch.Tensor,
+    freqs: torch.Tensor | None,
+    *,
+    epsilon: float,
+    rot_dim: int,
+    tensor_layout: str = "HND",
+    norm_scope: str = "head",
+    split_half: bool = False,
+    rotate_qk: bool = False,
+    stabilize_k: bool = False,
+) -> PrequantizedQK:
+    """Prepare normalized/rotated Q/K without materializing BF16 intermediates."""
+    if not q.is_cuda or not k.is_cuda:
+        raise ValueError("Q/K inputs must be on CUDA")
+    if q.device != k.device:
+        raise ValueError("Q/K inputs must share one CUDA device")
+    if q.dtype not in (torch.float16, torch.bfloat16) or k.dtype != q.dtype:
+        raise TypeError("fused Q/K preprocessing requires matching FP16 or BF16 inputs")
+    if (
+        q.ndim != 4
+        or k.ndim != 4
+        or q.shape[0] != k.shape[0]
+        or q.shape[-1] != k.shape[-1]
+    ):
+        raise ValueError(
+            "fused Q/K preprocessing requires compatible four-dimensional tensors"
+        )
+    if q.stride(-1) != 1 or k.stride(-1) != 1:
+        raise ValueError("the last Q/K dimension must be contiguous")
+    head_dim = int(q.shape[-1])
+    if head_dim not in (64, 128):
+        raise ValueError("fused Q/K preprocessing requires head_dim 64 or 128")
+    q_norm = q_norm.to(device=q.device, dtype=q.dtype).contiguous()
+    k_norm = k_norm.to(device=q.device, dtype=q.dtype).contiguous()
+    if freqs is None:
+        freqs = torch.empty(0, device=q.device, dtype=q.dtype)
+    else:
+        freqs = freqs.to(device=q.device, dtype=q.dtype)
+    from .custom_ops import qk_rms_rope_int8
+
+    q_int8, q_scale, k_int8, k_scale = qk_rms_rope_int8(
+        q,
+        k,
+        q_norm,
+        k_norm,
+        freqs,
+        epsilon=float(epsilon),
+        rot_dim=int(rot_dim),
+        tensor_layout=tensor_layout,
+        norm_scope=norm_scope,
+        split_half=bool(split_half),
+        rotate_qk=bool(rotate_qk),
+        stabilize_k=bool(stabilize_k),
+    )
+    return PrequantizedQK(
+        query_int8=q_int8,
+        query_scale=q_scale,
+        key_int8=k_int8,
+        key_scale=k_scale,
+        tensor_layout=tensor_layout,
+        input_dtype=q.dtype,
+        original_head_dim=head_dim,
+    )
 
 
 def _validate_fixed_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, tensor_layout: str) -> None:
@@ -245,14 +326,61 @@ def prequantize_sageattn(
         tensor_layout=tensor_layout,
         fuse_qk=(is_causal or (tensor_layout == "HND" and q.size(-1) == 64)),
     )
-    return PrequantizedSageAttention(
+    qk = PrequantizedQK(
         query_int8=q_int8,
         query_scale=q_scale,
         key_int8=k_int8,
         key_scale=k_scale,
-        value=v.contiguous(),
         tensor_layout=tensor_layout,
+        input_dtype=v.dtype,
         original_head_dim=head_dim,
+    )
+    return prequantize_sageattn_from_qk(
+        qk,
+        v,
+        is_causal=is_causal,
+        sm_scale=scale,
+    )
+
+
+def prequantize_sageattn_from_qk(
+    qk: PrequantizedQK,
+    value: torch.Tensor,
+    *,
+    is_causal: bool = False,
+    sm_scale: Optional[float] = None,
+) -> PrequantizedSageAttention:
+    """Attach V to a fused Q/K preprocessing result without rereading Q/K."""
+    if qk.tensor_layout not in {"HND", "NHD"}:
+        raise ValueError(f"Unsupported tensor_layout: {qk.tensor_layout}")
+    if value.dtype != qk.input_dtype:
+        raise TypeError("preprocessed Q/K and V must have matching logical dtypes")
+    if value.device != qk.query_int8.device:
+        raise ValueError("preprocessed Q/K and V must share one CUDA device")
+    if value.ndim != 4 or value.stride(-1) != 1:
+        raise ValueError("preprocessed Sage V must be four-dimensional with contiguous channels")
+    head_axis = 1 if qk.tensor_layout == "HND" else 2
+    sequence_axis = 2 if qk.tensor_layout == "HND" else 1
+    if (
+        value.size(0) != qk.key_int8.size(0)
+        or value.size(head_axis) != qk.key_int8.size(head_axis)
+        or value.size(sequence_axis) != qk.key_int8.size(sequence_axis)
+        or value.size(-1) != qk.key_int8.size(-1)
+    ):
+        raise ValueError("preprocessed Q/K and V shapes are incompatible")
+    scale = (
+        float(sm_scale)
+        if sm_scale is not None
+        else qk.original_head_dim**-0.5
+    )
+    return PrequantizedSageAttention(
+        query_int8=qk.query_int8,
+        query_scale=qk.query_scale,
+        key_int8=qk.key_int8,
+        key_scale=qk.key_scale,
+        value=value.contiguous(),
+        tensor_layout=qk.tensor_layout,
+        original_head_dim=qk.original_head_dim,
         is_causal=bool(is_causal),
         sm_scale=scale,
     )
@@ -447,6 +575,130 @@ def w8a8attn(
     return output.transpose(1, 2) if tensor_layout == "NHD" else output
 
 
+def prequantize_sol_sageattn_from_qk(
+    qk: PrequantizedQK,
+    value: torch.Tensor,
+    *,
+    sm_scale: Optional[float] = None,
+    dense_query_ranges=(),
+    exact_kv_ranges=(),
+    threshold_sigma: float = 1.0,
+    residual_subblocks: int = 1,
+    use_w8a8: bool = False,
+    force_dense: bool = False,
+    key_tile_tokens: int = 0,
+) -> PrequantizedSolAttention:
+    """Attach V and Sol policy state to an already preprocessed Q/K pair."""
+    if qk.tensor_layout != "HND":
+        raise ValueError("experimental sparse attention requires HND layout")
+    if value.dtype != qk.input_dtype:
+        raise TypeError("preprocessed Q/K and V must have matching logical dtypes")
+    if value.device != qk.query_int8.device:
+        raise ValueError("preprocessed Q/K and V must share one CUDA device")
+    if value.ndim != 4 or value.stride(-1) != 1:
+        raise ValueError("preprocessed Sol V must be four-dimensional with contiguous channels")
+    if (
+        value.size(0) != qk.key_int8.size(0)
+        or value.size(1) != qk.key_int8.size(1)
+        or value.size(2) != qk.key_int8.size(2)
+        or value.size(3) != qk.key_int8.size(3)
+    ):
+        raise ValueError("preprocessed Q/K and V shapes are incompatible")
+
+    key_tile_tokens = int(key_tile_tokens)
+    if key_tile_tokens not in (0, 64, 128):
+        raise ValueError("key_tile_tokens must be 0 (auto), 64, or 128")
+    if key_tile_tokens == 0:
+        key_tile_tokens = 128 if qk.key_int8.size(2) > 1024 else 64
+    residual_subblocks = int(residual_subblocks)
+    if residual_subblocks not in (1, 2):
+        raise ValueError("residual_subblocks must be 1 or 2")
+
+    sparse_query_blocks, exact_kv_blocks, sparse_block_count = _sol_block_policy(
+        qk.query_int8.device,
+        qk.query_int8.size(2),
+        qk.key_int8.size(2),
+        dense_query_ranges,
+        exact_kv_ranges,
+    )
+    key_block_count = (qk.key_int8.size(2) + 63) // 64
+    possible_blocks = (
+        qk.query_int8.size(0)
+        * qk.query_int8.size(1)
+        * sparse_block_count
+        * key_block_count
+    )
+    if sparse_block_count == 0 and not use_w8a8:
+        raise ValueError("split FP16 Sol has no sparse Query blocks; use stable Sage")
+    if sparse_block_count == 0:
+        force_dense = True
+
+    if use_w8a8:
+        padded_key_length = ((value.size(2) + 63) // 64) * 64
+        value_int8 = torch.empty(
+            (value.size(0), value.size(1), value.size(3), padded_key_length),
+            dtype=torch.int8,
+            device=value.device,
+        )
+        value_scale = torch.empty(
+            (value.size(0), value.size(1), value.size(3)),
+            dtype=torch.float32,
+            device=value.device,
+        )
+        _qattn.quantize_v_int8_sm75(value, value_int8, value_scale)
+        if force_dense:
+            half_empty = torch.empty(
+                (0, 0, 0, 0), dtype=torch.float16, device=value.device
+            )
+            float_empty = torch.empty(
+                (0, 0, 0), dtype=torch.float32, device=value.device
+            )
+            summaries = (half_empty, half_empty, half_empty, float_empty, float_empty)
+        else:
+            summaries = tuple(
+                _qattn.sol_w8a8_precompute_summaries(
+                    qk.key_int8,
+                    qk.key_scale,
+                    value,
+                    value_scale,
+                    residual_subblocks,
+                )
+            )
+        retained_value = None
+    else:
+        value_int8 = torch.empty(0, dtype=torch.int8, device=value.device)
+        value_scale = torch.empty(0, dtype=torch.float32, device=value.device)
+        summaries = ()
+        retained_value = value.contiguous()
+
+    scale = (
+        float(sm_scale)
+        if sm_scale is not None
+        else qk.original_head_dim**-0.5
+    )
+    return PrequantizedSolAttention(
+        query_int8=qk.query_int8,
+        query_scale=qk.query_scale,
+        key_int8=qk.key_int8,
+        key_scale=qk.key_scale,
+        value=retained_value,
+        value_int8=value_int8,
+        value_scale=value_scale,
+        summaries=summaries,
+        sparse_query_blocks=sparse_query_blocks,
+        exact_kv_blocks=exact_kv_blocks,
+        output_dtype=value.dtype,
+        sm_scale=scale,
+        threshold_sigma=float(threshold_sigma),
+        residual_subblocks=residual_subblocks,
+        possible_blocks=possible_blocks,
+        use_w8a8=bool(use_w8a8),
+        force_dense=bool(force_dense),
+        original_head_dim=qk.original_head_dim,
+        key_tile_tokens=key_tile_tokens,
+    )
+
+
 @_on_input_device
 def prequantize_sol_sageattn(
     q: torch.Tensor,
@@ -482,39 +734,12 @@ def prequantize_sol_sageattn(
         raise ValueError("experimental sparse attention requires head_dim in [1, 128]")
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("the last Q/K/V dimension must be contiguous")
-    key_tile_tokens = int(key_tile_tokens)
-    if key_tile_tokens not in (0, 64, 128):
-        raise ValueError("key_tile_tokens must be 0 (auto), 64, or 128")
-    if key_tile_tokens == 0:
-        # The 128-token schedule reuses one 64-token shared tile twice, so the
-        # main CTA remains at 32 KiB.  It only amortizes loop/route control on
-        # long K/V; short calls retain the lower-latency CTA-K64 schedule.
-        key_tile_tokens = 128 if k.size(2) > 1024 else 64
-
-    scale = float(sm_scale) if sm_scale is not None else head_dim**-0.5
     kernel_head_dim = 64 if head_dim <= 64 else 128
     if head_dim < kernel_head_dim:
         padding = kernel_head_dim - head_dim
         q = torch.nn.functional.pad(q, (0, padding))
         k = torch.nn.functional.pad(k, (0, padding))
         v = torch.nn.functional.pad(v, (0, padding))
-    residual_subblocks = int(residual_subblocks)
-    if residual_subblocks not in (1, 2):
-        raise ValueError("residual_subblocks must be 1 or 2")
-    sparse_query_blocks, exact_kv_blocks, sparse_block_count = _sol_block_policy(
-        q.device,
-        q.size(2),
-        k.size(2),
-        dense_query_ranges,
-        exact_kv_ranges,
-    )
-    key_block_count = (k.size(2) + 63) // 64
-    possible_blocks = q.size(0) * q.size(1) * sparse_block_count * key_block_count
-    if sparse_block_count == 0 and not use_w8a8:
-        raise ValueError("split FP16 Sol has no sparse Query blocks; use stable Sage")
-    if sparse_block_count == 0:
-        force_dense = True
-
     if rotate_qk:
         q_int8, q_scale, k_int8, k_scale = per_warp_int8_hadamard(
             q, k, tensor_layout="HND", stabilize_k=bool(stabilize_k)
@@ -523,58 +748,25 @@ def prequantize_sol_sageattn(
         q_int8, q_scale, k_int8, k_scale = per_warp_int8(
             q, k, tensor_layout="HND", fuse_qk=True
         )
-    if use_w8a8:
-        padded_key_length = ((k.size(2) + 63) // 64) * 64
-        value_int8 = torch.empty(
-            (v.size(0), v.size(1), v.size(3), padded_key_length),
-            dtype=torch.int8,
-            device=v.device,
-        )
-        value_scale = torch.empty(
-            (v.size(0), v.size(1), v.size(3)),
-            dtype=torch.float32,
-            device=v.device,
-        )
-        _qattn.quantize_v_int8_sm75(v, value_int8, value_scale)
-        if force_dense:
-            half_empty = torch.empty((0, 0, 0, 0), dtype=torch.float16, device=v.device)
-            float_empty = torch.empty((0, 0, 0), dtype=torch.float32, device=v.device)
-            summaries = (half_empty, half_empty, half_empty, float_empty, float_empty)
-        else:
-            summaries = tuple(
-                _qattn.sol_w8a8_precompute_summaries(
-                    k_int8,
-                    k_scale,
-                    v,
-                    value_scale,
-                    residual_subblocks,
-                )
-            )
-        retained_value = None
-    else:
-        value_int8 = torch.empty(0, dtype=torch.int8, device=v.device)
-        value_scale = torch.empty(0, dtype=torch.float32, device=v.device)
-        summaries = ()
-        retained_value = v.contiguous()
-    return PrequantizedSolAttention(
+    qk = PrequantizedQK(
         query_int8=q_int8,
         query_scale=q_scale,
         key_int8=k_int8,
         key_scale=k_scale,
-        value=retained_value,
-        value_int8=value_int8,
-        value_scale=value_scale,
-        summaries=summaries,
-        sparse_query_blocks=sparse_query_blocks,
-        exact_kv_blocks=exact_kv_blocks,
-        output_dtype=v.dtype,
-        sm_scale=scale,
-        threshold_sigma=float(threshold_sigma),
-        residual_subblocks=residual_subblocks,
-        possible_blocks=possible_blocks,
-        use_w8a8=bool(use_w8a8),
-        force_dense=bool(force_dense),
+        tensor_layout="HND",
+        input_dtype=v.dtype,
         original_head_dim=head_dim,
+    )
+    return prequantize_sol_sageattn_from_qk(
+        qk,
+        v,
+        sm_scale=sm_scale,
+        dense_query_ranges=dense_query_ranges,
+        exact_kv_ranges=exact_kv_ranges,
+        threshold_sigma=threshold_sigma,
+        residual_subblocks=residual_subblocks,
+        use_w8a8=use_w8a8,
+        force_dense=force_dense,
         key_tile_tokens=key_tile_tokens,
     )
 

@@ -13,7 +13,10 @@ from dataclasses import dataclass
 
 import torch
 
+from ...attention.preprocessing import QKPreprocessSpec, qk_preprocessor
+from ...attention.stable import fused_qk_preprocessing_available
 from ...kernel_api import load_kernel_package
+from ...profiling import CUDA_PHASE_PROFILER
 from .layout import (
     ATTENTION_LAYOUT_KEY,
     RUNTIME_CONTEXT_ATTR,
@@ -39,6 +42,11 @@ _BLOCK_FORWARD_PARAMETERS = (
     "x",
     "t_emb",
     "mod_segments",
+    "rope_freqs",
+    "transformer_options",
+)
+_ATTENTION_FORWARD_PARAMETERS = (
+    "x",
     "rope_freqs",
     "transformer_options",
 )
@@ -392,6 +400,92 @@ def _compatible_block_forward(block_type: type[torch.nn.Module]) -> bool:
     return parameters == ("self", *_BLOCK_FORWARD_PARAMETERS)
 
 
+def _compatible_attention_forward(attention_type: type[torch.nn.Module]) -> bool:
+    parameters = tuple(inspect.signature(attention_type.forward).parameters)
+    return parameters == ("self", *_ATTENTION_FORWARD_PARAMETERS)
+
+
+def _make_attention_forward(attention, attention_container):
+    original = attention.forward
+
+    def forward(self, x, rope_freqs=None, transformer_options={}):
+        processor = qk_preprocessor(transformer_options)
+        if (
+            processor is None
+            or x.ndim != 2
+            or x.shape[0] < 64
+            or x.dtype not in (torch.float16, torch.bfloat16)
+            or self.head_dim not in (64, 128)
+            or (
+                torch.is_grad_enabled()
+                and (
+                    x.requires_grad
+                    or any(parameter.requires_grad for parameter in self.parameters())
+                )
+            )
+        ):
+            return original(
+                x,
+                rope_freqs=rope_freqs,
+                transformer_options=transformer_options,
+            )
+
+        import comfy.model_management
+
+        profiling = CUDA_PHASE_PROFILER.enabled
+        if profiling:
+            qkv = CUDA_PHASE_PROFILER.call(
+                "minimax.qkv_projection", self.qkv_proj, x
+            )
+        else:
+            qkv = self.qkv_proj(x)
+        sequence = x.shape[0]
+        inner = self.heads * self.head_dim
+        query, key, value = qkv.split(inner, dim=-1)
+        query = query.view(sequence, self.heads, self.head_dim)
+        key = key.view(sequence, self.heads, self.head_dim)
+        value = value.view(sequence, self.heads, self.head_dim)
+        query_norm = comfy.model_management.cast_to(
+            self.q_norm.weight, device=x.device, dtype=query.dtype
+        )
+        key_norm = comfy.model_management.cast_to(
+            self.k_norm.weight, device=x.device, dtype=key.dtype
+        )
+        rot_dim = int(rope_freqs.shape[-3] * 2) if rope_freqs is not None else 0
+        spec = QKPreprocessSpec(
+            query_norm=query_norm,
+            key_norm=key_norm,
+            freqs=rope_freqs,
+            epsilon=float(self.q_norm.eps),
+            rot_dim=rot_dim,
+            norm_scope="head",
+            split_half=True,
+        )
+        query = attention_container(query.transpose(0, 1).unsqueeze(0))
+        key = attention_container(key.transpose(0, 1).unsqueeze(0))
+        value = attention_container(value.transpose(0, 1).unsqueeze(0))
+        del qkv
+        output = processor(
+            query,
+            key,
+            value,
+            self.heads,
+            spec,
+            transformer_options=transformer_options,
+        ).squeeze(0)
+        if profiling:
+            output = CUDA_PHASE_PROFILER.call(
+                "minimax.out_projection", self.out_proj, output
+            )
+            CUDA_PHASE_PROFILER.complete_attention(
+                (1, self.heads, sequence, self.head_dim)
+            )
+            return output
+        return self.out_proj(output)
+
+    return types.MethodType(forward, attention)
+
+
 def _block_fusion_blocker(
     x: torch.Tensor,
     t_emb: torch.Tensor,
@@ -487,7 +581,8 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
         raise RuntimeError("MiniMax Turing integration requires a ComfyUI ModelPatcher")
 
     try:
-        from comfy.ldm.minimax.model import DiTBlock, _mod_gate
+        from comfy.ldm.minimax.model import Attention, DiTBlock, _mod_gate
+        from comfy.ldm.modules.attention import AttentionTensorContainer
     except ImportError:
         return 0
     if not _compatible_block_forward(DiTBlock):
@@ -518,6 +613,11 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
     index = device.index if device.index is not None else torch.cuda.current_device()
     block_fusions = 0
     mlp_fusions = 0
+    attention_fusions = 0
+    fuse_attention = (
+        fused_qk_preprocessing_available()
+        and _compatible_attention_forward(Attention)
+    )
     try:
         turing_segmented_rms_adaln = getattr(
             load_kernel_package(), "turing_segmented_rms_adaln"
@@ -529,6 +629,12 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
     audit = _RuntimeDispatchAudit(expected_blocks, eligible_fc2)
 
     for layer_index, (name, block) in enumerate(candidates):
+        if fuse_attention and type(block.attn) is Attention:
+            model.add_object_patch(
+                f"{name}.attn.forward",
+                _make_attention_forward(block.attn, AttentionTensorContainer),
+            )
+            attention_fusions += 1
         if hasattr(block.mlp, "fc2") and is_turing_convrot_linear(block.mlp.fc2):
             model.add_object_patch(
                 f"{name}.mlp.forward",
@@ -555,6 +661,11 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
         LOG.info("Enabled MiniMax segmented RMSNorm+AdaLN on %d Turing blocks", block_fusions)
     if mlp_fusions:
         LOG.info("Enabled MiniMax fused ConvRot SwiGLU on %d Turing MLP layers", mlp_fusions)
+    if attention_fusions:
+        LOG.info(
+            "Enabled MiniMax fused Q/K RMSNorm+RoPE+INT8 preprocessing on %d attention layers",
+            attention_fusions,
+        )
     if eligible_fc2 and mlp_fusions != eligible_fc2:
         raise RuntimeError("MiniMax Turing fc2 adapter did not patch every eligible layer")
-    return max(block_fusions, mlp_fusions)
+    return max(block_fusions, mlp_fusions, attention_fusions)

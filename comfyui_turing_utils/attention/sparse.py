@@ -368,6 +368,31 @@ def prequantize_turing_sol_attention(
     return PrequantizedAttentionCall(state, call.attention)
 
 
+def prequantize_turing_sol_attention_from_qk(
+    qk,
+    value: torch.Tensor,
+    call: SolAttentionCall,
+    *,
+    routing_threshold: float,
+    scale: float | None,
+    use_w8a8: bool,
+    transformer_options=None,
+) -> PrequantizedAttentionCall:
+    tuning = attention_kernel_tuning(transformer_options)
+    state = load_turing_sage().prequantize_sol_sageattn_from_qk(
+        qk,
+        value,
+        sm_scale=scale,
+        dense_query_ranges=call.dense_query_ranges,
+        exact_kv_ranges=call.exact_kv_ranges,
+        threshold_sigma=routing_threshold,
+        residual_subblocks=call.residual_subblocks,
+        use_w8a8=bool(use_w8a8),
+        key_tile_tokens=tuning.key_tile_tokens,
+    )
+    return PrequantizedAttentionCall(state, call.attention)
+
+
 def turing_sol_attention_from_prequantized(
     quantized: PrequantizedAttentionCall,
     *,

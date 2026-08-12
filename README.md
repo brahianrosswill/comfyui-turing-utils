@@ -12,7 +12,7 @@ Wan/Bernini context-window utilities.
 - Python 3.10 or newer
 - PyTorch with CUDA and ComfyUI
 - `comfy-kitchen>=0.2.26` for ConvRot model integration
-- the independently installed `comfyui-turing-utils-kernel>=0.20.0` on exact sm75
+- the independently installed `comfyui-turing-utils-kernel>=0.22.0` on exact sm75
 
 ## Installation
 
@@ -90,10 +90,10 @@ rows in BF16, use FP32 only for active rotation/reduction scratch, and stay unde
 the default 48 KiB shared-memory limit. MiniMax-specific integration is isolated
 under `comfyui_turing_utils/adapters/minimax/`, including packed-sequence VRAM
 planning for text, keyframes, and multimodal references. Wan/Bernini integration
-is isolated under `comfyui_turing_utils/adapters/`; it adds only batch-aware,
-per-reference-padded VRAM planning
-and leaves Wan block normalization, projections, attention dispatch, and
-feed-forward execution to ComfyUI.
+is isolated under `comfyui_turing_utils/adapters/`; it adds batch-aware,
+per-reference-padded VRAM planning and, for supported Turing attention calls,
+the same single-owner Q/K/V lifetime and fused RMSNorm+RoPE+INT8 preprocessing
+used by H3. This includes explicitly selected Sol calls; Sol remains opt-in.
 Generic dtype, attention, and fused operators remain model-independent.
 
 The progressive-resolution patch is explicit and is never selected by a
@@ -155,12 +155,20 @@ correction, while original V means remain in the value approximation.
 Official-style `1x64` is the default; optional `2x32` improves bimodal
 skipped-block fidelity without changing routing.
 
-Kernel 0.21.0 adds native D64 W8A8/Sol execution while retaining the current
-ComfyUI attention tensor-container lifecycle. Supported bundled Sage, W8A8,
-and Sol calls quantize before output allocation and release their original
-Q/K/V storage as soon as
-the selected path permits. Older kernel packages continue through the
-compatible one-call path, but do not receive this peak-memory improvement.
+Kernel 0.22.0 retains the current ComfyUI attention tensor-container lifecycle
+and adds adapter-owned fused Q/K preprocessing. H3 per-head RMSNorm plus
+split-half RoPE, and Wan/Bernini whole-row RMSNorm plus interleaved RoPE, feed
+the production INT8 Q/K representation without materializing normalized BF16
+Q/K. Dense Sage, dense W8A8, Sol, and Sol-W8A8 share this path for H3 and
+Wan/Bernini self-attention; protected Sol
+steps/layers use the matching dense finalizer. Raw Q/K are released after the
+fused preprocessing launch, and W8A8 releases raw V after V quantization. The
+D128 preprocessing CTA uses at most about 21.1 KiB static shared memory; D64
+uses about 10.6 KiB.
+
+Internal CUDA phase timing is disabled by default and allocates no events. For
+a bounded diagnostic run, set `COMFYUI_TURING_UTILS_PROFILE_CALLS` to the
+number of attention calls to collect before one report is emitted.
 
 Sol's `use_w8a8` switch is disabled by default for backward-compatible quality.
 When enabled, selected exact blocks and protected dense steps/layers use the

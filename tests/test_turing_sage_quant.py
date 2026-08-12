@@ -13,9 +13,78 @@ sys.path.insert(0, str(PLUGIN_ROOT / "kernel"))
 
 from comfyui_turing_utils_kernel import turing_sage  # noqa: E402
 from comfyui_turing_utils_kernel.turing_sage import quant  # noqa: E402
+from comfyui_turing_utils_kernel.turing_sage.custom_ops import (  # noqa: E402
+    qk_rms_rope_int8,
+)
 
 
 class TuringSageQuantContractTest(unittest.TestCase):
+    def test_fused_qk_preprocessor_has_fake_tensor_contract(self):
+        query = torch.empty((2, 4, 129, 128), dtype=torch.bfloat16, device="meta")
+        key = torch.empty((2, 2, 129, 128), dtype=torch.bfloat16, device="meta")
+        query_norm = torch.empty((128,), dtype=torch.bfloat16, device="meta")
+        key_norm = torch.empty((128,), dtype=torch.bfloat16, device="meta")
+        freqs = torch.empty(
+            (1, 129, 1, 64, 2, 2), dtype=torch.bfloat16, device="meta"
+        )
+
+        query_int8, query_scale, key_int8, key_scale = qk_rms_rope_int8(
+            query,
+            key,
+            query_norm,
+            key_norm,
+            freqs,
+            1e-6,
+            128,
+            "HND",
+            "head",
+            True,
+            True,
+            True,
+        )
+
+        self.assertEqual(query_int8.shape, query.shape)
+        self.assertEqual(query_int8.dtype, torch.int8)
+        self.assertEqual(query_scale.shape, (2, 4, 12))
+        self.assertEqual(query_scale.dtype, torch.float32)
+        self.assertEqual(key_int8.shape, key.shape)
+        self.assertEqual(key_int8.dtype, torch.int8)
+        self.assertEqual(key_scale.shape, (2, 2, 3))
+        self.assertEqual(key_scale.dtype, torch.float32)
+
+    def test_fused_qk_preprocessor_is_a_fullgraph_leaf(self):
+        query = torch.empty((1, 4, 129, 64), dtype=torch.float16, device="meta")
+        key = torch.empty((1, 2, 129, 64), dtype=torch.float16, device="meta")
+        query_norm = torch.empty((64,), dtype=torch.float16, device="meta")
+        key_norm = torch.empty((64,), dtype=torch.float16, device="meta")
+        freqs = torch.empty((0,), dtype=torch.float16, device="meta")
+
+        compiled = torch.compile(
+            lambda q, k, qw, kw, f: qk_rms_rope_int8(
+                q,
+                k,
+                qw,
+                kw,
+                f,
+                1e-6,
+                0,
+                "HND",
+                "head",
+                False,
+                False,
+                False,
+            ),
+            backend="eager",
+            fullgraph=True,
+        )
+        query_int8, query_scale, key_int8, key_scale = compiled(
+            query, key, query_norm, key_norm, freqs
+        )
+        self.assertEqual(query_int8.shape, query.shape)
+        self.assertEqual(query_scale.shape, (1, 4, 12))
+        self.assertEqual(key_int8.shape, key.shape)
+        self.assertEqual(key_scale.shape, (1, 2, 3))
+
     def test_compiled_attention_facades_have_fake_tensor_contracts(self):
         q = torch.empty((1, 4, 129, 128), dtype=torch.bfloat16, device="meta")
         k = torch.empty((1, 2, 151, 128), dtype=torch.bfloat16, device="meta")
@@ -121,6 +190,7 @@ class TuringSageQuantContractTest(unittest.TestCase):
             turing_sage.__all__,
             [
                 "available",
+                "fused_qk_preprocessing_available",
                 "prequantize_sageattn",
                 "prequantize_sol_sageattn",
                 "preflight",

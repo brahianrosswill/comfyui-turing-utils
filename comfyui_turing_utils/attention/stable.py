@@ -18,6 +18,7 @@ from .layout import (
 from ..kernel_api import kernel_version, load_turing_sage
 from ..quantization.dispatch import is_supported_turing_device
 from .tuning import attention_kernel_tuning
+from .preprocessing import QKPreprocessSpec
 
 
 LOG = logging.getLogger("comfyui-turing-utils")
@@ -375,6 +376,81 @@ def split_prequantization_available() -> bool:
         return version_tuple >= (0, 20, 0) and load_turing_sage().split_prequantization_available()
     except (ImportError, OSError, ValueError, AttributeError):
         return False
+
+
+def fused_qk_preprocessing_available() -> bool:
+    try:
+        version_tuple = tuple(int(part) for part in kernel_version().split(".")[:3])
+        return (
+            version_tuple >= (0, 22, 0)
+            and load_turing_sage().fused_qk_preprocessing_available()
+        )
+    except (ImportError, OSError, ValueError, AttributeError):
+        return False
+
+
+def prequantize_turing_qk(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    spec: QKPreprocessSpec,
+    *,
+    kernel: str,
+    transformer_options=None,
+):
+    if kernel not in {"sage", "w8a8", "sol"}:
+        raise ValueError(f"unsupported fused Q/K target: {kernel}")
+    tuning = attention_kernel_tuning(transformer_options)
+    rotate_qk = kernel in {"w8a8", "sol"} and tuning.rotate_qk
+    stabilize_k = kernel in {"w8a8", "sol"} and tuning.stabilize_k
+    return load_turing_sage().prequantize_rms_rope_qk(
+        q,
+        k,
+        spec.query_norm,
+        spec.key_norm,
+        spec.freqs,
+        epsilon=spec.epsilon,
+        rot_dim=spec.rot_dim,
+        tensor_layout="HND",
+        norm_scope=spec.norm_scope,
+        split_half=spec.split_half,
+        rotate_qk=rotate_qk,
+        stabilize_k=stabilize_k,
+    )
+
+
+def prequantize_turing_attention_from_qk(
+    qk,
+    value: torch.Tensor,
+    call: AttentionCall,
+    *,
+    kernel: str,
+    scale: float | None,
+    is_causal: bool = False,
+    transformer_options=None,
+) -> PrequantizedAttentionCall:
+    turing_sage = load_turing_sage()
+    if kernel == "sage":
+        state = turing_sage.prequantize_sageattn_from_qk(
+            qk,
+            value,
+            is_causal=bool(is_causal),
+            sm_scale=scale,
+        )
+    elif kernel == "w8a8":
+        tuning = attention_kernel_tuning(transformer_options)
+        state = turing_sage.prequantize_sol_sageattn_from_qk(
+            qk,
+            value,
+            sm_scale=scale,
+            threshold_sigma=0.0,
+            residual_subblocks=1,
+            use_w8a8=True,
+            force_dense=True,
+            key_tile_tokens=tuning.key_tile_tokens,
+        )
+    else:
+        raise ValueError(f"unsupported split Turing attention kernel: {kernel}")
+    return PrequantizedAttentionCall(state, call)
 
 
 def prequantize_turing_attention(

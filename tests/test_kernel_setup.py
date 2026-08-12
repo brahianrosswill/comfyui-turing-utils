@@ -21,10 +21,10 @@ class KernelSetupTest(unittest.TestCase):
     def _extension(*, name, **kwargs):
         return SimpleNamespace(name=name, kwargs=kwargs)
 
-    def _run_windows_setup(self, conda_prefix: Path):
+    def _run_windows_setup(self, conda_prefix: Path, *, arch_list: str = "8.6"):
         environment = {
             "CONDA_PREFIX": str(conda_prefix),
-            "COMFYUI_TURING_UTILS_ARCH_LIST": "8.6",
+            "COMFYUI_TURING_UTILS_ARCH_LIST": arch_list,
         }
         with (
             mock.patch.object(platform, "system", return_value="Windows"),
@@ -75,7 +75,10 @@ class KernelSetupTest(unittest.TestCase):
         self.assertNotIn("-DCOMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS", flags)
         self.assertIn("csrc/turing/sage/sol_sparse_cuda_sm75.cu", extensions[1].kwargs["sources"])
         self.assertIn("csrc/turing/sage/quant_v_int8_cuda_sm75.cu", extensions[1].kwargs["sources"])
-        self.assertEqual(setup.call_args.kwargs["version"], "0.21.0")
+        self.assertIn(
+            "csrc/turing/sage/qk_preprocess.cu", extensions[2].kwargs["sources"]
+        )
+        self.assertEqual(setup.call_args.kwargs["version"], "0.22.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -97,7 +100,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.21.0")
+        self.assertEqual(metadata["project"]["version"], "0.22.0")
 
     def test_sparse_source_does_not_require_optional_cuda_library_headers(self):
         source = (
@@ -168,6 +171,29 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(str(cccl.resolve()), extensions[0].kwargs["include_dirs"])
         self.assertIn("/std:c++17", extensions[0].kwargs["extra_compile_args"]["cxx"])
         self.assertIn("-std=c++17", extensions[0].kwargs["extra_compile_args"]["nvcc"])
+
+    def test_windows_sm75_build_includes_fused_qk_source(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prefix = Path(temp_dir)
+            cccl = prefix / "Library" / "include" / "targets" / "x64"
+            (cccl / "nv").mkdir(parents=True)
+            (cccl / "nv" / "target").touch()
+            self._make_cutlass_headers(prefix / "Library" / "include")
+
+            extensions = self._run_windows_setup(prefix, arch_list="7.5")
+
+        self.assertEqual(
+            [extension.name for extension in extensions],
+            [
+                "comfyui_turing_utils_kernel._C",
+                "comfyui_turing_utils_kernel._sage_qattn_sm75",
+                "comfyui_turing_utils_kernel._sage_fused_sm75",
+            ],
+        )
+        fused = extensions[2]
+        self.assertIn("csrc/turing/sage/qk_preprocess.cu", fused.kwargs["sources"])
+        self.assertIn(str(cccl.resolve()), fused.kwargs["include_dirs"])
+        self.assertIn("-std=c++17", fused.kwargs["extra_compile_args"]["nvcc"])
 
     def test_nvidia_cutlass_python_package_is_auto_detected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
