@@ -1,4 +1,4 @@
-"""Bernini conditioning, context-window integration, and node definitions."""
+"""Bernini conditioning and context-window integration services."""
 
 from __future__ import annotations
 

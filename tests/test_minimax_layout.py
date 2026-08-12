@@ -15,7 +15,7 @@ sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 import attention  # noqa: E402
-import minimax_layout  # noqa: E402
+from comfyui_turing_utils.adapters.minimax import layout as minimax_layout  # noqa: E402
 
 
 class FakeBlock(torch.nn.Module):

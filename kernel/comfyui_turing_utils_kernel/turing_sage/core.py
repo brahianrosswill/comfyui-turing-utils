@@ -7,7 +7,7 @@ from typing import Any, Optional
 import torch
 
 from .. import _sage_fused_sm75 as _fused
-from . import sm75_compile
+from .. import _sage_qattn_sm75 as _qattn
 from .quant import (
     per_warp_int8,
     per_warp_int8_hadamard,
@@ -378,7 +378,7 @@ def sageattn_prequantized(
         or output.stride(-1) != 1
     ):
         raise ValueError("prequantized Sage output is incompatible")
-    lse = sm75_compile.qk_int8_sv_f16_accum_f32_attn(
+    lse = _qattn.qk_int8_sv_f16_accum_f32_attn(
         q_int8.contiguous(),
         k_int8.contiguous(),
         v.contiguous(),
@@ -535,14 +535,14 @@ def prequantize_sol_sageattn(
             dtype=torch.float32,
             device=v.device,
         )
-        sm75_compile.quantize_v_int8(v, value_int8, value_scale)
+        _qattn.quantize_v_int8_sm75(v, value_int8, value_scale)
         if force_dense:
             half_empty = torch.empty((0, 0, 0, 0), dtype=torch.float16, device=v.device)
             float_empty = torch.empty((0, 0, 0), dtype=torch.float32, device=v.device)
             summaries = (half_empty, half_empty, half_empty, float_empty, float_empty)
         else:
             summaries = tuple(
-                sm75_compile.sol_w8a8_precompute_summaries(
+                _qattn.sol_w8a8_precompute_summaries(
                     k_int8,
                     k_scale,
                     v,
@@ -591,7 +591,14 @@ def sol_sparse_sageattn_from_prequantized(
             device=quantized.query_int8.device,
         )
         if quantized.use_w8a8:
-            selected = sm75_compile.sol_sparse_online_w8a8_prequantized_attn(
+            (
+                key_summary,
+                key_score_summary,
+                value_mean,
+                key_summary_mean,
+                key_summary_variance,
+            ) = quantized.summaries
+            selected = _qattn.sol_sparse_online_w8a8_prequantized_attn(
                 quantized.query_int8,
                 quantized.key_int8,
                 quantized.value_int8,
@@ -599,7 +606,11 @@ def sol_sparse_sageattn_from_prequantized(
                 output,
                 quantized.query_scale,
                 quantized.key_scale,
-                quantized.summaries,
+                key_summary,
+                key_score_summary,
+                value_mean,
+                key_summary_mean,
+                key_summary_variance,
                 quantized.sparse_query_blocks,
                 quantized.exact_kv_blocks,
                 quantized.threshold_sigma,
@@ -610,7 +621,7 @@ def sol_sparse_sageattn_from_prequantized(
                 quantized.key_tile_tokens,
             )
         else:
-            selected = sm75_compile.sol_sparse_online_int8_f16_attn(
+            selected = _qattn.sol_sparse_online_int8_f16_attn(
                 quantized.query_int8,
                 quantized.key_int8,
                 quantized.value,
@@ -741,7 +752,7 @@ def sageattn_varlen(
             max_seqlen_k,
         )
         output = torch.empty_like(q)
-        sm75_compile.qk_int8_sv_f16_varlen_accum_f32_attn(
+        _qattn.qk_int8_sv_f16_varlen_accum_f32_attn(
             q_int8,
             k_int8,
             v.contiguous(),

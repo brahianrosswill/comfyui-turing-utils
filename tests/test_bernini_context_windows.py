@@ -16,7 +16,8 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 
 import comfy.context_windows  # noqa: E402
 import comfy.conds  # noqa: E402
-import bernini_nodes  # noqa: E402
+from comfyui_turing_utils.adapters import bernini as bernini_nodes  # noqa: E402
+from comfyui_turing_utils.nodes.bernini import BerniniContextWindowsCore  # noqa: E402
 
 
 class FakeModel:
@@ -46,7 +47,7 @@ class BerniniContextWindowsTest(unittest.TestCase):
             bernini_nodes._validate_context_window_frames(5, 8)
 
     def test_input_order_matches_wan_context_window_node(self):
-        input_names = list(bernini_nodes.BerniniContextWindowsCore.INPUT_TYPES()["required"])
+        input_names = list(BerniniContextWindowsCore.INPUT_TYPES()["required"])
         self.assertEqual(
             input_names,
             [
@@ -62,7 +63,7 @@ class BerniniContextWindowsTest(unittest.TestCase):
             ],
         )
         self.assertEqual(
-            bernini_nodes.BerniniContextWindowsCore.INPUT_TYPES()["required"]["context_overlap"][1]["step"],
+            BerniniContextWindowsCore.INPUT_TYPES()["required"]["context_overlap"][1]["step"],
             4,
         )
 
@@ -70,7 +71,7 @@ class BerniniContextWindowsTest(unittest.TestCase):
         original_install = bernini_nodes._install_bernini_absolute_rope_patch
         bernini_nodes._install_bernini_absolute_rope_patch = lambda: None
         try:
-            patched = bernini_nodes.BerniniContextWindowsCore().apply(
+            patched = BerniniContextWindowsCore().apply(
                 FakeModel(),
                 context_length=81,
                 context_overlap=28,
@@ -123,7 +124,7 @@ class BerniniContextWindowsTest(unittest.TestCase):
             "_install_bernini_absolute_rope_patch",
             side_effect=AssertionError("absolute patch must not be installed"),
         ):
-            patched = bernini_nodes.BerniniContextWindowsCore().apply(
+            patched = BerniniContextWindowsCore().apply(
                 FakeModel(),
                 context_length=81,
                 context_overlap=28,

@@ -12,7 +12,7 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 import attention as attention_backends  # noqa: E402
-import attention_nodes  # noqa: E402
+from comfyui_turing_utils.nodes import attention as attention_nodes  # noqa: E402
 
 
 class FakePatcher:
@@ -142,7 +142,8 @@ class SparseAttentionNodeTest(unittest.TestCase):
         model = object()
         patched = object()
         with mock.patch(
-            "attention_nodes.apply_sparse_attention_patch", return_value=patched
+            "comfyui_turing_utils.nodes.attention.apply_sparse_attention_patch",
+            return_value=patched,
         ) as apply_patch:
             output = attention_nodes.SolSparseAttentionPatch().patch(
                 model,

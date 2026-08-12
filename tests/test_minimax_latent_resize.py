@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib
 import sys
 import unittest
 from pathlib import Path
@@ -10,14 +9,13 @@ import torch
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 COMFY_ROOT = PLUGIN_ROOT.parents[1]
-CUSTOM_NODES_ROOT = PLUGIN_ROOT.parent
 sys.path.insert(0, str(COMFY_ROOT))
-sys.path.insert(0, str(CUSTOM_NODES_ROOT))
+sys.path.insert(0, str(PLUGIN_ROOT))
 
 import comfy.nested_tensor  # noqa: E402
 
 
-minimax_nodes = importlib.import_module("comfyui-turing-utils.minimax_nodes")
+from comfyui_turing_utils.nodes import minimax as minimax_nodes  # noqa: E402
 
 
 def _h3_latent():

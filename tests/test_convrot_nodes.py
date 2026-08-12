@@ -22,9 +22,11 @@ import nodes as comfy_nodes  # noqa: E402
 
 sys.path.insert(0, str(PLUGIN_ROOT))
 
-from convrot_nodes import (  # noqa: E402
+from comfyui_turing_utils.nodes.loaders import (  # noqa: E402
     ConvRotCLIPLoader,
     ConvRotDiffusionModelLoader,
+)
+from comfyui_turing_utils.quantization.convrot import (  # noqa: E402
     ConvRotSummary,
     _convrot_model_names,
     _convrot_skip_reason,
@@ -491,10 +493,10 @@ class ConvRotModelFilterTest(unittest.TestCase):
                 return_value="/models/dense.safetensors",
             ),
             mock.patch(
-                "convrot_nodes._convrot_skip_reason",
+                "comfyui_turing_utils.quantization.convrot._convrot_skip_reason",
                 return_value="does not contain supported ConvRot quantization metadata",
             ),
-            mock.patch("convrot_nodes.load_convrot_model") as load_model,
+            mock.patch("comfyui_turing_utils.quantization.convrot.load_convrot_model") as load_model,
             self.assertRaisesRegex(ValueError, "is not a supported ConvRot model"),
         ):
             ConvRotDiffusionModelLoader().load_diffusion_model("dense.safetensors")
@@ -555,13 +557,13 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
                 "comfy.model_detection.model_config_from_unet",
                 return_value=SimpleNamespace(unet_config={"image_model": "wan"}),
             ),
-            mock.patch("convrot_nodes._validate_runtime_support"),
-            mock.patch("convrot_nodes.prepare_turing_runtime") as prepare_runtime,
-            mock.patch("convrot_nodes.select_compute_dtype", return_value=None),
-            mock.patch("convrot_nodes.normalize_turing_convrot_weight_dtypes") as normalize_dtypes,
+            mock.patch("comfyui_turing_utils.quantization.convrot._validate_runtime_support"),
+            mock.patch("comfyui_turing_utils.quantization.convrot.prepare_turing_runtime") as prepare_runtime,
+            mock.patch("comfyui_turing_utils.quantization.convrot.select_compute_dtype", return_value=None),
+            mock.patch("comfyui_turing_utils.quantization.convrot.normalize_turing_convrot_weight_dtypes") as normalize_dtypes,
             mock.patch("comfy.sd.load_diffusion_model_state_dict", return_value=fake_model) as load_state,
-            mock.patch("convrot_nodes.apply_model_adapters") as apply_adapters,
-            mock.patch("convrot_nodes.apply_attention_backend") as apply_backend,
+            mock.patch("comfyui_turing_utils.quantization.convrot.apply_model_adapters") as apply_adapters,
+            mock.patch("comfyui_turing_utils.quantization.convrot.apply_attention_backend") as apply_backend,
         ):
             loaded = load_convrot_model("model.safetensors")
 
@@ -596,13 +598,13 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
             mock.patch("comfy.model_detection.unet_prefix_from_state_dict", return_value="model.diffusion_model."),
             mock.patch("comfy.model_detection.model_config_from_unet", return_value=model_config),
             mock.patch("comfy.model_management.get_torch_device", return_value=torch.device("cuda", 0)),
-            mock.patch("convrot_nodes._validate_runtime_support"),
-            mock.patch("convrot_nodes.prepare_turing_runtime") as prepare_runtime,
-            mock.patch("convrot_nodes.select_compute_dtype", return_value=torch.bfloat16),
-            mock.patch("convrot_nodes.normalize_turing_convrot_weight_dtypes") as normalize_dtypes,
+            mock.patch("comfyui_turing_utils.quantization.convrot._validate_runtime_support"),
+            mock.patch("comfyui_turing_utils.quantization.convrot.prepare_turing_runtime") as prepare_runtime,
+            mock.patch("comfyui_turing_utils.quantization.convrot.select_compute_dtype", return_value=torch.bfloat16),
+            mock.patch("comfyui_turing_utils.quantization.convrot.normalize_turing_convrot_weight_dtypes") as normalize_dtypes,
             mock.patch("comfy.sd.load_diffusion_model_state_dict", return_value=fake_model) as load_state,
-            mock.patch("convrot_nodes.apply_model_adapters") as apply_adapters,
-            mock.patch("convrot_nodes.apply_attention_backend") as apply_backend,
+            mock.patch("comfyui_turing_utils.quantization.convrot.apply_model_adapters") as apply_adapters,
+            mock.patch("comfyui_turing_utils.quantization.convrot.apply_attention_backend") as apply_backend,
         ):
             loaded = load_convrot_model("model.safetensors")
 
@@ -635,8 +637,8 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
         with (
             mock.patch("comfy.utils.load_torch_file", return_value=(state_dict, {})),
             mock.patch("comfy.model_management.text_encoder_device", return_value=torch.device("cuda", 0)),
-            mock.patch("convrot_nodes._validate_runtime_support") as validate,
-            mock.patch("convrot_nodes.prepare_turing_runtime") as prepare_runtime,
+            mock.patch("comfyui_turing_utils.quantization.convrot._validate_runtime_support") as validate,
+            mock.patch("comfyui_turing_utils.quantization.convrot.prepare_turing_runtime") as prepare_runtime,
             mock.patch("comfy.sd.load_text_encoder_state_dicts", side_effect=fake_load_text_encoder),
         ):
             loaded = load_convrot_clip(
@@ -753,7 +755,7 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
                     "optional": {"device": official_device},
                 },
             ),
-            mock.patch("convrot_nodes._convrot_model_names") as filter_names,
+            mock.patch("comfyui_turing_utils.quantization.convrot._convrot_model_names") as filter_names,
         ):
             inputs = ConvRotCLIPLoader.INPUT_TYPES()
 
@@ -766,15 +768,15 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
         fake_clip = object()
         with (
             mock.patch(
-                "convrot_nodes._official_clip_types",
+                "comfyui_turing_utils.quantization.convrot._official_clip_types",
                 return_value=("stable_diffusion", "minimax"),
             ),
             mock.patch(
-                "convrot_nodes._resolve_convrot_model_path",
+                "comfyui_turing_utils.quantization.convrot._resolve_convrot_model_path",
                 return_value="/models/minimax.safetensors",
             ),
             mock.patch(
-                "convrot_nodes.load_convrot_clip", return_value=fake_clip
+                "comfyui_turing_utils.quantization.convrot.load_convrot_clip", return_value=fake_clip
             ) as load_clip,
         ):
             result = ConvRotCLIPLoader().load_clip(
@@ -800,10 +802,10 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
         fake_model = object()
         with (
             mock.patch(
-                "convrot_nodes._resolve_convrot_model_path",
+                "comfyui_turing_utils.quantization.convrot._resolve_convrot_model_path",
                 return_value="/models/convrot.safetensors",
             ),
-            mock.patch("convrot_nodes.load_convrot_model", return_value=fake_model) as load_model,
+            mock.patch("comfyui_turing_utils.quantization.convrot.load_convrot_model", return_value=fake_model) as load_model,
         ):
             result = ConvRotDiffusionModelLoader().load_diffusion_model(
                 "convrot.safetensors",

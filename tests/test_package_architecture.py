@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ast
-import importlib
 import sys
 import unittest
 from pathlib import Path
@@ -45,22 +44,24 @@ class PackageArchitectureTest(unittest.TestCase):
 
         self.assertEqual(registered_model_adapters(), ("minimax_h3", "wan"))
 
-    def test_legacy_modules_alias_the_new_implementation(self):
-        aliases = {
-            "attention": "comfyui_turing_utils.attention.api",
-            "minimax_adapter": "comfyui_turing_utils.adapters.minimax.acceleration",
-            "minimax_layout": "comfyui_turing_utils.adapters.minimax.layout",
-            "precision": "comfyui_turing_utils.precision",
-            "turing_fusions": "comfyui_turing_utils.quantization.fusions",
-            "turing_ops": "comfyui_turing_utils.quantization.dispatch",
-            "wan_adapter": "comfyui_turing_utils.adapters.wan",
-        }
-        for legacy_name, implementation_name in aliases.items():
-            with self.subTest(module=legacy_name):
-                self.assertIs(
-                    importlib.import_module(legacy_name),
-                    importlib.import_module(implementation_name),
-                )
+    def test_root_contains_only_the_attention_compatibility_facade(self):
+        retired_modules = (
+            "attention_nodes.py",
+            "bernini_nodes.py",
+            "convrot_nodes.py",
+            "minimax_adapter.py",
+            "minimax_layout.py",
+            "minimax_nodes.py",
+            "nodes.py",
+            "precision.py",
+            "reference_nodes.py",
+            "turing_fusions.py",
+            "turing_ops.py",
+            "wan_adapter.py",
+            "wan_nodes.py",
+        )
+        self.assertFalse(any((ROOT / name).exists() for name in retired_modules))
+        self.assertTrue((ROOT / "attention.py").is_file())
 
     def test_node_ids_remain_stable(self):
         from comfyui_turing_utils.registration import NODE_CLASS_MAPPINGS

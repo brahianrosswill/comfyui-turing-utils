@@ -7,6 +7,37 @@ The repository has two intentionally independent lifecycles:
 - `kernel/` builds and installs `comfyui-turing-utils-kernel`. Its extension
   names and public Python API are an ABI boundary for the plugin.
 
+The maintained source tree is intentionally shallow:
+
+```text
+comfyui-turing-utils/
+├── __init__.py                  # ComfyUI entry point
+├── attention.py                 # sole legacy Python compatibility facade
+├── comfyui_turing_utils/
+│   ├── attention/               # dense/sparse backends, layout and patches
+│   ├── quantization/            # ConvRot loading, dispatch and fusions
+│   ├── adapters/                # MiniMax, Wan and Bernini integration
+│   ├── media/                   # references, resize and padding
+│   ├── nodes/                   # thin ComfyUI schemas
+│   ├── hardware.py
+│   ├── kernel_api.py            # independent-kernel boundary
+│   ├── precision.py
+│   └── registration.py          # sole node mapping table
+├── kernel/
+│   ├── comfyui_turing_utils_kernel/
+│   │   ├── ops.py               # linear/fusion custom ops
+│   │   └── turing_sage/         # attention API, quantization and scheduling
+│   ├── csrc/turing/             # exact-SM75 CUDA/C++ sources
+│   ├── scripts/                 # validation and benchmarks
+│   └── setup.py
+├── docs/
+└── tests/
+```
+
+There are no model or node implementation modules at repository root. New
+functionality belongs in one existing package above unless it introduces a
+genuinely new responsibility.
+
 ## Dependency direction
 
 ```text
@@ -47,10 +78,12 @@ is the only node mapping table.
 
 ## Compatibility
 
-The legacy top-level Python modules are temporary aliases to the new package so
-third-party imports continue to work. ComfyUI workflow compatibility is governed
-by the stable `NODE_CLASS_MAPPINGS` keys, input names, and defaults rather than
-Python filenames. New code and tests should import `comfyui_turing_utils` paths.
+ComfyUI workflow compatibility is governed by the stable
+`NODE_CLASS_MAPPINGS` keys, input names, and defaults rather than Python
+filenames. Implementation and tests import canonical `comfyui_turing_utils`
+paths. The sole top-level compatibility module is `attention.py`; it preserves
+the old monkey-patchable attention facade while downstream integrations migrate
+to `comfyui_turing_utils.attention`.
 
 Sparse attention remains explicit and is never selected by loader `auto`.
 Model-specific topology is installed through the attention-layout provider

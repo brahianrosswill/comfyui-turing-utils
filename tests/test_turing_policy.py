@@ -14,8 +14,8 @@ COMFY_ROOT = PLUGIN_ROOT.parents[1]
 sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
-import precision as bf16_policy  # noqa: E402
-import turing_ops  # noqa: E402
+from comfyui_turing_utils import precision as bf16_policy  # noqa: E402
+from comfyui_turing_utils.quantization import dispatch as turing_ops  # noqa: E402
 from comfy_kitchen.backends import cuda as kitchen_cuda  # noqa: E402
 
 
@@ -65,7 +65,7 @@ class BF16PolicyTest(unittest.TestCase):
 
     def test_non_turing_cuda_keeps_comfyui_policy(self):
         with (
-            mock.patch("precision._explicit_dtype_override", return_value=False),
+            mock.patch("comfyui_turing_utils.precision._explicit_dtype_override", return_value=False),
             mock.patch("torch.cuda.is_available", return_value=True),
             mock.patch("torch.cuda.get_device_capability", return_value=(8, 6)),
         ):
@@ -74,31 +74,31 @@ class BF16PolicyTest(unittest.TestCase):
 
     def test_model_without_declared_bf16_keeps_comfyui_policy(self):
         config = SimpleNamespace(supported_inference_dtypes=[torch.float16, torch.float32])
-        with mock.patch("precision._explicit_dtype_override", return_value=False):
+        with mock.patch("comfyui_turing_utils.precision._explicit_dtype_override", return_value=False):
             dtype = bf16_policy.select_compute_dtype(config, torch.device("cuda", 0))
         self.assertIsNone(dtype)
 
     def test_explicit_comfyui_dtype_override_wins(self):
-        with mock.patch("precision._explicit_dtype_override", return_value=True):
+        with mock.patch("comfyui_turing_utils.precision._explicit_dtype_override", return_value=True):
             dtype = bf16_policy.select_compute_dtype(BF16_CONFIG, torch.device("cuda", 0))
         self.assertIsNone(dtype)
 
     def test_supported_turing_selects_bf16_independently_of_runtime_preflight(self):
         with (
-            mock.patch("precision._explicit_dtype_override", return_value=False),
+            mock.patch("comfyui_turing_utils.precision._explicit_dtype_override", return_value=False),
             mock.patch("torch.cuda.is_available", return_value=True),
             mock.patch("torch.cuda.get_device_capability", return_value=(7, 5)),
-            mock.patch("precision.is_supported_turing_device", return_value=True),
+            mock.patch("comfyui_turing_utils.precision.is_supported_turing_device", return_value=True),
         ):
             dtype = bf16_policy.select_compute_dtype(BF16_CONFIG, torch.device("cuda", 1))
         self.assertIs(dtype, torch.bfloat16)
 
     def test_turing_model_with_fp16_support_keeps_comfyui_policy(self):
         with (
-            mock.patch("precision._explicit_dtype_override", return_value=False),
+            mock.patch("comfyui_turing_utils.precision._explicit_dtype_override", return_value=False),
             mock.patch("torch.cuda.is_available", return_value=True),
             mock.patch("torch.cuda.get_device_capability", return_value=(7, 5)),
-            mock.patch("precision.is_supported_turing_device", return_value=True),
+            mock.patch("comfyui_turing_utils.precision.is_supported_turing_device", return_value=True),
         ):
             dtype = bf16_policy.select_compute_dtype(
                 FP16_BF16_CONFIG, torch.device("cuda", 0)
@@ -107,9 +107,9 @@ class BF16PolicyTest(unittest.TestCase):
 
     def test_turing_preflight_failure_does_not_silently_fallback_to_fp32(self):
         with (
-            mock.patch("precision.is_supported_turing_device", return_value=True),
-            mock.patch("precision.bundled_available", return_value=True),
-            mock.patch("precision.preflight_bundled", side_effect=RuntimeError("attention self-test")),
+            mock.patch("comfyui_turing_utils.precision.is_supported_turing_device", return_value=True),
+            mock.patch("comfyui_turing_utils.precision.bundled_available", return_value=True),
+            mock.patch("comfyui_turing_utils.precision.preflight_bundled", side_effect=RuntimeError("attention self-test")),
             self.assertRaisesRegex(RuntimeError, "attention self-test"),
         ):
             bf16_policy.prepare_turing_runtime(
@@ -118,10 +118,10 @@ class BF16PolicyTest(unittest.TestCase):
 
     def test_legacy_sage_alias_preflights_the_canonical_bundled_backend(self):
         with (
-            mock.patch("precision.is_supported_turing_device", return_value=True),
-            mock.patch("precision._check_kernel_contract"),
-            mock.patch("precision.bundled_available", return_value=True),
-            mock.patch("precision.preflight_bundled") as preflight,
+            mock.patch("comfyui_turing_utils.precision.is_supported_turing_device", return_value=True),
+            mock.patch("comfyui_turing_utils.precision._check_kernel_contract"),
+            mock.patch("comfyui_turing_utils.precision.bundled_available", return_value=True),
+            mock.patch("comfyui_turing_utils.precision.preflight_bundled") as preflight,
         ):
             bf16_policy.prepare_turing_runtime(
                 NO_CONVROT, torch.device("cuda", 0), "sage_"
@@ -150,11 +150,11 @@ class BF16PolicyTest(unittest.TestCase):
                     }
                 },
             ),
-            mock.patch("precision.is_supported_turing_device", return_value=True),
-            mock.patch("precision._check_kitchen_contract"),
-            mock.patch("precision.register_backend", return_value=True) as register,
-            mock.patch("precision.backend_available", return_value=True),
-            mock.patch("precision.preflight_kitchen") as preflight,
+            mock.patch("comfyui_turing_utils.precision.is_supported_turing_device", return_value=True),
+            mock.patch("comfyui_turing_utils.precision._check_kitchen_contract"),
+            mock.patch("comfyui_turing_utils.precision.register_backend", return_value=True) as register,
+            mock.patch("comfyui_turing_utils.precision.backend_available", return_value=True),
+            mock.patch("comfyui_turing_utils.precision.preflight_kitchen") as preflight,
         ):
             bf16_policy.prepare_turing_runtime(summary, torch.device("cuda", 0), "sdpa")
         register.assert_called_once_with()
@@ -162,11 +162,11 @@ class BF16PolicyTest(unittest.TestCase):
 
     def test_gtx16_keeps_comfyui_fallback(self):
         with (
-            mock.patch("precision._explicit_dtype_override", return_value=False),
+            mock.patch("comfyui_turing_utils.precision._explicit_dtype_override", return_value=False),
             mock.patch("torch.cuda.is_available", return_value=True),
             mock.patch("torch.cuda.get_device_capability", return_value=(7, 5)),
             mock.patch("torch.cuda.get_device_name", return_value="NVIDIA GeForce GTX 1660 Ti"),
-            mock.patch("precision.is_supported_turing_device", return_value=False),
+            mock.patch("comfyui_turing_utils.precision.is_supported_turing_device", return_value=False),
         ):
             dtype = bf16_policy.select_compute_dtype(BF16_CONFIG, torch.device("cuda", 0))
         self.assertIsNone(dtype)
@@ -179,7 +179,7 @@ class BF16PolicyTest(unittest.TestCase):
         old_qdata_ptr = module.weight._qdata.data_ptr()
         old_scale_ptr = module.weight._params.scale.data_ptr()
 
-        with mock.patch("precision.is_supported_turing_device", return_value=True):
+        with mock.patch("comfyui_turing_utils.precision.is_supported_turing_device", return_value=True):
             count = bf16_policy.normalize_turing_convrot_weight_dtypes(
                 root, torch.device("cuda", 0), torch.bfloat16
             )
@@ -200,7 +200,7 @@ class BF16PolicyTest(unittest.TestCase):
         dense_weight = dense.weight
         plain_weight = plain_int8.weight
 
-        with mock.patch("precision.is_supported_turing_device", return_value=True):
+        with mock.patch("comfyui_turing_utils.precision.is_supported_turing_device", return_value=True):
             count = bf16_policy.normalize_turing_convrot_weight_dtypes(
                 root, torch.device("cuda", 0), torch.bfloat16
             )
@@ -217,7 +217,7 @@ class BF16PolicyTest(unittest.TestCase):
         root.w4a4 = self._module_with_weight(self._w4_weight(linear_dtype="int4"))
         root.w4a8 = self._module_with_weight(self._w4_weight(linear_dtype="int8"))
 
-        with mock.patch("precision.is_supported_turing_device", return_value=True):
+        with mock.patch("comfyui_turing_utils.precision.is_supported_turing_device", return_value=True):
             count = bf16_policy.normalize_turing_convrot_weight_dtypes(
                 root, torch.device("cuda", 0), torch.bfloat16
             )
@@ -233,7 +233,7 @@ class BF16PolicyTest(unittest.TestCase):
             with self.subTest(supported=supported, dtype=dtype):
                 module = self._module_with_weight(self._w8_weight(torch.float32, convrot=True))
                 with mock.patch(
-                    "precision.is_supported_turing_device", return_value=supported
+                    "comfyui_turing_utils.precision.is_supported_turing_device", return_value=supported
                 ):
                     count = bf16_policy.normalize_turing_convrot_weight_dtypes(
                         module, torch.device("cuda", 0), dtype

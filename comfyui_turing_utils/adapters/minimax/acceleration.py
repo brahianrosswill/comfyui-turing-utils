@@ -1,4 +1,4 @@
-"""MiniMax H3 memory planning, Turing fusions, and progressive sampling."""
+"""MiniMax H3 memory planning and Turing block fusions."""
 
 from __future__ import annotations
 
@@ -558,21 +558,3 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
     if eligible_fc2 and mlp_fusions != eligible_fc2:
         raise RuntimeError("MiniMax Turing fc2 adapter did not patch every eligible layer")
     return max(block_fusions, mlp_fusions)
-
-
-# Re-export the explicit experimental patch for the public MiniMax facade.
-from .progressive import (
-    _PROGRESSIVE_COND_WRAPPER_KEY,
-    _PROGRESSIVE_OUTER_WRAPPER_KEY,
-    _H3ProgressiveResolutionConfig,
-    _h3_latent_shapes,
-    _h3_progressive_target_hw,
-    _resize_h3_video,
-    _downsample_h3_video,
-    _resize_h3_keyframe_payload,
-    _resize_h3_memory_condition,
-    _patch_h3_conds_for_shapes,
-    _h3_conds_support_progressive_resize,
-    _make_h3_progressive_wrappers,
-    apply_h3_progressive_resolution_patch,
-)

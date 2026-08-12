@@ -15,7 +15,7 @@ COMFY_ROOT = PLUGIN_ROOT.parents[1]
 sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
-import minimax_adapter  # noqa: E402
+from comfyui_turing_utils.adapters.minimax import acceleration as minimax_adapter  # noqa: E402
 
 
 def _convrot_weight(kind: str):
@@ -122,7 +122,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
                 original_block_forward = root.block.forward
                 original_mlp_forward = root.block.mlp.forward
                 with (
-                    mock.patch("minimax_adapter.is_supported_turing_device", return_value=True),
+                    mock.patch("comfyui_turing_utils.adapters.minimax.acceleration.is_supported_turing_device", return_value=True),
                     mock.patch.object(minimax_model, "DiTBlock", FakeBlock),
                     mock.patch.dict(
                         sys.modules,
@@ -152,7 +152,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
         root.block = ChangedBlock()
         patcher = FakePatcher(root)
         with (
-            mock.patch("minimax_adapter.is_supported_turing_device", return_value=True),
+            mock.patch("comfyui_turing_utils.adapters.minimax.acceleration.is_supported_turing_device", return_value=True),
             mock.patch.object(minimax_model, "DiTBlock", ChangedBlock),
             self.assertLogs("comfyui-turing-utils", level="WARNING"),
         ):
@@ -202,7 +202,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
 
         with (
             mock.patch(
-                "minimax_adapter.turing_linear_input_act",
+                "comfyui_turing_utils.adapters.minimax.acceleration.turing_linear_input_act",
                 return_value=sentinel,
             ) as fused,
             self.assertLogs("comfyui-turing-utils", level="INFO") as captured,
@@ -362,7 +362,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
         )
         target_area = 24 * 7 * 8 * 10 + 32 * 2 * 12
         with mock.patch(
-            "minimax_adapter.turing_int8_workspace_bytes",
+            "comfyui_turing_utils.adapters.minimax.acceleration.turing_int8_workspace_bytes",
             side_effect=lambda rows, output: rows + output,
         ):
             required = base.memory_required(

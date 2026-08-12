@@ -15,7 +15,7 @@ COMFY_ROOT = PLUGIN_ROOT.parents[1]
 sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
-import wan_adapter  # noqa: E402
+from comfyui_turing_utils.adapters import wan as wan_adapter  # noqa: E402
 
 
 class WanMemoryPlanningTest(unittest.TestCase):
@@ -121,12 +121,12 @@ class WanMemoryPlanningTest(unittest.TestCase):
         patcher = SimpleNamespace(model=base)
         context = [torch.empty(1, 16, 3, 8, 8)]
         with (
-            mock.patch("wan_adapter.is_supported_turing_device", return_value=True),
+            mock.patch("comfyui_turing_utils.adapters.wan.is_supported_turing_device", return_value=True),
             mock.patch(
-                "wan_adapter._quantized_wan_summary",
+                "comfyui_turing_utils.adapters.wan._quantized_wan_summary",
                 return_value=(Counter({"w8a8": 2}), (4096,)),
             ),
-            mock.patch("wan_adapter.turing_int8_workspace_bytes", return_value=64.0),
+            mock.patch("comfyui_turing_utils.adapters.wan.turing_int8_workspace_bytes", return_value=64.0),
         ):
             count = wan_adapter.apply_wan_adapter(patcher, torch.device("cuda", 0))
 

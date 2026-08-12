@@ -16,7 +16,7 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 import comfy.conds  # noqa: E402
 import comfy.patcher_extension  # noqa: E402
 import comfy.utils  # noqa: E402
-import minimax_adapter  # noqa: E402
+from comfyui_turing_utils.adapters.minimax import progressive as minimax_adapter  # noqa: E402
 
 
 class FakePatcher:

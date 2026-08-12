@@ -184,8 +184,9 @@ memory respectively. A40 compute_75 direction
 tests validate numerical behavior and speed; final quality, occupancy, and
 throughput still require an actual Turing GPU.
 
-See [`docs/turing-runtime.md`](docs/turing-runtime.md) for the dispatch and
-validation matrix and [`docs/architecture.md`](docs/architecture.md) for the
+See [`docs/operator-support.md`](docs/operator-support.md) for the operator and
+feature matrix, [`docs/turing-runtime.md`](docs/turing-runtime.md) for dispatch
+and validation details, and [`docs/architecture.md`](docs/architecture.md) for the
 Python/kernel layering. Experimental Sage1/Sage2 sources are not installed or
 exposed by loader nodes.
 

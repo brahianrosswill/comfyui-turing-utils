@@ -13,9 +13,11 @@ COMFY_ROOT = PLUGIN_ROOT.parents[1]
 sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
-import bernini_nodes  # noqa: E402
-import minimax_nodes  # noqa: E402
-import reference_nodes  # noqa: E402
+from comfyui_turing_utils.adapters import bernini as bernini_adapter  # noqa: E402
+from comfyui_turing_utils.media import references as reference_media  # noqa: E402
+from comfyui_turing_utils.nodes import bernini as bernini_nodes  # noqa: E402
+from comfyui_turing_utils.nodes import minimax as minimax_nodes  # noqa: E402
+from comfyui_turing_utils.nodes import references as reference_nodes  # noqa: E402
 
 
 def _spatial_kwargs(**overrides):
@@ -186,7 +188,7 @@ class ReferenceNodesTest(unittest.TestCase):
         image = torch.zeros(1, 16, 16, 3)
         mask = torch.zeros(1, 16, 16)
         mask[0, 7, 7] = 1.0
-        options = reference_nodes.SpatialOptions(
+        options = reference_media.SpatialOptions(
             width=4,
             height=4,
             keep_proportion="stretch",
@@ -194,7 +196,7 @@ class ReferenceNodesTest(unittest.TestCase):
             divisible_by=1,
         )
 
-        _, resized = reference_nodes._spatial_transform(image, options, mask)
+        _, resized = reference_media._spatial_transform(image, options, mask)
         self.assertGreater(float(resized.sum()), 0.0)
 
     def test_kj_resize_v2_modes_produce_matching_output_geometry(self):
@@ -211,9 +213,9 @@ class ReferenceNodesTest(unittest.TestCase):
         }
         for mode, expected in expected_shapes.items():
             with self.subTest(mode=mode):
-                output = reference_nodes._spatial_transform(
+                output = reference_media._spatial_transform(
                     image,
-                    reference_nodes.SpatialOptions(
+                    reference_media.SpatialOptions(
                         width=16,
                         height=16,
                         upscale_method="bilinear",
@@ -227,9 +229,9 @@ class ReferenceNodesTest(unittest.TestCase):
         image = torch.rand(3, 9, 13, 3)
         for width, height in ((0, 512), (512, 0), (0, 0)):
             with self.subTest(width=width, height=height):
-                output = reference_nodes._spatial_transform(
+                output = reference_media._spatial_transform(
                     image,
-                    reference_nodes.SpatialOptions(
+                    reference_media.SpatialOptions(
                         width=width,
                         height=height,
                         keep_proportion="crop",
@@ -242,16 +244,16 @@ class ReferenceNodesTest(unittest.TestCase):
     def test_video_frame_count_zero_preserves_lengths_and_positive_value_aligns_at_end(self):
         short = torch.ones(3, 4, 4, 3)
         long = torch.full((5, 4, 4, 3), 2.0)
-        identity = reference_nodes.SpatialOptions(width=0, height=0, divisible_by=1)
-        unchanged = reference_nodes.VideoReferenceSet(
+        identity = reference_media.SpatialOptions(width=0, height=0, divisible_by=1)
+        unchanged = reference_media.VideoReferenceSet(
             (short, long),
-            reference_nodes.VideoOptions(spatial=identity, frame_count=0),
+            reference_media.VideoOptions(spatial=identity, frame_count=0),
         ).materialize()
         self.assertEqual([video.shape[0] for video in unchanged], [3, 5])
 
-        aligned = reference_nodes.VideoReferenceSet(
+        aligned = reference_media.VideoReferenceSet(
             (short, long),
-            reference_nodes.VideoOptions(
+            reference_media.VideoOptions(
                 spatial=identity,
                 frame_count=4,
                 short_video_fill="black",
@@ -263,18 +265,18 @@ class ReferenceNodesTest(unittest.TestCase):
         self.assertTrue(torch.equal(aligned[1], long[:4]))
 
         numbered = torch.arange(5, dtype=torch.float32).reshape(5, 1, 1, 1).repeat(1, 2, 2, 3)
-        trimmed = reference_nodes.VideoReferenceSet(
+        trimmed = reference_media.VideoReferenceSet(
             (numbered,),
-            reference_nodes.VideoOptions(spatial=identity, frame_count=3),
+            reference_media.VideoOptions(spatial=identity, frame_count=3),
         ).materialize()[0]
         self.assertTrue(torch.equal(trimmed, numbered[:3]))
 
     def test_spatial_resize_and_frame_alignment_are_independent(self):
         video = torch.ones(3, 8, 12, 3)
-        spatial_only = reference_nodes.VideoReferenceSet(
+        spatial_only = reference_media.VideoReferenceSet(
             (video,),
-            reference_nodes.VideoOptions(
-                spatial=reference_nodes.SpatialOptions(
+            reference_media.VideoOptions(
+                spatial=reference_media.SpatialOptions(
                     width=4,
                     height=4,
                     keep_proportion="stretch",
@@ -286,10 +288,10 @@ class ReferenceNodesTest(unittest.TestCase):
         ).materialize()[0]
         self.assertEqual(tuple(spatial_only.shape), (3, 4, 4, 3))
 
-        temporal_only = reference_nodes.VideoReferenceSet(
+        temporal_only = reference_media.VideoReferenceSet(
             (video,),
-            reference_nodes.VideoOptions(
-                spatial=reference_nodes.SpatialOptions(width=0, height=0, divisible_by=1),
+            reference_media.VideoOptions(
+                spatial=reference_media.SpatialOptions(width=0, height=0, divisible_by=1),
                 frame_count=5,
             ),
         ).materialize()[0]
@@ -321,7 +323,7 @@ class ReferenceNodesTest(unittest.TestCase):
         self.assertGreater(float(latent["noise_mask"].sum()), 0.0)
         self.assertIs(output[0][0][1]["context_latents"][0], latent["samples"])
         self.assertEqual(
-            output[0][0][1][bernini_nodes._CONTEXT_ROLES_KEY],
+            output[0][0][1][bernini_adapter._CONTEXT_ROLES_KEY],
             ("aligned",),
         )
 
@@ -350,9 +352,9 @@ class ReferenceNodesTest(unittest.TestCase):
         self.assertTrue(torch.equal(padded[1][-1], mask[-1]))
 
     def test_h3_hub_delegates_native_order_and_audio_binding(self):
-        images = reference_nodes.ImageReferenceSet((torch.zeros(1, 8, 8, 3),))
-        videos = reference_nodes.VideoReferenceSet((torch.zeros(5, 8, 8, 3),))
-        audios = reference_nodes.AudioReferenceSet(({"waveform": "paired"}, {"waveform": "standalone"}))
+        images = reference_media.ImageReferenceSet((torch.zeros(1, 8, 8, 3),))
+        videos = reference_media.VideoReferenceSet((torch.zeros(5, 8, 8, 3),))
+        audios = reference_media.AudioReferenceSet(({"waveform": "paired"}, {"waveform": "standalone"}))
         sentinel = object()
         with mock.patch.object(
             minimax_nodes.MiniMaxH3ReferenceToVideo,

@@ -13,8 +13,8 @@ COMFY_ROOT = PLUGIN_ROOT.parents[1]
 sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
-import turing_fusions
-import turing_ops
+from comfyui_turing_utils.quantization import dispatch as turing_ops
+from comfyui_turing_utils.quantization import fusions as turing_fusions
 
 
 class SegmentValidationTest(unittest.TestCase):
@@ -83,13 +83,13 @@ class FusionDispatchTest(unittest.TestCase):
         offload = (None, None, None)
 
         with (
-            mock.patch("turing_ops.is_supported_turing_device", return_value=True),
+            mock.patch("comfyui_turing_utils.quantization.dispatch.is_supported_turing_device", return_value=True),
             mock.patch(
                 "comfy.ops.cast_bias_weight",
                 return_value=(weight, None, offload),
             ) as cast,
             mock.patch("comfy.ops.uncast_bias_weight") as uncast,
-            mock.patch("turing_ops.int8_linear", return_value=output) as int8_linear,
+            mock.patch("comfyui_turing_utils.quantization.dispatch.int8_linear", return_value=output) as int8_linear,
         ):
             result = turing_fusions.turing_linear_input_act(linear, x, "swiglu")
 
@@ -114,13 +114,13 @@ class FusionDispatchTest(unittest.TestCase):
                 output = torch.empty((2, 4), dtype=torch.bfloat16)
                 offload = (None, None, None)
                 with (
-                    mock.patch("turing_ops.is_supported_turing_device", return_value=True),
+                    mock.patch("comfyui_turing_utils.quantization.dispatch.is_supported_turing_device", return_value=True),
                     mock.patch(
                         "comfy.ops.cast_bias_weight",
                         return_value=(weight, None, offload),
                     ),
                     mock.patch("comfy.ops.uncast_bias_weight") as uncast,
-                    mock.patch("turing_ops.convrot_w4a4_linear", return_value=output) as kernel,
+                    mock.patch("comfyui_turing_utils.quantization.dispatch.convrot_w4a4_linear", return_value=output) as kernel,
                 ):
                     result = turing_fusions.turing_linear_input_act(linear, x, "swiglu")
 
@@ -136,12 +136,12 @@ class FusionDispatchTest(unittest.TestCase):
         output = torch.empty((2, 4), dtype=torch.bfloat16)
         offload = (None, None, None)
         with (
-            mock.patch("turing_ops.is_supported_turing_device", return_value=True),
+            mock.patch("comfyui_turing_utils.quantization.dispatch.is_supported_turing_device", return_value=True),
             mock.patch(
                 "comfy.ops.cast_bias_weight", return_value=(weight, None, offload)
             ),
             mock.patch("comfy.ops.uncast_bias_weight"),
-            mock.patch("turing_ops.int8_linear", return_value=output) as kernel,
+            mock.patch("comfyui_turing_utils.quantization.dispatch.int8_linear", return_value=output) as kernel,
         ):
             result = turing_fusions.turing_linear_input_act(
                 linear, x, "gelu_tanh"
@@ -207,7 +207,7 @@ class FusionDispatchTest(unittest.TestCase):
                 return_value=(dense, None, offload),
             ),
             mock.patch("comfy.ops.uncast_bias_weight") as uncast,
-            mock.patch("turing_ops.int8_linear") as int8_linear,
+            mock.patch("comfyui_turing_utils.quantization.dispatch.int8_linear") as int8_linear,
         ):
             result = turing_fusions.turing_linear_input_act(linear, x, "swiglu")
 
