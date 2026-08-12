@@ -1,7 +1,9 @@
 import hashlib
 import os
 import platform
+import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import urllib.request
@@ -18,6 +20,74 @@ if IS_WINDOWS:
 
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
+
+
+def _parse_cuda_version(value) -> tuple[int, int] | None:
+    match = re.search(r"(?<!\d)(\d+)\.(\d+)", str(value or ""))
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def _cuda_toolkit_version() -> tuple[int, int] | None:
+    """Resolve the toolkit used by NVCC, not merely the runtime driver."""
+    nvcc_candidates: list[Path] = []
+    for root in (CUDA_HOME, os.environ.get("CUDA_PATH")):
+        if root:
+            nvcc_candidates.append(
+                Path(root) / "bin" / ("nvcc.exe" if IS_WINDOWS else "nvcc")
+            )
+    discovered = shutil.which("nvcc")
+    if discovered:
+        nvcc_candidates.append(Path(discovered))
+    seen: set[str] = set()
+    for candidate in nvcc_candidates:
+        key = os.path.normcase(os.path.abspath(candidate))
+        if key in seen or not candidate.is_file():
+            continue
+        seen.add(key)
+        try:
+            result = subprocess.run(
+                [str(candidate), "--version"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError):
+            continue
+        match = re.search(r"release\s+(\d+)\.(\d+)", result.stdout + result.stderr)
+        if match:
+            return int(match.group(1)), int(match.group(2))
+
+    # Conda CUDA packages may expose version metadata even when nvcc is not on
+    # PATH during PEP-517 isolation.
+    for root in (CUDA_HOME, os.environ.get("CUDA_PATH"), os.environ.get("CONDA_PREFIX")):
+        if not root:
+            continue
+        root_path = Path(root)
+        for metadata in (root_path / "version.json", root_path / "version.txt"):
+            if metadata.is_file():
+                try:
+                    version = _parse_cuda_version(metadata.read_text(encoding="utf-8"))
+                except OSError:
+                    version = None
+                if version is not None:
+                    return version
+
+    try:
+        import torch
+
+        return _parse_cuda_version(torch.version.cuda)
+    except (AttributeError, ImportError):
+        return None
+
+
+def _default_cxx_standard(cuda_version: tuple[int, int] | None) -> str:
+    # NVCC gained C++20 support in CUDA 12.0.  The pinned CUTLASS visitor
+    # templates also compile more reliably in that dialect on MSVC.  Older
+    # toolkits remain on their supported C++17 path.
+    if cuda_version is not None:
+        return "c++20" if cuda_version >= (12, 0) else "c++17"
+    return "c++20" if IS_WINDOWS else "c++17"
 
 
 def _is_cutlass_include_dir(candidate: Path) -> bool:
@@ -264,7 +334,8 @@ COMMON_DEFINES = [
     "-DENABLE_BF16=1",
 ]
 
-DEFAULT_CXX_STANDARD = "c++20" if IS_WINDOWS else "c++17"
+CUDA_TOOLKIT_VERSION = _cuda_toolkit_version()
+DEFAULT_CXX_STANDARD = _default_cxx_standard(CUDA_TOOLKIT_VERSION)
 HOST_CXX_STANDARD = os.environ.get(
     "COMFYUI_TURING_UTILS_HOST_CXX_STANDARD",
     os.environ.get("COMFYUI_TURING_UTILS_CXX_STANDARD", DEFAULT_CXX_STANDARD),
@@ -418,7 +489,7 @@ if _includes_sm75():
 
 setup(
     name="comfyui-turing-utils-kernel",
-    version="0.22.1",
+    version="0.22.2",
     packages=find_packages(where=str(ROOT)),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

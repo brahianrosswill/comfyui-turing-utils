@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = ROOT / "kernel"
 COMFYUI_ROOT = ROOT.parents[1]
-EXPECTED_VERSION = "0.22.1"
+EXPECTED_VERSION = "0.22.2"
 
 
 def _run(command: list[str], *, cwd: Path = ROOT, env=None) -> None:
@@ -67,12 +67,13 @@ def _static_gate() -> None:
         raise RuntimeError("C++/pybind attention ABI does not expose both key-tile arguments")
     setup_source = (KERNEL / "setup.py").read_text(encoding="utf-8")
     for marker in (
-        'DEFAULT_CXX_STANDARD = "c++20" if IS_WINDOWS else "c++17"',
+        "CUDA_TOOLKIT_VERSION = _cuda_toolkit_version()",
+        'return "c++20" if cuda_version >= (12, 0) else "c++17"',
         '"COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD", DEFAULT_CXX_STANDARD',
     ):
         if marker not in setup_source:
             raise RuntimeError(
-                "Windows CUTLASS builds must retain their C++20 language gate"
+                "CUDA-aware CUTLASS C++ language selection is incomplete"
             )
     fused_header = (KERNEL / "csrc/turing/sage/fused.h").read_text(encoding="utf-8")
     fused_binding = (KERNEL / "csrc/turing/sage/pybind_fused.cpp").read_text(

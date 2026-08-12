@@ -21,7 +21,13 @@ class KernelSetupTest(unittest.TestCase):
     def _extension(*, name, **kwargs):
         return SimpleNamespace(name=name, kwargs=kwargs)
 
-    def _run_windows_setup(self, conda_prefix: Path, *, arch_list: str = "8.6"):
+    def _run_windows_setup(
+        self,
+        conda_prefix: Path,
+        *,
+        arch_list: str = "8.6",
+        cuda_version: str = "12.8",
+    ):
         environment = {
             "CONDA_PREFIX": str(conda_prefix),
             "COMFYUI_TURING_UTILS_ARCH_LIST": arch_list,
@@ -30,6 +36,7 @@ class KernelSetupTest(unittest.TestCase):
             mock.patch.object(platform, "system", return_value="Windows"),
             mock.patch.dict(os.environ, environment, clear=False),
             mock.patch("torch.utils.cpp_extension.CUDA_HOME", None),
+            mock.patch("torch.version.cuda", cuda_version),
             mock.patch("torch.utils.cpp_extension.CUDAExtension", side_effect=self._extension),
             mock.patch("torch.utils.cpp_extension.BuildExtension", object()),
             mock.patch("shutil.which", return_value=None),
@@ -78,7 +85,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(
             "csrc/turing/sage/qk_preprocess.cu", extensions[2].kwargs["sources"]
         )
-        self.assertEqual(setup.call_args.kwargs["version"], "0.22.1")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.22.2")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -100,7 +107,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.22.1")
+        self.assertEqual(metadata["project"]["version"], "0.22.2")
 
     def test_sparse_source_does_not_require_optional_cuda_library_headers(self):
         source = (
@@ -194,6 +201,23 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn("csrc/turing/sage/qk_preprocess.cu", fused.kwargs["sources"])
         self.assertIn(str(cccl.resolve()), fused.kwargs["include_dirs"])
         self.assertIn("-std=c++20", fused.kwargs["extra_compile_args"]["nvcc"])
+
+    def test_cuda_11_selects_cxx17_unless_explicitly_overridden(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prefix = Path(temp_dir)
+            cccl = prefix / "Library" / "include" / "targets" / "x64"
+            (cccl / "nv").mkdir(parents=True)
+            (cccl / "nv" / "target").touch()
+            self._make_cutlass_headers(prefix / "Library" / "include")
+
+            extensions = self._run_windows_setup(
+                prefix,
+                cuda_version="11.8",
+            )
+
+        flags = extensions[0].kwargs["extra_compile_args"]
+        self.assertIn("/std:c++17", flags["cxx"])
+        self.assertIn("-std=c++17", flags["nvcc"])
 
     def test_nvidia_cutlass_python_package_is_auto_detected(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -1,7 +1,7 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's exact-sm75
-runtime. Version 0.22.1 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
+runtime. Version 0.22.2 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, bundled Sage attention, pure-INT8 W8A8 attention,
 and an explicitly selected experimental model-independent sparse attention
@@ -79,9 +79,12 @@ not imported or executed during normal inference.
 On Windows, use an x64 Visual Studio Developer shell. CUDA 12.8 Conda users
 must have the CCCL directory containing `nv/target`; the build discovers
 `%CONDA_PREFIX%\Library\include\targets\x64` automatically.
-Linux uses C++17. Windows uses C++20 for both MSVC and NVCC because CUTLASS's
-EVT-based W4A8 epilogue does not instantiate reliably under NVCC/MSVC in
-C++17 mode. The standards can be overridden with
+The build selects its language dialect from the actual CUDA toolkit used by
+NVCC: CUDA 12 and newer use C++20, while older toolkits use C++17. NVCC 12.0
+was the first CUDA release with C++20 support, and CUTLASS's EVT-based W4A8
+epilogue instantiates more reliably under NVCC/MSVC in that dialect. Detection
+prefers `nvcc --version` and toolkit metadata over PyTorch's compiled CUDA
+label. The standards can be overridden with
 `COMFYUI_TURING_UTILS_HOST_CXX_STANDARD` and
 `COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD` when diagnosing a toolchain issue.
 
