@@ -22,6 +22,7 @@ from .stable import (
     SPARSE_REFERENCE_VIDEO,
     SPARSE_ROUTING_THRESHOLD,
     SPARSE_SKIPPED_RESIDUAL,
+    SPARSE_USE_W8A8,
     AttentionCall,
     PrequantizedAttentionCall,
     _LOGGED_SPARSE_DENSE_REASONS,
@@ -272,6 +273,15 @@ def _sparse_dense_layer(
     else:
         layer_index = layout.layer_index
         layer_count = layout.layer_count
+    if (
+        isinstance(layer_count, int)
+        and not isinstance(layer_count, bool)
+        and layer_count > 0
+        and dense_prefix_layers + dense_suffix_layers >= layer_count
+    ):
+        # An overlapping prefix/suffix intentionally turns the patch into the
+        # selected dense backend without entering any Sol preprocessing path.
+        return 0 <= layer_index < layer_count
     if 0 <= layer_index < dense_prefix_layers:
         return True
     return (
@@ -463,7 +473,7 @@ def turing_sol_sparse_attention(
     debug_route_keys: set[tuple] | None = None,
     debug_route_state: dict[tuple, list[tuple[torch.Tensor, int, int]]] | None = None,
     debug_context: dict | None = None,
-    use_w8a8: bool = False,
+    use_w8a8: bool = SPARSE_USE_W8A8,
     **kwargs,
 ) -> torch.Tensor:
     original_q, original_k, original_v = q, k, v

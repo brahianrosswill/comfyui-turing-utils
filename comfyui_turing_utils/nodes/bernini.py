@@ -9,14 +9,6 @@ import node_helpers
 from comfy_api.latest import io
 
 from ..adapters import bernini as service
-from ..media.references import (
-    ImageReferenceSet,
-    ImageReferences,
-    SpatialOptions,
-    VideoReferenceSet,
-    VideoReferences,
-    _spatial_transform,
-)
 
 
 class BerniniInpaintCondition(io.ComfyNode):
@@ -37,8 +29,6 @@ class BerniniInpaintCondition(io.ComfyNode):
                 io.Int.Input("batch_size", default=1, min=1, max=4096),
                 io.Boolean.Input("source_as_context", default=False, tooltip="Also append the aligned source video as Bernini context tokens."),
                 io.Mask.Input("mask", optional=True, tooltip="White is repainted and black is preserved. Omit for global repaint."),
-                ImageReferences.Input("image_references", optional=True),
-                VideoReferences.Input("video_references", optional=True),
             ],
             outputs=[
                 io.Conditioning.Output(display_name="positive"),
@@ -49,7 +39,7 @@ class BerniniInpaintCondition(io.ComfyNode):
 
     @classmethod
     def execute(cls, positive, negative, vae, source_video, width, height, length, batch_size,
-                source_as_context=False, mask=None, image_references=None, video_references=None):
+                source_as_context=False, mask=None):
         length = int(length)
         if (length - 1) % 4 != 0:
             raise ValueError(f"Bernini length must be 4*n+1 real frames; got {length}")
@@ -57,18 +47,9 @@ class BerniniInpaintCondition(io.ComfyNode):
         source_video, mask = service._align_source_video_and_mask(
             source_video, mask, length
         )
-        source_options = SpatialOptions(
-            width=int(width),
-            height=int(height),
-            upscale_method="area",
-            keep_proportion="crop",
-            crop_position="center",
-            divisible_by=1,
+        source_video, mask = service._resize_source_video_and_mask(
+            source_video, mask, width, height
         )
-        if mask is None:
-            source_video = _spatial_transform(source_video, source_options)
-        else:
-            source_video, mask = _spatial_transform(source_video, source_options, mask)
 
         source_latent = vae.encode(source_video)
         source_latent = comfy.utils.repeat_to_batch_size(source_latent, int(batch_size))
@@ -81,15 +62,6 @@ class BerniniInpaintCondition(io.ComfyNode):
         if source_as_context:
             context.append(source_latent)
             roles.append("aligned")
-
-        if isinstance(video_references, VideoReferenceSet):
-            for video in video_references.materialize():
-                context.append(vae.encode(video))
-                roles.append("global")
-        if isinstance(image_references, ImageReferenceSet):
-            for image in image_references.materialize():
-                context.append(vae.encode(image))
-                roles.append("global")
 
         if context:
             values = {

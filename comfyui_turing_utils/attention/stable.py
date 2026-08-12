@@ -24,8 +24,8 @@ SPARSE_SKIPPED_RESIDUAL = "1x64"
 SPARSE_REFERENCE_IMAGE = False
 SPARSE_REFERENCE_VIDEO = True
 SPARSE_REFERENCE_AUDIO = False
-SPARSE_USE_W8A8 = False
-SPARSE_DENSE_PREFIX_STEPS = 0
+SPARSE_USE_W8A8 = True
+SPARSE_DENSE_PREFIX_STEPS = 1
 SPARSE_DENSE_SUFFIX_STEPS = 0
 SPARSE_DENSE_PREFIX_LAYERS = 2
 SPARSE_DENSE_SUFFIX_LAYERS = 0
@@ -42,7 +42,7 @@ _LOGGED_SPARSE_DENSE_REASONS: set[str] = set()
 @dataclasses.dataclass(frozen=True)
 class AttentionBackend:
     option: str
-    attention_function: str | None
+    attention_function: str
     label: str
     install_hint: str | None = None
     aliases: tuple[str, ...] = ()
@@ -212,20 +212,24 @@ def register_attention_backend(backend: AttentionBackend) -> None:
 
 register_attention_backend(
     AttentionBackend(
-        option="auto",
-        attention_function=None,
-        label="auto",
-        aliases=("default", "none", "comfyui_default"),
+        option="w8a8",
+        attention_function="comfy_kitchen_int8",
+        label="w8a8",
+        install_hint="Update ComfyUI and comfy-kitchen for INT8 attention support.",
+        aliases=(
+            "int8_attention",
+            "turing_w8a8",
+        ),
     )
 )
 register_attention_backend(
     AttentionBackend(
-        option="sage_attn",
+        option="sage",
         attention_function="sage",
-        label="sage attn",
+        label="sage",
         install_hint="Install sageattention in the ComfyUI Python environment.",
         aliases=(
-            "sage",
+            "sage_attn",
             "sage_",
             "sageattention",
             "sage_attention",
@@ -237,23 +241,6 @@ register_attention_backend(
 )
 register_attention_backend(
     AttentionBackend(
-        option="w8a8",
-        attention_function=None,
-        label="w8a8",
-        aliases=("int8_attention", "turing_w8a8"),
-    )
-)
-register_attention_backend(
-    AttentionBackend(
-        option="flash_attn",
-        attention_function="flash",
-        label="flash attn",
-        install_hint="Install flash-attn in the ComfyUI Python environment.",
-        aliases=("flash", "flash_attention", "flashattention"),
-    )
-)
-register_attention_backend(
-    AttentionBackend(
         option="sdpa",
         attention_function="pytorch",
         label="sdpa",
@@ -261,16 +248,13 @@ register_attention_backend(
     )
 )
 
-AUTO_BACKEND_PRIORITY = ("sage_attn", "flash_attn", "sdpa")
-
-
 def attention_backend_choices() -> tuple[str, ...]:
     return tuple(_BACKENDS)
 
 
 def normalize_attention_backend(value: str | None) -> str:
     if value is None:
-        return "auto"
+        return "w8a8"
     option = _ALIASES.get(_normalize_key(value))
     if option is None:
         raise ValueError(
@@ -286,9 +270,7 @@ def _comfy_attention_function(name: str) -> Callable | None:
     return comfy_attention.get_attention_function(name, None)
 
 
-def _resolve_attention_function(backend: AttentionBackend) -> Callable | None:
-    if backend.attention_function is None:
-        return None
+def _resolve_attention_function(backend: AttentionBackend) -> Callable:
     function = _comfy_attention_function(backend.attention_function)
     if function is not None:
         return function
@@ -303,16 +285,8 @@ def _resolve_attention_function(backend: AttentionBackend) -> Callable | None:
 
 def _select_attention_backend(option: str) -> tuple[AttentionBackend, Callable]:
     option = normalize_attention_backend(option)
-    if option != "auto":
-        backend = _BACKENDS[option]
-        return backend, _resolve_attention_function(backend)
-
-    for candidate in AUTO_BACKEND_PRIORITY:
-        backend = _BACKENDS[candidate]
-        function = _comfy_attention_function(backend.attention_function)
-        if function is not None:
-            return backend, function
-    raise RuntimeError("No supported attention backend is available")
+    backend = _BACKENDS[option]
+    return backend, _resolve_attention_function(backend)
 
 
 def bundled_available() -> bool:

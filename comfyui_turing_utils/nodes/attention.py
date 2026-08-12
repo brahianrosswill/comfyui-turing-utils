@@ -125,7 +125,7 @@ class SolSparseAttentionPatch:
                 "dense_prefix_steps": (
                     "INT",
                     {
-                        "default": 0,
+                        "default": 1,
                         "min": 0,
                         "max": 1000,
                         "step": 1,
@@ -149,7 +149,7 @@ class SolSparseAttentionPatch:
                         "min": 0,
                         "max": 256,
                         "step": 1,
-                        "tooltip": "Keep this many transformer layers at the beginning of every sparse step on the selected dense backend.",
+                        "tooltip": "Keep this many transformer layers at the beginning of every sparse step on the selected dense backend. If prefix + suffix reaches the model layer count, all layers use the dense backend without Sol preprocessing.",
                     },
                 ),
                 "dense_suffix_layers": (
@@ -159,7 +159,7 @@ class SolSparseAttentionPatch:
                         "min": 0,
                         "max": 256,
                         "step": 1,
-                        "tooltip": "Keep this many transformer layers at the end of every sparse step on the selected dense backend. Requires layer-count metadata.",
+                        "tooltip": "Keep this many transformer layers at the end of every sparse step on the selected dense backend. Requires layer-count metadata; overlap with the prefix intentionally makes all layers dense.",
                     },
                 ),
             },
@@ -167,8 +167,8 @@ class SolSparseAttentionPatch:
                 "use_w8a8": (
                     "BOOLEAN",
                     {
-                        "default": False,
-                        "tooltip": "Use signed INT8 V and unsigned INT8 probability Tensor Cores for Sol exact blocks and protected dense steps/layers. Experimental; disabled keeps the stable FP16/BF16 PV path.",
+                        "default": True,
+                        "tooltip": "Use signed INT8 V and unsigned INT8 probability Tensor Cores for Sol exact blocks and protected dense steps/layers. Enabled is the default Turing fast path.",
                     },
                 ),
                 "debug_route_density": (
@@ -197,11 +197,11 @@ class SolSparseAttentionPatch:
         sparse_reference_image: bool = False,
         sparse_reference_video: bool = True,
         sparse_reference_audio: bool = False,
-        dense_prefix_steps: int = 0,
+        dense_prefix_steps: int = 1,
         dense_suffix_steps: int = 0,
         dense_prefix_layers: int = 2,
         dense_suffix_layers: int = 0,
-        use_w8a8: bool = False,
+        use_w8a8: bool = True,
         debug_route_density: bool = False,
     ):
         return (

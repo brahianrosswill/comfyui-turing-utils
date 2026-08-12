@@ -4,7 +4,16 @@ from __future__ import annotations
 
 import torch
 
-from ..media.padding import repeat_last_frame
+
+def repeat_last_frame(tensor: torch.Tensor, count: int) -> torch.Tensor:
+    """Append copies of the final frame along the first dimension."""
+    count = int(count)
+    if count <= 0:
+        return tensor
+    if tensor.shape[0] < 1:
+        raise ValueError("Cannot repeat the final item of an empty tensor")
+    tail = tensor[-1:].repeat(count, *([1] * (tensor.ndim - 1)))
+    return torch.cat((tensor, tail), dim=0)
 
 
 def _is_wan_frame_count(frame_count: int) -> bool:
@@ -15,11 +24,6 @@ def _ceil_wan_frame_count(frame_count: int) -> int:
     if frame_count < 1:
         raise ValueError("Video must contain at least one frame.")
     return ((frame_count - 1 + 3) // 4) * 4 + 1
-
-
-def _pad_first_dim(tensor: torch.Tensor, pad_count: int) -> torch.Tensor:
-    """Compatibility name for the shared end-padding implementation."""
-    return repeat_last_frame(tensor, pad_count)
 
 
 class WanVideoFramesPadding:
@@ -67,9 +71,9 @@ class WanVideoFramesPadding:
         output_length = self._target_length(frame_count, target_frame_count)
         pad_count = output_length - frame_count
 
-        image = _pad_first_dim(image, pad_count)
+        image = repeat_last_frame(image, pad_count)
         if mask is not None:
-            mask = _pad_first_dim(mask, pad_count)
+            mask = repeat_last_frame(mask, pad_count)
         return (image, mask, width, height, output_length, frame_count)
 
     @staticmethod

@@ -12,15 +12,69 @@ import torch
 import torch.nn.functional as F
 
 from .methods import OriginalMethod, weak_method
-from ..media.references import (
-    _validate_image,
-)
 
 
 LOG = logging.getLogger("comfyui-turing-utils")
 _BERNINI_ROPE_WRAPPER_KEY = "turing_utils_bernini_context_rope"
 _ABSOLUTE_INDEX_KEY = "turing_utils_bernini_absolute_latent_indices"
 _CONTEXT_ROLES_KEY = "turing_utils_bernini_context_roles"
+
+
+def _validate_source_video(source_video: torch.Tensor) -> torch.Tensor:
+    if (
+        not torch.is_tensor(source_video)
+        or source_video.ndim != 4
+        or int(source_video.shape[-1]) < 3
+        or any(int(size) < 1 for size in source_video.shape[:3])
+    ):
+        shape = tuple(source_video.shape) if torch.is_tensor(source_video) else type(source_video).__name__
+        raise ValueError(
+            "source_video must be a non-empty IMAGE tensor [frames,height,width,channels], "
+            f"got {shape}"
+        )
+    return source_video[..., :3]
+
+
+def _resize_source_video_and_mask(
+    source_video: torch.Tensor,
+    mask: torch.Tensor | None,
+    width: int,
+    height: int,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Center-crop Bernini source media and conservatively resize its mask."""
+    width, height = int(width), int(height)
+    source_height, source_width = map(int, source_video.shape[1:3])
+    source_aspect = source_width / source_height
+    target_aspect = width / height
+    if source_aspect > target_aspect:
+        crop_width = max(1, round(source_height * target_aspect))
+        crop_height = source_height
+    else:
+        crop_width = source_width
+        crop_height = max(1, round(source_width / target_aspect))
+    left = (source_width - crop_width) // 2
+    top = (source_height - crop_height) // 2
+    source_video = source_video[:, top:top + crop_height, left:left + crop_width]
+    if mask is not None:
+        mask = mask[:, top:top + crop_height, left:left + crop_width]
+
+    source_video = F.interpolate(
+        source_video.movedim(-1, 1),
+        size=(height, width),
+        mode="area",
+    ).movedim(1, -1)
+    if mask is None:
+        return source_video, None
+
+    mask = mask.float().unsqueeze(1)
+    pooled_height = min(crop_height, height)
+    pooled_width = min(crop_width, width)
+    if (pooled_height, pooled_width) != (crop_height, crop_width):
+        mask = F.adaptive_max_pool2d(mask, (pooled_height, pooled_width))
+    if tuple(mask.shape[-2:]) != (height, width):
+        mask = F.interpolate(mask, size=(height, width), mode="nearest-exact")
+    mask = F.max_pool2d(mask, kernel_size=3, stride=1, padding=1).squeeze(1)
+    return source_video, mask
 
 
 def _context_roles(value, count: int) -> tuple[str, ...] | None:
@@ -396,7 +450,7 @@ def _make_extra_conds_with_bernini_roles(base_model):
 
 
 def _align_source_video_and_mask(source_video, mask, length: int):
-    source_video = _validate_image(source_video, "source_video")
+    source_video = _validate_source_video(source_video)
     source_length = int(source_video.shape[0])
     if mask is not None:
         if mask.ndim == 2:

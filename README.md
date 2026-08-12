@@ -2,8 +2,8 @@
 
 Compatibility and performance extensions that fill gaps in ComfyUI on older
 NVIDIA Turing GPUs. The plugin currently provides ConvRot W8A8/W4A8/W4A4
-support, exact-sm75 BF16 activation storage, bundled Turing Sage attention, and
-Wan/Bernini context-window utilities.
+support, exact-sm75 BF16 activation storage, bundled Turing Sage/W8A8
+attention, and focused Wan/Bernini utilities.
 
 ## Requirements
 
@@ -30,21 +30,12 @@ only after its CUDA sources or required version change.
 ## Nodes
 
 - `Load ConvRot DiT` loads ComfyUI ConvRot diffusion models. It supports W8A8,
-  W4A8, and W4A4 dispatch and selects bundled Sage automatically on exact sm75.
+  W4A8, and W4A4 dispatch. Its attention choices are `w8a8`, `sage`, and
+  `sdpa`; W8A8 is the default.
 - `Load ConvRot CLIP` loads a ConvRot text encoder independently of the DiT.
-- `Reference Image/Video/Audio Hub` collects ordered heterogeneous references.
-  Hubs can be chained; image/video resizing follows KJ Resize Image v2 controls,
-  zero width/height defaults disable resizing, and an optional positive video
-  frame count trims or pads only at the end.
-- `Optional Resize Image v2` mirrors KJ Resize Image v2's controls, defaults,
-  dimensions, mask output, and resize/crop/pad behavior. Its image socket is
-  optional; without an image it returns no image, allowing one node to feed an
-  optional first- or last-frame condition socket without fabricating a frame.
 - `Bernini Inpaint Condition` starts sampling from the source-video latent,
   supports local or global repainting, and optionally adds the source as aligned
   context tokens.
-- `MiniMax H3 Reference Condition (Hub)` feeds fixed Hub inputs into H3's native
-  picture/video/audio reference protocol.
 - `Bernini Context Windows` applies reference-aware Wan context windows with
   selectable absolute or official relative temporal positions.
 - `Wan Video Frames Padding` exposes Wan-compatible frame padding.
@@ -52,25 +43,12 @@ only after its CUDA sources or required version change.
 - `H3 Concat AV Latent` combines standalone H3 video and audio latents into the
   model's native nested AV latent. `H3 Separate AV Latent` splits the streams
   again; both nodes preserve matching video/audio noise masks.
-- `Resize MiniMax H3 AV Latent (Experimental)` stretches only the packed H3
-  video latent to an exact independently selected width and height on the
-  model's 32-pixel grid, while preserving the audio latent unchanged. It is
-  intended for explicitly separated low- and high-resolution sampling stages
-  and performs no cropping, padding, re-noising, or sigma conversion. An
-  optional conditioning input can resize first/last H3 keyframe latents onto
-  the same grid; independent picture/video reference latents are not changed.
-- `Patch H3 Progressive Resolution (Experimental)` keeps one final-resolution
-  H3 video/audio latent but can evaluate an initial low stage and a following
-  medium stage at independently configured video short edges. Stage names
-  describe execution order rather than size; either target may be larger than
-  the other. Audio stays untouched, and already-encoded first/last-frame latents
-  can be resized and cached without running conditioning a second time.
 - `Patch Sol Sparse Attention (Experimental)` applies the model-generic,
   loader-independent
   long-sequence sparse backend. It uses an input-adaptive statistical threshold,
   keeps one 64-token skipped-block centroid by default, accepts semantic
   multimodal layout metadata, and exposes integer dense-step safeguards,
-  dense first/last-layer protection, an optional SM75 W8A8 PV path, and an
+  dense first/last-layer protection, the SM75 W8A8 PV path by default, and an
   internal automatic short-sequence crossover.
 - `Patch Turing Attention Kernel Tuning (Experimental)` overrides the logical
   CTA-K schedule and the fused Hadamard/adaptive-anchor quality controls for
@@ -96,37 +74,14 @@ the same single-owner Q/K/V lifetime and fused RMSNorm+RoPE+INT8 preprocessing
 used by H3. This includes explicitly selected Sol calls; Sol remains opt-in.
 Generic dtype, attention, and fused operators remain model-independent.
 
-The progressive-resolution patch is explicit and is never selected by a
-loader. Build H3 conditioning once at the final output size, then connect the
-model through the patch before constructing the guider or KSampler. The sampler
-continues to own the final-resolution noisy state. The first
-`low_resolution_steps` evaluations use `low_short_edge`; the following
-`medium_resolution_steps` evaluations use `medium_short_edge`, so their sum is
-the complete staged interval. During those steps the patch temporarily repacks
-a staged-resolution video stream with the unchanged audio stream, runs the
-normal H3 conditioning path, and enlarges the denoised video prediction before
-returning it to the sampler. A target at or above the final short edge is a
-no-op for that stage. H3 rebuilds its packed layout from the temporary latent
-shape. `sigma_blend` is the default input policy: it blends
-noise-variance-preserving nearest sampling with area filtering over the complete
-staged interval. The returned denoised prediction preserves the sampler's
-high-resolution residual, which is algebraically equivalent to resizing H3's
-flow velocity instead of repeatedly projecting the sampler state into the
-staged-resolution subspace. The configured low and medium step counts remain
-fully user-controlled, including all-staged configurations intended for
-diagnostics. Spatial condition areas, masks, controls, and GLIGEN are
-currently unsupported and make that model call fall back to full resolution.
-Peak memory is still set by the later final-resolution steps, and final quality
-and speed require local workflow validation.
-
 The bundled Sage backend accepts FP16/BF16 Q/K/V, GQA, causal attention,
 unequal sequence lengths, HND/NHD layouts, and head dimensions up to 128. FP32
 callers use BF16 boundary storage and receive FP32 output. On non-Turing GPUs,
-the plugin prefers an installed SageAttention backend and then follows ComfyUI's
-normal fallback order.
+the explicit `sage` choice uses ComfyUI's registered SageAttention backend.
 
-The explicit `w8a8` attention backend is exact-sm75-only and is
-never selected by `auto`. It retains stable Sage's INT8 Q/K score domain,
+The default `w8a8` attention backend uses the bundled exact-sm75 kernel on
+supported Turing GPUs and Comfy Kitchen INT8 attention on newer architectures.
+The bundled kernel retains stable Sage's INT8 Q/K score domain,
 quantizes V channel-wise to signed INT8, packs online-softmax probabilities to
 unsigned INT8, and evaluates both QK and PV with Turing Tensor Cores. It
 supports FP16/BF16 storage, GQA, unequal sequence lengths, head dimensions
@@ -134,10 +89,10 @@ supports FP16/BF16 storage, GQA, unequal sequence lengths, head dimensions
 varlen `[total_tokens, heads, dim]` inputs. Arbitrary masks remain unsupported.
 The dense/sparse core has native D64 and D128 specializations, pads 1--63 only to
 D64 and 65--127 only to D128, and retains the original softmax scale and output
-width. The dense kernel uses a route-free specialization of the Sol exact-token core;
-unsupported calls fall back through the pre-existing attention override.
+width. The dense kernel uses a route-free specialization of the Sol exact-token
+core; unsupported calls fall back through the pre-existing attention override.
 
-Sparse attention is not a loader option and `auto` never selects it. Connect
+Sparse attention is not a loader option. Connect
 the model through the experimental Sol patch node to enable it explicitly. The
 kernel accepts FP16/BF16/FP32 Q/K/V, GQA, head dimensions 1--128, unequal Q/K,
 and unmasked non-causal sequences; incompatible or short calls use bundled
@@ -145,11 +100,11 @@ stable Sage. Automatic semantic protection requires separate Query/K layout
 metadata for unequal sequences; ambiguous single-sequence metadata falls back
 instead of applying the wrong ranges.
 
-Online Sol routing, its optional W8A8 mode, and the explicit dense W8A8 backend
-require kernel package 0.23.0. Adapter-protected Query blocks run through the
-selected exact dense backend, while every sparse Query
-keeps protected modality blocks as exact K/V sinks. Selected blocks reuse stable Sage's INT8
-Tensor Core QK path. Routing and exact selected-block QK both derive from the
+Online Sol routing and the bundled dense/Sol W8A8 backends require kernel
+package 0.23.0. Adapter-protected Query blocks run through the
+selected exact dense backend, while every sparse Query keeps protected modality
+blocks as exact K/V sinks. Selected blocks reuse stable Sage's INT8 Tensor Core
+QK path. Routing and exact selected-block QK both derive from the
 same prequantized INT8 Q/K tensors and scales. Exact proxy/correction scores
 remain in the post-Hadamard INT8 score domain, while route centroids are
 inverse-transformed to the pre-Hadamard basis before diagonal threshold
@@ -176,8 +131,8 @@ Internal CUDA phase timing is disabled by default and allocates no events. For
 a bounded diagnostic run, set `COMFYUI_TURING_UTILS_PROFILE_CALLS` to the
 number of attention calls to collect before one report is emitted.
 
-Sol's `use_w8a8` switch is disabled by default for backward-compatible quality.
-When enabled, selected exact blocks and protected dense steps/layers use the
+Sol's `use_w8a8` switch is enabled by default. Selected exact blocks and
+protected dense steps/layers use the
 same signed-V/unsigned-probability Tensor Core path. Skipped-block correction
 keeps original V centroids and FP32 online state, so the switch changes exact
 PV throughput rather than the routing policy. Both variants keep a 64-query
@@ -185,6 +140,16 @@ tile. Native D64 uses 16 KiB dynamic shared memory, while D128 uses 32 KiB. The
 automatic logical K schedule uses 64 tokens for short K and two sequential
 64-token stages for K above 1024.
 The latter does not hold 128 K/V tokens in shared memory, preserving CTA density.
+
+Sol keeps the first denoising step and the first two transformer layers dense
+by default. If `dense_prefix_layers + dense_suffix_layers` reaches or exceeds
+the runtime layer count, every layer dispatches directly to the selected dense
+W8A8 or Sage backend and skips all Sol preprocessing.
+
+The `sdpa` option keeps ComfyUI's `AttentionTensorContainer` ownership path.
+On exact-sm75, BF16 Q/K/V are consumed and converted one at a time to FP16 before
+calling PyTorch SDPA, avoiding its slow BF16 math fallback while bounding the
+period where floating input copies overlap. The output is restored to BF16.
 
 The threshold and fixed +/- one-block local neighborhood execute inside each
 attention CTA. Only compact, head-independent dense-Query and exact-KV policy

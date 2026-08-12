@@ -256,12 +256,12 @@ def _make_dense_container_function(kernel: str) -> Callable:
     return container_function
 
 
-def _uses_bundled_turing_sage(option: str, device: torch.device | None) -> bool:
+def _uses_bundled_turing_attention(option: str, device: torch.device | None) -> bool:
     option = normalize_attention_backend(option)
     return bool(
         device is not None
         and is_supported_turing_device(device)
-        and option in {"auto", "sage_attn", "w8a8"}
+        and option in {"sage", "w8a8"}
     )
 
 
@@ -279,14 +279,81 @@ def _dtype_compatible_fallback(original: Callable, *args, **kwargs):
     return original(*args, **kwargs)
 
 
+def _uses_turing_bf16_sdpa(q, k, v) -> bool:
+    return bool(
+        all(isinstance(tensor, torch.Tensor) for tensor in (q, k, v))
+        and q.dtype is torch.bfloat16
+        and k.dtype is torch.bfloat16
+        and v.dtype is torch.bfloat16
+        and q.device == k.device == v.device
+        and is_supported_turing_device(q.device)
+    )
+
+
+def _convert_sdpa_mask_to_fp16(args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+    """Match floating additive masks to FP16 Q/K/V; boolean masks stay exact."""
+    if args and torch.is_tensor(args[0]) and args[0].is_floating_point():
+        positional = list(args)
+        positional[0] = positional[0].to(torch.float16)
+        return tuple(positional), kwargs
+    mask = kwargs.get("mask")
+    if torch.is_tensor(mask) and mask.is_floating_point():
+        kwargs = dict(kwargs)
+        kwargs["mask"] = mask.to(torch.float16)
+    return args, kwargs
+
+
+def _turing_sdpa_fp16(
+    target: Callable,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    heads: int,
+    *args,
+    **kwargs,
+):
+    """Avoid Turing's BF16 SDPA math fallback while preserving its API dtype."""
+    use_fp16 = _uses_turing_bf16_sdpa(q, k, v)
+    if not use_fp16:
+        return target(q, k, v, heads, *args, **kwargs)
+
+    q = q.to(torch.float16)
+    k = k.to(torch.float16)
+    v = v.to(torch.float16)
+    args, kwargs = _convert_sdpa_mask_to_fp16(args, kwargs)
+    return target(q, k, v, heads, *args, **kwargs).to(torch.bfloat16)
+
+
+def _make_sdpa_container_function(target: Callable) -> Callable:
+    """Consume Q/K/V before SDPA conversion so BF16 and FP16 overlap is bounded."""
+
+    def container_function(q, k, v, heads: int, *args, **kwargs):
+        # Validate every owner before the first take to avoid a partial transfer.
+        query_view, key_view, value_view = q.peek(), k.peek(), v.peek()
+        use_fp16 = _uses_turing_bf16_sdpa(query_view, key_view, value_view)
+        del query_view, key_view, value_view
+
+        query = q.take()
+        if use_fp16:
+            query = query.to(torch.float16)
+        key = k.take()
+        if use_fp16:
+            key = key.to(torch.float16)
+        value = v.take()
+        if use_fp16:
+            value = value.to(torch.float16)
+
+        if not use_fp16:
+            return target(query, key, value, heads, *args, **kwargs)
+        args, kwargs = _convert_sdpa_mask_to_fp16(args, kwargs)
+        return target(query, key, value, heads, *args, **kwargs).to(torch.bfloat16)
+
+    return container_function
+
+
 def make_attention_override(option: str, device: torch.device | None = None) -> Callable:
     option = normalize_attention_backend(option)
-    bundled_turing = _uses_bundled_turing_sage(option, device)
-    if option == "w8a8" and not bundled_turing:
-        raise RuntimeError(
-            "The W8A8 attention backend requires the bundled exact-sm75 kernel; "
-            "select sage_attn, flash_attn, or sdpa on other GPUs."
-        )
+    bundled_turing = _uses_bundled_turing_attention(option, device)
     if bundled_turing:
         if option == "w8a8" and not bundled_w8a8_available():
             raise RuntimeError(
@@ -302,7 +369,7 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
             preflight_bundled_w8a8(device)
         else:
             preflight_bundled(device)
-        backend = _BACKENDS[option if option == "w8a8" else "sage_attn"]
+        backend = _BACKENDS[option]
         target = turing_w8a8_attention if option == "w8a8" else turing_sage_attention
         implementation = (
             "bundled_turing_w8a8"
@@ -320,12 +387,14 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
         if bundled_turing:
             return target(fallback, *args, **kwargs)
         if (
-            backend.option == "sage_attn"
+            backend.option == "sage"
             and len(args) >= 3
             and all(isinstance(value, torch.Tensor) for value in args[:3])
             and any(value.dtype == torch.float32 for value in args[:3])
         ):
             return fallback(*args, **kwargs)
+        if backend.option == "sdpa" and len(args) >= 4:
+            return _turing_sdpa_fp16(target, *args, **kwargs)
         return target(*args, **kwargs)
 
     attention_override.turing_utils_attention_backend = backend.option
@@ -338,6 +407,13 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
         attention_override.prepared_attention_executor = _make_dense_prepared_executor(
             "w8a8" if option == "w8a8" else "sage"
         )
+    if not bundled_turing and backend.option == "sdpa":
+        attention_override.container_function = _make_sdpa_container_function(target)
+    elif (
+        not bundled_turing
+        and callable(getattr(target, "container_function", None))
+    ):
+        attention_override.container_function = target.container_function
     return attention_override
 
 

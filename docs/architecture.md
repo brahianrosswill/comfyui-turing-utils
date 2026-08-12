@@ -17,7 +17,6 @@ comfyui-turing-utils/
 │   ├── attention/               # dense/sparse backends, layout and patches
 │   ├── quantization/            # ConvRot loading, dispatch and fusions
 │   ├── adapters/                # MiniMax, Wan and Bernini integration
-│   ├── media/                   # references, resize and padding
 │   ├── nodes/                   # thin ComfyUI schemas
 │   ├── hardware.py
 │   ├── kernel_api.py            # independent-kernel boundary
@@ -60,7 +59,7 @@ built-in adapters without importing ComfyUI node definitions.
 | Package | Responsibility |
 |---|---|
 | `attention/stable.py` | backend registry, stable bundled Sage/W8A8, dtype/layout facade |
-| `attention/sparse.py` | explicit experimental Sol policy, including optional W8A8 PV dispatch |
+| `attention/sparse.py` | explicit experimental Sol policy, with W8A8 or FP16 PV dispatch |
 | `attention/protocol.py` | versioned tensor ownership, transform, capability, and execution contract |
 | `attention/integration.py` | model-neutral projected-QKV handoff and attention-site registry |
 | `attention/layout.py` | versioned Query/KV modality topology contract and provider registry |
@@ -69,11 +68,10 @@ built-in adapters without importing ComfyUI node definitions.
 | `quantization/convrot.py` | ConvRot metadata parsing and model/CLIP loading services |
 | `quantization/dispatch.py` | W8A8/W4A8/W4A4 activation quantization and GEMM dispatch |
 | `quantization/fusions.py` | model-independent fused activation and normalization operations |
-| `adapters/minimax/` | H3 layout publication, VRAM planning, block fusions, and explicit progressive experiment |
+| `adapters/minimax/` | H3 layout publication, VRAM planning, and block fusions |
 | `adapters/wan.py` | Wan/Bernini packed-context planning and supported self-attention preprocessing |
 | `adapters/wan_layout.py` | loader-independent Wan/Bernini self-attention sequence semantics |
 | `adapters/bernini.py` | Bernini context-window and absolute-RoPE integration |
-| `media/` | reference sets, resizing transforms, and shared video padding |
 | `nodes/` | thin ComfyUI schemas and calls into the implementation packages |
 
 `hardware.py` owns architecture predicates. `kernel_api.py` is the only module
@@ -89,7 +87,7 @@ paths. The sole top-level compatibility module is `attention.py`; it preserves
 the old monkey-patchable attention facade while downstream integrations migrate
 to `comfyui_turing_utils.attention`.
 
-Sparse attention remains explicit and is never selected by loader `auto`.
+Sparse attention remains explicit and is never selected by a loader backend.
 Model-specific topology is installed through the attention-layout provider
 registry, so the official ComfyUI loader and ConvRot loader follow the same path.
 Model-side fused Q/K handoff is installed through a separate attention-site

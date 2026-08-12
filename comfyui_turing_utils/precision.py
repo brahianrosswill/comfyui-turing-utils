@@ -106,7 +106,7 @@ def prepare_turing_runtime(
 
     if attention_backend is not None:
         attention_backend = normalize_attention_backend(attention_backend)
-    bundled_attention = attention_backend in {"auto", "sage_attn"}
+    bundled_attention = attention_backend in {"w8a8", "sage"}
     needs_kernel = bool(summary.w4a4 or summary.w4a8 or summary.w8a8) or bundled_attention
     if needs_kernel:
         _check_kernel_contract()

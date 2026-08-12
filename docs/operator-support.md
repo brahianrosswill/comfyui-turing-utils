@@ -16,9 +16,9 @@ ComfyUI nodes
 ```
 
 The plugin and kernel package remain independently installable. A Python-only
-plugin update does not rebuild CUDA. Sparse attention and W8A8 attention remain
-explicit opt-ins; loader `auto` selects the stable bundled Sage path on a
-supported Turing GPU.
+plugin update does not rebuild CUDA. Sparse attention remains an explicit patch.
+The loader defaults to bundled W8A8 on supported Turing GPUs and Comfy Kitchen
+INT8 attention on newer architectures; Sage and SDPA remain explicit choices.
 
 ## Public custom operators
 
@@ -51,7 +51,7 @@ duplicate full W4A4 and W8A8 GEMM implementations.
 
 | Feature | Stable Sage | Dense W8A8 | Sol FP16-PV | Sol W8A8 |
 |---|---:|---:|---:|---:|
-| Production status | default on Turing | explicit | experimental patch | experimental patch option |
+| Production status | explicit | loader default | experimental patch option | experimental patch default |
 | Input storage | FP16/BF16 | FP16/BF16 | FP16/BF16 | FP16/BF16 |
 | QK score domain | INT8, FP32 accumulation | INT8, FP32 accumulation | INT8-consistent routing and score | INT8-consistent routing and score |
 | PV path | FP16 Tensor Core, FP32 accumulation | U8 x S8 Tensor Core | FP16 Tensor Core | U8 x S8 Tensor Core |
@@ -95,8 +95,7 @@ runtime.
 - MiniMax H3 publishes packed text/image/video/audio token ranges, estimates
   packed dynamic-VRAM allocations, fuses segmented RMSNorm+AdaLN, and fuses
   fc1 -> SwiGLU -> fc2-input quantization. Supported attention calls also fuse
-  per-head RMSNorm+split-half RoPE directly into INT8 Q/K. Progressive
-  resolution remains an explicit experiment.
+  per-head RMSNorm+split-half RoPE directly into INT8 Q/K.
 - Wan publishes packed-context memory estimates and fuses its whole-row Q/K
   RMSNorm plus interleaved RoPE into Sage/W8A8/Sol Q/K quantization.
 - Bernini provides conditioning, context-window memory estimation, and
@@ -104,8 +103,8 @@ runtime.
   generic fused preprocessing and tensor-lifetime path, including explicitly
   selected Sol; it does not own
   quantized CUDA kernels.
-- Reference hubs, padding, resizing, and H3 AV latent utilities are media or
-  conditioning operations, not CUDA kernel families.
+- Video padding and H3 AV latent utilities are media operations, not CUDA
+  kernel families.
 
 ## Optimization status
 

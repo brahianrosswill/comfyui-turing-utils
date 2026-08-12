@@ -192,7 +192,7 @@ class MiniMaxLayoutProviderTest(unittest.TestCase):
         for key, value in first_forwards.items():
             self.assertIs(patcher.object_patches[key], value)
 
-    def test_runtime_layout_rebuilds_stale_progressive_resolution_payload(self):
+    def test_runtime_layout_rebuilds_stale_shape_payload(self):
         import comfy.ldm.minimax.model as minimax_model
 
         diffusion = FakeMiniMaxDiffusion()

@@ -20,7 +20,6 @@ import comfy.utils
 
 from ..attention import (
     apply_attention_backend,
-    attention_backend_choices,
     normalize_attention_backend,
 )
 from ..adapters.registry import apply_model_adapters
@@ -410,7 +409,7 @@ def _validate_runtime_support(expected: ConvRotSummary, device: torch.device | N
 def load_convrot_model(
     model_path: str | Path,
     force_int8_gemm: bool = False,
-    attention_backend: str | None = "auto",
+    attention_backend: str | None = "w8a8",
     *,
     disable_dynamic: bool = False,
 ):

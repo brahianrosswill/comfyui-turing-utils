@@ -113,7 +113,7 @@ class BF16PolicyTest(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "attention self-test"),
         ):
             bf16_policy.prepare_turing_runtime(
-                NO_CONVROT, torch.device("cuda", 0), "auto"
+                NO_CONVROT, torch.device("cuda", 0), "w8a8"
             )
 
     def test_legacy_sage_alias_preflights_the_canonical_bundled_backend(self):

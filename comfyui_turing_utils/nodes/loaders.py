@@ -7,6 +7,7 @@ import torch
 
 import comfy.sd
 
+from ..attention import attention_backend_choices
 from ..quantization import convrot as service
 
 
@@ -37,15 +38,14 @@ class ConvRotDiffusionModelLoader:
             },
             "optional": {
                 "patch_attention": (
-                    service.attention_backend_choices(),
+                    attention_backend_choices(),
                     {
-                        "default": "auto",
+                        "default": "w8a8",
                         "tooltip": (
-                            "Select this ConvRot model's attention backend. "
-                            "sage_attn uses the bundled implementation on Turing and the installed SageAttention "
-                            "package elsewhere. auto uses the same Turing path; elsewhere it tries sage_attn, "
-                            "then flash_attn, then PyTorch SDPA. Experimental sparse attention is configured "
-                            "with the separate Patch Sol Sparse Attention node."
+                            "Select w8a8, sage, or sdpa. On Turing, w8a8 and sage use the bundled exact-sm75 "
+                            "kernels; elsewhere w8a8 uses Comfy Kitchen and sage uses the installed SageAttention "
+                            "package. Turing BF16 SDPA inputs are stored as FP16 for the attention call. "
+                            "Experimental sparse attention is configured with the separate Sol patch node."
                         ),
                     },
                 ),
@@ -62,7 +62,7 @@ class ConvRotDiffusionModelLoader:
         self,
         unet_name: str,
         force_int8_gemm: bool = False,
-        patch_attention: str = "auto",
+        patch_attention: str = "w8a8",
     ):
         model_path = service._resolve_convrot_model_path(
             service.DIFFUSION_FOLDER_NAME, unet_name

@@ -63,7 +63,7 @@ class PackageArchitectureTest(unittest.TestCase):
         self.assertFalse(any((ROOT / name).exists() for name in retired_modules))
         self.assertTrue((ROOT / "attention.py").is_file())
 
-    def test_node_ids_remain_stable(self):
+    def test_registered_node_ids_match_the_maintained_surface(self):
         from comfyui_turing_utils.registration import NODE_CLASS_MAPPINGS
 
         self.assertEqual(
@@ -75,15 +75,8 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsMiniMaxH3VideoFramesPadding",
                 "TuringUtilsBerniniContextWindowsCore",
                 "TuringUtilsBerniniInpaintCondition",
-                "TuringUtilsReferenceImageHub",
-                "TuringUtilsReferenceVideoHub",
-                "TuringUtilsReferenceAudioHub",
-                "TuringUtilsOptionalResizeImageV2",
-                "TuringUtilsMiniMaxH3ReferenceConditionHub",
                 "TuringUtilsH3ConcatAVLatent",
                 "TuringUtilsH3SeparateAVLatent",
-                "TuringUtilsMiniMaxH3LatentResize",
-                "TuringUtilsMiniMaxH3ProgressiveResolutionPatch",
                 "TuringUtilsSolSparseAttentionPatch",
                 "TuringUtilsAttentionKernelTuningPatch",
             ),

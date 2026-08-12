@@ -17,7 +17,10 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 import comfy.context_windows  # noqa: E402
 import comfy.conds  # noqa: E402
 from comfyui_turing_utils.adapters import bernini as bernini_nodes  # noqa: E402
-from comfyui_turing_utils.nodes.bernini import BerniniContextWindowsCore  # noqa: E402
+from comfyui_turing_utils.nodes.bernini import (  # noqa: E402
+    BerniniContextWindowsCore,
+    BerniniInpaintCondition,
+)
 
 
 class FakeModel:
@@ -38,7 +41,44 @@ class FakeModel:
         self.removed_wrappers.append((wrapper_type, key))
 
 
+class FakeVAE:
+    def encode(self, image):
+        return torch.zeros(
+            1,
+            16,
+            ((image.shape[0] - 1) // 4) + 1,
+            image.shape[1] // 8,
+            image.shape[2] // 8,
+        )
+
+
 class BerniniContextWindowsTest(unittest.TestCase):
+    def test_inpaint_uses_source_latent_and_conservative_mask(self):
+        source = torch.zeros(5, 16, 16, 3)
+        mask = torch.zeros(5, 16, 16)
+        mask[2, 7, 7] = 1.0
+        output = BerniniInpaintCondition.execute(
+            [[torch.zeros(1), {}]],
+            [[torch.zeros(1), {}]],
+            FakeVAE(),
+            source,
+            16,
+            16,
+            5,
+            1,
+            source_as_context=True,
+            mask=mask,
+        )
+        latent = output[2]
+        self.assertEqual(tuple(latent["samples"].shape), (1, 16, 2, 2, 2))
+        self.assertGreater(float(latent["noise_mask"].sum()), 0.0)
+        self.assertIs(output[0][0][1]["context_latents"][0], latent["samples"])
+
+    def test_inpaint_schema_has_no_removed_reference_hub_inputs(self):
+        input_names = [item.id for item in BerniniInpaintCondition.define_schema().inputs]
+        self.assertNotIn("image_references", input_names)
+        self.assertNotIn("video_references", input_names)
+
     def test_wan_frame_conversion_matches_official_node(self):
         self.assertEqual(bernini_nodes._validate_context_window_frames(81, 30), (21, 7))
         self.assertEqual(bernini_nodes._validate_context_window_frames(1, 0), (1, 0))

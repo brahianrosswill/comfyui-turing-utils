@@ -187,6 +187,7 @@ class AttentionBackendsTest(unittest.TestCase):
             override = attention_backends.make_sparse_attention_override(
                 torch.device("cuda", 0),
                 dense_prefix_layers=0,
+                use_w8a8=False,
             )
             request = attention_backends.PreparedAttention.from_hnd(
                 q, k, v, heads=2, qk_transform=spec, transformer_options={}
@@ -367,17 +368,22 @@ class AttentionBackendsTest(unittest.TestCase):
     def test_backend_choices_are_stable(self):
         self.assertEqual(
             attention_backends.attention_backend_choices(),
-            ("auto", "sage_attn", "w8a8", "flash_attn", "sdpa"),
+            ("w8a8", "sage", "sdpa"),
         )
 
     def test_aliases_normalize_to_node_options(self):
-        self.assertEqual(attention_backends.normalize_attention_backend("default"), "auto")
+        self.assertEqual(attention_backends.normalize_attention_backend(None), "w8a8")
         self.assertEqual(attention_backends.normalize_attention_backend("torch-sdpa"), "sdpa")
-        self.assertEqual(attention_backends.normalize_attention_backend("sage attention"), "sage_attn")
-        self.assertEqual(attention_backends.normalize_attention_backend("sage"), "sage_attn")
-        self.assertEqual(attention_backends.normalize_attention_backend("sage_"), "sage_attn")
-        self.assertEqual(attention_backends.normalize_attention_backend("turing-sage"), "sage_attn")
-        self.assertEqual(attention_backends.normalize_attention_backend("flash-attn"), "flash_attn")
+        self.assertEqual(attention_backends.normalize_attention_backend("sage attention"), "sage")
+        self.assertEqual(attention_backends.normalize_attention_backend("sage_attn"), "sage")
+        self.assertEqual(attention_backends.normalize_attention_backend("sage_"), "sage")
+        self.assertEqual(attention_backends.normalize_attention_backend("turing-sage"), "sage")
+        with self.assertRaises(ValueError):
+            attention_backends.normalize_attention_backend("flash-attn")
+        with self.assertRaises(ValueError):
+            attention_backends.normalize_attention_backend("auto")
+        with self.assertRaises(ValueError):
+            attention_backends.normalize_attention_backend("default")
         with self.assertRaises(ValueError):
             attention_backends.normalize_attention_backend("sage1")
         with self.assertRaises(ValueError):
@@ -386,69 +392,12 @@ class AttentionBackendsTest(unittest.TestCase):
     def test_backend_registration_rejects_alias_collisions_without_partial_registration(self):
         backend = attention_backends.AttentionBackend(
             option="test_collision",
-            attention_function=None,
+            attention_function="unused",
             label="sage",
         )
         with self.assertRaisesRegex(ValueError, "alias collision"):
             attention_backends.register_attention_backend(backend)
         self.assertNotIn("test_collision", attention_backends.attention_backend_choices())
-
-    def test_auto_prefers_sage(self):
-        model = FakeModel()
-        functions = {
-            "sage": lambda *args, **kwargs: None,
-            "flash": lambda *args, **kwargs: None,
-            "pytorch": lambda *args, **kwargs: None,
-        }
-        with mock.patch(
-            "comfy.ldm.modules.attention.get_attention_function",
-            side_effect=lambda name, default: functions.get(name, default),
-        ):
-            attention_backends.apply_attention_backend(model, "auto")
-
-        self.assertEqual(
-            model.model_options["transformer_options"]["turing_utils_attention_backend"],
-            "sage_attn",
-        )
-        self.assertEqual(
-            model.model_options["transformer_options"]["turing_utils_attention_implementation"],
-            "comfy:sage",
-        )
-
-    def test_auto_falls_back_to_flash(self):
-        model = FakeModel()
-        functions = {
-            "sage": None,
-            "flash": lambda *args, **kwargs: None,
-            "pytorch": lambda *args, **kwargs: None,
-        }
-        with mock.patch(
-            "comfy.ldm.modules.attention.get_attention_function",
-            side_effect=lambda name, default: functions.get(name, default),
-        ):
-            attention_backends.apply_attention_backend(model, "auto")
-
-        transformer_options = model.model_options["transformer_options"]
-        self.assertEqual(transformer_options["turing_utils_attention_backend"], "flash_attn")
-        self.assertIn("optimized_attention_override", transformer_options)
-
-    def test_auto_falls_back_to_sdpa(self):
-        model = FakeModel()
-        functions = {
-            "sage": None,
-            "flash": None,
-            "pytorch": lambda *args, **kwargs: None,
-        }
-        with mock.patch(
-            "comfy.ldm.modules.attention.get_attention_function",
-            side_effect=lambda name, default: functions.get(name, default),
-        ):
-            attention_backends.apply_attention_backend(model, "auto")
-
-        self.assertEqual(
-            model.model_options["transformer_options"]["turing_utils_attention_backend"],
-            "sdpa",
-        )
 
     def test_external_sage_sends_fp32_qkv_to_pytorch_attention(self):
         sage = mock.Mock()
@@ -460,7 +409,7 @@ class AttentionBackendsTest(unittest.TestCase):
                 sage if name == "sage" else pytorch if name == "pytorch" else default
             ),
         ):
-            override = attention_backends.make_attention_override("sage_attn")
+            override = attention_backends.make_attention_override("sage")
             q = torch.randn(1, 2, 4, 8, dtype=torch.float32)
             self.assertEqual(override(original, q, q, q, 2, skip_reshape=True), "pytorch")
         pytorch.assert_called_once()
@@ -474,7 +423,7 @@ class AttentionBackendsTest(unittest.TestCase):
             "comfy.ldm.modules.attention.get_attention_function",
             side_effect=lambda name, default: sage if name == "sage" else default,
         ):
-            override = attention_backends.make_attention_override("sage_attn")
+            override = attention_backends.make_attention_override("sage")
 
         bf16 = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
         fp32 = bf16.float()
@@ -493,7 +442,7 @@ class AttentionBackendsTest(unittest.TestCase):
             "comfy.ldm.modules.attention.get_attention_function",
             side_effect=lambda name, default: sage if name == "sage" else default,
         ):
-            override = attention_backends.make_attention_override("sage_attn")
+            override = attention_backends.make_attention_override("sage")
 
         q = torch.randn(1, 2, 4, 8, dtype=torch.float16)
         out = override(lambda *args, **kwargs: None, q, q, q, 2, skip_reshape=True)
@@ -513,7 +462,7 @@ class AttentionBackendsTest(unittest.TestCase):
             ),
             mock.patch("comfy.ldm.modules.attention.sageattn") as sage,
         ):
-            attention_backends.apply_attention_backend(model, "sage_attn")
+            attention_backends.apply_attention_backend(model, "sage")
             transformer_options = model.model_options["transformer_options"]
             q = torch.randn(1, 2, 4, 8, dtype=torch.float32)
             output = comfy_attention.optimized_attention(
@@ -546,6 +495,69 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertIs(captured["q"], q)
         self.assertIs(out, q)
 
+    def test_turing_sdpa_converts_bf16_qkv_to_fp16_and_restores_output(self):
+        captured = {}
+
+        def sdpa(q, k, v, *args, **kwargs):
+            captured["dtypes"] = (q.dtype, k.dtype, v.dtype)
+            captured["mask_dtype"] = kwargs["mask"].dtype
+            return q
+
+        with (
+            mock.patch(
+                "comfy.ldm.modules.attention.get_attention_function",
+                side_effect=lambda name, default: sdpa if name == "pytorch" else default,
+            ),
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+        ):
+            override = attention_backends.make_attention_override(
+                "sdpa", device=torch.device("cuda", 0)
+            )
+            q = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+            mask = torch.zeros(4, 4, dtype=torch.float32)
+            out = override(
+                lambda *args, **kwargs: None,
+                q,
+                q,
+                q,
+                2,
+                mask=mask,
+                skip_reshape=True,
+            )
+
+        self.assertEqual(captured["dtypes"], (torch.float16,) * 3)
+        self.assertEqual(captured["mask_dtype"], torch.float16)
+        self.assertEqual(out.dtype, torch.bfloat16)
+
+    def test_turing_sdpa_container_consumes_inputs_before_fp16_call(self):
+        captured = {}
+
+        def sdpa(q, k, v, *args, **kwargs):
+            captured["dtypes"] = (q.dtype, k.dtype, v.dtype)
+            return q
+
+        with (
+            mock.patch(
+                "comfy.ldm.modules.attention.get_attention_function",
+                side_effect=lambda name, default: sdpa if name == "pytorch" else default,
+            ),
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+        ):
+            override = attention_backends.make_attention_override(
+                "sdpa", device=torch.device("cuda", 0)
+            )
+            containers = tuple(
+                comfy_attention.AttentionTensorContainer(
+                    torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+                )
+                for _ in range(3)
+            )
+            out = override.container_function(*containers, 2, skip_reshape=True)
+
+        self.assertEqual(captured["dtypes"], (torch.float16,) * 3)
+        self.assertEqual(out.dtype, torch.bfloat16)
+        self.assertTrue(all(container.tensor is None for container in containers))
+
     def test_sdpa_backend_overrides_optimized_attention(self):
         model = FakeModel()
         attention_backends.apply_attention_backend(model, "sdpa")
@@ -559,7 +571,7 @@ class AttentionBackendsTest(unittest.TestCase):
         out = comfy_attention.optimized_attention(q, k, v, heads=2, transformer_options=transformer_options)
         self.assertEqual(tuple(out.shape), (1, 8, 16))
 
-    def test_turing_auto_uses_stable_bundled_sage_baseline(self):
+    def test_turing_explicit_sage_uses_stable_bundled_baseline(self):
         model = FakeModel()
         q = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
         with (
@@ -568,7 +580,7 @@ class AttentionBackendsTest(unittest.TestCase):
             mock.patch("attention.preflight_bundled") as preflight,
             mock.patch("attention.turing_sage_attention", return_value=q) as kernel,
         ):
-            attention_backends.apply_attention_backend(model, "auto", device=torch.device("cuda", 0))
+            attention_backends.apply_attention_backend(model, "sage", device=torch.device("cuda", 0))
             override = model.model_options["transformer_options"]["optimized_attention_override"]
             out = override(lambda *args, **kwargs: None, q, q, q, 2, skip_reshape=True)
 
@@ -577,14 +589,14 @@ class AttentionBackendsTest(unittest.TestCase):
         preflight.assert_called_once_with(torch.device("cuda", 0))
         self.assertEqual(
             model.model_options["transformer_options"]["turing_utils_attention_backend"],
-            "sage_attn",
+            "sage",
         )
         self.assertEqual(
             model.model_options["transformer_options"]["turing_utils_attention_implementation"],
             "bundled_turing_sage",
         )
 
-    def test_turing_explicit_sage_attn_selects_bundled_backend(self):
+    def test_turing_explicit_sage_selects_bundled_backend(self):
         model = FakeModel()
         q = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
         with (
@@ -594,7 +606,7 @@ class AttentionBackendsTest(unittest.TestCase):
             mock.patch("attention.turing_sage_attention", return_value=q) as kernel,
         ):
             attention_backends.apply_attention_backend(
-                model, "sage_attn", device=torch.device("cuda", 0)
+                model, "sage", device=torch.device("cuda", 0)
             )
             override = model.model_options["transformer_options"]["optimized_attention_override"]
             override(lambda *args, **kwargs: None, q, q, q, 2, skip_reshape=True)
@@ -635,14 +647,23 @@ class AttentionBackendsTest(unittest.TestCase):
             "bundled_turing_w8a8",
         )
 
-    def test_explicit_w8a8_rejects_non_turing_device(self):
+    def test_explicit_w8a8_uses_kitchen_on_non_turing_device(self):
+        kitchen = mock.Mock(return_value="kitchen")
+        kitchen.container_function = mock.Mock(return_value="container")
         with (
             mock.patch("attention.is_supported_turing_device", return_value=False),
-            self.assertRaisesRegex(RuntimeError, "exact-sm75"),
+            mock.patch(
+                "comfy.ldm.modules.attention.get_attention_function",
+                side_effect=lambda name, default: (
+                    kitchen if name == "comfy_kitchen_int8" else default
+                ),
+            ),
         ):
-            attention_backends.make_attention_override(
+            override = attention_backends.make_attention_override(
                 "w8a8", device=torch.device("cuda", 0)
             )
+        self.assertEqual(override.turing_utils_attention_implementation, "comfy:comfy_kitchen_int8")
+        self.assertIs(override.container_function, kitchen.container_function)
 
     def test_legacy_sage_alias_uses_external_sage_on_non_turing_device(self):
         sage = mock.Mock(return_value="sage")
@@ -656,20 +677,8 @@ class AttentionBackendsTest(unittest.TestCase):
             override = attention_backends.make_attention_override(
                 "sage", device=torch.device("cuda", 0)
             )
-        self.assertEqual(override.turing_utils_attention_backend, "sage_attn")
+        self.assertEqual(override.turing_utils_attention_backend, "sage")
         self.assertEqual(override.turing_utils_attention_implementation, "comfy:sage")
-
-    def test_turing_explicit_non_sage_backend_is_honored(self):
-        flash = lambda *args, **kwargs: None
-        with (
-            mock.patch("attention.is_supported_turing_device", return_value=True),
-            mock.patch(
-                "comfy.ldm.modules.attention.get_attention_function",
-                side_effect=lambda name, default: flash if name == "flash" else default,
-            ),
-        ):
-            override = attention_backends.make_attention_override("flash_attn", device=torch.device("cuda", 0))
-        self.assertEqual(override.turing_utils_attention_backend, "flash_attn")
 
     def test_sparse_override_preflights_independent_kernel(self):
         q = torch.zeros((1, 2, 256, 128), dtype=torch.bfloat16)
@@ -695,6 +704,7 @@ class AttentionBackendsTest(unittest.TestCase):
                 dense_prefix_layers=3,
                 dense_suffix_layers=4,
                 debug_route_density=True,
+                use_w8a8=False,
             )
             output = override(
                 mock.Mock(),
@@ -737,7 +747,7 @@ class AttentionBackendsTest(unittest.TestCase):
             mock.patch("attention.turing_sol_sparse_attention", return_value=q) as sparse,
         ):
             override = attention_backends.make_sparse_attention_override(
-                torch.device("cuda", 0), debug_route_density=True
+                torch.device("cuda", 0), debug_route_density=True, use_w8a8=False
             )
             for layer_index in (0, 1, 49):
                 override(
@@ -809,6 +819,42 @@ class AttentionBackendsTest(unittest.TestCase):
         dense.assert_called_once()
         sparse.assert_called_once()
         self.assertTrue(sparse.call_args.kwargs["use_w8a8"])
+
+    def test_overlapping_dense_layer_ranges_bypass_sol_for_every_layer(self):
+        q = torch.zeros((1, 2, 4096, 128), dtype=torch.bfloat16)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention.bundled_sparse_available", return_value=True),
+            mock.patch("attention.bundled_w8a8_available", return_value=True),
+            mock.patch("attention.preflight_bundled"),
+            mock.patch("attention.preflight_bundled_sparse"),
+            mock.patch("attention.preflight_bundled_w8a8"),
+            mock.patch("attention.turing_w8a8_attention", return_value=q) as dense,
+            mock.patch("attention.turing_sol_sparse_attention", return_value=q) as sparse,
+        ):
+            override = attention_backends.make_sparse_attention_override(
+                torch.device("cuda", 0),
+                dense_prefix_layers=26,
+                dense_suffix_layers=25,
+            )
+            for layer_index in range(50):
+                override(
+                    mock.Mock(),
+                    q,
+                    q,
+                    q,
+                    2,
+                    skip_reshape=True,
+                    transformer_options={
+                        "turing_utils_attention_layout": {
+                            "layer_index": layer_index,
+                            "layer_count": 50,
+                        }
+                    },
+                )
+
+        self.assertEqual(dense.call_count, 50)
+        sparse.assert_not_called()
 
     def test_experimental_sparse_rejects_non_turing_device(self):
         with (

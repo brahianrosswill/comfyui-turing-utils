@@ -536,7 +536,7 @@ class FakeModel:
 
 
 class ConvRotCLIPLoaderTest(unittest.TestCase):
-    def test_load_model_defaults_to_auto_and_preserves_it_for_reload(self):
+    def test_load_model_defaults_to_w8a8_and_preserves_it_for_reload(self):
         state_dict = {
             "model.diffusion_model.blocks.0.ffn.0.comfy_quant": quant_tensor(
                 {"format": "convrot_w4a4"}
@@ -569,18 +569,18 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
 
         self.assertIs(loaded, fake_model)
         prepare_runtime.assert_called_once_with(
-            ConvRotSummary(w4a4=1), torch.device("cuda", 0), "auto"
+            ConvRotSummary(w4a4=1), torch.device("cuda", 0), "w8a8"
         )
         self.assertEqual(load_state.call_args.kwargs["model_options"], {})
         self.assertIsNone(fake_model.compute_dtype)
         normalize_dtypes.assert_not_called()
         apply_adapters.assert_called_once_with(fake_model, torch.device("cuda", 0))
-        apply_backend.assert_called_once_with(fake_model, "auto", device=torch.device("cuda", 0))
+        apply_backend.assert_called_once_with(fake_model, "w8a8", device=torch.device("cuda", 0))
         self.assertEqual(
             fake_model.cached_patcher_init,
             (
                 load_convrot_model,
-                ("model.safetensors", False, "auto"),
+                ("model.safetensors", False, "w8a8"),
             ),
         )
 
@@ -610,7 +610,7 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
 
         self.assertIs(loaded, fake_model)
         prepare_runtime.assert_called_once_with(
-            ConvRotSummary(w4a4=1), torch.device("cuda", 0), "auto"
+            ConvRotSummary(w4a4=1), torch.device("cuda", 0), "w8a8"
         )
         self.assertEqual(load_state.call_args.kwargs["model_options"], {"dtype": torch.bfloat16})
         self.assertEqual(fake_model.compute_dtype, torch.bfloat16)
@@ -618,7 +618,7 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
             fake_model, torch.device("cuda", 0), torch.bfloat16
         )
         apply_adapters.assert_called_once_with(fake_model, torch.device("cuda", 0))
-        apply_backend.assert_called_once_with(fake_model, "auto", device=torch.device("cuda", 0))
+        apply_backend.assert_called_once_with(fake_model, "w8a8", device=torch.device("cuda", 0))
 
     def test_load_clip_forces_mixed_ops_and_preserves_activation_override(self):
         state_dict = {
@@ -793,9 +793,9 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
         self.assertNotIn("activation_dtype", inputs["required"])
         self.assertEqual(
             inputs["optional"]["patch_attention"][0],
-            ("auto", "sage_attn", "w8a8", "flash_attn", "sdpa"),
+            ("w8a8", "sage", "sdpa"),
         )
-        self.assertEqual(inputs["optional"]["patch_attention"][1]["default"], "auto")
+        self.assertEqual(inputs["optional"]["patch_attention"][1]["default"], "w8a8")
         self.assertNotIn("turing_bf16_mode", inputs["optional"])
 
     def test_diffusion_node_forwards_attention_backend(self):
@@ -810,14 +810,14 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
             result = ConvRotDiffusionModelLoader().load_diffusion_model(
                 "convrot.safetensors",
                 force_int8_gemm=True,
-                patch_attention="flash_attn",
+                patch_attention="sdpa",
             )
 
         self.assertEqual(result, (fake_model,))
         load_model.assert_called_once_with(
             "/models/convrot.safetensors",
             True,
-            attention_backend="flash_attn",
+            attention_backend="sdpa",
         )
 
     def test_node_rejects_invalid_clip_type(self):

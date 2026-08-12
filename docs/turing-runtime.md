@@ -27,7 +27,7 @@ not skip attention or quantized-kernel preflight.
 | `comfyui_turing_utils/attention/` | prepared-attention protocol, stable Sage, sparse policies, semantic layout, and patches |
 | `comfyui_turing_utils/nodes/attention.py` | model-independent experimental sparse-attention patch UI |
 | `comfyui_turing_utils/quantization/` | exact-sm75 W8/W4 dispatch, ConvRot loading, and generic fusions |
-| `comfyui_turing_utils/adapters/minimax/` | MiniMax layout, packed-sequence planning, fusions, and progressive experiment |
+| `comfyui_turing_utils/adapters/minimax/` | MiniMax layout, packed-sequence planning, and fusions |
 | `comfyui_turing_utils/adapters/wan.py` | Wan/Bernini context-aware planning and Q/K preprocessing hooks |
 | `comfyui_turing_utils/adapters/wan_layout.py` | Wan/Bernini semantic attention-layout provider |
 | `comfyui_turing_utils/kernel_api.py` | sole lazy boundary to the independently installed kernel package |
@@ -92,31 +92,35 @@ Turing optimization. The reproducible comparison is available through
 
 ## Attention matrix
 
-On exact sm75, both `auto` and the explicit `sage_attn` option select the
-bundled Sage implementation; the standalone package is not required. On other
-GPUs, `sage_attn` means the independently installed SageAttention package.
-Legacy serialized `sage`, `sage_`, `sage_hybrid`, and `turing_sage` values
-normalize invisibly to `sage_attn` and are not displayed by either loader.
+The loader exposes exactly `w8a8`, `sage`, and `sdpa`, with W8A8 selected by
+default. On exact sm75, W8A8 and Sage use the bundled implementations. On other
+GPUs, W8A8 delegates to Comfy Kitchen and Sage delegates to ComfyUI's registered
+SageAttention function. `auto` is no longer accepted. Legacy serialized
+`sage_attn`, `sage_`, `sage_hybrid`, and `turing_sage` values normalize
+invisibly to `sage` and are not displayed by the loader.
 
 | Option | Q/K path | Smoothing | PV path |
 |---|---|---|---|
-| `sage_attn` on Turing | INT8, per-16-token Q-warp scales | disabled | FP16 V tiles with direct FP32 accumulation |
-| explicit `w8a8` on Turing | stable-Sage INT8 score domain | disabled | channel-wise signed INT8 V and unsigned INT8 probabilities, INT32 Tensor Core PV, FP32 online state |
+| `sage` on Turing | INT8, per-16-token Q-warp scales | disabled | FP16 V tiles with direct FP32 accumulation |
+| `w8a8` on Turing | stable-Sage INT8 score domain | disabled | channel-wise signed INT8 V and unsigned INT8 probabilities, INT32 Tensor Core PV, FP32 online state |
 | `Patch Sol Sparse Attention` | fused 64-token centroid routing; selected tiles reuse stable Sage INT8 QK | input-adaptive `mean + tau * std` threshold | exact FP16 V tiles plus skipped-block V centroids, FP32 online accumulation |
 
 Integer Q/K MMA accumulates into INT32. The stable facade supports FP16 and
 BF16 Q/K/V, HND/NHD, GQA, causal mode, unequal Q/KV lengths, head dimensions
 through 128, and variable-length batches. BF16 V is converted tile-by-tile
 while loading shared memory, so no full V conversion tensor exists. FP32 Q/K/V
-use one BF16 boundary conversion and restore FP32 output.
+use one BF16 boundary conversion and restore FP32 output. Explicit SDPA instead
+consumes BF16 containers and converts Q, K, then V to FP16 before PyTorch
+dispatch on exact sm75, avoiding the BF16 math implementation while bounding
+overlapping storage; its output is restored to BF16.
 
 When either logical sequence is shorter than the 64-token SM75 CTA, the facade
 uses a bounded exact FP32 SDPA path. It contains fewer than 4096 scores per head
 and cannot reproduce the large-sequence SDPA allocation failure.
 
 The sparse backend is installed only by the independent
-`Patch Sol Sparse Attention (Experimental)` node and is never part of a loader's
-`auto` priority list. Dispatch depends only on the attention call: matching
+`Patch Sol Sparse Attention (Experimental)` node and is never a loader option.
+Dispatch depends only on the attention call: matching
 FP16, BF16, or FP32 Q/K/V; head dimensions 1--128; unmasked non-causal attention;
 and both Q and K meeting the configurable minimum sequence length. HND and
 ComfyUI's unreshaped layout, GQA, unequal Q/K lengths, and incomplete final
@@ -124,12 +128,11 @@ blocks are supported. Other calls use bundled stable Sage without model-family,
 sampling-step checks. A model adapter may publish semantic layer and topology
 metadata; unknown models remain fully generic.
 
-The explicit `w8a8` backend and Sol's `use_w8a8` option require kernel 0.23.0.
+The bundled `w8a8` backend and Sol's `use_w8a8` option require kernel 0.23.0.
 They are specialized for exact sm75 and head dimensions 1--128. Dense W8A8
 supports fixed HND/NHD and native packed-varlen inputs, GQA, unequal Q/K
 lengths, and an upper-left causal diagonal; arbitrary masks remain unsupported.
-Sol remains fixed-shape, unmasked, and non-causal. `auto` continues to select
-stable Sage. The W8A8 path
+Sol remains fixed-shape, unmasked, and non-causal. The W8A8 path
 keeps the same Q64 tile shape as Sol: native D64 uses 16 KiB shared memory and
 native D128 uses 32 KiB. V is quantized once per call into a channel-major,
 16-token-permuted signed-INT8 tensor;
@@ -137,7 +140,7 @@ softmax probabilities are packed to unsigned INT8; PV uses SM75 U8xS8 Tensor
 Core MMA and the output remains FP32 until normalization and dtype writeback.
 The route-free dense specialization omits centroid summaries and route state.
 Short calls can lose to stable Sage because the extra V scan is not amortized,
-which is why W8A8 remains explicit.
+so exact-sm75 users should still compare W8A8 and Sage for short sequences.
 
 For packed varlen, Q/K/output and cumulative sequence metadata remain compact;
 the implementation does not pad every sequence to the batch maximum or launch
@@ -213,10 +216,12 @@ path.
 
 `skipped_residual=1x64` is the official-style fast default. `2x32` changes only
 the skipped-block reconstruction; it deliberately shares the identical route.
-`dense_prefix_steps=0`, `dense_suffix_steps=0`, `dense_prefix_layers=2`, and
+`dense_prefix_steps=1`, `dense_suffix_steps=0`, `dense_prefix_layers=2`, and
 `dense_suffix_layers=0` match the default protection policy. Every dense step or
-layer calls the selected protected backend directly: stable bundled Sage by
-default, or the route-free bundled W8A8 kernel when `use_w8a8` is enabled.
+layer calls the selected protected backend directly: route-free bundled W8A8
+by default, or stable bundled Sage when `use_w8a8` is disabled. If the prefix
+and suffix layer counts sum to at least the runtime layer count, every valid
+layer takes this direct dense path and no Sol summaries or routing are built.
 
 The common layout contract contains contiguous semantic segments. MiniMax H3's
 adapter publishes text, keyframe/reference image, reference-video first/last
@@ -306,7 +311,8 @@ W8A8 versus 765.2 ms for stable Sage, and 220.9 ms for Sol-W8A8 versus 282.8 ms
 for Sol with FP16 PV. Thus V quantization is amortized at the intended long
 sequence: dense W8A8 was 1.07x faster and Sol-W8A8 was 1.28x faster than its
 FP16-PV counterpart. At 4k--16k tokens the extra V scan can instead make W8A8
-slower; this reinforces explicit opt-in and does not justify changing `auto`.
+slower; this is the main reason to retain Sage as an explicit alternative to
+the W8A8 default.
 
 Kernel 0.22.3 removes an unintended runtime two-stage loop from route-free
 dense W8A8 while retaining CTA-K64/128 staging for Sol. On the same A40
@@ -322,14 +328,17 @@ instantiations exclude them. Their complete checkpoint and reproduction steps
 are documented in
 [`kernel/experiments/turing_sage_variants`](../kernel/experiments/turing_sage_variants/README.md).
 
-On non-Turing GPUs, installed standalone Sage has priority, followed by Flash
-Attention and PyTorch SDPA. An all-FP32 call that cannot enter external Sage
-uses ComfyUI's PyTorch attention implementation deterministically.
+On non-Turing GPUs the selected backend is deterministic: W8A8 uses Comfy
+Kitchen, Sage uses the registered SageAttention function, and SDPA uses
+ComfyUI's PyTorch implementation. Flash Attention is not a loader option. An
+all-FP32 call that cannot enter external Sage uses ComfyUI's PyTorch attention
+implementation deterministically.
 
-The loader log reports `sage_attn via bundled_turing_sage` when `auto` or
-`sage_attn` binds the local SM75 implementation. Sol logs the resolved protected
-ranges, three reference switches, threshold, residual profile, and fixed local
-radius. MiniMax additionally emits its fused block/MLP dispatch counters.
+The loader log reports `w8a8 via bundled_turing_w8a8` or
+`sage via bundled_turing_sage` for local SM75 implementations. Sol logs the
+resolved protected ranges, three reference switches, threshold, residual
+profile, and fixed local radius. MiniMax additionally emits its fused block/MLP
+dispatch counters.
 
 `debug_route_density` is disabled by default. With kernel package 0.23.0 or
 newer, the already-running sparse CTA accumulates one selected-block counter;
