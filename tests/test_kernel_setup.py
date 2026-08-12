@@ -78,7 +78,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(
             "csrc/turing/sage/qk_preprocess.cu", extensions[2].kwargs["sources"]
         )
-        self.assertEqual(setup.call_args.kwargs["version"], "0.22.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.22.1")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -100,7 +100,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.22.0")
+        self.assertEqual(metadata["project"]["version"], "0.22.1")
 
     def test_sparse_source_does_not_require_optional_cuda_library_headers(self):
         source = (
@@ -169,8 +169,8 @@ class KernelSetupTest(unittest.TestCase):
         self.assertEqual([extension.name for extension in extensions], ["comfyui_turing_utils_kernel._C"])
         self.assertEqual(extensions[0].kwargs["include_dirs"][1], str(conda_include.resolve()))
         self.assertIn(str(cccl.resolve()), extensions[0].kwargs["include_dirs"])
-        self.assertIn("/std:c++17", extensions[0].kwargs["extra_compile_args"]["cxx"])
-        self.assertIn("-std=c++17", extensions[0].kwargs["extra_compile_args"]["nvcc"])
+        self.assertIn("/std:c++20", extensions[0].kwargs["extra_compile_args"]["cxx"])
+        self.assertIn("-std=c++20", extensions[0].kwargs["extra_compile_args"]["nvcc"])
 
     def test_windows_sm75_build_includes_fused_qk_source(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -193,7 +193,7 @@ class KernelSetupTest(unittest.TestCase):
         fused = extensions[2]
         self.assertIn("csrc/turing/sage/qk_preprocess.cu", fused.kwargs["sources"])
         self.assertIn(str(cccl.resolve()), fused.kwargs["include_dirs"])
-        self.assertIn("-std=c++17", fused.kwargs["extra_compile_args"]["nvcc"])
+        self.assertIn("-std=c++20", fused.kwargs["extra_compile_args"]["nvcc"])
 
     def test_nvidia_cutlass_python_package_is_auto_detected(self):
         with tempfile.TemporaryDirectory() as temp_dir:

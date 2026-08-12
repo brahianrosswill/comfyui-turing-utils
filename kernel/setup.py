@@ -264,11 +264,14 @@ COMMON_DEFINES = [
     "-DENABLE_BF16=1",
 ]
 
+DEFAULT_CXX_STANDARD = "c++20" if IS_WINDOWS else "c++17"
 HOST_CXX_STANDARD = os.environ.get(
     "COMFYUI_TURING_UTILS_HOST_CXX_STANDARD",
-    os.environ.get("COMFYUI_TURING_UTILS_CXX_STANDARD", "c++17"),
+    os.environ.get("COMFYUI_TURING_UTILS_CXX_STANDARD", DEFAULT_CXX_STANDARD),
 )
-NVCC_CXX_STANDARD = os.environ.get("COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD", "c++17")
+NVCC_CXX_STANDARD = os.environ.get(
+    "COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD", DEFAULT_CXX_STANDARD
+)
 
 NVCC_FLAGS = [
     *COMMON_DEFINES,
@@ -415,7 +418,7 @@ if _includes_sm75():
 
 setup(
     name="comfyui-turing-utils-kernel",
-    version="0.22.0",
+    version="0.22.1",
     packages=find_packages(where=str(ROOT)),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

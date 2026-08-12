@@ -155,7 +155,7 @@ correction, while original V means remain in the value approximation.
 Official-style `1x64` is the default; optional `2x32` improves bimodal
 skipped-block fidelity without changing routing.
 
-Kernel 0.22.0 retains the current ComfyUI attention tensor-container lifecycle
+Kernel 0.22.1 retains the current ComfyUI attention tensor-container lifecycle
 and adds adapter-owned fused Q/K preprocessing. H3 per-head RMSNorm plus
 split-half RoPE, and Wan/Bernini whole-row RMSNorm plus interleaved RoPE, feed
 the production INT8 Q/K representation without materializing normalized BF16
