@@ -321,8 +321,7 @@ def validate_sparse(device: torch.device) -> None:
         w8a8attn,
     )
     from comfyui_turing_utils_kernel.turing_sage.quant import (
-        quantize_key_per_block,
-        quantize_query_per_warp,
+        per_warp_int8_hadamard,
     )
 
     for dtype in (torch.float16, torch.bfloat16):
@@ -398,8 +397,7 @@ def validate_sparse(device: torch.device) -> None:
     v = torch.randn(
         (1, 2, 1025, 128), generator=generator, device=device, dtype=torch.bfloat16
     )
-    q_int8, q_scale = quantize_query_per_warp(q)
-    k_int8, k_scale = quantize_key_per_block(k)
+    q_int8, q_scale, k_int8, k_scale = per_warp_int8_hadamard(q, k)
     expected_selected = _expected_int8_sol_route_count(
         q_int8, q_scale, k_int8, k_scale, threshold_sigma=1.0
     )

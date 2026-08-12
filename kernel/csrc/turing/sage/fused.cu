@@ -199,7 +199,67 @@ __global__ void QuantInt8Kernel(T *__restrict__ input, T *__restrict__ mean, int
   }
 }
 
-template <uint32_t head_dim, uint32_t BLOCK_SIZE, uint32_t THREADS_PER_BLOCK, typename T>
+// Fixed randomized orthogonal transform used by the W8A8/Sol quantizer.  Q
+// and K share the same diagonal and normalized Walsh-Hadamard transform, so
+// exact dot products are invariant while per-tile INT8 ranges become tighter.
+// The signs match Comfy-Kitchen's production INT8 attention transform.
+__device__ __forceinline__ bool convrot_negative_sign(int channel)
+{
+  constexpr uint32_t signs[4] = {
+      0x1035997bu, 0x8087f5eeu, 0xee2e4e1au, 0x71132418u};
+  const uint32_t bit = (signs[channel >> 5] >> (channel & 31)) & 1u;
+  return bit == 0u;
+}
+
+template <uint32_t head_dim>
+__device__ __forceinline__ void attention_hadamard8(float (&values)[8], int dim_pack)
+{
+#pragma unroll
+  for (int channel = 0; channel < 8; ++channel)
+  {
+    if (convrot_negative_sign(dim_pack * 8 + channel))
+      values[channel] = -values[channel];
+  }
+#pragma unroll
+  for (int span = 1; span < 8; span <<= 1)
+  {
+#pragma unroll
+    for (int base = 0; base < 8; base += span * 2)
+    {
+#pragma unroll
+      for (int offset = 0; offset < span; ++offset)
+      {
+        const float left = values[base + offset];
+        const float right = values[base + offset + span];
+        values[base + offset] = left + right;
+        values[base + offset + span] = left - right;
+      }
+    }
+  }
+
+  constexpr int pack_count = head_dim / 8;
+  const int pack_lane = threadIdx.x & (pack_count - 1);
+#pragma unroll
+  for (int bit = 1; bit < pack_count; bit <<= 1)
+  {
+#pragma unroll
+    for (int channel = 0; channel < 8; ++channel)
+    {
+      const float other = __shfl_xor_sync(
+          0xffffffffu, values[channel], bit, pack_count);
+      values[channel] =
+          (pack_lane & bit) ? other - values[channel] : values[channel] + other;
+    }
+  }
+  constexpr float normalization = head_dim == 64
+      ? 0.125f
+      : 0.08838834764831845f;
+#pragma unroll
+  for (int channel = 0; channel < 8; ++channel)
+    values[channel] *= normalization;
+}
+
+template <uint32_t head_dim, uint32_t BLOCK_SIZE, uint32_t THREADS_PER_BLOCK, bool ROTATE, typename T>
 __device__ __forceinline__ void quant_int8_tile(T *__restrict__ input,
                                                 int8_t *__restrict__ output,
                                                 float *__restrict__ scale,
@@ -254,6 +314,10 @@ __device__ __forceinline__ void quant_int8_tile(T *__restrict__ input,
       {
         x_val_float[i][j] = 0.0f;
       }
+    }
+    if constexpr (ROTATE)
+    {
+      attention_hadamard8<head_dim>(x_val_float[i], dim_pack);
     }
   }
 
@@ -311,7 +375,7 @@ __device__ __forceinline__ void quant_int8_tile(T *__restrict__ input,
   }
 }
 
-template <uint32_t head_dim, uint32_t Q_BLOCK_SIZE, uint32_t K_BLOCK_SIZE, uint32_t THREADS_PER_BLOCK, typename T>
+template <uint32_t head_dim, uint32_t Q_BLOCK_SIZE, uint32_t K_BLOCK_SIZE, uint32_t THREADS_PER_BLOCK, bool ROTATE, typename T>
 __global__ void QuantQKInt8Kernel(T *__restrict__ query,
                                   T *__restrict__ key,
                                   int8_t *__restrict__ query_output,
@@ -349,7 +413,7 @@ __global__ void QuantQKInt8Kernel(T *__restrict__ query,
   {
     const uint32_t head_id = task_id / query_scale_len;
     const uint32_t tile_id = task_id - head_id * query_scale_len;
-    quant_int8_tile<head_dim, Q_BLOCK_SIZE, THREADS_PER_BLOCK, T>(
+    quant_int8_tile<head_dim, Q_BLOCK_SIZE, THREADS_PER_BLOCK, ROTATE, T>(
         query, query_output, query_scale, tile_id, head_id, batch_id, qo_len,
         stride_bz_q, stride_seq_q, stride_h_q,
         stride_bz_qo, stride_seq_qo, stride_h_qo,
@@ -362,7 +426,7 @@ __global__ void QuantQKInt8Kernel(T *__restrict__ query,
     const uint32_t tile_id = key_task_id - head_id * key_scale_len;
     if (head_id < num_kv_heads)
     {
-      quant_int8_tile<head_dim, K_BLOCK_SIZE, THREADS_PER_BLOCK, T>(
+      quant_int8_tile<head_dim, K_BLOCK_SIZE, THREADS_PER_BLOCK, ROTATE, T>(
           key, key_output, key_scale, tile_id, head_id, batch_id, kv_len,
           stride_bz_k, stride_seq_k, stride_h_k,
           stride_bz_ko, stride_seq_ko, stride_h_ko,
@@ -1878,7 +1942,7 @@ void quant_per_warp_int8_cuda(
   });
 }
 
-void quant_qk_per_warp_int8_cuda(
+static void quant_qk_per_warp_int8_cuda_impl(
                 at::Tensor query,
                 at::Tensor key,
                 at::Tensor query_output,
@@ -1888,7 +1952,8 @@ void quant_qk_per_warp_int8_cuda(
                 int query_block_size,
                 int query_warp_block_size,
                 int key_block_size,
-                int tensor_layout)
+                int tensor_layout,
+                bool rotate)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
@@ -1972,6 +2037,25 @@ void quant_qk_per_warp_int8_cuda(
 
   auto input_dtype = query.scalar_type();
 
+#define LAUNCH_QK(ROTATE)                                                      \
+  QuantQKInt8Kernel<HEAD_DIM, QUERY_WARP_BLOCK_SIZE, KEY_BLOCK_SIZE,           \
+                    THREADS_PER_BLOCK, ROTATE, c_type><<<                      \
+      grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(                    \
+    reinterpret_cast<c_type*>(query.data_ptr()),                               \
+    reinterpret_cast<c_type*>(key.data_ptr()),                                 \
+    query_output.data_ptr<int8_t>(),                                           \
+    key_output.data_ptr<int8_t>(),                                             \
+    reinterpret_cast<float*>(query_scale.data_ptr()),                          \
+    reinterpret_cast<float*>(key_scale.data_ptr()),                            \
+    qo_len, kv_len, num_qo_heads, num_kv_heads,                                \
+    query_scale_len, key_scale_len,                                            \
+    query.stride(0), stride_seq_q, stride_h_q,                                 \
+    key.stride(0), stride_seq_k, stride_h_k,                                   \
+    query_output.stride(0), stride_seq_qo, stride_h_qo,                        \
+    key_output.stride(0), stride_seq_ko, stride_h_ko,                          \
+    query_scale.stride(0), query_scale.stride(1),                              \
+    key_scale.stride(0), key_scale.stride(1));
+
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
     DISPATCH_WARP_BLOCK_SIZE(query_warp_block_size, QUERY_WARP_BLOCK_SIZE, {
       DISPATCH_BLOCK_SIZE(key_block_size, KEY_BLOCK_SIZE, {
@@ -1980,31 +2064,55 @@ void quant_qk_per_warp_int8_cuda(
           dim3 grid(num_qo_heads * query_scale_len + num_kv_heads * key_scale_len, batch_size);
           dim3 block(THREADS_PER_BLOCK);
 
-          QuantQKInt8Kernel<HEAD_DIM, QUERY_WARP_BLOCK_SIZE, KEY_BLOCK_SIZE, THREADS_PER_BLOCK, c_type><<<
-              grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
-            reinterpret_cast<c_type*>(query.data_ptr()),
-            reinterpret_cast<c_type*>(key.data_ptr()),
-            query_output.data_ptr<int8_t>(),
-            key_output.data_ptr<int8_t>(),
-            reinterpret_cast<float*>(query_scale.data_ptr()),
-            reinterpret_cast<float*>(key_scale.data_ptr()),
-            qo_len,
-            kv_len,
-            num_qo_heads,
-            num_kv_heads,
-            query_scale_len,
-            key_scale_len,
-            query.stride(0), stride_seq_q, stride_h_q,
-            key.stride(0), stride_seq_k, stride_h_k,
-            query_output.stride(0), stride_seq_qo, stride_h_qo,
-            key_output.stride(0), stride_seq_ko, stride_h_ko,
-            query_scale.stride(0), query_scale.stride(1),
-            key_scale.stride(0), key_scale.stride(1)
-          );
+          if (rotate)
+          {
+            LAUNCH_QK(true)
+          }
+          else
+          {
+            LAUNCH_QK(false)
+          }
         });
       });
     });
   });
+#undef LAUNCH_QK
+}
+
+void quant_qk_per_warp_int8_cuda(
+                at::Tensor query,
+                at::Tensor key,
+                at::Tensor query_output,
+                at::Tensor key_output,
+                at::Tensor query_scale,
+                at::Tensor key_scale,
+                int query_block_size,
+                int query_warp_block_size,
+                int key_block_size,
+                int tensor_layout)
+{
+  quant_qk_per_warp_int8_cuda_impl(
+      query, key, query_output, key_output, query_scale, key_scale,
+      query_block_size, query_warp_block_size, key_block_size, tensor_layout,
+      false);
+}
+
+void quant_qk_per_warp_int8_rotated_cuda(
+                at::Tensor query,
+                at::Tensor key,
+                at::Tensor query_output,
+                at::Tensor key_output,
+                at::Tensor query_scale,
+                at::Tensor key_scale,
+                int query_block_size,
+                int query_warp_block_size,
+                int key_block_size,
+                int tensor_layout)
+{
+  quant_qk_per_warp_int8_cuda_impl(
+      query, key, query_output, key_output, query_scale, key_scale,
+      query_block_size, query_warp_block_size, key_block_size, tensor_layout,
+      true);
 }
 
 void quant_per_warp_int8_varlen_cuda(

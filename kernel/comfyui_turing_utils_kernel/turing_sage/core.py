@@ -10,9 +10,8 @@ from .. import _sage_fused_sm75 as _fused
 from . import sm75_compile
 from .quant import (
     per_warp_int8,
+    per_warp_int8_hadamard,
     per_warp_int8_varlen,
-    quantize_key_per_block,
-    quantize_query_per_warp,
 )
 
 
@@ -489,8 +488,9 @@ def prequantize_sol_sageattn(
     if sparse_block_count == 0:
         force_dense = True
 
-    q_int8, q_scale = quantize_query_per_warp(q, tensor_layout="HND")
-    k_int8, k_scale = quantize_key_per_block(k, tensor_layout="HND")
+    q_int8, q_scale, k_int8, k_scale = per_warp_int8_hadamard(
+        q, k, tensor_layout="HND"
+    )
     if use_w8a8:
         padded_key_length = ((k.size(2) + 63) // 64) * 64
         value_int8 = torch.empty(

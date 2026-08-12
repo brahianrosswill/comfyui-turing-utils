@@ -80,6 +80,22 @@ class TuringSageQuantContractTest(unittest.TestCase):
         quant_q.assert_called_once()
         quant_k.assert_called_once()
 
+    def test_hadamard_quantizer_fuses_qk_and_preserves_scale_contract(self):
+        q = torch.empty((2, 4, 129, 128), dtype=torch.bfloat16)
+        k = torch.empty((2, 2, 151, 128), dtype=torch.bfloat16)
+        with mock.patch.object(
+            quant._fused, "quant_qk_per_warp_int8_rotated_cuda"
+        ) as fused:
+            q_int8, q_scale, k_int8, k_scale = quant.per_warp_int8_hadamard(q, k)
+
+        self.assertEqual(q_int8.shape, q.shape)
+        self.assertEqual(k_int8.shape, k.shape)
+        self.assertEqual(q_scale.shape, (2, 4, 12))
+        self.assertEqual(k_scale.shape, (2, 2, 3))
+        fused.assert_called_once_with(
+            q, k, q_int8, k_int8, q_scale, k_scale, 64, 16, 64, 1
+        )
+
     def test_production_quant_module_has_no_experimental_api(self):
         self.assertFalse(hasattr(quant, "per_thread_int4"))
         self.assertFalse(hasattr(quant, "per_thread_int4_fused"))
