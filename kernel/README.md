@@ -62,6 +62,12 @@ python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --exper
 python kernel/scripts/validate_wan_fusions.py --device cuda:0
 ```
 
+`--experimental-sparse` also runs the explicit correctness gate. A fully
+selected Sol route is compared with stable Sage, while Sol-W8A8 is compared
+with route-free W8A8. The gate checks finite output, maximum absolute error,
+relative L2 error, cosine similarity, and exact selected-block coverage; it is
+not imported or executed during normal inference.
+
 On Windows, use an x64 Visual Studio Developer shell. CUDA 12.8 Conda users
 must have the CCCL directory containing `nv/target`; the build discovers
 `%CONDA_PREFIX%\Library\include\targets\x64` automatically.

@@ -96,6 +96,7 @@ class TuringSageQuantContractTest(unittest.TestCase):
                 "preflight",
                 "preflight_sparse",
                 "preflight_w8a8",
+                "run_attention_correctness_gate",
                 "sageattn",
                 "sageattn_compiled",
                 "sageattn_from_prequantized",

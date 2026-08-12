@@ -315,6 +315,7 @@ def _expected_int8_sol_route_count(
 
 def validate_sparse(device: torch.device) -> None:
     from comfyui_turing_utils_kernel.turing_sage import (
+        run_attention_correctness_gate,
         sageattn,
         sol_sparse_sageattn,
         w8a8attn,
@@ -361,6 +362,17 @@ def validate_sparse(device: torch.device) -> None:
                 return_stats=True,
                 use_w8a8=True,
             )
+            if query_length == 129:
+                for use_w8a8 in (False, True):
+                    gate = run_attention_correctness_gate(
+                        q, k, v, use_w8a8=use_w8a8
+                    )
+                    print(
+                        f"attention correctness {gate.candidate}->{gate.reference} "
+                        f"{dtype}: max_abs={gate.max_abs:.6g} "
+                        f"relative_l2={gate.relative_l2:.6g} "
+                        f"cosine={gate.cosine:.7f}"
+                    )
             _assert_close(
                 f"Sol W8A8 exact route {dtype} Q={query_length} K={key_length}",
                 sol_w8a8,

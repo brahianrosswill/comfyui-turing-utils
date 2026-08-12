@@ -249,6 +249,13 @@ def preflight(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
+def run_attention_correctness_gate(*args, **kwargs):
+    """Run the explicit Sol-vs-dense numerical release gate."""
+    from .correctness import run_attention_correctness_gate as implementation
+
+    return implementation(*args, **kwargs)
+
+
 __all__ = [
     "available",
     "prequantize_sageattn",
@@ -256,6 +263,7 @@ __all__ = [
     "preflight",
     "preflight_sparse",
     "preflight_w8a8",
+    "run_attention_correctness_gate",
     "sageattn",
     "sageattn_compiled",
     "sageattn_from_prequantized",
