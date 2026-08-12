@@ -29,6 +29,31 @@ class FakePatcher:
 
 
 class SparseAttentionNodeTest(unittest.TestCase):
+    def test_kernel_tuning_node_has_safe_defaults(self):
+        inputs = attention_nodes.AttentionKernelTuningPatch.INPUT_TYPES()["required"]
+        self.assertEqual(tuple(inputs), ("model", "key_tile", "hadamard_qk", "adaptive_k_anchor"))
+        self.assertEqual(inputs["key_tile"][0][0], "auto")
+        self.assertTrue(inputs["hadamard_qk"][1]["default"])
+        self.assertTrue(inputs["adaptive_k_anchor"][1]["default"])
+
+    def test_kernel_tuning_patch_is_order_independent_model_metadata(self):
+        model = FakePatcher()
+        patched = attention_backends.apply_attention_kernel_tuning_patch(
+            model,
+            key_tile="128",
+            rotate_qk=False,
+            stabilize_k=True,
+        )
+        self.assertIsNot(patched, model)
+        self.assertNotIn(
+            "turing_utils_attention_tuning",
+            model.model_options["transformer_options"],
+        )
+        self.assertEqual(
+            patched.model_options["transformer_options"]["turing_utils_attention_tuning"],
+            {"key_tile_tokens": 128, "rotate_qk": False, "stabilize_k": False},
+        )
+
     def test_schema_exposes_tunable_sparse_parameters(self):
         inputs = attention_nodes.SolSparseAttentionPatch.INPUT_TYPES()["required"]
         self.assertEqual(

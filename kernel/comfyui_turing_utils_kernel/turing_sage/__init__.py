@@ -128,6 +128,9 @@ def sol_sparse_sageattn_compiled(
     residual_subblocks: int = 1,
     use_w8a8: bool = False,
     sm_scale: float | None = None,
+    key_tile_tokens: int = 0,
+    rotate_qk: bool = True,
+    stabilize_k: bool = True,
 ):
     from .custom_ops import sol_attention
 
@@ -145,6 +148,9 @@ def sol_sparse_sageattn_compiled(
         int(residual_subblocks),
         bool(use_w8a8),
         float(sm_scale) if sm_scale is not None else -1.0,
+        int(key_tile_tokens),
+        bool(rotate_qk),
+        bool(stabilize_k),
     )
 
 
@@ -161,6 +167,9 @@ def w8a8attn_compiled(
     *,
     tensor_layout: str = "HND",
     sm_scale: float | None = None,
+    key_tile_tokens: int = 0,
+    rotate_qk: bool = True,
+    stabilize_k: bool = True,
 ):
     from .custom_ops import w8a8_attention
 
@@ -170,6 +179,9 @@ def w8a8attn_compiled(
         v,
         tensor_layout,
         float(sm_scale) if sm_scale is not None else -1.0,
+        int(key_tile_tokens),
+        bool(rotate_qk),
+        bool(stabilize_k),
     )
 
 

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .nodes.attention import SolSparseAttentionPatch
+from .nodes.attention import AttentionKernelTuningPatch, SolSparseAttentionPatch
 from .nodes.bernini import BerniniContextWindowsCore, BerniniInpaintCondition
 from .nodes.loaders import ConvRotCLIPLoader, ConvRotDiffusionModelLoader
 from .nodes.minimax import (
@@ -32,6 +32,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsMiniMaxH3LatentResize": MiniMaxH3LatentResize,
     "TuringUtilsMiniMaxH3ProgressiveResolutionPatch": MiniMaxH3ProgressiveResolutionPatch,
     "TuringUtilsSolSparseAttentionPatch": SolSparseAttentionPatch,
+    "TuringUtilsAttentionKernelTuningPatch": AttentionKernelTuningPatch,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -51,4 +52,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsMiniMaxH3LatentResize": "Resize MiniMax H3 AV Latent (Experimental)",
     "TuringUtilsMiniMaxH3ProgressiveResolutionPatch": "Patch H3 Progressive Resolution (Experimental)",
     "TuringUtilsSolSparseAttentionPatch": "Patch Sol Sparse Attention (Experimental)",
+    "TuringUtilsAttentionKernelTuningPatch": "Patch Turing Attention Kernel Tuning (Experimental)",
 }

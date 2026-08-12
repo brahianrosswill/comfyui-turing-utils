@@ -44,6 +44,9 @@ def w8a8_attention(
     value: torch.Tensor,
     tensor_layout: str,
     sm_scale: float,
+    key_tile_tokens: int,
+    rotate_qk: bool,
+    stabilize_k: bool,
 ) -> torch.Tensor:
     from .core import w8a8attn
 
@@ -53,11 +56,16 @@ def w8a8_attention(
         value,
         tensor_layout=tensor_layout,
         sm_scale=sm_scale if sm_scale > 0.0 else None,
+        key_tile_tokens=key_tile_tokens,
+        rotate_qk=rotate_qk,
+        stabilize_k=stabilize_k,
     )
 
 
 @w8a8_attention.register_fake
-def _w8a8_attention_fake(query, key, value, tensor_layout, sm_scale):
+def _w8a8_attention_fake(
+    query, key, value, tensor_layout, sm_scale, key_tile_tokens, rotate_qk, stabilize_k
+):
     return torch.empty_like(query)
 
 
@@ -117,6 +125,9 @@ def sol_attention(
     residual_subblocks: int,
     use_w8a8: bool,
     sm_scale: float,
+    key_tile_tokens: int,
+    rotate_qk: bool,
+    stabilize_k: bool,
 ) -> torch.Tensor:
     from .core import sol_sparse_sageattn
 
@@ -135,6 +146,9 @@ def sol_attention(
         threshold_sigma=threshold_sigma,
         residual_subblocks=residual_subblocks,
         use_w8a8=use_w8a8,
+        key_tile_tokens=key_tile_tokens,
+        rotate_qk=rotate_qk,
+        stabilize_k=stabilize_k,
     )
 
 
@@ -151,5 +165,8 @@ def _sol_attention_fake(
     residual_subblocks,
     use_w8a8,
     sm_scale,
+    key_tile_tokens,
+    rotate_qk,
+    stabilize_k,
 ):
     return torch.empty_like(query)

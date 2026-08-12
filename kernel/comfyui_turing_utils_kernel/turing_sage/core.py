@@ -55,6 +55,7 @@ class PrequantizedSolAttention:
     use_w8a8: bool
     force_dense: bool
     original_head_dim: int
+    key_tile_tokens: int
 
 
 def _normalize_token_ranges(ranges, sequence_length: int) -> tuple[tuple[int, int], ...]:
@@ -401,6 +402,9 @@ def w8a8attn(
     *,
     tensor_layout: str = "HND",
     sm_scale: Optional[float] = None,
+    key_tile_tokens: int = 0,
+    rotate_qk: bool = True,
+    stabilize_k: bool = True,
 ):
     """Experimental pure-INT8 QK/PV attention specialized for SM75.
 
@@ -435,6 +439,9 @@ def w8a8attn(
         residual_subblocks=1,
         use_w8a8=True,
         force_dense=True,
+        key_tile_tokens=key_tile_tokens,
+        rotate_qk=rotate_qk,
+        stabilize_k=stabilize_k,
     )
     output = sol_sparse_sageattn_from_prequantized(quantized)
     return output.transpose(1, 2) if tensor_layout == "NHD" else output
@@ -454,6 +461,9 @@ def prequantize_sol_sageattn(
     residual_subblocks: int = 1,
     use_w8a8: bool = False,
     force_dense: bool = False,
+    key_tile_tokens: int = 0,
+    rotate_qk: bool = True,
+    stabilize_k: bool = True,
 ) -> PrequantizedSolAttention:
     """Prepare Sol Q/K/V and correction state before output allocation."""
     if not q.is_cuda:
@@ -472,6 +482,14 @@ def prequantize_sol_sageattn(
         raise ValueError("experimental sparse attention requires head_dim in [1, 128]")
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("the last Q/K/V dimension must be contiguous")
+    key_tile_tokens = int(key_tile_tokens)
+    if key_tile_tokens not in (0, 64, 128):
+        raise ValueError("key_tile_tokens must be 0 (auto), 64, or 128")
+    if key_tile_tokens == 0:
+        # The 128-token schedule reuses one 64-token shared tile twice, so the
+        # main CTA remains at 32 KiB.  It only amortizes loop/route control on
+        # long K/V; short calls retain the lower-latency CTA-K64 schedule.
+        key_tile_tokens = 128 if k.size(2) > 1024 else 64
 
     scale = float(sm_scale) if sm_scale is not None else head_dim**-0.5
     if head_dim < 128:
@@ -496,9 +514,14 @@ def prequantize_sol_sageattn(
     if sparse_block_count == 0:
         force_dense = True
 
-    q_int8, q_scale, k_int8, k_scale = per_warp_int8_hadamard(
-        q, k, tensor_layout="HND"
-    )
+    if rotate_qk:
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8_hadamard(
+            q, k, tensor_layout="HND", stabilize_k=bool(stabilize_k)
+        )
+    else:
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8(
+            q, k, tensor_layout="HND", fuse_qk=True
+        )
     if use_w8a8:
         padded_key_length = ((k.size(2) + 63) // 64) * 64
         value_int8 = torch.empty(
@@ -551,6 +574,7 @@ def prequantize_sol_sageattn(
         use_w8a8=bool(use_w8a8),
         force_dense=bool(force_dense),
         original_head_dim=head_dim,
+        key_tile_tokens=key_tile_tokens,
     )
 
 
@@ -582,6 +606,7 @@ def sol_sparse_sageattn_from_prequantized(
                 quantized.sm_scale,
                 int(return_stats),
                 int(quantized.force_dense),
+                quantized.key_tile_tokens,
             )
         else:
             selected = sm75_compile.sol_sparse_online_int8_f16_attn(
@@ -601,6 +626,7 @@ def sol_sparse_sageattn_from_prequantized(
                 int(return_stats),
                 0,
                 0,
+                quantized.key_tile_tokens,
             )
     output = output[..., : quantized.original_head_dim]
     return (output, selected, quantized.possible_blocks) if return_stats else output
@@ -621,6 +647,9 @@ def sol_sparse_sageattn(
     return_stats: bool = False,
     use_w8a8: bool = False,
     _force_dense: bool = False,
+    key_tile_tokens: int = 0,
+    rotate_qk: bool = True,
+    stabilize_k: bool = True,
 ):
     """SM75 Sol attention with online routing and modality-aware exact ranges."""
     if not use_w8a8:
@@ -649,6 +678,9 @@ def sol_sparse_sageattn(
         residual_subblocks=residual_subblocks,
         use_w8a8=use_w8a8,
         force_dense=_force_dense,
+        key_tile_tokens=key_tile_tokens,
+        rotate_qk=rotate_qk,
+        stabilize_k=stabilize_k,
     )
     return sol_sparse_sageattn_from_prequantized(
         quantized,

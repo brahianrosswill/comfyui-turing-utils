@@ -17,6 +17,7 @@ from .layout import (
 )
 from ..kernel_api import kernel_version, load_turing_sage
 from ..quantization.dispatch import is_supported_turing_device
+from .tuning import attention_kernel_tuning
 
 
 LOG = logging.getLogger("comfyui-turing-utils")
@@ -339,7 +340,7 @@ def bundled_sparse_available() -> bool:
         version_tuple = tuple(int(part) for part in version.split(".")[:3])
     except ValueError:
         return False
-    return version_tuple >= (0, 17, 0) and turing_sage.sparse_available()
+    return version_tuple >= (0, 20, 0) and turing_sage.sparse_available()
 
 
 def bundled_w8a8_available() -> bool:
@@ -351,7 +352,7 @@ def bundled_w8a8_available() -> bool:
         version_tuple = tuple(int(part) for part in kernel_version().split(".")[:3])
     except ValueError:
         return False
-    return version_tuple >= (0, 18, 0) and turing_sage.w8a8_available()
+    return version_tuple >= (0, 20, 0) and turing_sage.w8a8_available()
 
 
 def _sageattn(*args, **kwargs):
@@ -371,7 +372,7 @@ def _sol_sparse_sageattn(*args, **kwargs):
 def split_prequantization_available() -> bool:
     try:
         version_tuple = tuple(int(part) for part in kernel_version().split(".")[:3])
-        return version_tuple >= (0, 19, 0) and load_turing_sage().split_prequantization_available()
+        return version_tuple >= (0, 20, 0) and load_turing_sage().split_prequantization_available()
     except (ImportError, OSError, ValueError, AttributeError):
         return False
 
@@ -385,6 +386,7 @@ def prequantize_turing_attention(
     kernel: str,
     scale: float | None,
     is_causal: bool = False,
+    transformer_options=None,
 ) -> PrequantizedAttentionCall:
     q, k, v = normalize_turing_attention_tensors(q, k, v, call)
     turing_sage = load_turing_sage()
@@ -399,6 +401,7 @@ def prequantize_turing_attention(
             smooth_k=False,
         )
     elif kernel == "w8a8":
+        tuning = attention_kernel_tuning(transformer_options)
         if call.tensor_layout == "NHD":
             q = q.transpose(1, 2).contiguous()
             k = k.transpose(1, 2).contiguous()
@@ -413,6 +416,9 @@ def prequantize_turing_attention(
             residual_subblocks=1,
             use_w8a8=True,
             force_dense=True,
+            key_tile_tokens=tuning.key_tile_tokens,
+            rotate_qk=tuning.rotate_qk,
+            stabilize_k=tuning.stabilize_k,
         )
     else:
         raise ValueError(f"unsupported split Turing attention kernel: {kernel}")
@@ -593,6 +599,7 @@ def turing_sage_attention(
             )
             _LOGGED_FP32_COMPAT = True
     attention_kernel = _w8a8attn if turing_kernel == "w8a8" else _sageattn
+    tuning = attention_kernel_tuning(kwargs.get("transformer_options"))
     output = attention_kernel(
         q,
         k,
@@ -600,7 +607,11 @@ def turing_sage_attention(
         tensor_layout=tensor_layout,
         sm_scale=kwargs.get("scale"),
         **(
-            {}
+            {
+                "key_tile_tokens": tuning.key_tile_tokens,
+                "rotate_qk": tuning.rotate_qk,
+                "stabilize_k": tuning.stabilize_k,
+            }
             if turing_kernel == "w8a8"
             else {
                 "is_causal": bool(kwargs.get("is_causal", False)),

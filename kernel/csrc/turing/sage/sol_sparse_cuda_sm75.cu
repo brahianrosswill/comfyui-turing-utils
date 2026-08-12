@@ -512,6 +512,7 @@ __global__ void sparse_attention_kernel(
     int64_t stride_batch_o,
     int64_t stride_head_o,
     int64_t stride_sequence_o,
+    int key_blocks_per_stage,
     float threshold_sigma,
     float softmax_scale)
 {
@@ -858,8 +859,17 @@ __global__ void sparse_attention_kernel(
       query_length,
       shared_query_int8);
   __syncthreads();
-  for (int key_block = 0; key_block < num_key_blocks; ++key_block)
+  for (int key_group = 0; key_group < num_key_blocks;
+       key_group += key_blocks_per_stage)
   {
+#pragma unroll
+    for (int key_stage = 0; key_stage < 2; ++key_stage)
+    {
+    if (key_stage >= key_blocks_per_stage)
+      continue;
+    const int key_block = key_group + key_stage;
+    if (key_block >= num_key_blocks)
+      continue;
     if constexpr (!ForceDense)
     {
       if (!route_selected(local_route, key_block))
@@ -944,6 +954,7 @@ __global__ void sparse_attention_kernel(
           value_offset);
     }
     __syncthreads();
+    }
   }
 
   if constexpr (UseW8A8)
@@ -1065,7 +1076,8 @@ void launch_sparse_threshold_attention(
     at::Tensor selected_count,
     int residual_subblocks,
     float threshold_sigma,
-    float softmax_scale)
+    float softmax_scale,
+    int key_tile_tokens)
 {
   const int batch_size = query_int8.size(0);
   const int num_query_heads = query_int8.size(1);
@@ -1161,6 +1173,7 @@ void launch_sparse_threshold_attention(
       output.stride(0),
       output.stride(1),
       output.stride(2),
+      key_tile_tokens / kBlockTokens,
       threshold_sigma,
       softmax_scale);
   check_launch("sparse attention");
@@ -1184,7 +1197,8 @@ at::Tensor sol_sparse_online_int8_f16_attn(
     float softmax_scale,
     int return_stats,
     int use_w8a8,
-    int force_dense)
+    int force_dense,
+    int key_tile_tokens)
 {
   CHECK_CUDA(query_int8);
   CHECK_CUDA(key_int8);
@@ -1262,6 +1276,9 @@ at::Tensor sol_sparse_online_int8_f16_attn(
       "Sol residual_subblocks must be 1 or 2");
   TORCH_CHECK(use_w8a8 == 0 || use_w8a8 == 1, "use_w8a8 must be 0 or 1");
   TORCH_CHECK(force_dense == 0 || force_dense == 1, "force_dense must be 0 or 1");
+  TORCH_CHECK(
+      key_tile_tokens == 64 || key_tile_tokens == 128,
+      "key_tile_tokens must be 64 or 128");
   TORCH_CHECK(!force_dense || use_w8a8,
               "the specialized dense attention path currently requires W8A8");
 
@@ -1352,21 +1369,21 @@ at::Tensor sol_sparse_online_int8_f16_attn(
         key_summary, key_score_summary, value_mean,
         key_summary_mean, key_summary_variance,
         sparse_query_blocks, exact_kv_blocks, selected_count,
-        residual_subblocks, threshold_sigma, softmax_scale);
+        residual_subblocks, threshold_sigma, softmax_scale, key_tile_tokens);
     else if (use_w8a8)
       launch_sparse_threshold_attention<half, true, false>(
         query_int8, key_int8, value, value_int8, value_scale, output, query_scale, key_scale,
         key_summary, key_score_summary, value_mean,
         key_summary_mean, key_summary_variance,
         sparse_query_blocks, exact_kv_blocks, selected_count,
-        residual_subblocks, threshold_sigma, softmax_scale);
+        residual_subblocks, threshold_sigma, softmax_scale, key_tile_tokens);
     else
       launch_sparse_threshold_attention<half, false, false>(
         query_int8, key_int8, value, value_int8, value_scale, output, query_scale, key_scale,
         key_summary, key_score_summary, value_mean,
         key_summary_mean, key_summary_variance,
         sparse_query_blocks, exact_kv_blocks, selected_count,
-        residual_subblocks, threshold_sigma, softmax_scale);
+        residual_subblocks, threshold_sigma, softmax_scale, key_tile_tokens);
   }
   else
   {
@@ -1376,21 +1393,21 @@ at::Tensor sol_sparse_online_int8_f16_attn(
         key_summary, key_score_summary, value_mean,
         key_summary_mean, key_summary_variance,
         sparse_query_blocks, exact_kv_blocks, selected_count,
-        residual_subblocks, threshold_sigma, softmax_scale);
+        residual_subblocks, threshold_sigma, softmax_scale, key_tile_tokens);
     else if (use_w8a8)
       launch_sparse_threshold_attention<nv_bfloat16, true, false>(
         query_int8, key_int8, value, value_int8, value_scale, output, query_scale, key_scale,
         key_summary, key_score_summary, value_mean,
         key_summary_mean, key_summary_variance,
         sparse_query_blocks, exact_kv_blocks, selected_count,
-        residual_subblocks, threshold_sigma, softmax_scale);
+        residual_subblocks, threshold_sigma, softmax_scale, key_tile_tokens);
     else
       launch_sparse_threshold_attention<nv_bfloat16, false, false>(
         query_int8, key_int8, value, value_int8, value_scale, output, query_scale, key_scale,
         key_summary, key_score_summary, value_mean,
         key_summary_mean, key_summary_variance,
         sparse_query_blocks, exact_kv_blocks, selected_count,
-        residual_subblocks, threshold_sigma, softmax_scale);
+        residual_subblocks, threshold_sigma, softmax_scale, key_tile_tokens);
   }
   return selected_count;
 }
@@ -1548,7 +1565,8 @@ at::Tensor sol_sparse_online_w8a8_prequantized_attn(
     int residual_subblocks,
     float softmax_scale,
     int return_stats,
-    int force_dense)
+    int force_dense,
+    int key_tile_tokens)
 {
   CHECK_CUDA(query_int8);
   CHECK_CUDA(key_int8);
@@ -1584,6 +1602,9 @@ at::Tensor sol_sparse_online_w8a8_prequantized_attn(
       residual_subblocks == 1 || residual_subblocks == 2,
       "Sol residual_subblocks must be 1 or 2");
   TORCH_CHECK(force_dense == 0 || force_dense == 1, "force_dense must be 0 or 1");
+  TORCH_CHECK(
+      key_tile_tokens == 64 || key_tile_tokens == 128,
+      "key_tile_tokens must be 64 or 128");
 
   const int batch_size = query_int8.size(0);
   const int num_query_heads = query_int8.size(1);
@@ -1678,14 +1699,14 @@ at::Tensor sol_sparse_online_w8a8_prequantized_attn(
           query_scale, key_scale, key_summary, key_score_summary, value_mean,
           key_summary_mean, key_summary_variance, sparse_query_blocks,
           exact_kv_blocks, selected_count, residual_subblocks,
-          threshold_sigma, softmax_scale);
+          threshold_sigma, softmax_scale, key_tile_tokens);
     else
       launch_sparse_threshold_attention<half, true, false, true>(
           query_int8, key_int8, output, value_int8, value_scale, output,
           query_scale, key_scale, key_summary, key_score_summary, value_mean,
           key_summary_mean, key_summary_variance, sparse_query_blocks,
           exact_kv_blocks, selected_count, residual_subblocks,
-          threshold_sigma, softmax_scale);
+          threshold_sigma, softmax_scale, key_tile_tokens);
   }
   else
   {
@@ -1695,14 +1716,14 @@ at::Tensor sol_sparse_online_w8a8_prequantized_attn(
           query_scale, key_scale, key_summary, key_score_summary, value_mean,
           key_summary_mean, key_summary_variance, sparse_query_blocks,
           exact_kv_blocks, selected_count, residual_subblocks,
-          threshold_sigma, softmax_scale);
+          threshold_sigma, softmax_scale, key_tile_tokens);
     else
       launch_sparse_threshold_attention<nv_bfloat16, true, false, true>(
           query_int8, key_int8, output, value_int8, value_scale, output,
           query_scale, key_scale, key_summary, key_score_summary, value_mean,
           key_summary_mean, key_summary_variance, sparse_query_blocks,
           exact_kv_blocks, selected_count, residual_subblocks,
-          threshold_sigma, softmax_scale);
+          threshold_sigma, softmax_scale, key_tile_tokens);
   }
   return selected_count;
 }

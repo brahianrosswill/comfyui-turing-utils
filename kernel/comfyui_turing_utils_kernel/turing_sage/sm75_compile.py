@@ -75,10 +75,11 @@ def sol_sparse_online_int8_f16_attn(
     return_stats,
     use_w8a8,
     force_dense,
+    key_tile_tokens,
 ):
     if not hasattr(_qattn_sm75, "sol_sparse_online_int8_f16_attn"):
         raise RuntimeError(
-            "online Sol routing requires comfyui-turing-utils-kernel 0.17.0 or newer"
+            "online Sol routing requires comfyui-turing-utils-kernel 0.20.0 or newer"
         )
     return _qattn_sm75.sol_sparse_online_int8_f16_attn(
         query_int8,
@@ -97,13 +98,14 @@ def sol_sparse_online_int8_f16_attn(
         return_stats,
         use_w8a8,
         force_dense,
+        key_tile_tokens,
     )
 
 
 def quantize_v_int8(value, quantized, scale):
     if not hasattr(_qattn_sm75, "quantize_v_int8_sm75"):
         raise RuntimeError(
-            "W8A8 attention requires comfyui-turing-utils-kernel 0.18.0 or newer"
+            "W8A8 attention requires comfyui-turing-utils-kernel 0.20.0 or newer"
         )
     _qattn_sm75.quantize_v_int8_sm75(value, quantized, scale)
 
@@ -117,7 +119,7 @@ def sol_w8a8_precompute_summaries(
 ):
     if not hasattr(_qattn_sm75, "sol_w8a8_precompute_summaries"):
         raise RuntimeError(
-            "split Sol W8A8 requires comfyui-turing-utils-kernel 0.19.0 or newer"
+            "split Sol W8A8 requires comfyui-turing-utils-kernel 0.20.0 or newer"
         )
     return _qattn_sm75.sol_w8a8_precompute_summaries(
         key_int8,
@@ -144,10 +146,11 @@ def sol_sparse_online_w8a8_prequantized_attn(
     sm_scale,
     return_stats,
     force_dense,
+    key_tile_tokens,
 ):
     if not hasattr(_qattn_sm75, "sol_sparse_online_w8a8_prequantized_attn"):
         raise RuntimeError(
-            "split Sol W8A8 requires comfyui-turing-utils-kernel 0.19.0 or newer"
+            "split Sol W8A8 requires comfyui-turing-utils-kernel 0.20.0 or newer"
         )
     (
         key_summary,
@@ -176,4 +179,5 @@ def sol_sparse_online_w8a8_prequantized_attn(
         sm_scale,
         return_stats,
         force_dense,
+        key_tile_tokens,
     )

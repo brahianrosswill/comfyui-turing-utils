@@ -45,7 +45,8 @@ at::Tensor sol_sparse_online_int8_f16_attn(at::Tensor query_int8,
                     float softmax_scale,
                     int return_stats,
                     int use_w8a8,
-                    int force_dense);
+                    int force_dense,
+                    int key_tile_tokens);
 
 std::vector<at::Tensor> sol_w8a8_precompute_summaries(
                     at::Tensor key_int8,
@@ -73,7 +74,8 @@ at::Tensor sol_sparse_online_w8a8_prequantized_attn(
                     int residual_subblocks,
                     float softmax_scale,
                     int return_stats,
-                    int force_dense);
+                    int force_dense,
+                    int key_tile_tokens);
 
 void quantize_v_int8_sm75(at::Tensor value,
                     at::Tensor quantized,

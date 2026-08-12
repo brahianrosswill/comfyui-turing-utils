@@ -1,7 +1,7 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's exact-sm75
-runtime. Version 0.19.0 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
+runtime. Version 0.20.0 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, bundled Sage attention, pure-INT8 W8A8 attention,
 and an explicitly selected experimental model-independent sparse attention
@@ -83,12 +83,16 @@ toolchain on Linux and Windows. The standards can be overridden with
 `COMFYUI_TURING_UTILS_HOST_CXX_STANDARD` and
 `COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD` when diagnosing a toolchain issue.
 
-Version 0.19 adds the split prequantize/execute attention ABI used by current
+Version 0.20 retains the split prequantize/execute attention ABI used by current
 ComfyUI attention tensor containers. It releases the original Q/K/V storage
 before allocating the output (W8A8 keeps no floating-point V copy), while the
 one-call APIs remain available for older ComfyUI/plugin combinations. All
 attention launches use PyTorch's current CUDA stream and can participate in
-CUDA Graph capture.
+CUDA Graph capture. Dense W8A8 and Sol additionally accept logical CTA-K64 or
+CTA-K128 scheduling. CTA-K128 processes two consecutive 64-token stages while
+reusing the same shared tile, so both modes retain the 32 KiB main-kernel
+shared-memory budget. Fused Hadamard Q/K rotation and adaptive K anchoring can
+be disabled only through the explicit experimental tuning patch.
 
 ## Check
 

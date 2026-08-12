@@ -120,6 +120,7 @@ def _make_dense_container_function(kernel: str) -> Callable:
             kernel=kernel,
             scale=kwargs.get("scale"),
             is_causal=bool(kwargs.get("is_causal", False)),
+            transformer_options=kwargs.get("transformer_options"),
         )
         del query, key, value
         return turing_attention_from_prequantized(quantized, kernel=kernel)
@@ -435,6 +436,7 @@ def make_sparse_attention_override(
                 routing_threshold=routing_threshold,
                 scale=kwargs.get("scale"),
                 use_w8a8=use_w8a8,
+                transformer_options=transformer_options,
             )
             del query, key, value
             debug_key = (

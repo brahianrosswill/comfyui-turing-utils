@@ -26,9 +26,9 @@ class FakeModel:
 
 
 class AttentionBackendsTest(unittest.TestCase):
-    def test_split_prequantization_requires_019_kernel_abi(self):
+    def test_split_prequantization_requires_020_kernel_abi(self):
         sage_module = SimpleNamespace(split_prequantization_available=lambda: True)
-        for version, expected in (("0.18.0", False), ("0.19.0", True)):
+        for version, expected in (("0.19.0", False), ("0.20.0", True)):
             with self.subTest(version=version), mock.patch.dict(
                 sys.modules,
                 {
@@ -159,13 +159,13 @@ class AttentionBackendsTest(unittest.TestCase):
         with mock.patch.dict(
             sys.modules,
             {
-                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.17.0"),
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.20.0"),
                 "comfyui_turing_utils_kernel.turing_sage": sage_module,
             },
         ):
             self.assertTrue(attention_backends.bundled_sparse_available())
 
-    def test_w8a8_backend_requires_018_kernel_abi(self):
+    def test_w8a8_backend_requires_020_kernel_abi(self):
         sage_module = SimpleNamespace(w8a8_available=lambda: True)
         with mock.patch.dict(
             sys.modules,
@@ -178,7 +178,7 @@ class AttentionBackendsTest(unittest.TestCase):
         with mock.patch.dict(
             sys.modules,
             {
-                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.18.0"),
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.20.0"),
                 "comfyui_turing_utils_kernel.turing_sage": sage_module,
             },
         ):
