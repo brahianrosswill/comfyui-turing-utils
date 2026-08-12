@@ -82,12 +82,13 @@ def _cuda_toolkit_version() -> tuple[int, int] | None:
 
 
 def _default_cxx_standard(cuda_version: tuple[int, int] | None) -> str:
-    # NVCC gained C++20 support in CUDA 12.0.  The pinned CUTLASS visitor
-    # templates also compile more reliably in that dialect on MSVC.  Older
-    # toolkits remain on their supported C++17 path.
-    if cuda_version is not None:
-        return "c++20" if cuda_version >= (12, 0) else "c++17"
-    return "c++20" if IS_WINDOWS else "c++17"
+    # CUTLASS's EVT-based W4A8 epilogue needs C++20 specifically on the
+    # NVCC/MSVC path. Linux remains on PyTorch's portable C++17 baseline so a
+    # CUDA 12 toolkit does not accidentally require GCC 10+ merely because
+    # NVCC itself understands C++20. Older Windows toolkits also stay on C++17.
+    if not IS_WINDOWS:
+        return "c++17"
+    return "c++20" if cuda_version is None or cuda_version >= (12, 0) else "c++17"
 
 
 def _is_cutlass_include_dir(candidate: Path) -> bool:
@@ -489,7 +490,7 @@ if _includes_sm75():
 
 setup(
     name="comfyui-turing-utils-kernel",
-    version="0.22.2",
+    version="0.22.3",
     packages=find_packages(where=str(ROOT)),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

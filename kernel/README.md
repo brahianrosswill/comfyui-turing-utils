@@ -1,7 +1,7 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's exact-sm75
-runtime. Version 0.22.2 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
+runtime. Version 0.22.3 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, bundled Sage attention, pure-INT8 W8A8 attention,
 and an explicitly selected experimental model-independent sparse attention
@@ -79,12 +79,14 @@ not imported or executed during normal inference.
 On Windows, use an x64 Visual Studio Developer shell. CUDA 12.8 Conda users
 must have the CCCL directory containing `nv/target`; the build discovers
 `%CONDA_PREFIX%\Library\include\targets\x64` automatically.
-The build selects its language dialect from the actual CUDA toolkit used by
-NVCC: CUDA 12 and newer use C++20, while older toolkits use C++17. NVCC 12.0
-was the first CUDA release with C++20 support, and CUTLASS's EVT-based W4A8
-epilogue instantiates more reliably under NVCC/MSVC in that dialect. Detection
-prefers `nvcc --version` and toolkit metadata over PyTorch's compiled CUDA
-label. The standards can be overridden with
+The build selects its Windows language dialect from the actual CUDA toolkit
+used by NVCC: CUDA 12 and newer use C++20, while older toolkits use C++17.
+NVCC 12.0 was the first CUDA release with C++20 support, and CUTLASS's
+EVT-based W4A8 epilogue instantiates more reliably under NVCC/MSVC in that
+dialect. Linux stays on PyTorch's portable C++17 baseline, including with CUDA
+12, so it does not unnecessarily require GCC 10+. Toolkit detection prefers
+`nvcc --version` and toolkit metadata over PyTorch's compiled CUDA label. The
+standards can be overridden with
 `COMFYUI_TURING_UTILS_HOST_CXX_STANDARD` and
 `COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD` when diagnosing a toolchain issue.
 
@@ -93,9 +95,11 @@ ComfyUI attention tensor containers. It releases the original Q/K/V storage
 before allocating the output (W8A8 keeps no floating-point V copy), while the
 one-call APIs remain available for older ComfyUI/plugin combinations. All
 attention launches use PyTorch's current CUDA stream and can participate in
-CUDA Graph capture. Dense W8A8 and Sol additionally accept logical CTA-K64 or
-CTA-K128 scheduling. CTA-K128 processes two consecutive 64-token stages while
-reusing the same shared tile. Native D64 uses 16 KiB dynamic shared memory and
+CUDA Graph capture. Sol accepts logical CTA-K64 or CTA-K128 scheduling;
+CTA-K128 processes two consecutive 64-token stages while reusing the same
+shared tile. Route-free dense W8A8 accepts either value for ABI compatibility
+but deliberately normalizes both to its faster compile-time CTA-K64 loop.
+Native D64 uses 16 KiB dynamic shared memory and
 native D128 uses 32 KiB; inputs below either width pad only to the next native
 specialization. Fused Hadamard Q/K rotation and adaptive K anchoring can be
 disabled only through the explicit experimental tuning patch.
@@ -103,6 +107,9 @@ The new Q/K preprocessing operator accepts FP16/BF16 D64/D128 HND/NHD tensors.
 Its largest D128 rotated/anchored specialization uses about 21.1 KiB static
 shared memory with no local spill in the compute_75 cubin, while D64 uses about
 10.6 KiB. Model semantics remain in plugin adapters rather than the kernel API.
+Version 0.22.3 restores a compile-time single-stage loop for route-free dense
+W8A8. This keeps the D128 dense specialization at 180 registers/thread and
+removes the sparse CTA-K staging overhead without changing the public ABI.
 
 ## Check
 

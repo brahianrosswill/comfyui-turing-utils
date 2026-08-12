@@ -894,14 +894,24 @@ __global__ void sparse_attention_kernel(
       query_length,
       shared_query_int8);
   __syncthreads();
+  // The dense W8A8 path used to share the sparse kernel's runtime two-block
+  // staging loop.  Even though dense execution never needs staged routing,
+  // that runtime loop kept the second-stage state live on SM75 and raised the
+  // D128 register footprint.  Make the dense specialization a compile-time
+  // one-block loop; sparse variants retain the selectable 64/128-token tile.
+  constexpr int kMaxKeyStages = ForceDense ? 1 : 2;
+  const int key_group_stride = ForceDense ? 1 : key_blocks_per_stage;
   for (int key_group = 0; key_group < num_key_blocks;
-       key_group += key_blocks_per_stage)
+       key_group += key_group_stride)
   {
 #pragma unroll
-    for (int key_stage = 0; key_stage < 2; ++key_stage)
+    for (int key_stage = 0; key_stage < kMaxKeyStages; ++key_stage)
     {
-    if (key_stage >= key_blocks_per_stage)
-      continue;
+    if constexpr (!ForceDense)
+    {
+      if (key_stage >= key_blocks_per_stage)
+        continue;
+    }
     const int key_block = key_group + key_stage;
     if (key_block >= num_key_blocks)
       continue;

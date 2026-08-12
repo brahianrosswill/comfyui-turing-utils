@@ -239,7 +239,7 @@ The D128 W8A8 sparse specialization uses 252 registers per thread
 with a 16-byte stack frame but reports zero local-memory spill; 128 threads use
 32768 registers per CTA, so the 32 KiB shared-memory and register budgets still
 permit two CTAs on a 64 KiB/65536-register Turing SM. The route-free dense D128
-W8A8 specialization uses 193 registers and no stack/local spill. Native D64
+W8A8 specialization uses 180 registers and no stack/local spill. Native D64
 W8A8 uses 176/183 registers for sparse BF16/FP16 and 134 registers for the
 route-free dense kernel, with no stack/local spill. These resource
 figures are static compute_75 reports; resident-CTA throughput still requires a
@@ -268,6 +268,13 @@ for Sol with FP16 PV. Thus V quantization is amortized at the intended long
 sequence: dense W8A8 was 1.07x faster and Sol-W8A8 was 1.28x faster than its
 FP16-PV counterpart. At 4k--16k tokens the extra V scan can instead make W8A8
 slower; this reinforces explicit opt-in and does not justify changing `auto`.
+
+Kernel 0.22.3 removes an unintended runtime two-stage loop from route-free
+dense W8A8 while retaining CTA-K64/128 staging for Sol. On the same A40
+compute_75 direction check at BF16, `N=53,192`, and 56 heads, the prequantized
+W8A8 core measured 696.3 ms versus 774.1 ms for stable Sage (1.11x). Before
+the fix the dense core measured about 946 ms. This is still an A40 directional
+test; exact-sm75 end-to-end throughput remains the acceptance criterion.
 
 The Sage1 and Sage2 adaptations produced severe block artefacts and black
 flicker in local Turing tests. They are unstable experiments, not production
