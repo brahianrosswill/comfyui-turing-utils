@@ -16,6 +16,8 @@
 
 #include "torch_compat.h"
 
+#include <vector>
+
 at::Tensor qk_int8_sv_f16_accum_f32_attn(at::Tensor query,
                     at::Tensor key,
                     at::Tensor value,
@@ -43,6 +45,34 @@ at::Tensor sol_sparse_online_int8_f16_attn(at::Tensor query_int8,
                     float softmax_scale,
                     int return_stats,
                     int use_w8a8,
+                    int force_dense);
+
+std::vector<at::Tensor> sol_w8a8_precompute_summaries(
+                    at::Tensor key_int8,
+                    at::Tensor key_scale,
+                    at::Tensor value,
+                    at::Tensor value_scale,
+                    int residual_subblocks);
+
+at::Tensor sol_sparse_online_w8a8_prequantized_attn(
+                    at::Tensor query_int8,
+                    at::Tensor key_int8,
+                    at::Tensor value_int8,
+                    at::Tensor value_scale,
+                    at::Tensor output,
+                    at::Tensor query_scale,
+                    at::Tensor key_scale,
+                    at::Tensor key_summary,
+                    at::Tensor key_score_summary,
+                    at::Tensor value_mean,
+                    at::Tensor key_summary_mean,
+                    at::Tensor key_summary_variance,
+                    at::Tensor sparse_query_blocks,
+                    at::Tensor exact_kv_blocks,
+                    float threshold_sigma,
+                    int residual_subblocks,
+                    float softmax_scale,
+                    int return_stats,
                     int force_dense);
 
 at::Tensor frame_sparse_int8_f16_attn(at::Tensor query_int8,

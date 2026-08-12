@@ -1,4 +1,5 @@
 from collections import OrderedDict
+from dataclasses import dataclass
 from functools import wraps
 from threading import Lock
 from typing import Any, Optional
@@ -25,6 +26,59 @@ _SOL_POLICY_CACHE: OrderedDict[
     tuple, tuple[torch.Tensor, torch.Tensor, int]
 ] = OrderedDict()
 _SOL_POLICY_CACHE_LOCK = Lock()
+
+
+@dataclass(frozen=True, slots=True)
+class PrequantizedSageAttention:
+    query_int8: torch.Tensor
+    query_scale: torch.Tensor
+    key_int8: torch.Tensor
+    key_scale: torch.Tensor
+    value: torch.Tensor
+    tensor_layout: str
+    original_head_dim: int
+    is_causal: bool
+    sm_scale: float
+
+
+@dataclass(frozen=True, slots=True)
+class PrequantizedSolAttention:
+    query_int8: torch.Tensor
+    query_scale: torch.Tensor
+    key_int8: torch.Tensor
+    key_scale: torch.Tensor
+    value: Optional[torch.Tensor]
+    value_int8: torch.Tensor
+    value_scale: torch.Tensor
+    summaries: tuple[torch.Tensor, ...]
+    sparse_query_blocks: torch.Tensor
+    exact_kv_blocks: torch.Tensor
+    output_dtype: torch.dtype
+    sm_scale: float
+    threshold_sigma: float
+    residual_subblocks: int
+    possible_blocks: int
+    use_w8a8: bool
+    force_dense: bool
+
+
+@dataclass(frozen=True, slots=True)
+class PrequantizedFrameAttention:
+    prefix_query_int8: Optional[torch.Tensor]
+    prefix_query_scale: Optional[torch.Tensor]
+    video_query_int8: torch.Tensor
+    video_query_scale: torch.Tensor
+    key_int8: torch.Tensor
+    key_scale: torch.Tensor
+    value: torch.Tensor
+    row_offsets: torch.Tensor
+    key_blocks: torch.Tensor
+    output_shape: tuple[int, ...]
+    output_dtype: torch.dtype
+    prefix_tokens: int
+    padded_prefix_tokens: int
+    sm_scale: float
+    density: float
 
 
 def _normalize_token_ranges(ranges, sequence_length: int) -> tuple[tuple[int, int], ...]:
@@ -416,18 +470,17 @@ def _short_sequence_attention(
 
 
 @_on_input_device
-def sageattn(
+def prequantize_sageattn(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     tensor_layout: str = "HND",
     is_causal: bool = False,
     sm_scale: Optional[float] = None,
-    return_lse: bool = False,
     smooth_k: bool = False,
     **kwargs: Any,
-):
-    """Stable SM75 Sage: per-warp INT8 Q/K and direct FP32 PV accumulation."""
+) -> PrequantizedSageAttention:
+    """Quantize Q/K and detach V storage before allocating the output."""
     if smooth_k:
         raise ValueError("the production Turing Sage backend does not enable experimental smoothing")
     if not q.is_cuda:
@@ -440,13 +493,9 @@ def sageattn(
         raise TypeError("Q/K/V must have matching dtypes")
     _validate_fixed_qkv(q, k, v, tensor_layout)
 
-    short_result = _short_sequence_attention(
-        q, k, v, tensor_layout, is_causal, sm_scale, return_lse
-    )
-    if short_result is not None:
-        return short_result if return_lse else short_result[0]
-
-    tensor_layout_id = 0 if tensor_layout == "NHD" else 1
+    sequence_axis = 2 if tensor_layout == "HND" else 1
+    if q.size(sequence_axis) < 64 or k.size(sequence_axis) < 64:
+        raise ValueError("split Sage attention requires Q/K sequences of at least 64 tokens")
     head_dim = q.size(-1)
     if head_dim < 64:
         padding = 64 - head_dim
@@ -470,22 +519,70 @@ def sageattn(
         tensor_layout=tensor_layout,
         fuse_qk=(is_causal or (tensor_layout == "HND" and q.size(-1) == 64)),
     )
-    output = torch.empty_like(q)
-    lse = sm75_compile.qk_int8_sv_f16_accum_f32_attn(
-        q_int8,
-        k_int8,
-        v.contiguous(),
-        output,
-        q_scale,
-        k_scale,
-        tensor_layout_id,
-        int(is_causal),
-        2,
-        scale,
-        int(return_lse),
+    return PrequantizedSageAttention(
+        query_int8=q_int8,
+        query_scale=q_scale,
+        key_int8=k_int8,
+        key_scale=k_scale,
+        value=v.contiguous(),
+        tensor_layout=tensor_layout,
+        original_head_dim=head_dim,
+        is_causal=bool(is_causal),
+        sm_scale=scale,
     )
-    output = output[..., :head_dim]
-    return (output, lse / 1.44269504) if return_lse else output
+
+
+def sageattn_from_prequantized(
+    quantized: PrequantizedSageAttention,
+    *,
+    return_lse: bool = False,
+):
+    with torch.cuda.device(quantized.query_int8.device):
+        result = sageattn_prequantized(
+            quantized.query_int8,
+            quantized.query_scale,
+            quantized.key_int8,
+            quantized.key_scale,
+            quantized.value,
+            tensor_layout=quantized.tensor_layout,
+            is_causal=quantized.is_causal,
+            sm_scale=quantized.sm_scale,
+            return_lse=return_lse,
+        )
+    if return_lse:
+        output, lse = result
+        return output[..., :quantized.original_head_dim], lse
+    return result[..., :quantized.original_head_dim]
+
+
+@_on_input_device
+def sageattn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    sm_scale: Optional[float] = None,
+    return_lse: bool = False,
+    smooth_k: bool = False,
+    **kwargs: Any,
+):
+    """Stable SM75 Sage: per-warp INT8 Q/K and direct FP32 PV accumulation."""
+    short_result = _short_sequence_attention(
+        q, k, v, tensor_layout, is_causal, sm_scale, return_lse
+    )
+    if short_result is not None:
+        return short_result if return_lse else short_result[0]
+    quantized = prequantize_sageattn.__wrapped__(
+        q,
+        k,
+        v,
+        tensor_layout=tensor_layout,
+        is_causal=is_causal,
+        sm_scale=sm_scale,
+        smooth_k=smooth_k,
+    )
+    return sageattn_from_prequantized(quantized, return_lse=return_lse)
 
 
 @_on_input_device
@@ -602,7 +699,7 @@ def w8a8attn(
         raise TypeError("Turing W8A8 Q/K/V must have matching dtypes")
     if q_hnd.size(-1) != 128:
         raise ValueError("Turing W8A8 currently requires head_dim=128")
-    output = sol_sparse_sageattn(
+    quantized = prequantize_sol_sageattn.__wrapped__(
         q_hnd,
         k_hnd,
         v_hnd,
@@ -611,13 +708,14 @@ def w8a8attn(
         threshold_sigma=0.0,
         residual_subblocks=1,
         use_w8a8=True,
-        _force_dense=True,
+        force_dense=True,
     )
+    output = sol_sparse_sageattn_from_prequantized(quantized)
     return output.transpose(1, 2) if tensor_layout == "NHD" else output
 
 
 @_on_input_device
-def sol_sparse_sageattn(
+def prequantize_sol_sageattn(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -628,11 +726,10 @@ def sol_sparse_sageattn(
     exact_kv_ranges=(),
     threshold_sigma: float = 1.0,
     residual_subblocks: int = 1,
-    return_stats: bool = False,
     use_w8a8: bool = False,
-    _force_dense: bool = False,
-):
-    """SM75 Sol attention with online routing and modality-aware exact ranges."""
+    force_dense: bool = False,
+) -> PrequantizedSolAttention:
+    """Prepare Sol Q/K/V and correction state before output allocation."""
     if not q.is_cuda:
         raise ValueError("Input tensors must be on CUDA")
     if tensor_layout != "HND":
@@ -663,14 +760,10 @@ def sol_sparse_sageattn(
     key_block_count = (k.size(2) + 63) // 64
     possible_blocks = q.size(0) * q.size(1) * sparse_block_count * key_block_count
     if sparse_block_count == 0 and not use_w8a8:
-        dense = sageattn(q, k, v, tensor_layout="HND", sm_scale=scale)
-        if return_stats:
-            return dense, torch.zeros(1, dtype=torch.int64, device=q.device), 0
-        return dense
+        raise ValueError("split FP16 Sol has no sparse Query blocks; use stable Sage")
     if sparse_block_count == 0:
-        _force_dense = True
+        force_dense = True
 
-    output = torch.empty_like(q)
     q_int8, q_scale = quantize_query_per_warp(q, tensor_layout="HND")
     k_int8, k_scale = quantize_key_per_block(k, tensor_layout="HND")
     if use_w8a8:
@@ -686,36 +779,149 @@ def sol_sparse_sageattn(
             device=v.device,
         )
         sm75_compile.quantize_v_int8(v, value_int8, value_scale)
+        if force_dense:
+            half_empty = torch.empty((0, 0, 0, 0), dtype=torch.float16, device=v.device)
+            float_empty = torch.empty((0, 0, 0), dtype=torch.float32, device=v.device)
+            summaries = (half_empty, half_empty, half_empty, float_empty, float_empty)
+        else:
+            summaries = tuple(
+                sm75_compile.sol_w8a8_precompute_summaries(
+                    k_int8,
+                    k_scale,
+                    v,
+                    value_scale,
+                    residual_subblocks,
+                )
+            )
+        retained_value = None
     else:
         value_int8 = torch.empty(0, dtype=torch.int8, device=v.device)
         value_scale = torch.empty(0, dtype=torch.float32, device=v.device)
-    selected = sm75_compile.sol_sparse_online_int8_f16_attn(
-        q_int8,
-        k_int8,
-        v,
-        value_int8,
-        value_scale,
-        output,
-        q_scale,
-        k_scale,
-        sparse_query_blocks,
-        exact_kv_blocks,
-        float(threshold_sigma),
-        residual_subblocks,
-        scale,
-        int(return_stats),
-        int(bool(use_w8a8)),
-        int(bool(_force_dense)),
+        summaries = ()
+        retained_value = v.contiguous()
+    return PrequantizedSolAttention(
+        query_int8=q_int8,
+        query_scale=q_scale,
+        key_int8=k_int8,
+        key_scale=k_scale,
+        value=retained_value,
+        value_int8=value_int8,
+        value_scale=value_scale,
+        summaries=summaries,
+        sparse_query_blocks=sparse_query_blocks,
+        exact_kv_blocks=exact_kv_blocks,
+        output_dtype=v.dtype,
+        sm_scale=scale,
+        threshold_sigma=float(threshold_sigma),
+        residual_subblocks=residual_subblocks,
+        possible_blocks=possible_blocks,
+        use_w8a8=bool(use_w8a8),
+        force_dense=bool(force_dense),
     )
 
-    # Dense Query blocks are handled by the same CUDA grid.  They bypass route
-    # pruning and scan every K/V block, so no Python-side sublaunch or output
-    # copy is required and Q/K/V quantization remains single-pass.
-    return (output, selected, possible_blocks) if return_stats else output
+
+def sol_sparse_sageattn_from_prequantized(
+    quantized: PrequantizedSolAttention,
+    *,
+    return_stats: bool = False,
+):
+    with torch.cuda.device(quantized.query_int8.device):
+        output = torch.empty(
+            quantized.query_int8.shape,
+            dtype=quantized.output_dtype,
+            device=quantized.query_int8.device,
+        )
+        if quantized.use_w8a8:
+            selected = sm75_compile.sol_sparse_online_w8a8_prequantized_attn(
+                quantized.query_int8,
+                quantized.key_int8,
+                quantized.value_int8,
+                quantized.value_scale,
+                output,
+                quantized.query_scale,
+                quantized.key_scale,
+                quantized.summaries,
+                quantized.sparse_query_blocks,
+                quantized.exact_kv_blocks,
+                quantized.threshold_sigma,
+                quantized.residual_subblocks,
+                quantized.sm_scale,
+                int(return_stats),
+                int(quantized.force_dense),
+            )
+        else:
+            selected = sm75_compile.sol_sparse_online_int8_f16_attn(
+                quantized.query_int8,
+                quantized.key_int8,
+                quantized.value,
+                quantized.value_int8,
+                quantized.value_scale,
+                output,
+                quantized.query_scale,
+                quantized.key_scale,
+                quantized.sparse_query_blocks,
+                quantized.exact_kv_blocks,
+                quantized.threshold_sigma,
+                quantized.residual_subblocks,
+                quantized.sm_scale,
+                int(return_stats),
+                0,
+                0,
+            )
+    return (output, selected, quantized.possible_blocks) if return_stats else output
 
 
 @_on_input_device
-def frame_sparse_sageattn(
+def sol_sparse_sageattn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    tensor_layout: str = "HND",
+    sm_scale: Optional[float] = None,
+    dense_query_ranges=(),
+    exact_kv_ranges=(),
+    threshold_sigma: float = 1.0,
+    residual_subblocks: int = 1,
+    return_stats: bool = False,
+    use_w8a8: bool = False,
+    _force_dense: bool = False,
+):
+    """SM75 Sol attention with online routing and modality-aware exact ranges."""
+    if not use_w8a8:
+        sparse_query_blocks, _, sparse_block_count = _sol_block_policy(
+            q.device,
+            q.size(2),
+            k.size(2),
+            dense_query_ranges,
+            exact_kv_ranges,
+        )
+        if sparse_block_count == 0:
+            dense = sageattn(q, k, v, tensor_layout="HND", sm_scale=sm_scale)
+            if return_stats:
+                return dense, torch.zeros(1, dtype=torch.int64, device=q.device), 0
+            return dense
+        del sparse_query_blocks
+    quantized = prequantize_sol_sageattn.__wrapped__(
+        q,
+        k,
+        v,
+        tensor_layout=tensor_layout,
+        sm_scale=sm_scale,
+        dense_query_ranges=dense_query_ranges,
+        exact_kv_ranges=exact_kv_ranges,
+        threshold_sigma=threshold_sigma,
+        residual_subblocks=residual_subblocks,
+        use_w8a8=use_w8a8,
+        force_dense=_force_dense,
+    )
+    return sol_sparse_sageattn_from_prequantized(
+        quantized,
+        return_stats=return_stats,
+    )
+
+@_on_input_device
+def prequantize_frame_sparse_sageattn(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -735,9 +941,8 @@ def frame_sparse_sageattn(
     spatial_tokens_width: int = 0,
     radial_spatial_radius: int = 1,
     radial_max_temporal_stride: int = 16,
-    return_schedule_density: bool = False,
-):
-    """Structured frame-sparse SM75 Sage with a cached head-independent route."""
+) -> PrequantizedFrameAttention:
+    """Prepare structured frame-sparse Q/K and schedule before output allocation."""
     if not q.is_cuda:
         raise ValueError("Input tensors must be on CUDA")
     if tensor_layout != "HND":
@@ -800,7 +1005,6 @@ def frame_sparse_sageattn(
         )
 
     scale = float(sm_scale) if sm_scale is not None else 128**-0.5
-    output = torch.empty_like(q)
     k_int8, k_scale = quantize_key_per_block(k, tensor_layout="HND")
 
     # Non-video Query tokens remain exact and see every K/V token. This keeps
@@ -808,7 +1012,6 @@ def frame_sparse_sageattn(
     # explicitly reduced for video Query rows.
     if topology_start_tokens:
         q_prefix = q[:, :, :topology_start_tokens]
-        prefix_output = output[:, :, :topology_start_tokens]
         padded_prefix = topology_start_tokens < 64
         if padded_prefix:
             q_prefix = torch.nn.functional.pad(
@@ -817,35 +1020,13 @@ def frame_sparse_sageattn(
         q_prefix_int8, q_prefix_scale = quantize_query_per_warp(
             q_prefix, tensor_layout="HND"
         )
-        if padded_prefix:
-            padded_output = torch.empty_like(q_prefix)
-            sageattn_prequantized(
-                q_prefix_int8,
-                q_prefix_scale,
-                k_int8,
-                k_scale,
-                v,
-                tensor_layout="HND",
-                sm_scale=scale,
-                output=padded_output,
-            )
-            prefix_output.copy_(padded_output[:, :, :topology_start_tokens])
-            del padded_output
-        else:
-            sageattn_prequantized(
-                q_prefix_int8,
-                q_prefix_scale,
-                k_int8,
-                k_scale,
-                v,
-                tensor_layout="HND",
-                sm_scale=scale,
-                output=prefix_output,
-            )
-        del q_prefix_int8, q_prefix_scale
+        padded_prefix_tokens = q_prefix.size(2)
+    else:
+        q_prefix_int8 = None
+        q_prefix_scale = None
+        padded_prefix_tokens = 0
 
     q_video = q[:, :, topology_start_tokens:]
-    video_output = output[:, :, topology_start_tokens:]
     q_int8, q_scale = quantize_query_per_warp(q_video, tensor_layout="HND")
     row_offsets, key_blocks, density = _frame_sparse_schedule(
         device=q.device,
@@ -864,18 +1045,136 @@ def frame_sparse_sageattn(
         radial_spatial_radius=radial_spatial_radius,
         radial_max_temporal_stride=radial_max_temporal_stride,
     )
-    sm75_compile.frame_sparse_int8_f16_attn(
-        q_int8.contiguous(),
-        k_int8.contiguous(),
-        v.contiguous(),
-        video_output,
-        q_scale.contiguous(),
-        k_scale.contiguous(),
-        row_offsets,
-        key_blocks,
-        scale,
+    return PrequantizedFrameAttention(
+        prefix_query_int8=q_prefix_int8,
+        prefix_query_scale=q_prefix_scale,
+        video_query_int8=q_int8,
+        video_query_scale=q_scale,
+        key_int8=k_int8,
+        key_scale=k_scale,
+        value=v.contiguous(),
+        row_offsets=row_offsets,
+        key_blocks=key_blocks,
+        output_shape=tuple(q.shape),
+        output_dtype=q.dtype,
+        prefix_tokens=topology_start_tokens,
+        padded_prefix_tokens=padded_prefix_tokens,
+        sm_scale=scale,
+        density=density,
     )
-    return (output, density) if return_schedule_density else output
+
+
+def frame_sparse_sageattn_from_prequantized(
+    quantized: PrequantizedFrameAttention,
+    *,
+    return_schedule_density: bool = False,
+):
+    with torch.cuda.device(quantized.key_int8.device):
+        output = torch.empty(
+            quantized.output_shape,
+            dtype=quantized.output_dtype,
+            device=quantized.key_int8.device,
+        )
+        if quantized.prefix_query_int8 is not None:
+            prefix_output = output[:, :, :quantized.prefix_tokens]
+            if quantized.padded_prefix_tokens != quantized.prefix_tokens:
+                padded_output = torch.empty(
+                    (
+                        output.size(0),
+                        output.size(1),
+                        quantized.padded_prefix_tokens,
+                        output.size(3),
+                    ),
+                    dtype=output.dtype,
+                    device=output.device,
+                )
+                sageattn_prequantized(
+                    quantized.prefix_query_int8,
+                    quantized.prefix_query_scale,
+                    quantized.key_int8,
+                    quantized.key_scale,
+                    quantized.value,
+                    tensor_layout="HND",
+                    sm_scale=quantized.sm_scale,
+                    output=padded_output,
+                )
+                prefix_output.copy_(padded_output[:, :, :quantized.prefix_tokens])
+            else:
+                sageattn_prequantized(
+                    quantized.prefix_query_int8,
+                    quantized.prefix_query_scale,
+                    quantized.key_int8,
+                    quantized.key_scale,
+                    quantized.value,
+                    tensor_layout="HND",
+                    sm_scale=quantized.sm_scale,
+                    output=prefix_output,
+                )
+
+        video_output = output[:, :, quantized.prefix_tokens:]
+        sm75_compile.frame_sparse_int8_f16_attn(
+            quantized.video_query_int8.contiguous(),
+            quantized.key_int8.contiguous(),
+            quantized.value,
+            video_output,
+            quantized.video_query_scale.contiguous(),
+            quantized.key_scale.contiguous(),
+            quantized.row_offsets,
+            quantized.key_blocks,
+            quantized.sm_scale,
+        )
+    if return_schedule_density:
+        return output, quantized.density
+    return output
+
+
+@_on_input_device
+def frame_sparse_sageattn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    tensor_layout: str = "HND",
+    sm_scale: Optional[float] = None,
+    prefix_tokens: int = 0,
+    topology_start_tokens: int,
+    topology_tokens: int,
+    tokens_per_frame: int,
+    temporal_window_frames: int = 2,
+    global_anchor_stride: int = 12,
+    global_anchor_offset: int = 0,
+    sink_frames: int = 1,
+    sparse_pattern: str = "frame_window",
+    spatial_tokens_height: int = 0,
+    spatial_tokens_width: int = 0,
+    radial_spatial_radius: int = 1,
+    radial_max_temporal_stride: int = 16,
+    return_schedule_density: bool = False,
+):
+    quantized = prequantize_frame_sparse_sageattn.__wrapped__(
+        q,
+        k,
+        v,
+        tensor_layout=tensor_layout,
+        sm_scale=sm_scale,
+        prefix_tokens=prefix_tokens,
+        topology_start_tokens=topology_start_tokens,
+        topology_tokens=topology_tokens,
+        tokens_per_frame=tokens_per_frame,
+        temporal_window_frames=temporal_window_frames,
+        global_anchor_stride=global_anchor_stride,
+        global_anchor_offset=global_anchor_offset,
+        sink_frames=sink_frames,
+        sparse_pattern=sparse_pattern,
+        spatial_tokens_height=spatial_tokens_height,
+        spatial_tokens_width=spatial_tokens_width,
+        radial_spatial_radius=radial_spatial_radius,
+        radial_max_temporal_stride=radial_max_temporal_stride,
+    )
+    return frame_sparse_sageattn_from_prequantized(
+        quantized,
+        return_schedule_density=return_schedule_density,
+    )
 
 
 @_on_input_device

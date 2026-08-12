@@ -34,6 +34,22 @@ def w8a8_available() -> bool:
     return hasattr(module, "quantize_v_int8_sm75")
 
 
+def split_prequantization_available() -> bool:
+    if not w8a8_available():
+        return False
+    try:
+        module = importlib.import_module("comfyui_turing_utils_kernel._sage_qattn_sm75")
+    except (ImportError, OSError):
+        return False
+    return all(
+        hasattr(module, name)
+        for name in (
+            "sol_w8a8_precompute_summaries",
+            "sol_sparse_online_w8a8_prequantized_attn",
+        )
+    )
+
+
 def frame_sparse_available() -> bool:
     if not available():
         return False
@@ -49,6 +65,27 @@ def sageattn(*args, **kwargs):
     from .core import sageattn as implementation
 
     return implementation(*args, **kwargs)
+
+
+def sageattn_compiled(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    tensor_layout: str = "HND",
+    is_causal: bool = False,
+    sm_scale: float | None = None,
+):
+    from .custom_ops import sage_attention
+
+    return sage_attention(
+        q,
+        k,
+        v,
+        tensor_layout,
+        bool(is_causal),
+        float(sm_scale) if sm_scale is not None else -1.0,
+    )
 
 
 def sageattn_varlen(*args, **kwargs):
@@ -69,8 +106,63 @@ def w8a8attn(*args, **kwargs):
     return implementation(*args, **kwargs)
 
 
+def w8a8attn_compiled(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    tensor_layout: str = "HND",
+    sm_scale: float | None = None,
+):
+    from .custom_ops import w8a8_attention
+
+    return w8a8_attention(
+        q,
+        k,
+        v,
+        tensor_layout,
+        float(sm_scale) if sm_scale is not None else -1.0,
+    )
+
+
 def frame_sparse_sageattn(*args, **kwargs):
     from .core import frame_sparse_sageattn as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def prequantize_sageattn(*args, **kwargs):
+    from .core import prequantize_sageattn as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def sageattn_from_prequantized(*args, **kwargs):
+    from .core import sageattn_from_prequantized as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def prequantize_sol_sageattn(*args, **kwargs):
+    from .core import prequantize_sol_sageattn as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def sol_sparse_sageattn_from_prequantized(*args, **kwargs):
+    from .core import sol_sparse_sageattn_from_prequantized as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def prequantize_frame_sparse_sageattn(*args, **kwargs):
+    from .core import prequantize_frame_sparse_sageattn as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def frame_sparse_sageattn_from_prequantized(*args, **kwargs):
+    from .core import frame_sparse_sageattn_from_prequantized as implementation
 
     return implementation(*args, **kwargs)
 
@@ -231,14 +323,23 @@ __all__ = [
     "available",
     "frame_sparse_available",
     "frame_sparse_sageattn",
+    "frame_sparse_sageattn_from_prequantized",
+    "prequantize_frame_sparse_sageattn",
+    "prequantize_sageattn",
+    "prequantize_sol_sageattn",
     "preflight",
     "preflight_frame_sparse",
     "preflight_sparse",
     "preflight_w8a8",
     "sageattn",
+    "sageattn_compiled",
+    "sageattn_from_prequantized",
     "sageattn_varlen",
     "sol_sparse_sageattn",
+    "sol_sparse_sageattn_from_prequantized",
+    "split_prequantization_available",
     "sparse_available",
     "w8a8attn",
+    "w8a8attn_compiled",
     "w8a8_available",
 ]

@@ -16,6 +16,37 @@ from comfyui_turing_utils_kernel.turing_sage import quant  # noqa: E402
 
 
 class TuringSageQuantContractTest(unittest.TestCase):
+    def test_compiled_attention_facades_have_fake_tensor_contracts(self):
+        q = torch.empty((1, 4, 129, 128), dtype=torch.bfloat16, device="meta")
+        k = torch.empty((1, 2, 151, 128), dtype=torch.bfloat16, device="meta")
+        v = torch.empty_like(k)
+
+        stable = turing_sage.sageattn_compiled(q, k, v)
+        w8a8 = turing_sage.w8a8attn_compiled(q, k, v)
+
+        self.assertEqual(stable.shape, q.shape)
+        self.assertEqual(stable.dtype, q.dtype)
+        self.assertEqual(stable.device.type, "meta")
+        self.assertEqual(w8a8.shape, q.shape)
+        self.assertEqual(w8a8.dtype, q.dtype)
+        self.assertEqual(w8a8.device.type, "meta")
+
+    def test_compiled_attention_facade_is_a_fullgraph_leaf(self):
+        q = torch.empty((1, 4, 129, 128), dtype=torch.bfloat16, device="meta")
+        k = torch.empty((1, 2, 151, 128), dtype=torch.bfloat16, device="meta")
+        v = torch.empty_like(k)
+
+        compiled = torch.compile(
+            lambda query, key, value: turing_sage.sageattn_compiled(
+                query, key, value
+            ),
+            backend="eager",
+            fullgraph=True,
+        )
+        output = compiled(q, k, v)
+        self.assertEqual(output.shape, q.shape)
+        self.assertEqual(output.device.type, "meta")
+
     def test_split_quantizers_preserve_production_scale_contract(self):
         q = torch.empty((2, 4, 129, 128), dtype=torch.bfloat16)
         k = torch.empty((2, 2, 151, 128), dtype=torch.bfloat16)
@@ -62,15 +93,24 @@ class TuringSageQuantContractTest(unittest.TestCase):
                 "available",
                 "frame_sparse_available",
                 "frame_sparse_sageattn",
+                "frame_sparse_sageattn_from_prequantized",
+                "prequantize_frame_sparse_sageattn",
+                "prequantize_sageattn",
+                "prequantize_sol_sageattn",
                 "preflight",
                 "preflight_frame_sparse",
                 "preflight_sparse",
                 "preflight_w8a8",
                 "sageattn",
+                "sageattn_compiled",
+                "sageattn_from_prequantized",
                 "sageattn_varlen",
                 "sol_sparse_sageattn",
+                "sol_sparse_sageattn_from_prequantized",
+                "split_prequantization_available",
                 "sparse_available",
                 "w8a8attn",
+                "w8a8attn_compiled",
                 "w8a8_available",
             ],
         )

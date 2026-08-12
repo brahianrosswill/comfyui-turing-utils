@@ -12,7 +12,13 @@ from .sparse import (
     _resolve_frame_sparse_quality_profile,
     _sparse_dense_layer,
     _sparse_dense_schedule,
+    inspect_frame_attention_call,
+    inspect_sol_attention_call,
+    prequantize_turing_frame_attention,
+    prequantize_turing_sol_attention,
+    turing_frame_attention_from_prequantized,
     turing_frame_sparse_attention,
+    turing_sol_attention_from_prequantized,
     turing_sol_sparse_attention,
 )
 from .stable import (
@@ -44,14 +50,95 @@ from .stable import (
     bundled_sparse_available,
     bundled_w8a8_available,
     is_supported_turing_device,
+    inspect_turing_attention_call,
     normalize_attention_backend,
+    prequantize_turing_attention,
     preflight_bundled,
     preflight_bundled_frame_sparse,
     preflight_bundled_sparse,
     preflight_bundled_w8a8,
+    split_prequantization_available,
+    turing_attention_from_prequantized,
     turing_sage_attention,
     turing_w8a8_attention,
 )
+
+
+def _default_attention_fallback() -> Callable:
+    from comfy.ldm.modules import attention as comfy_attention
+
+    return comfy_attention.optimized_attention
+
+
+def _container_fallback(fallback: Callable, q, k, v, heads: int, *args, **kwargs):
+    return _dtype_compatible_fallback(
+        fallback,
+        q.take(),
+        k.take(),
+        v.take(),
+        heads,
+        *args,
+        **kwargs,
+    )
+
+
+def _make_dense_container_function(kernel: str) -> Callable:
+    fallback = _default_attention_fallback()
+
+    def container_function(
+        q,
+        k,
+        v,
+        heads: int,
+        mask=None,
+        attn_precision=None,
+        skip_reshape: bool = False,
+        skip_output_reshape: bool = False,
+        **kwargs,
+    ):
+        call, reason = inspect_turing_attention_call(
+            q.peek(),
+            k.peek(),
+            v.peek(),
+            heads,
+            mask=mask,
+            skip_reshape=skip_reshape,
+            skip_output_reshape=skip_output_reshape,
+            enable_gqa=bool(kwargs.get("enable_gqa", False)),
+            low_precision_attention=kwargs.get("low_precision_attention", True),
+            is_causal=bool(kwargs.get("is_causal", False)),
+            kernel=kernel,
+            require_long_sequence=True,
+        )
+        if reason is not None:
+            return _container_fallback(
+                fallback,
+                q,
+                k,
+                v,
+                heads,
+                mask=mask,
+                attn_precision=attn_precision,
+                skip_reshape=skip_reshape,
+                skip_output_reshape=skip_output_reshape,
+                **kwargs,
+            )
+        query = q.take()
+        key = k.take()
+        value = v.take()
+        quantized = prequantize_turing_attention(
+            query,
+            key,
+            value,
+            call,
+            kernel=kernel,
+            scale=kwargs.get("scale"),
+            is_causal=bool(kwargs.get("is_causal", False)),
+        )
+        del query, key, value
+        return turing_attention_from_prequantized(quantized, kernel=kernel)
+
+    return container_function
 
 
 def _uses_bundled_turing_sage(option: str, device: torch.device | None) -> bool:
@@ -128,6 +215,10 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
 
     attention_override.turing_utils_attention_backend = backend.option
     attention_override.turing_utils_attention_implementation = implementation
+    if bundled_turing and split_prequantization_available():
+        attention_override.container_function = _make_dense_container_function(
+            "w8a8" if option == "w8a8" else "sage"
+        )
     return attention_override
 
 
@@ -278,6 +369,120 @@ def make_sparse_attention_override(
             use_w8a8=use_w8a8,
             **kwargs,
         )
+
+    if split_prequantization_available():
+        dense_container = _make_dense_container_function(
+            "w8a8" if use_w8a8 else "sage"
+        )
+
+        def container_function(
+            q,
+            k,
+            v,
+            heads: int,
+            mask=None,
+            attn_precision=None,
+            skip_reshape: bool = False,
+            skip_output_reshape: bool = False,
+            **kwargs,
+        ):
+            transformer_options = kwargs.get("transformer_options")
+            if _sparse_dense_schedule(
+                transformer_options,
+                dense_prefix_steps,
+                dense_suffix_steps,
+                schedule_state,
+            ) or _sparse_dense_layer(
+                transformer_options,
+                dense_prefix_layers,
+                dense_suffix_layers,
+            ):
+                return dense_container(
+                    q,
+                    k,
+                    v,
+                    heads,
+                    mask=mask,
+                    attn_precision=attn_precision,
+                    skip_reshape=skip_reshape,
+                    skip_output_reshape=skip_output_reshape,
+                    **kwargs,
+                )
+            sol_call, reason = inspect_sol_attention_call(
+                q.peek(),
+                k.peek(),
+                v.peek(),
+                heads,
+                mask=mask,
+                skip_reshape=skip_reshape,
+                skip_output_reshape=skip_output_reshape,
+                min_sequence_tokens=min_sequence_tokens,
+                prefix_policy=prefix_policy,
+                manual_prefix_tokens=manual_prefix_tokens,
+                skipped_residual=skipped_residual,
+                sparse_reference_image=sparse_reference_image,
+                sparse_reference_video=sparse_reference_video,
+                sparse_reference_audio=sparse_reference_audio,
+                transformer_options=transformer_options,
+                kwargs=kwargs,
+            )
+            if reason is not None:
+                return dense_container(
+                    q,
+                    k,
+                    v,
+                    heads,
+                    mask=mask,
+                    attn_precision=attn_precision,
+                    skip_reshape=skip_reshape,
+                    skip_output_reshape=skip_output_reshape,
+                    **kwargs,
+                )
+            query = q.take()
+            key = k.take()
+            value = v.take()
+            quantized = prequantize_turing_sol_attention(
+                query,
+                key,
+                value,
+                sol_call,
+                routing_threshold=routing_threshold,
+                scale=kwargs.get("scale"),
+                use_w8a8=use_w8a8,
+            )
+            del query, key, value
+            debug_key = (
+                sol_call.attention.input_dtype,
+                sol_call.attention.query_tokens,
+                sol_call.attention.key_tokens,
+                sol_call.protected_ranges,
+                routing_threshold,
+                sol_call.residual_subblocks,
+                use_w8a8,
+            )
+            collect_stats = debug_route_density and debug_key not in debug_route_keys
+            result = turing_sol_attention_from_prequantized(
+                quantized,
+                return_stats=collect_stats,
+            )
+            if collect_stats:
+                output, selected, possible = result
+                selected_blocks = int(selected.item())
+                LOG.warning(
+                    "[Turing sparse debug] selected=%d/%d density=%.4f Q=%d K=%d threshold=%.2f residual=%s",
+                    selected_blocks,
+                    possible,
+                    selected_blocks / possible if possible else 0.0,
+                    sol_call.attention.query_tokens,
+                    sol_call.attention.key_tokens,
+                    routing_threshold,
+                    skipped_residual,
+                )
+                debug_route_keys.add(debug_key)
+                return output
+            return result
+
+        attention_override.container_function = container_function
 
     attention_override.turing_utils_attention_backend = "sol_sparse_attn"
     attention_override.turing_utils_attention_implementation = "bundled_turing_sol_sparse_experimental"
@@ -509,6 +714,95 @@ def make_frame_sparse_attention_override(
             debug_route_density=debug_route_density,
             **kwargs,
         )
+
+    if split_prequantization_available():
+        dense_container = _make_dense_container_function("sage")
+
+        def container_function(
+            q,
+            k,
+            v,
+            heads: int,
+            mask=None,
+            attn_precision=None,
+            skip_reshape: bool = False,
+            skip_output_reshape: bool = False,
+            **kwargs,
+        ):
+            transformer_options = kwargs.get("transformer_options")
+            if _sparse_dense_schedule(
+                transformer_options,
+                dense_prefix_steps,
+                dense_suffix_steps,
+                schedule_state,
+            ) or _sparse_dense_layer(
+                transformer_options,
+                dense_prefix_layers,
+                dense_suffix_layers,
+            ):
+                return dense_container(
+                    q,
+                    k,
+                    v,
+                    heads,
+                    mask=mask,
+                    attn_precision=attn_precision,
+                    skip_reshape=skip_reshape,
+                    skip_output_reshape=skip_output_reshape,
+                    **kwargs,
+                )
+            frame_call, reason = inspect_frame_attention_call(
+                q.peek(),
+                k.peek(),
+                v.peek(),
+                heads,
+                mask=mask,
+                skip_reshape=skip_reshape,
+                skip_output_reshape=skip_output_reshape,
+                prefix_policy=prefix_policy,
+                manual_prefix_tokens=manual_prefix_tokens,
+                global_anchor_stride=global_anchor_stride,
+                rotate_global_anchors=rotate_global_anchors,
+                sparse_pattern=sparse_pattern,
+                radial_max_temporal_stride=radial_max_temporal_stride,
+                transformer_options=transformer_options,
+                kwargs=kwargs,
+            )
+            if reason is not None:
+                return dense_container(
+                    q,
+                    k,
+                    v,
+                    heads,
+                    mask=mask,
+                    attn_precision=attn_precision,
+                    skip_reshape=skip_reshape,
+                    skip_output_reshape=skip_output_reshape,
+                    **kwargs,
+                )
+            query = q.take()
+            key = k.take()
+            value = v.take()
+            quantized = prequantize_turing_frame_attention(
+                query,
+                key,
+                value,
+                frame_call,
+                scale=kwargs.get("scale"),
+                temporal_window_frames=temporal_window_frames,
+                global_anchor_stride=global_anchor_stride,
+                sink_frames=sink_frames,
+                sparse_pattern=sparse_pattern,
+                radial_spatial_radius=radial_spatial_radius,
+                radial_max_temporal_stride=radial_max_temporal_stride,
+            )
+            del query, key, value
+            return turing_frame_attention_from_prequantized(
+                quantized,
+                return_schedule_density=False,
+            )
+
+        attention_override.container_function = container_function
 
     attention_override.turing_utils_attention_backend = "frame_sparse_attn"
     attention_override.turing_utils_attention_implementation = (

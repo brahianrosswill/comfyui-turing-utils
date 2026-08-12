@@ -1,7 +1,7 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's exact-sm75
-runtime. Version 0.18.0 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
+runtime. Version 0.19.0 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, bundled Sage attention, pure-INT8 W8A8 attention,
 and an explicitly selected experimental model-independent sparse attention
@@ -72,10 +72,17 @@ python kernel/scripts/validate_wan_fusions.py --device cuda:0
 On Windows, use an x64 Visual Studio Developer shell. CUDA 12.8 Conda users
 must have the CCCL directory containing `nv/target`; the build discovers
 `%CONDA_PREFIX%\Library\include\targets\x64` automatically.
-The extension uses C++20 by default. This is required for the bundled CUTLASS
-W4A8 templates to compile reliably with NVCC and MSVC. The host and device
-standards can be overridden with `COMFYUI_TURING_UTILS_HOST_CXX_STANDARD` and
+The default host and CUDA language level is C++17, matching PyTorch's extension
+toolchain on Linux and Windows. The standards can be overridden with
+`COMFYUI_TURING_UTILS_HOST_CXX_STANDARD` and
 `COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD` when diagnosing a toolchain issue.
+
+Version 0.19 adds the split prequantize/execute attention ABI used by current
+ComfyUI attention tensor containers. It releases the original Q/K/V storage
+before allocating the output (W8A8 keeps no floating-point V copy), while the
+one-call APIs remain available for older ComfyUI/plugin combinations. All
+attention launches use PyTorch's current CUDA stream and can participate in
+CUDA Graph capture.
 
 ## Check
 

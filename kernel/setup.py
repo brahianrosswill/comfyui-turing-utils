@@ -266,9 +266,9 @@ COMMON_DEFINES = [
 
 HOST_CXX_STANDARD = os.environ.get(
     "COMFYUI_TURING_UTILS_HOST_CXX_STANDARD",
-    os.environ.get("COMFYUI_TURING_UTILS_CXX_STANDARD", "c++20"),
+    os.environ.get("COMFYUI_TURING_UTILS_CXX_STANDARD", "c++17"),
 )
-NVCC_CXX_STANDARD = os.environ.get("COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD", "c++20")
+NVCC_CXX_STANDARD = os.environ.get("COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD", "c++17")
 
 NVCC_FLAGS = [
     *COMMON_DEFINES,
@@ -415,7 +415,7 @@ if _includes_sm75():
 
 setup(
     name="comfyui-turing-utils-kernel",
-    version="0.18.0",
+    version="0.19.0",
     packages=find_packages(where=str(ROOT)),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

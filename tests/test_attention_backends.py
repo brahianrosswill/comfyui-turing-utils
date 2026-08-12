@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import sys
+import gc
 import unittest
+import weakref
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -24,6 +26,94 @@ class FakeModel:
 
 
 class AttentionBackendsTest(unittest.TestCase):
+    def test_split_prequantization_requires_019_kernel_abi(self):
+        sage_module = SimpleNamespace(split_prequantization_available=lambda: True)
+        for version, expected in (("0.18.0", False), ("0.19.0", True)):
+            with self.subTest(version=version), mock.patch.dict(
+                sys.modules,
+                {
+                    "comfyui_turing_utils_kernel": SimpleNamespace(__version__=version),
+                    "comfyui_turing_utils_kernel.turing_sage": sage_module,
+                },
+            ):
+                self.assertEqual(
+                    attention_backends.split_prequantization_available(), expected
+                )
+
+    def test_container_path_releases_inputs_before_output_allocation(self):
+        references = []
+
+        def containers():
+            tensors = [
+                torch.zeros((1, 2, 64, 128), dtype=torch.bfloat16)
+                for _ in range(3)
+            ]
+            references.extend(weakref.ref(tensor) for tensor in tensors)
+            return tuple(
+                comfy_attention.AttentionTensorContainer(tensor) for tensor in tensors
+            )
+
+        def prequantize(*args, **kwargs):
+            return "packed"
+
+        def consume(quantized, *, kernel):
+            gc.collect()
+            self.assertTrue(all(reference() is None for reference in references))
+            self.assertEqual(kernel, "w8a8")
+            return torch.zeros((1, 2, 64, 128), dtype=torch.bfloat16)
+
+        q, k, v = containers()
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch(
+                "attention.prequantize_turing_attention", new=prequantize
+            ),
+            mock.patch(
+                "attention.turing_attention_from_prequantized", side_effect=consume
+            ),
+        ):
+            function = attention_backends._make_dense_container_function("w8a8")
+            output = function(
+                q,
+                k,
+                v,
+                2,
+                skip_reshape=True,
+                skip_output_reshape=True,
+            )
+
+        self.assertEqual(output.shape, (1, 2, 64, 128))
+        self.assertIsNone(q.tensor)
+        self.assertIsNone(k.tensor)
+        self.assertIsNone(v.tensor)
+
+    def test_container_preflight_falls_back_without_partial_consumption(self):
+        tensors = [
+            torch.zeros((1, 2, 64, 128), dtype=torch.bfloat16) for _ in range(3)
+        ]
+        q, k, v = (
+            comfy_attention.AttentionTensorContainer(tensor) for tensor in tensors
+        )
+        fallback = mock.Mock(return_value="fallback")
+        with (
+            mock.patch("attention._default_attention_fallback", return_value=fallback),
+            mock.patch(
+                "attention.inspect_turing_attention_call",
+                return_value=(None, "unsupported"),
+            ),
+            mock.patch("attention.prequantize_turing_attention") as prequant,
+        ):
+            function = attention_backends._make_dense_container_function("sage")
+            output = function(q, k, v, 2, skip_reshape=True)
+
+        self.assertEqual(output, "fallback")
+        prequant.assert_not_called()
+        fallback.assert_called_once()
+        self.assertEqual(fallback.call_args.args[:3], tuple(tensors))
+        self.assertIsNone(q.tensor)
+        self.assertIsNone(k.tensor)
+        self.assertIsNone(v.tensor)
+
     def test_sparse_backend_requires_the_fused_routing_abi(self):
         sage_module = SimpleNamespace(sparse_available=lambda: True)
         with mock.patch.dict(

@@ -1045,7 +1045,7 @@ void check_launch(const char *name)
   TORCH_CHECK(error == cudaSuccess, name, " launch failed: ", cudaGetErrorString(error));
 }
 
-template <typename T, bool UseW8A8, bool ForceDense>
+template <typename T, bool UseW8A8, bool ForceDense, bool SummariesReady = false>
 void launch_sparse_threshold_attention(
     at::Tensor query_int8,
     at::Tensor key_int8,
@@ -1078,7 +1078,7 @@ void launch_sparse_threshold_attention(
   const int padded_residual_summaries = key_score_summary.size(2);
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
 
-  if constexpr (!ForceDense)
+  if constexpr (!ForceDense && !SummariesReady)
   {
     dim3 key_summary_grid(num_key_blocks, num_kv_heads, batch_size);
     kv_block_summary_kernel<T, UseW8A8><<<key_summary_grid, kHeadDim, 0, stream>>>(
@@ -1391,6 +1391,318 @@ at::Tensor sol_sparse_online_int8_f16_attn(
         key_summary_mean, key_summary_variance,
         sparse_query_blocks, exact_kv_blocks, selected_count,
         residual_subblocks, threshold_sigma, softmax_scale);
+  }
+  return selected_count;
+}
+
+std::vector<at::Tensor> sol_w8a8_precompute_summaries(
+    at::Tensor key_int8,
+    at::Tensor key_scale,
+    at::Tensor value,
+    at::Tensor value_scale,
+    int residual_subblocks)
+{
+  CHECK_CUDA(key_int8);
+  CHECK_CUDA(key_scale);
+  CHECK_CUDA(value);
+  CHECK_CUDA(value_scale);
+  CHECK_LASTDIM_CONTIGUOUS(key_int8);
+  CHECK_LASTDIM_CONTIGUOUS(value);
+  CHECK_CONTIGUOUS(key_scale);
+  CHECK_CONTIGUOUS(value_scale);
+  CHECK_DIMS(key_int8, 4);
+  CHECK_DIMS(key_scale, 3);
+  CHECK_DIMS(value, 4);
+  CHECK_DIMS(value_scale, 3);
+  CHECK_DTYPE(key_int8, at::ScalarType::Char);
+  CHECK_DTYPE(key_scale, at::ScalarType::Float);
+  CHECK_DTYPE(value_scale, at::ScalarType::Float);
+  TORCH_CHECK(
+      value.scalar_type() == at::ScalarType::Half ||
+          value.scalar_type() == at::ScalarType::BFloat16,
+      "Sol W8A8 summary V must be float16 or bfloat16");
+  TORCH_CHECK(
+      key_int8.device() == key_scale.device() &&
+          key_int8.device() == value.device() &&
+          key_int8.device() == value_scale.device(),
+      "Sol W8A8 summary tensors must share one CUDA device");
+  TORCH_CHECK(
+      key_int8.size(0) == value.size(0) &&
+          key_int8.size(1) == value.size(1) &&
+          key_int8.size(2) == value.size(2) &&
+          key_int8.size(3) == kHeadDim && value.size(3) == kHeadDim,
+      "Sol W8A8 summary K/V shapes are incompatible");
+  TORCH_CHECK(
+      residual_subblocks == 1 || residual_subblocks == 2,
+      "Sol residual_subblocks must be 1 or 2");
+
+  const int batch_size = key_int8.size(0);
+  const int num_kv_heads = key_int8.size(1);
+  const int key_length = key_int8.size(2);
+  const int num_key_blocks = div_ceil(key_length, kBlockTokens);
+  const int padded_key_blocks = div_ceil(num_key_blocks, kRouteTile) * kRouteTile;
+  const int residual_tokens = kBlockTokens / residual_subblocks;
+  const int num_residual_summaries = div_ceil(key_length, residual_tokens);
+  const int padded_residual_summaries =
+      div_ceil(num_residual_summaries, kSummaryTileTokens) * kSummaryTileTokens;
+  TORCH_CHECK(
+      key_scale.sizes() == at::IntArrayRef({batch_size, num_kv_heads, num_key_blocks}),
+      "Sol W8A8 K scale shape is incompatible");
+  TORCH_CHECK(
+      value_scale.sizes() == at::IntArrayRef({batch_size, num_kv_heads, kHeadDim}),
+      "Sol W8A8 V scale shape is incompatible");
+
+  const auto half_options = value.options().dtype(at::ScalarType::Half);
+  const auto float_options = value.options().dtype(at::ScalarType::Float);
+  at::Tensor key_score_summary = at::empty(
+      {batch_size, num_kv_heads, padded_residual_summaries, kHeadDim}, half_options);
+  at::Tensor key_summary = residual_subblocks == 1
+      ? key_score_summary
+      : at::empty(
+          {batch_size, num_kv_heads, padded_key_blocks, kHeadDim}, half_options);
+  at::Tensor value_mean = at::empty_like(key_score_summary);
+  at::Tensor key_summary_mean = at::empty(
+      {batch_size, num_kv_heads, kHeadDim}, float_options);
+  at::Tensor key_summary_variance = at::empty_like(key_summary_mean);
+
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  dim3 summary_grid(num_key_blocks, num_kv_heads, batch_size);
+  if (value.scalar_type() == at::ScalarType::Half)
+  {
+    kv_block_summary_kernel<half, true><<<summary_grid, kHeadDim, 0, stream>>>(
+        key_int8.data_ptr<int8_t>(),
+        key_scale.data_ptr<float>(),
+        reinterpret_cast<const half *>(value.data_ptr()),
+        value_scale.data_ptr<float>(),
+        reinterpret_cast<half *>(key_summary.data_ptr()),
+        reinterpret_cast<half *>(key_score_summary.data_ptr()),
+        reinterpret_cast<half *>(value_mean.data_ptr()),
+        batch_size,
+        num_kv_heads,
+        key_length,
+        padded_key_blocks,
+        residual_subblocks,
+        padded_residual_summaries,
+        key_int8.stride(0),
+        key_int8.stride(1),
+        key_int8.stride(2),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2));
+  }
+  else
+  {
+    kv_block_summary_kernel<nv_bfloat16, true><<<summary_grid, kHeadDim, 0, stream>>>(
+        key_int8.data_ptr<int8_t>(),
+        key_scale.data_ptr<float>(),
+        reinterpret_cast<const nv_bfloat16 *>(value.data_ptr()),
+        value_scale.data_ptr<float>(),
+        reinterpret_cast<half *>(key_summary.data_ptr()),
+        reinterpret_cast<half *>(key_score_summary.data_ptr()),
+        reinterpret_cast<half *>(value_mean.data_ptr()),
+        batch_size,
+        num_kv_heads,
+        key_length,
+        padded_key_blocks,
+        residual_subblocks,
+        padded_residual_summaries,
+        key_int8.stride(0),
+        key_int8.stride(1),
+        key_int8.stride(2),
+        value.stride(0),
+        value.stride(1),
+        value.stride(2));
+  }
+  check_launch("sparse K/V summary");
+  key_summary_stats_kernel<<<batch_size * num_kv_heads, kHeadDim, 0, stream>>>(
+      reinterpret_cast<const half *>(key_summary.data_ptr()),
+      key_summary_mean.data_ptr<float>(),
+      key_summary_variance.data_ptr<float>(),
+      num_key_blocks,
+      padded_key_blocks);
+  check_launch("sparse key summary statistics");
+  return {
+      key_summary,
+      key_score_summary,
+      value_mean,
+      key_summary_mean,
+      key_summary_variance};
+}
+
+at::Tensor sol_sparse_online_w8a8_prequantized_attn(
+    at::Tensor query_int8,
+    at::Tensor key_int8,
+    at::Tensor value_int8,
+    at::Tensor value_scale,
+    at::Tensor output,
+    at::Tensor query_scale,
+    at::Tensor key_scale,
+    at::Tensor key_summary,
+    at::Tensor key_score_summary,
+    at::Tensor value_mean,
+    at::Tensor key_summary_mean,
+    at::Tensor key_summary_variance,
+    at::Tensor sparse_query_blocks,
+    at::Tensor exact_kv_blocks,
+    float threshold_sigma,
+    int residual_subblocks,
+    float softmax_scale,
+    int return_stats,
+    int force_dense)
+{
+  CHECK_CUDA(query_int8);
+  CHECK_CUDA(key_int8);
+  CHECK_CUDA(value_int8);
+  CHECK_CUDA(value_scale);
+  CHECK_CUDA(output);
+  CHECK_CUDA(query_scale);
+  CHECK_CUDA(key_scale);
+  CHECK_CUDA(sparse_query_blocks);
+  CHECK_CUDA(exact_kv_blocks);
+  CHECK_LASTDIM_CONTIGUOUS(query_int8);
+  CHECK_LASTDIM_CONTIGUOUS(key_int8);
+  CHECK_LASTDIM_CONTIGUOUS(output);
+  CHECK_CONTIGUOUS(value_int8);
+  CHECK_CONTIGUOUS(value_scale);
+  CHECK_CONTIGUOUS(query_scale);
+  CHECK_CONTIGUOUS(key_scale);
+  CHECK_CONTIGUOUS(sparse_query_blocks);
+  CHECK_CONTIGUOUS(exact_kv_blocks);
+  CHECK_DTYPE(query_int8, at::ScalarType::Char);
+  CHECK_DTYPE(key_int8, at::ScalarType::Char);
+  CHECK_DTYPE(value_int8, at::ScalarType::Char);
+  CHECK_DTYPE(value_scale, at::ScalarType::Float);
+  CHECK_DTYPE(query_scale, at::ScalarType::Float);
+  CHECK_DTYPE(key_scale, at::ScalarType::Float);
+  CHECK_DTYPE(sparse_query_blocks, at::ScalarType::Byte);
+  CHECK_DTYPE(exact_kv_blocks, at::ScalarType::Byte);
+  TORCH_CHECK(
+      output.scalar_type() == at::ScalarType::Half ||
+          output.scalar_type() == at::ScalarType::BFloat16,
+      "prequantized Sol W8A8 output must be float16 or bfloat16");
+  TORCH_CHECK(
+      residual_subblocks == 1 || residual_subblocks == 2,
+      "Sol residual_subblocks must be 1 or 2");
+  TORCH_CHECK(force_dense == 0 || force_dense == 1, "force_dense must be 0 or 1");
+
+  const int batch_size = query_int8.size(0);
+  const int num_query_heads = query_int8.size(1);
+  const int num_kv_heads = key_int8.size(1);
+  const int query_length = query_int8.size(2);
+  const int key_length = key_int8.size(2);
+  const int num_query_blocks = div_ceil(query_length, kBlockTokens);
+  const int num_key_blocks = div_ceil(key_length, kBlockTokens);
+  const int padded_key_blocks = div_ceil(num_key_blocks, kRouteTile) * kRouteTile;
+  const int residual_tokens = kBlockTokens / residual_subblocks;
+  const int num_residual_summaries = div_ceil(key_length, residual_tokens);
+  const int padded_residual_summaries =
+      div_ceil(num_residual_summaries, kSummaryTileTokens) * kSummaryTileTokens;
+  TORCH_CHECK(
+      query_int8.dim() == 4 && key_int8.dim() == 4 && output.dim() == 4,
+      "prequantized Sol W8A8 Q/K/O must be four-dimensional");
+  TORCH_CHECK(
+      query_int8.size(3) == kHeadDim && key_int8.size(3) == kHeadDim,
+      "prequantized Sol W8A8 requires head_dim=128");
+  TORCH_CHECK(
+      output.sizes() == query_int8.sizes(),
+      "prequantized Sol W8A8 output must match Q");
+  TORCH_CHECK(
+      num_kv_heads > 0 && num_query_heads % num_kv_heads == 0,
+      "prequantized Sol W8A8 Q heads must be divisible by KV heads");
+  TORCH_CHECK(
+      value_int8.sizes() == at::IntArrayRef(
+          {batch_size, num_kv_heads, kHeadDim, div_ceil(key_length, kBlockTokens) * kBlockTokens}),
+      "prequantized Sol W8A8 V shape is incompatible");
+  TORCH_CHECK(
+      value_scale.sizes() == at::IntArrayRef({batch_size, num_kv_heads, kHeadDim}),
+      "prequantized Sol W8A8 V scale is incompatible");
+  TORCH_CHECK(
+      query_scale.sizes() == at::IntArrayRef({batch_size, num_query_heads, num_query_blocks * kWarps}) &&
+          key_scale.sizes() == at::IntArrayRef({batch_size, num_kv_heads, num_key_blocks}),
+      "prequantized Sol W8A8 Q/K scale shapes are incompatible");
+  TORCH_CHECK(
+      sparse_query_blocks.numel() == num_query_blocks &&
+          exact_kv_blocks.numel() == num_key_blocks,
+      "prequantized Sol W8A8 policy shapes are incompatible");
+
+  if (!force_dense)
+  {
+    CHECK_CUDA(key_summary);
+    CHECK_CUDA(key_score_summary);
+    CHECK_CUDA(value_mean);
+    CHECK_CUDA(key_summary_mean);
+    CHECK_CUDA(key_summary_variance);
+    CHECK_CONTIGUOUS(key_summary);
+    CHECK_CONTIGUOUS(key_score_summary);
+    CHECK_CONTIGUOUS(value_mean);
+    CHECK_CONTIGUOUS(key_summary_mean);
+    CHECK_CONTIGUOUS(key_summary_variance);
+    CHECK_DTYPE(key_summary, at::ScalarType::Half);
+    CHECK_DTYPE(key_score_summary, at::ScalarType::Half);
+    CHECK_DTYPE(value_mean, at::ScalarType::Half);
+    CHECK_DTYPE(key_summary_mean, at::ScalarType::Float);
+    CHECK_DTYPE(key_summary_variance, at::ScalarType::Float);
+    TORCH_CHECK(
+        key_summary.sizes() == at::IntArrayRef({batch_size, num_kv_heads, padded_key_blocks, kHeadDim}) &&
+            key_score_summary.sizes() == at::IntArrayRef({batch_size, num_kv_heads, padded_residual_summaries, kHeadDim}) &&
+            value_mean.sizes() == key_score_summary.sizes() &&
+            key_summary_mean.sizes() == at::IntArrayRef({batch_size, num_kv_heads, kHeadDim}) &&
+            key_summary_variance.sizes() == key_summary_mean.sizes(),
+        "precomputed Sol W8A8 summary shapes are incompatible");
+  }
+  TORCH_CHECK(
+      query_int8.device() == key_int8.device() &&
+          query_int8.device() == value_int8.device() &&
+          query_int8.device() == value_scale.device() &&
+          query_int8.device() == output.device() &&
+          query_int8.device() == query_scale.device() &&
+          query_int8.device() == key_scale.device() &&
+          query_int8.device() == sparse_query_blocks.device() &&
+          query_int8.device() == exact_kv_blocks.device() &&
+          (force_dense ||
+              (query_int8.device() == key_summary.device() &&
+               query_int8.device() == key_score_summary.device() &&
+               query_int8.device() == value_mean.device() &&
+               query_int8.device() == key_summary_mean.device() &&
+               query_int8.device() == key_summary_variance.device())),
+      "prequantized Sol W8A8 tensors must share one CUDA device");
+
+  at::Tensor selected_count = return_stats
+      ? at::zeros({1}, output.options().dtype(at::ScalarType::Long))
+      : at::empty({0}, output.options().dtype(at::ScalarType::Long));
+  if (output.scalar_type() == at::ScalarType::Half)
+  {
+    if (force_dense)
+      launch_sparse_threshold_attention<half, true, true, true>(
+          query_int8, key_int8, output, value_int8, value_scale, output,
+          query_scale, key_scale, key_summary, key_score_summary, value_mean,
+          key_summary_mean, key_summary_variance, sparse_query_blocks,
+          exact_kv_blocks, selected_count, residual_subblocks,
+          threshold_sigma, softmax_scale);
+    else
+      launch_sparse_threshold_attention<half, true, false, true>(
+          query_int8, key_int8, output, value_int8, value_scale, output,
+          query_scale, key_scale, key_summary, key_score_summary, value_mean,
+          key_summary_mean, key_summary_variance, sparse_query_blocks,
+          exact_kv_blocks, selected_count, residual_subblocks,
+          threshold_sigma, softmax_scale);
+  }
+  else
+  {
+    if (force_dense)
+      launch_sparse_threshold_attention<nv_bfloat16, true, true, true>(
+          query_int8, key_int8, output, value_int8, value_scale, output,
+          query_scale, key_scale, key_summary, key_score_summary, value_mean,
+          key_summary_mean, key_summary_variance, sparse_query_blocks,
+          exact_kv_blocks, selected_count, residual_subblocks,
+          threshold_sigma, softmax_scale);
+    else
+      launch_sparse_threshold_attention<nv_bfloat16, true, false, true>(
+          query_int8, key_int8, output, value_int8, value_scale, output,
+          query_scale, key_scale, key_summary, key_score_summary, value_mean,
+          key_summary_mean, key_summary_variance, sparse_query_blocks,
+          exact_kv_blocks, selected_count, residual_subblocks,
+          threshold_sigma, softmax_scale);
   }
   return selected_count;
 }

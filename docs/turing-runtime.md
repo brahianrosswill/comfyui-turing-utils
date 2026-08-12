@@ -135,6 +135,16 @@ The route-free dense specialization omits centroid summaries and route state.
 Short calls can lose to stable Sage because the extra V scan is not amortized,
 which is why W8A8 remains explicit.
 
+Kernel 0.19.0 adds the split prequantize/execute ABI used by current ComfyUI's
+`AttentionTensorContainer`. Q/K quantization, optional V quantization, and Sol
+correction summaries are completed before allocating the output. The original
+Q/K/V tensors are then released; stable Sage and FP16-PV sparse paths retain
+only the contiguous V buffer required by the main kernel, while W8A8 retains
+only quantized V. Older kernels remain supported through the one-call ABI.
+All bundled attention kernels launch on PyTorch's current CUDA stream, which
+also makes the graph-leaf dense Sage/W8A8 operations safe for CUDA Graph
+capture.
+
 The node keeps the measured 4096-token crossover internally; shorter calls use
 stable Sage. `routing_threshold=1.0` matches the official mean-plus-one-standard-
 deviation policy. Lower values preserve more exact blocks. The local safeguard

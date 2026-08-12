@@ -109,6 +109,77 @@ def quantize_v_int8(value, quantized, scale):
     _qattn_sm75.quantize_v_int8_sm75(value, quantized, scale)
 
 
+def sol_w8a8_precompute_summaries(
+    key_int8,
+    key_scale,
+    value,
+    value_scale,
+    residual_subblocks,
+):
+    if not hasattr(_qattn_sm75, "sol_w8a8_precompute_summaries"):
+        raise RuntimeError(
+            "split Sol W8A8 requires comfyui-turing-utils-kernel 0.19.0 or newer"
+        )
+    return _qattn_sm75.sol_w8a8_precompute_summaries(
+        key_int8,
+        key_scale,
+        value,
+        value_scale,
+        residual_subblocks,
+    )
+
+
+def sol_sparse_online_w8a8_prequantized_attn(
+    query_int8,
+    key_int8,
+    value_int8,
+    value_scale,
+    output,
+    query_scale,
+    key_scale,
+    summaries,
+    sparse_query_blocks,
+    exact_kv_blocks,
+    threshold_sigma,
+    residual_subblocks,
+    sm_scale,
+    return_stats,
+    force_dense,
+):
+    if not hasattr(_qattn_sm75, "sol_sparse_online_w8a8_prequantized_attn"):
+        raise RuntimeError(
+            "split Sol W8A8 requires comfyui-turing-utils-kernel 0.19.0 or newer"
+        )
+    (
+        key_summary,
+        key_score_summary,
+        value_mean,
+        key_summary_mean,
+        key_summary_variance,
+    ) = summaries
+    return _qattn_sm75.sol_sparse_online_w8a8_prequantized_attn(
+        query_int8,
+        key_int8,
+        value_int8,
+        value_scale,
+        output,
+        query_scale,
+        key_scale,
+        key_summary,
+        key_score_summary,
+        value_mean,
+        key_summary_mean,
+        key_summary_variance,
+        sparse_query_blocks,
+        exact_kv_blocks,
+        threshold_sigma,
+        residual_subblocks,
+        sm_scale,
+        return_stats,
+        force_dense,
+    )
+
+
 def frame_sparse_int8_f16_attn(
     query_int8,
     key_int8,

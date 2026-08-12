@@ -76,7 +76,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn("csrc/turing/sage/sol_sparse_cuda_sm75.cu", extensions[1].kwargs["sources"])
         self.assertIn("csrc/turing/sage/quant_v_int8_cuda_sm75.cu", extensions[1].kwargs["sources"])
         self.assertIn("csrc/turing/sage/frame_sparse_cuda_sm75.cu", extensions[1].kwargs["sources"])
-        self.assertEqual(setup.call_args.kwargs["version"], "0.18.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.19.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -86,7 +86,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.18.0")
+        self.assertEqual(metadata["project"]["version"], "0.19.0")
 
     def test_sparse_source_does_not_require_optional_cuda_library_headers(self):
         source = (
@@ -139,6 +139,20 @@ class KernelSetupTest(unittest.TestCase):
         self.assertNotIn("key_score_summary", source)
         self.assertNotIn("route_threshold", source)
 
+    def test_attention_launches_use_pytorch_current_cuda_stream(self):
+        sage_dir = PLUGIN_ROOT / "kernel" / "csrc" / "turing" / "sage"
+        fixed = (sage_dir / "qk_int_sv_f16_cuda_sm75.cu").read_text(encoding="utf-8")
+        varlen = (sage_dir / "qk_int_sv_f16_varlen_cuda_sm75.cu").read_text(
+            encoding="utf-8"
+        )
+        fused = (sage_dir / "fused.cu").read_text(encoding="utf-8")
+
+        current_stream = "c10::cuda::getCurrentCUDAStream()"
+        self.assertIn(current_stream, fixed)
+        self.assertIn(current_stream, varlen)
+        self.assertGreaterEqual(fused.count(current_stream), 20)
+        self.assertNotIn("<<<grid, block>>>", fused)
+
     def test_windows_conda_target_specific_cccl_path_is_added(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             prefix = Path(temp_dir)
@@ -153,8 +167,8 @@ class KernelSetupTest(unittest.TestCase):
         self.assertEqual([extension.name for extension in extensions], ["comfyui_turing_utils_kernel._C"])
         self.assertEqual(extensions[0].kwargs["include_dirs"][1], str(conda_include.resolve()))
         self.assertIn(str(cccl.resolve()), extensions[0].kwargs["include_dirs"])
-        self.assertIn("/std:c++20", extensions[0].kwargs["extra_compile_args"]["cxx"])
-        self.assertIn("-std=c++20", extensions[0].kwargs["extra_compile_args"]["nvcc"])
+        self.assertIn("/std:c++17", extensions[0].kwargs["extra_compile_args"]["cxx"])
+        self.assertIn("-std=c++17", extensions[0].kwargs["extra_compile_args"]["nvcc"])
 
     def test_nvidia_cutlass_python_package_is_auto_detected(self):
         with tempfile.TemporaryDirectory() as temp_dir:

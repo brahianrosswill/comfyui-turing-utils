@@ -151,6 +151,12 @@ correction, while original V means remain in the value approximation.
 Official-style `1x64` is the default; optional `2x32` improves bimodal
 skipped-block fidelity without changing routing.
 
+Kernel 0.19.0 integrates current ComfyUI's attention tensor-container
+lifecycle. Supported bundled Sage, W8A8, Sol, and frame-sparse calls quantize
+before output allocation and release their original Q/K/V storage as soon as
+the selected path permits. Older kernel packages continue through the
+compatible one-call path, but do not receive this peak-memory improvement.
+
 Sol's `use_w8a8` switch is disabled by default for backward-compatible quality.
 When enabled, selected exact blocks and protected dense steps/layers use the
 same signed-V/unsigned-probability Tensor Core path. Skipped-block correction

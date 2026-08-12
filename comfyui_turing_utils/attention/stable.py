@@ -63,6 +63,141 @@ class AttentionBackend:
     aliases: tuple[str, ...] = ()
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class AttentionCall:
+    batch: int
+    heads: int
+    kv_heads: int
+    head_dim: int
+    query_tokens: int
+    key_tokens: int
+    tensor_layout: str
+    input_dtype: torch.dtype
+    skip_output_reshape: bool
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PrequantizedAttentionCall:
+    kernel_state: object
+    call: AttentionCall
+
+
+def inspect_turing_attention_call(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    heads: int,
+    *,
+    mask=None,
+    skip_reshape: bool = False,
+    skip_output_reshape: bool = False,
+    enable_gqa: bool = False,
+    low_precision_attention: bool = True,
+    is_causal: bool = False,
+    kernel: str = "sage",
+    require_long_sequence: bool = False,
+) -> tuple[AttentionCall | None, str | None]:
+    if kernel not in {"sage", "w8a8", "sol", "frame"}:
+        raise ValueError(f"unsupported Turing attention kernel: {kernel}")
+    if not isinstance(q, torch.Tensor) or not isinstance(k, torch.Tensor) or not isinstance(v, torch.Tensor):
+        return None, "Q/K/V are not tensors"
+    if not is_supported_turing_device(q.device):
+        return None, "Q/K/V are not on a supported sm75 GPU"
+    if mask is not None:
+        return None, "an attention mask was supplied"
+    if not low_precision_attention:
+        return None, "low_precision_attention=False"
+    if kernel in {"w8a8", "sol", "frame"} and is_causal:
+        return None, f"causal attention is not supported by Turing {kernel}"
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        return None, "Q/K/V dtypes do not match"
+    if q.dtype not in SUPPORTED_INPUT_DTYPES:
+        return None, f"Q/K/V dtype {q.dtype} is unsupported"
+    if q.device != k.device or q.device != v.device:
+        return None, "Q/K/V devices do not match"
+
+    heads = int(heads)
+    if skip_reshape:
+        if q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or heads <= 0 or q.shape[1] != heads:
+            return None, "skip_reshape Q/K/V layout is incompatible"
+        batch, _, query_tokens, head_dim = q.shape
+        kv_heads = k.shape[1]
+        key_tokens = k.shape[2]
+        tensor_layout = "HND"
+        if (
+            k.shape[0] != batch
+            or v.shape[0] != batch
+            or k.shape != v.shape
+            or k.shape[-1] != head_dim
+            or kv_heads <= 0
+            or heads % kv_heads != 0
+        ):
+            return None, "Q/K/V shapes or head counts are incompatible"
+    else:
+        if q.ndim != 3 or k.ndim != 3 or v.ndim != 3 or heads <= 0 or q.shape[-1] % heads:
+            return None, "unreshaped Q/K/V layout is incompatible"
+        batch = q.shape[0]
+        head_dim = q.shape[-1] // heads
+        if head_dim <= 0 or k.shape[0] != batch or v.shape[0] != batch or k.shape != v.shape:
+            return None, "unreshaped Q/K/V shapes are incompatible"
+        kv_heads = k.shape[-1] // head_dim if enable_gqa else heads
+        if kv_heads <= 0 or k.shape[-1] != kv_heads * head_dim or heads % kv_heads:
+            return None, "unreshaped K/V head counts are incompatible"
+        query_tokens = q.shape[1]
+        key_tokens = k.shape[1]
+        tensor_layout = "NHD"
+
+    if query_tokens <= 0 or key_tokens <= 0:
+        return None, "empty Q/K sequences are unsupported"
+    required_head_dim = kernel in {"w8a8", "sol", "frame"}
+    if (required_head_dim and head_dim != 128) or (not required_head_dim and not 0 < head_dim <= 128):
+        return None, f"head_dim={head_dim} is unsupported by Turing {kernel}"
+    if require_long_sequence and (query_tokens < 64 or key_tokens < 64):
+        return None, "split attention requires Q/K sequences of at least 64 tokens"
+    if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
+        return None, "the last Q/K/V dimension is not contiguous"
+    return AttentionCall(
+        batch=batch,
+        heads=heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        query_tokens=query_tokens,
+        key_tokens=key_tokens,
+        tensor_layout=tensor_layout,
+        input_dtype=q.dtype,
+        skip_output_reshape=bool(skip_output_reshape),
+    ), None
+
+
+def normalize_turing_attention_tensors(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    call: AttentionCall,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if call.tensor_layout == "NHD":
+        q = q.reshape(call.batch, call.query_tokens, call.heads, call.head_dim)
+        k = k.reshape(call.batch, call.key_tokens, call.kv_heads, call.head_dim)
+        v = v.reshape(call.batch, call.key_tokens, call.kv_heads, call.head_dim)
+    if call.input_dtype == torch.float32:
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
+    return q, k, v
+
+
+def finish_turing_attention_output(output: torch.Tensor, call: AttentionCall) -> torch.Tensor:
+    if call.tensor_layout == "HND":
+        result = output if call.skip_output_reshape else output.transpose(1, 2).reshape(
+            call.batch, -1, call.heads * call.head_dim
+        )
+    elif call.skip_output_reshape:
+        result = output.transpose(1, 2)
+    else:
+        result = output.reshape(call.batch, -1, call.heads * call.head_dim)
+    return result.to(call.input_dtype) if call.input_dtype == torch.float32 else result
+
+
 _BACKENDS: dict[str, AttentionBackend] = {}
 _ALIASES: dict[str, str] = {}
 
@@ -243,11 +378,13 @@ def bundled_w8a8_available() -> bool:
 
 
 def _sageattn(*args, **kwargs):
-    return load_turing_sage().sageattn(*args, **kwargs)
+    if kwargs.pop("smooth_k", False):
+        raise ValueError("the production Turing Sage backend does not enable smoothing")
+    return load_turing_sage().sageattn_compiled(*args, **kwargs)
 
 
 def _w8a8attn(*args, **kwargs):
-    return load_turing_sage().w8a8attn(*args, **kwargs)
+    return load_turing_sage().w8a8attn_compiled(*args, **kwargs)
 
 
 def _sol_sparse_sageattn(*args, **kwargs):
@@ -256,6 +393,76 @@ def _sol_sparse_sageattn(*args, **kwargs):
 
 def _frame_sparse_sageattn(*args, **kwargs):
     return load_turing_sage().frame_sparse_sageattn(*args, **kwargs)
+
+
+def split_prequantization_available() -> bool:
+    try:
+        version_tuple = tuple(int(part) for part in kernel_version().split(".")[:3])
+        return version_tuple >= (0, 19, 0) and load_turing_sage().split_prequantization_available()
+    except (ImportError, OSError, ValueError, AttributeError):
+        return False
+
+
+def prequantize_turing_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    call: AttentionCall,
+    *,
+    kernel: str,
+    scale: float | None,
+    is_causal: bool = False,
+) -> PrequantizedAttentionCall:
+    q, k, v = normalize_turing_attention_tensors(q, k, v, call)
+    turing_sage = load_turing_sage()
+    if kernel == "sage":
+        state = turing_sage.prequantize_sageattn(
+            q,
+            k,
+            v,
+            tensor_layout=call.tensor_layout,
+            is_causal=bool(is_causal),
+            sm_scale=scale,
+            smooth_k=False,
+        )
+    elif kernel == "w8a8":
+        if call.tensor_layout == "NHD":
+            q = q.transpose(1, 2).contiguous()
+            k = k.transpose(1, 2).contiguous()
+            v = v.transpose(1, 2).contiguous()
+        state = turing_sage.prequantize_sol_sageattn(
+            q,
+            k,
+            v,
+            tensor_layout="HND",
+            sm_scale=scale,
+            threshold_sigma=0.0,
+            residual_subblocks=1,
+            use_w8a8=True,
+            force_dense=True,
+        )
+    else:
+        raise ValueError(f"unsupported split Turing attention kernel: {kernel}")
+    return PrequantizedAttentionCall(state, call)
+
+
+def turing_attention_from_prequantized(
+    quantized: PrequantizedAttentionCall,
+    *,
+    kernel: str,
+) -> torch.Tensor:
+    turing_sage = load_turing_sage()
+    if kernel == "sage":
+        output = turing_sage.sageattn_from_prequantized(quantized.kernel_state)
+    elif kernel == "w8a8":
+        output = turing_sage.sol_sparse_sageattn_from_prequantized(
+            quantized.kernel_state
+        )
+        if quantized.call.tensor_layout == "NHD":
+            output = output.transpose(1, 2)
+    else:
+        raise ValueError(f"unsupported split Turing attention kernel: {kernel}")
+    return finish_turing_attention_output(output, quantized.call)
 
 
 def preflight_bundled(device: torch.device) -> None:
@@ -356,74 +563,31 @@ def turing_sage_attention(
         "skip_output_reshape": skip_output_reshape,
         **kwargs,
     }
-    if not is_supported_turing_device(q.device):
+    call, reason = inspect_turing_attention_call(
+        q,
+        k,
+        v,
+        heads,
+        mask=mask,
+        skip_reshape=skip_reshape,
+        skip_output_reshape=skip_output_reshape,
+        enable_gqa=bool(kwargs.get("enable_gqa", False)),
+        low_precision_attention=kwargs.get("low_precision_attention", True),
+        is_causal=bool(kwargs.get("is_causal", False)),
+        kernel=turing_kernel,
+    )
+    if reason is not None:
         return _bundled_fallback(
             fallback,
-            "Q/K/V are not on a supported sm75 GPU",
+            reason,
             fallback_args,
             fallback_kwargs,
         )
-    if mask is not None:
-        return _bundled_fallback(
-            fallback,
-            "an attention mask was supplied",
-            fallback_args,
-            fallback_kwargs,
-        )
-    if kwargs.get("low_precision_attention", True) is False:
-        return _bundled_fallback(
-            fallback,
-            "low_precision_attention=False",
-            fallback_args,
-            fallback_kwargs,
-        )
-    if turing_kernel == "w8a8" and bool(kwargs.get("is_causal", False)):
-        return _bundled_fallback(
-            fallback,
-            "causal attention is not supported by Turing W8A8",
-            fallback_args,
-            fallback_kwargs,
-        )
-    if q.dtype != k.dtype or q.dtype != v.dtype:
-        raise RuntimeError(
-            f"Turing Sage requires matching Q/K/V dtypes, got {q.dtype}, {k.dtype}, {v.dtype}"
-        )
-    if q.dtype not in SUPPORTED_INPUT_DTYPES:
-        raise RuntimeError(f"Turing Sage supports FP16, BF16, or FP32 Q/K/V, got {q.dtype}")
-    if q.device != k.device or q.device != v.device:
-        raise RuntimeError("Turing Sage requires Q/K/V on the same CUDA device")
-
-    input_dtype = q.dtype
-    enable_gqa = bool(kwargs.get("enable_gqa", False))
-    if skip_reshape:
-        if q.ndim != 4 or k.ndim != 4 or v.ndim != 4 or q.shape[1] != heads:
-            return _bundled_fallback(
-                fallback,
-                "skip_reshape Q/K/V layout is incompatible",
-                fallback_args,
-                fallback_kwargs,
-            )
-        batch, _, _, head_dim = q.shape
-        tensor_layout = "HND"
-    else:
-        try:
-            q, k, v, batch, head_dim = _reshape_qkv(q, k, v, heads, enable_gqa)
-        except ValueError:
-            return _bundled_fallback(
-                fallback,
-                "unreshaped Q/K/V layout is incompatible",
-                fallback_args,
-                fallback_kwargs,
-            )
-        tensor_layout = "NHD"
-
-    if head_dim <= 0 or head_dim > 128 or (turing_kernel == "w8a8" and head_dim != 128):
-        return _bundled_fallback(
-            fallback,
-            f"head_dim={head_dim} is unsupported by Turing {turing_kernel}",
-            fallback_args,
-            fallback_kwargs,
-        )
+    input_dtype = call.input_dtype
+    batch = call.batch
+    head_dim = call.head_dim
+    tensor_layout = call.tensor_layout
+    q, k, v = normalize_turing_attention_tensors(q, k, v, call)
 
     index = q.device.index if q.device.index is not None else torch.cuda.current_device()
     sequence_axis = 2 if tensor_layout == "HND" else 1
@@ -465,10 +629,6 @@ def turing_sage_attention(
                 "Turing attention FP32 compatibility uses BF16 Q/K/V storage and restores FP32 output"
             )
             _LOGGED_FP32_COMPAT = True
-        q = q.to(torch.bfloat16)
-        k = k.to(torch.bfloat16)
-        v = v.to(torch.bfloat16)
-
     attention_kernel = _w8a8attn if turing_kernel == "w8a8" else _sageattn
     output = attention_kernel(
         q,
@@ -485,13 +645,7 @@ def turing_sage_attention(
             }
         ),
     )
-    if tensor_layout == "HND":
-        result = output if skip_output_reshape else output.transpose(1, 2).reshape(batch, -1, heads * head_dim)
-    elif skip_output_reshape:
-        result = output.transpose(1, 2)
-    else:
-        result = output.reshape(batch, -1, heads * head_dim)
-    return result.to(input_dtype) if input_dtype == torch.float32 else result
+    return finish_turing_attention_output(output, call)
 
 
 def turing_w8a8_attention(*args, **kwargs) -> torch.Tensor:

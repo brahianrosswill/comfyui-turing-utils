@@ -893,7 +893,8 @@ void token_block_mean_cuda(
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
       dim3 grid(num_blocks, num_heads, batch_size);
-      TokenBlockMeanKernel<HEAD_DIM, c_type><<<grid, HEAD_DIM>>>(
+      TokenBlockMeanKernel<HEAD_DIM, c_type><<<
+          grid, HEAD_DIM, 0, c10::cuda::getCurrentCUDAStream()>>>(
           reinterpret_cast<c_type *>(input.data_ptr()), output.data_ptr<float>(),
           num_tokens, block_size, input.stride(0), stride_seq_input, stride_h_input,
           output.stride(0), output.stride(1), output.stride(2));
@@ -973,7 +974,8 @@ static void quant_per_thread_int4_cuda_impl(
       dim3 grid(num_blocks * groups_per_block, num_heads, batch_size);
       if (subtract_mean)
       {
-        QuantPerThreadInt4Kernel<HEAD_DIM, is_query, true, c_type><<<grid, 256>>>(
+        QuantPerThreadInt4Kernel<HEAD_DIM, is_query, true, c_type><<<
+            grid, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<c_type *>(input.data_ptr()), mean.data_ptr<float>(),
             output.data_ptr<int8_t>(), scale.data_ptr<float>(), num_tokens,
             input.stride(0), stride_seq_input, stride_h_input,
@@ -983,7 +985,8 @@ static void quant_per_thread_int4_cuda_impl(
       }
       else
       {
-        QuantPerThreadInt4Kernel<HEAD_DIM, is_query, false, c_type><<<grid, 256>>>(
+        QuantPerThreadInt4Kernel<HEAD_DIM, is_query, false, c_type><<<
+            grid, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<c_type *>(input.data_ptr()), nullptr,
             output.data_ptr<int8_t>(), scale.data_ptr<float>(), num_tokens,
             input.stride(0), stride_seq_input, stride_h_input,
@@ -1267,7 +1270,8 @@ void quant_query_per_thread_int4_fused_cuda(
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
       dim3 grid(num_blocks, num_heads, batch_size);
-      QuantQueryPerThreadInt4FusedKernel<HEAD_DIM, c_type><<<grid, 256>>>(
+      QuantQueryPerThreadInt4FusedKernel<HEAD_DIM, c_type><<<
+          grid, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
           reinterpret_cast<c_type *>(input.data_ptr()), mean.data_ptr<float>(),
           output.data_ptr<int8_t>(), scale.data_ptr<float>(), num_tokens,
           input.stride(0), stride_seq_input, stride_h_input,
@@ -1334,7 +1338,8 @@ void quant_key_per_thread_int4_fused_cuda(
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
     DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, {
       dim3 grid(num_blocks, num_heads, batch_size);
-      QuantKeyPerThreadInt4FusedKernel<HEAD_DIM, c_type><<<grid, 128>>>(
+      QuantKeyPerThreadInt4FusedKernel<HEAD_DIM, c_type><<<
+          grid, 128, 0, c10::cuda::getCurrentCUDAStream()>>>(
           reinterpret_cast<c_type *>(input.data_ptr()), mean.data_ptr<float>(),
           output.data_ptr<int8_t>(), scale.data_ptr<float>(), num_tokens,
           input.stride(0), stride_seq_input, stride_h_input,
@@ -1503,7 +1508,8 @@ void sage2_score_correction_cuda(
                 batch_size * query_heads);
       if (subtract_key_mean)
       {
-        Sage2ScoreCorrectionKernel<HEAD_DIM, true, c_type><<<grid, 32>>>(
+        Sage2ScoreCorrectionKernel<HEAD_DIM, true, c_type><<<
+            grid, 32, 0, c10::cuda::getCurrentCUDAStream()>>>(
             query_mean.data_ptr<float>(),
             reinterpret_cast<c_type *>(key.data_ptr()),
             key_mean.data_ptr<float>(), output.data_ptr<float>(),
@@ -1512,7 +1518,8 @@ void sage2_score_correction_cuda(
       }
       else
       {
-        Sage2ScoreCorrectionKernel<HEAD_DIM, false, c_type><<<grid, 32>>>(
+        Sage2ScoreCorrectionKernel<HEAD_DIM, false, c_type><<<
+            grid, 32, 0, c10::cuda::getCurrentCUDAStream()>>>(
             query_mean.data_ptr<float>(),
             reinterpret_cast<c_type *>(key.data_ptr()), nullptr,
             output.data_ptr<float>(), query_blocks, key_tokens,
@@ -1590,7 +1597,8 @@ void quant_per_block_int8_cuda(
 
         dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
 
-        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, true, false, c_type><<<grid, block>>>(
+        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, true, false, c_type><<<
+            grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
           reinterpret_cast<c_type*>(input.data_ptr()),
           nullptr,
           output.data_ptr<int8_t>(),
@@ -1672,7 +1680,8 @@ void quant_per_block_int8_cuda(
 
         dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
 
-        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<grid, block>>>(
+        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<
+            grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
           reinterpret_cast<c_type*>(input.data_ptr()),
           nullptr,
           output.data_ptr<int8_t>(),
@@ -1763,7 +1772,8 @@ void quant_per_block_int8_fuse_sub_mean_cuda(
 
         dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
 
-        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, true, c_type><<<grid, block>>>(
+        QuantInt8Kernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread, false, true, c_type><<<
+            grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
           reinterpret_cast<c_type*>(input.data_ptr()),
           reinterpret_cast<c_type*>(mean.data_ptr()),
           output.data_ptr<int8_t>(),
@@ -1849,7 +1859,8 @@ void quant_per_warp_int8_cuda(
 
           dim3 block(WARP_BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
 
-          QuantInt8Kernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<grid, block>>>(
+          QuantInt8Kernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, false, false, c_type><<<
+              grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<c_type*>(input.data_ptr()),
             nullptr,
             output.data_ptr<int8_t>(),
@@ -1969,7 +1980,8 @@ void quant_qk_per_warp_int8_cuda(
           dim3 grid(num_qo_heads * query_scale_len + num_kv_heads * key_scale_len, batch_size);
           dim3 block(THREADS_PER_BLOCK);
 
-          QuantQKInt8Kernel<HEAD_DIM, QUERY_WARP_BLOCK_SIZE, KEY_BLOCK_SIZE, THREADS_PER_BLOCK, c_type><<<grid, block>>>(
+          QuantQKInt8Kernel<HEAD_DIM, QUERY_WARP_BLOCK_SIZE, KEY_BLOCK_SIZE, THREADS_PER_BLOCK, c_type><<<
+              grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
             reinterpret_cast<c_type*>(query.data_ptr()),
             reinterpret_cast<c_type*>(key.data_ptr()),
             query_output.data_ptr<int8_t>(),
@@ -2048,7 +2060,8 @@ void quant_per_warp_int8_varlen_cuda(
 
           if (index_dtype == at::ScalarType::Int)
           {
-            QuantInt8VarlenKernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, int32_t, c_type><<<grid, block>>>(
+            QuantInt8VarlenKernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, int32_t, c_type><<<
+                grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
                 reinterpret_cast<c_type *>(input.data_ptr()),
                 reinterpret_cast<int32_t *>(cu_seqlens.data_ptr()),
                 output.data_ptr<int8_t>(),
@@ -2059,7 +2072,8 @@ void quant_per_warp_int8_varlen_cuda(
           }
           else if (index_dtype == at::ScalarType::Long)
           {
-            QuantInt8VarlenKernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, int64_t, c_type><<<grid, block>>>(
+            QuantInt8VarlenKernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, int64_t, c_type><<<
+                grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
                 reinterpret_cast<c_type *>(input.data_ptr()),
                 reinterpret_cast<int64_t *>(cu_seqlens.data_ptr()),
                 output.data_ptr<int8_t>(),
@@ -2148,7 +2162,8 @@ void sub_mean_cuda(
 
         dim3 block(BLOCK_SIZE * (HEAD_DIM / 8) / num_pack_per_thread);
 
-        SubMeanKernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread><<<grid, block>>>(
+        SubMeanKernel<HEAD_DIM, BLOCK_SIZE, num_pack_per_thread><<<
+            grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
           reinterpret_cast<c_type*>(input.data_ptr()),
           reinterpret_cast<c_type*>(mean.data_ptr()),
           reinterpret_cast<half*>(output.data_ptr()),
@@ -2226,7 +2241,8 @@ void transpose_pad_permute_cuda(
 
       dim3 block(CTA_SIZE * (HEAD_DIM / 8));
 
-      TransposePadPermuteKernel<HEAD_DIM, CTA_SIZE, true, c_type><<<grid, block>>>(
+      TransposePadPermuteKernel<HEAD_DIM, CTA_SIZE, true, c_type><<<
+          grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
         reinterpret_cast<c_type*>(input.data_ptr()),
         reinterpret_cast<c_type*>(output.data_ptr()),
         num_tokens,
@@ -2299,7 +2315,8 @@ void scale_fuse_quant_cuda(
   auto input_dtype = input.scalar_type();
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-    MeanScaleKernel<64, false, c_type><<<grid, block>>>(
+    MeanScaleKernel<64, false, c_type><<<
+        grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<c_type*>(input.data_ptr()),
       reinterpret_cast<int8_t*>(output.data_ptr()),
       nullptr,
@@ -2382,7 +2399,8 @@ void mean_scale_fuse_quant_cuda(
   auto input_dtype = input.scalar_type();
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
-    MeanScaleKernel<64, true, c_type><<<grid, block>>>(
+    MeanScaleKernel<64, true, c_type><<<
+        grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<c_type*>(input.data_ptr()),
       reinterpret_cast<int8_t*>(output.data_ptr()),
       reinterpret_cast<float*>(mean.data_ptr()),

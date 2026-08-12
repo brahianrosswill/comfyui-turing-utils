@@ -515,7 +515,7 @@ static void launch_qk_int_sv_f16_varlen_attn(
   dim3 grid(div_ceil(max_seqlen_q, CTA_Q), num_qo_heads, batch_size);
   dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));
 
-  kernel_func<<<grid, block, smem_max>>>(
+  kernel_func<<<grid, block, smem_max, c10::cuda::getCurrentCUDAStream()>>>(
       query.data_ptr<int8_t>(),
       key.data_ptr<int8_t>(),
       reinterpret_cast<DTypeV *>(value.data_ptr()),
