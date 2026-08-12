@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import types
 
 import comfy.context_windows
 import comfy.conds
@@ -12,6 +11,7 @@ import comfy.utils
 import torch
 import torch.nn.functional as F
 
+from .methods import OriginalMethod, weak_method
 from ..media.references import (
     _validate_image,
 )
@@ -383,16 +383,16 @@ def _resize_bernini_context(cond_key, cond_value, window, x_in, device, new_cond
 
 
 def _make_extra_conds_with_bernini_roles(base_model):
-    original = base_model.extra_conds
+    original = OriginalMethod.capture(base_model.extra_conds, base_model)
 
     def extra_conds(self, **kwargs):
-        out = original(**kwargs)
+        out = original(self, **kwargs)
         roles = kwargs.get(_CONTEXT_ROLES_KEY)
         if roles is not None:
             out[_CONTEXT_ROLES_KEY] = comfy.conds.CONDConstant(tuple(roles))
         return out
 
-    return types.MethodType(extra_conds, base_model)
+    return weak_method(extra_conds, base_model)
 
 
 def _align_source_video_and_mask(source_video, mask, length: int):

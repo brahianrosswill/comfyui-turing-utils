@@ -10,10 +10,10 @@ from __future__ import annotations
 import inspect
 import logging
 import math
-import types
 
 import torch
 
+from .methods import OriginalMethod, weak_method
 from ..attention.layout import (
     ATTENTION_LAYOUT_KEY,
     AttentionSegment,
@@ -287,6 +287,8 @@ def _forward_has_provider(forward) -> bool:
 
 
 def _make_layout_forward(diffusion_model, original):
+    original = OriginalMethod.capture(original, diffusion_model)
+
     def forward_orig(
         self,
         x,
@@ -298,12 +300,13 @@ def _make_layout_forward(diffusion_model, original):
         **kwargs,
     ):
         publish_wan_attention_layout(
-            diffusion_model,
+            self,
             x,
             transformer_options,
             kwargs,
         )
         return original(
+            self,
             x,
             t,
             context,
@@ -314,7 +317,7 @@ def _make_layout_forward(diffusion_model, original):
         )
 
     setattr(forward_orig, _FORWARD_PROVIDER_ATTR, True)
-    return types.MethodType(forward_orig, diffusion_model)
+    return weak_method(forward_orig, diffusion_model)
 
 
 def ensure_wan_attention_layout_provider(model) -> LayoutProviderStatus:

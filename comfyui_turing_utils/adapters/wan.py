@@ -5,11 +5,11 @@ from __future__ import annotations
 import logging
 import math
 import inspect
-import types
 from collections import Counter
 
 import torch
 
+from .methods import OriginalMethod, weak_method
 from ..attention.integration import AttentionSiteStatus, execute_projected_attention
 from ..attention.protocol import (
     QKTransformSpec,
@@ -42,7 +42,10 @@ def _compatible_self_attention_forward(attention_type) -> bool:
 
 
 def _make_self_attention_forward(attention, attention_container, original=None):
-    original = attention.forward if original is None else original
+    original = OriginalMethod.capture(
+        attention.forward if original is None else original,
+        attention,
+    )
 
     def forward(self, x, freqs, transformer_options={}):
         executor = prepared_attention_executor(transformer_options)
@@ -69,7 +72,12 @@ def _make_self_attention_forward(attention, attention_container, original=None):
                 )
             )
         ):
-            return original(x, freqs, transformer_options=transformer_options)
+            return original(
+                self,
+                x,
+                freqs,
+                transformer_options=transformer_options,
+            )
 
         import comfy.model_management
 
@@ -108,7 +116,12 @@ def _make_self_attention_forward(attention, attention_container, original=None):
         )
         if not outcome.supported:
             del query, key, value
-            return original(x, freqs, transformer_options=transformer_options)
+            return original(
+                self,
+                x,
+                freqs,
+                transformer_options=transformer_options,
+            )
         output = outcome.output
         if profiling:
             output = CUDA_PHASE_PROFILER.call("wan.out_projection", self.o, output)
@@ -119,7 +132,7 @@ def _make_self_attention_forward(attention, attention_container, original=None):
         return self.o(output)
 
     setattr(forward, _PREPARED_ATTENTION_FORWARD_ATTR, True)
-    return types.MethodType(forward, attention)
+    return weak_method(forward, attention)
 
 
 def _has_prepared_attention_forward(forward) -> bool:
@@ -234,10 +247,10 @@ def _shape_token_rows(shape, patch_size) -> int:
 
 
 def _make_extra_conds_shapes(base_model, patch_size):
-    original = base_model.extra_conds_shapes
+    original = OriginalMethod.capture(base_model.extra_conds_shapes, base_model)
 
     def extra_conds_shapes(self, **kwargs):
-        out = dict(original(**kwargs))
+        out = dict(original(self, **kwargs))
         context = getattr(self, _MEMORY_CONTEXT_ATTR, None)
         estimate_batch_size = (
             context.get("batch_size") if isinstance(context, dict) else None
@@ -251,11 +264,11 @@ def _make_extra_conds_shapes(base_model, patch_size):
             out[_CONTEXT_SHAPE_KEY] = shape
         return out
 
-    return types.MethodType(extra_conds_shapes, base_model)
+    return weak_method(extra_conds_shapes, base_model)
 
 
 def _make_extra_conds(base_model, patch_size):
-    original = base_model.extra_conds
+    original = OriginalMethod.capture(base_model.extra_conds, base_model)
 
     class PaddedContextLatents:
         def __init__(self, cond):
@@ -298,21 +311,21 @@ def _make_extra_conds(base_model, patch_size):
             return _context_latents_shape(self.cond, patch_size)
 
     def extra_conds(self, **kwargs):
-        out = original(**kwargs)
+        out = original(self, **kwargs)
         context = out.get(_CONTEXT_SHAPE_KEY)
         values = getattr(context, "cond", None)
         if isinstance(values, list):
             out[_CONTEXT_SHAPE_KEY] = PaddedContextLatents(values)
         return out
 
-    return types.MethodType(extra_conds, base_model)
+    return weak_method(extra_conds, base_model)
 
 
 def _make_memory_required(base_model, patch_size, w8_output_channels: tuple[int, ...]):
-    original = base_model.memory_required
+    original = OriginalMethod.capture(base_model.memory_required, base_model)
 
     def memory_required(self, input_shape, cond_shapes={}):
-        required = original(input_shape, cond_shapes=cond_shapes)
+        required = original(self, input_shape, cond_shapes=cond_shapes)
         if not w8_output_channels:
             return required
 
@@ -325,7 +338,7 @@ def _make_memory_required(base_model, patch_size, w8_output_channels: tuple[int,
         )
         return required + workspace
 
-    return types.MethodType(memory_required, base_model)
+    return weak_method(memory_required, base_model)
 
 
 def _make_outer_sample_wrapper(base_model):

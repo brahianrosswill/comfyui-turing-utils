@@ -5,12 +5,13 @@ from __future__ import annotations
 import inspect
 import logging
 import math
-import types
+import weakref
 from collections import Counter
 from collections.abc import Sequence
 
 import torch
 
+from ..methods import OriginalMethod, weak_method
 from ...attention.integration import AttentionSiteStatus, execute_projected_attention
 from ...attention.protocol import (
     QKTransformSpec,
@@ -211,10 +212,10 @@ def _minimax_memory_shape(kwargs, latent_shapes, diffusion_model):
 
 
 def _make_extra_conds_shapes(base_model, diffusion_model):
-    original = base_model.extra_conds_shapes
+    original = OriginalMethod.capture(base_model.extra_conds_shapes, base_model)
 
     def extra_conds_shapes(self, **kwargs):
-        out = dict(original(**kwargs))
+        out = dict(original(self, **kwargs))
         context = getattr(self, _MEMORY_CONTEXT_ATTR, None)
         latent_shapes = kwargs.get("latent_shapes")
         if latent_shapes is None and isinstance(context, dict):
@@ -224,21 +225,21 @@ def _make_extra_conds_shapes(base_model, diffusion_model):
             out[_MEMORY_SHAPE_KEY] = shape
         return out
 
-    return types.MethodType(extra_conds_shapes, base_model)
+    return weak_method(extra_conds_shapes, base_model)
 
 
 def _make_extra_conds(base_model, diffusion_model):
-    original = base_model.extra_conds
+    original = OriginalMethod.capture(base_model.extra_conds, base_model)
 
     def extra_conds(self, **kwargs):
-        out = original(**kwargs)
+        out = original(self, **kwargs)
         latent_shapes = kwargs.get("latent_shapes")
         plan = _minimax_memory_shape(kwargs, latent_shapes, diffusion_model)
         if plan is not None:
             out[_MEMORY_SHAPE_KEY] = _MiniMaxMemoryCond(plan)
         return out
 
-    return types.MethodType(extra_conds, base_model)
+    return weak_method(extra_conds, base_model)
 
 
 def _dtype_size(dtype) -> int:
@@ -249,10 +250,10 @@ def _dtype_size(dtype) -> int:
 
 
 def _make_memory_required(base_model, w8_output_channels: tuple[int, ...]):
-    original = base_model.memory_required
+    original = OriginalMethod.capture(base_model.memory_required, base_model)
 
     def memory_required(self, input_shape, cond_shapes={}):
-        required = original(input_shape, cond_shapes=cond_shapes)
+        required = original(self, input_shape, cond_shapes=cond_shapes)
         plans = [
             shape
             for shape in cond_shapes.get(_MEMORY_SHAPE_KEY, ())
@@ -263,7 +264,7 @@ def _make_memory_required(base_model, w8_output_channels: tuple[int, ...]):
 
         dtype_size = _dtype_size(self.get_dtype_inference())
         heuristic_extra = sum(
-            original([1, 1, plan.equivalent_area], cond_shapes={})
+            original(self, [1, 1, plan.equivalent_area], cond_shapes={})
             for plan in plans
         )
         explicit_extra = sum(
@@ -279,7 +280,7 @@ def _make_memory_required(base_model, w8_output_channels: tuple[int, ...]):
             )
         return required
 
-    return types.MethodType(memory_required, base_model)
+    return weak_method(memory_required, base_model)
 
 
 _make_outer_sample_wrapper = make_minimax_runtime_context_wrapper
@@ -411,7 +412,10 @@ def _compatible_attention_forward(attention_type: type[torch.nn.Module]) -> bool
 
 
 def _make_attention_forward(attention, attention_container, original=None):
-    original = attention.forward if original is None else original
+    original = OriginalMethod.capture(
+        attention.forward if original is None else original,
+        attention,
+    )
 
     def forward(self, x, rope_freqs=None, transformer_options={}):
         executor = prepared_attention_executor(transformer_options)
@@ -430,6 +434,7 @@ def _make_attention_forward(attention, attention_container, original=None):
             )
         ):
             return original(
+                self,
                 x,
                 rope_freqs=rope_freqs,
                 transformer_options=transformer_options,
@@ -483,6 +488,7 @@ def _make_attention_forward(attention, attention_container, original=None):
         if not outcome.supported:
             del query, key, value
             return original(
+                self,
                 x,
                 rope_freqs=rope_freqs,
                 transformer_options=transformer_options,
@@ -499,7 +505,7 @@ def _make_attention_forward(attention, attention_container, original=None):
         return self.out_proj(output)
 
     setattr(forward, _PREPARED_ATTENTION_FORWARD_ATTR, True)
-    return types.MethodType(forward, attention)
+    return weak_method(forward, attention)
 
 
 def _has_prepared_attention_forward(forward) -> bool:
@@ -570,7 +576,7 @@ def _block_fusion_blocker(
 
 
 def _make_mlp_forward(mlp: torch.nn.Module, audit: _RuntimeDispatchAudit):
-    original = mlp.forward
+    original = OriginalMethod.capture(mlp.forward, mlp)
 
     def forward(self, x: torch.Tensor):
         blocker = None
@@ -580,10 +586,10 @@ def _make_mlp_forward(mlp: torch.nn.Module, audit: _RuntimeDispatchAudit):
             blocker = "fc2_not_turing_convrot"
         audit.record("mlp", blocker is None, x, blocker)
         if blocker is not None:
-            return original(x)
+            return original(self, x)
         return turing_linear_input_act(self.fc2, self.fc1(x), "swiglu")
 
-    return types.MethodType(forward, mlp)
+    return weak_method(forward, mlp)
 
 
 _minimax_temporal_topology = minimax_temporal_topology
@@ -599,7 +605,11 @@ def _make_block_forward(
     base_model=None,
     diffusion_model=None,
 ):
-    original = block.forward
+    original = OriginalMethod.capture(block.forward, block)
+    if base_model is not None:
+        base_model = weakref.proxy(base_model)
+    if diffusion_model is not None:
+        diffusion_model = weakref.proxy(diffusion_model)
 
     def forward(
         self,
@@ -621,6 +631,7 @@ def _make_block_forward(
         audit.record("block", blocker is None, x, blocker)
         if blocker is not None:
             return original(
+                self,
                 x,
                 t_emb,
                 mod_segments,
@@ -639,7 +650,7 @@ def _make_block_forward(
         h = segmented_rms_adaln(self.norm2, x, shift_mlp, scale_mlp, mod_segments)
         return mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
 
-    return mark_forward_as_minimax_layout_provider(types.MethodType(forward, block))
+    return mark_forward_as_minimax_layout_provider(weak_method(forward, block))
 
 def apply_minimax_adapter(model, device: torch.device) -> int:
     """Install MiniMax-only forward substitutions through the ModelPatcher."""

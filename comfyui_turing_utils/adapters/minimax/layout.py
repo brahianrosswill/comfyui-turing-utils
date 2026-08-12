@@ -11,7 +11,9 @@ from __future__ import annotations
 import inspect
 import logging
 import math
-import types
+import weakref
+
+from ..methods import OriginalMethod, weak_method
 
 from ...attention.layout import (
     ATTENTION_LAYOUT_KEY,
@@ -358,6 +360,9 @@ def _model_forward_has_provider(forward) -> bool:
 
 
 def _make_model_forward(base_model, diffusion_model, original):
+    original = OriginalMethod.capture(original, diffusion_model)
+    base_model = weakref.proxy(base_model)
+
     def forward(
         self,
         x,
@@ -372,13 +377,14 @@ def _make_model_forward(base_model, diffusion_model, original):
         payload = minimax_payload if isinstance(minimax_payload, dict) else {}
         runtime.update(
             packed_layout=_resolve_packed_layout(
-                diffusion_model, x, context, payload
+                self, x, context, payload
             ),
             refs=payload.get("refs"),
         )
         setattr(base_model, RUNTIME_CONTEXT_ATTR, runtime)
         try:
             return original(
+                self,
                 x,
                 timestep,
                 context,
@@ -396,7 +402,7 @@ def _make_model_forward(base_model, diffusion_model, original):
                 setattr(base_model, RUNTIME_CONTEXT_ATTR, previous)
 
     setattr(forward, _MODEL_FORWARD_PROVIDER_ATTR, True)
-    return types.MethodType(forward, diffusion_model)
+    return weak_method(forward, diffusion_model)
 
 
 def _make_layout_forward(
@@ -408,6 +414,10 @@ def _make_layout_forward(
     base_model,
     diffusion_model,
 ):
+    original = OriginalMethod.capture(original, block)
+    base_model = weakref.proxy(base_model)
+    diffusion_model = weakref.proxy(diffusion_model)
+
     def forward(
         self,
         x,
@@ -425,6 +435,7 @@ def _make_layout_forward(
             diffusion_model=diffusion_model,
         )
         return original(
+            self,
             x,
             t_emb,
             mod_segments,
@@ -433,7 +444,7 @@ def _make_layout_forward(
         )
 
     setattr(forward, _FORWARD_PROVIDER_ATTR, True)
-    return types.MethodType(forward, block)
+    return weak_method(forward, block)
 
 
 def mark_forward_as_minimax_layout_provider(forward):
