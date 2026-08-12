@@ -73,6 +73,19 @@ void quant_qk_per_warp_int8_rotated_cuda(
                 int key_block_size,
                 int tensor_layout);
 
+void quant_qk_per_warp_int8_rotated_anchored_cuda(
+                at::Tensor query,
+                at::Tensor key,
+                at::Tensor query_output,
+                at::Tensor key_output,
+                at::Tensor query_scale,
+                at::Tensor key_scale,
+                at::Tensor anchor_indices,
+                int query_block_size,
+                int query_warp_block_size,
+                int key_block_size,
+                int tensor_layout);
+
 void quant_per_warp_int8_varlen_cuda(
                 at::Tensor input,
                 at::Tensor cu_seqlens,

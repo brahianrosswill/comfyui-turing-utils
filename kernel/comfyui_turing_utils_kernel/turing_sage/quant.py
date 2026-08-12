@@ -97,6 +97,7 @@ def per_warp_int8_hadamard(
     WARPQ: int = 16,
     BLKK: int = 64,
     tensor_layout: str = "HND",
+    stabilize_k: bool = True,
 ):
     """Fuse the shared randomized Hadamard transform into Q/K quantization."""
     if tensor_layout == "HND":
@@ -120,18 +121,36 @@ def per_warp_int8_hadamard(
         dtype=torch.float32,
     )
     layout_id = 0 if tensor_layout == "NHD" else 1
-    _fused.quant_qk_per_warp_int8_rotated_cuda(
-        q,
-        k,
-        q_int8,
-        k_int8,
-        q_scale,
-        k_scale,
-        BLKQ,
-        WARPQ,
-        BLKK,
-        layout_id,
-    )
+    if stabilize_k:
+        anchor_indices = torch.empty(
+            (batch, kv_heads), dtype=torch.int32, device=q.device
+        )
+        _fused.quant_qk_per_warp_int8_rotated_anchored_cuda(
+            q,
+            k,
+            q_int8,
+            k_int8,
+            q_scale,
+            k_scale,
+            anchor_indices,
+            BLKQ,
+            WARPQ,
+            BLKK,
+            layout_id,
+        )
+    else:
+        _fused.quant_qk_per_warp_int8_rotated_cuda(
+            q,
+            k,
+            q_int8,
+            k_int8,
+            q_scale,
+            k_scale,
+            BLKQ,
+            WARPQ,
+            BLKK,
+            layout_id,
+        )
     return q_int8, q_scale, k_int8, k_scale
 
 

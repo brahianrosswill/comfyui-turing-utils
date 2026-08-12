@@ -84,7 +84,7 @@ class TuringSageQuantContractTest(unittest.TestCase):
         q = torch.empty((2, 4, 129, 128), dtype=torch.bfloat16)
         k = torch.empty((2, 2, 151, 128), dtype=torch.bfloat16)
         with mock.patch.object(
-            quant._fused, "quant_qk_per_warp_int8_rotated_cuda"
+            quant._fused, "quant_qk_per_warp_int8_rotated_anchored_cuda"
         ) as fused:
             q_int8, q_scale, k_int8, k_scale = quant.per_warp_int8_hadamard(q, k)
 
@@ -92,9 +92,23 @@ class TuringSageQuantContractTest(unittest.TestCase):
         self.assertEqual(k_int8.shape, k.shape)
         self.assertEqual(q_scale.shape, (2, 4, 12))
         self.assertEqual(k_scale.shape, (2, 2, 3))
-        fused.assert_called_once_with(
-            q, k, q_int8, k_int8, q_scale, k_scale, 64, 16, 64, 1
-        )
+        args = fused.call_args.args
+        for actual, expected in zip(
+            args[:6], (q, k, q_int8, k_int8, q_scale, k_scale)
+        ):
+            self.assertIs(actual, expected)
+        self.assertEqual(args[6].shape, (2, 2))
+        self.assertEqual(args[6].dtype, torch.int32)
+        self.assertEqual(args[7:], (64, 16, 64, 1))
+
+    def test_hadamard_quantizer_can_disable_k_stabilization(self):
+        q = torch.empty((1, 2, 65, 64), dtype=torch.float16)
+        k = torch.empty((1, 1, 73, 64), dtype=torch.float16)
+        with mock.patch.object(
+            quant._fused, "quant_qk_per_warp_int8_rotated_cuda"
+        ) as fused:
+            quant.per_warp_int8_hadamard(q, k, stabilize_k=False)
+        fused.assert_called_once()
 
     def test_production_quant_module_has_no_experimental_api(self):
         self.assertFalse(hasattr(quant, "per_thread_int4"))

@@ -259,7 +259,8 @@ __device__ __forceinline__ void attention_hadamard8(float (&values)[8], int dim_
     values[channel] *= normalization;
 }
 
-template <uint32_t head_dim, uint32_t BLOCK_SIZE, uint32_t THREADS_PER_BLOCK, bool ROTATE, typename T>
+template <uint32_t head_dim, uint32_t BLOCK_SIZE, uint32_t THREADS_PER_BLOCK,
+          bool ROTATE, bool ALLOW_ANCHOR, typename T>
 __device__ __forceinline__ void quant_int8_tile(T *__restrict__ input,
                                                 int8_t *__restrict__ output,
                                                 float *__restrict__ scale,
@@ -274,7 +275,8 @@ __device__ __forceinline__ void quant_int8_tile(T *__restrict__ input,
                                                 const uint32_t stride_seq_output,
                                                 const uint32_t stride_h_output,
                                                 const uint32_t stride_bz_scale,
-                                                const uint32_t stride_h_scale)
+                                                const uint32_t stride_h_scale,
+                                                const int anchor_index)
 {
   static_assert(std::is_same<T, half>::value || std::is_same<T, nv_bfloat16>::value, "Only half and bfloat16 are supported");
 
@@ -285,6 +287,22 @@ __device__ __forceinline__ void quant_int8_tile(T *__restrict__ input,
 
   const uint32_t thread_id = threadIdx.x;
   const uint32_t base_token = tile_id * BLOCK_SIZE;
+
+  __shared__ T anchor_shared[ALLOW_ANCHOR ? head_dim : 1];
+  if constexpr (ALLOW_ANCHOR)
+  {
+    if (anchor_index >= 0)
+    {
+      for (uint32_t channel = thread_id; channel < head_dim;
+           channel += THREADS_PER_BLOCK)
+      {
+        anchor_shared[channel] = input[
+            batch_id * stride_bz_input + head_id * stride_h_input +
+            anchor_index * stride_seq_input + channel];
+      }
+    }
+    __syncthreads();
+  }
 
   float x_val_float[num_pack_per_thread][8];
 
@@ -305,6 +323,19 @@ __device__ __forceinline__ void quant_int8_tile(T *__restrict__ input,
       for (uint32_t j = 0; j < 8; j++)
       {
         x_val_float[i][j] = convert_to_float(x_val[j]);
+      }
+      if constexpr (ALLOW_ANCHOR)
+      {
+        if (anchor_index >= 0)
+        {
+          T anchor_val[8];
+#pragma unroll
+          for (uint32_t j = 0; j < 8; j++)
+          {
+            anchor_val[j] = anchor_shared[dim_pack * pack_size + j];
+            x_val_float[i][j] -= convert_to_float(anchor_val[j]);
+          }
+        }
       }
     }
     else
@@ -375,6 +406,174 @@ __device__ __forceinline__ void quant_int8_tile(T *__restrict__ input,
   }
 }
 
+// Model-independent K stabilization detector adapted from Comfy-Kitchen.
+// Nine evenly-spaced keys are sampled per batch/head.  The sampled key nearest
+// their mean is used only when centering lowers energy without expanding the
+// observed range by more than 12.5%.  A negative index disables subtraction.
+constexpr int K_ANCHOR_THREADS = 128;
+constexpr int K_ANCHOR_SAMPLES = 9;
+constexpr int K_ANCHOR_MAX_CHANNELS = 128;
+
+template <typename T>
+__global__ __launch_bounds__(K_ANCHOR_THREADS) void DetectKAnchorKernel(
+    const T *__restrict__ key,
+    int *__restrict__ anchor_indices,
+    const int key_length,
+    const int head_dim,
+    const int num_kv_heads,
+    const int64_t stride_bz,
+    const int64_t stride_h,
+    const int64_t stride_seq)
+{
+  const int head_id = blockIdx.x;
+  const int batch_id = blockIdx.y;
+  const int thread_id = threadIdx.x;
+  const int lane_id = thread_id & 31;
+  const int warp_id = thread_id >> 5;
+  const int64_t bh_offset =
+      (int64_t)batch_id * stride_bz + (int64_t)head_id * stride_h;
+
+  __shared__ float samples[K_ANCHOR_SAMPLES * K_ANCHOR_MAX_CHANNELS];
+  __shared__ float warp_original_energy[4];
+  __shared__ float warp_original_max[4];
+  __shared__ float warp_candidate_distance[K_ANCHOR_SAMPLES][4];
+  __shared__ float warp_best_energy[4];
+  __shared__ float warp_best_max[4];
+  __shared__ int selected_candidate;
+
+  for (int index = thread_id; index < K_ANCHOR_SAMPLES * head_dim;
+       index += K_ANCHOR_THREADS)
+  {
+    const int sample = index / head_dim;
+    const int channel = index - sample * head_dim;
+    const int row = sample * (key_length - 1) / (K_ANCHOR_SAMPLES - 1);
+    samples[index] = convert_to_float(
+        key[bh_offset + (int64_t)row * stride_seq + channel]);
+  }
+  __syncthreads();
+
+  float original_energy = 0.0f;
+  float original_max = 0.0f;
+  float candidate_distance[K_ANCHOR_SAMPLES];
+#pragma unroll
+  for (int candidate = 0; candidate < K_ANCHOR_SAMPLES; ++candidate)
+    candidate_distance[candidate] = 0.0f;
+
+  for (int channel = thread_id; channel < head_dim; channel += K_ANCHOR_THREADS)
+  {
+    float channel_sum = 0.0f;
+#pragma unroll
+    for (int sample = 0; sample < K_ANCHOR_SAMPLES; ++sample)
+    {
+      const float value = samples[sample * head_dim + channel];
+      original_energy = fmaf(value, value, original_energy);
+      original_max = fmaxf(original_max, fabsf(value));
+      channel_sum += value;
+    }
+#pragma unroll
+    for (int candidate = 0; candidate < K_ANCHOR_SAMPLES; ++candidate)
+    {
+      const float distance =
+          K_ANCHOR_SAMPLES * samples[candidate * head_dim + channel] -
+          channel_sum;
+      candidate_distance[candidate] =
+          fmaf(distance, distance, candidate_distance[candidate]);
+    }
+  }
+
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1)
+  {
+    original_energy += __shfl_down_sync(0xffffffffu, original_energy, offset);
+    original_max = fmaxf(
+        original_max, __shfl_down_sync(0xffffffffu, original_max, offset));
+#pragma unroll
+    for (int candidate = 0; candidate < K_ANCHOR_SAMPLES; ++candidate)
+      candidate_distance[candidate] += __shfl_down_sync(
+          0xffffffffu, candidate_distance[candidate], offset);
+  }
+  if (lane_id == 0)
+  {
+    warp_original_energy[warp_id] = original_energy;
+    warp_original_max[warp_id] = original_max;
+#pragma unroll
+    for (int candidate = 0; candidate < K_ANCHOR_SAMPLES; ++candidate)
+      warp_candidate_distance[candidate][warp_id] =
+          candidate_distance[candidate];
+  }
+  __syncthreads();
+
+  if (thread_id == 0)
+  {
+    int best_candidate = 0;
+    float best_distance = 3.402823466e+38F;
+#pragma unroll
+    for (int candidate = 0; candidate < K_ANCHOR_SAMPLES; ++candidate)
+    {
+      float distance = 0.0f;
+#pragma unroll
+      for (int warp = 0; warp < 4; ++warp)
+        distance += warp_candidate_distance[candidate][warp];
+      if (distance < best_distance)
+      {
+        best_candidate = candidate;
+        best_distance = distance;
+      }
+    }
+    selected_candidate = best_candidate;
+  }
+  __syncthreads();
+
+  float best_energy = 0.0f;
+  float best_max = 0.0f;
+  for (int channel = thread_id; channel < head_dim; channel += K_ANCHOR_THREADS)
+  {
+    const float anchor = samples[selected_candidate * head_dim + channel];
+#pragma unroll
+    for (int sample = 0; sample < K_ANCHOR_SAMPLES; ++sample)
+    {
+      const float residual = samples[sample * head_dim + channel] - anchor;
+      best_energy = fmaf(residual, residual, best_energy);
+      best_max = fmaxf(best_max, fabsf(residual));
+    }
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1)
+  {
+    best_energy += __shfl_down_sync(0xffffffffu, best_energy, offset);
+    best_max = fmaxf(
+        best_max, __shfl_down_sync(0xffffffffu, best_max, offset));
+  }
+  if (lane_id == 0)
+  {
+    warp_best_energy[warp_id] = best_energy;
+    warp_best_max[warp_id] = best_max;
+  }
+  __syncthreads();
+
+  if (thread_id == 0)
+  {
+    float total_original_energy = 0.0f;
+    float total_original_max = 0.0f;
+    float total_best_energy = 0.0f;
+    float total_best_max = 0.0f;
+#pragma unroll
+    for (int warp = 0; warp < 4; ++warp)
+    {
+      total_original_energy += warp_original_energy[warp];
+      total_original_max = fmaxf(total_original_max, warp_original_max[warp]);
+      total_best_energy += warp_best_energy[warp];
+      total_best_max = fmaxf(total_best_max, warp_best_max[warp]);
+    }
+    const bool improves_range =
+        total_best_energy < total_original_energy &&
+        total_best_max <= total_original_max * 1.125f;
+    anchor_indices[batch_id * num_kv_heads + head_id] = improves_range
+        ? selected_candidate * (key_length - 1) / (K_ANCHOR_SAMPLES - 1)
+        : -1;
+  }
+}
+
 template <uint32_t head_dim, uint32_t Q_BLOCK_SIZE, uint32_t K_BLOCK_SIZE, uint32_t THREADS_PER_BLOCK, bool ROTATE, typename T>
 __global__ void QuantQKInt8Kernel(T *__restrict__ query,
                                   T *__restrict__ key,
@@ -403,7 +602,8 @@ __global__ void QuantQKInt8Kernel(T *__restrict__ query,
                                   const uint32_t stride_bz_q_scale,
                                   const uint32_t stride_h_q_scale,
                                   const uint32_t stride_bz_k_scale,
-                                  const uint32_t stride_h_k_scale)
+                                  const uint32_t stride_h_k_scale,
+                                  const int *__restrict__ anchor_indices)
 {
   const uint32_t task_id = blockIdx.x;
   const uint32_t batch_id = blockIdx.y;
@@ -413,11 +613,11 @@ __global__ void QuantQKInt8Kernel(T *__restrict__ query,
   {
     const uint32_t head_id = task_id / query_scale_len;
     const uint32_t tile_id = task_id - head_id * query_scale_len;
-    quant_int8_tile<head_dim, Q_BLOCK_SIZE, THREADS_PER_BLOCK, ROTATE, T>(
+    quant_int8_tile<head_dim, Q_BLOCK_SIZE, THREADS_PER_BLOCK, ROTATE, false, T>(
         query, query_output, query_scale, tile_id, head_id, batch_id, qo_len,
         stride_bz_q, stride_seq_q, stride_h_q,
         stride_bz_qo, stride_seq_qo, stride_h_qo,
-        stride_bz_q_scale, stride_h_q_scale);
+        stride_bz_q_scale, stride_h_q_scale, -1);
   }
   else
   {
@@ -426,11 +626,14 @@ __global__ void QuantQKInt8Kernel(T *__restrict__ query,
     const uint32_t tile_id = key_task_id - head_id * key_scale_len;
     if (head_id < num_kv_heads)
     {
-      quant_int8_tile<head_dim, K_BLOCK_SIZE, THREADS_PER_BLOCK, ROTATE, T>(
+      const int anchor_index = anchor_indices == nullptr
+          ? -1
+          : anchor_indices[batch_id * num_kv_heads + head_id];
+      quant_int8_tile<head_dim, K_BLOCK_SIZE, THREADS_PER_BLOCK, ROTATE, true, T>(
           key, key_output, key_scale, tile_id, head_id, batch_id, kv_len,
           stride_bz_k, stride_seq_k, stride_h_k,
           stride_bz_ko, stride_seq_ko, stride_h_ko,
-          stride_bz_k_scale, stride_h_k_scale);
+          stride_bz_k_scale, stride_h_k_scale, anchor_index);
     }
   }
 }
@@ -1953,7 +2156,8 @@ static void quant_qk_per_warp_int8_cuda_impl(
                 int query_warp_block_size,
                 int key_block_size,
                 int tensor_layout,
-                bool rotate)
+                bool rotate,
+                const at::Tensor &anchor_indices)
 {
   CHECK_CUDA(query);
   CHECK_CUDA(key);
@@ -2030,6 +2234,20 @@ static void quant_qk_per_warp_int8_cuda_impl(
   const int query_scale_len = ((qo_len + query_block_size - 1) / query_block_size) * (query_block_size / query_warp_block_size);
   const int key_scale_len = (kv_len + key_block_size - 1) / key_block_size;
 
+  int *anchor_ptr = nullptr;
+  if (anchor_indices.defined())
+  {
+    CHECK_CUDA(anchor_indices);
+    CHECK_CONTIGUOUS(anchor_indices);
+    CHECK_DTYPE(anchor_indices, at::ScalarType::Int);
+    CHECK_DIMS(anchor_indices, 2);
+    CHECK_SHAPE(anchor_indices, batch_size, num_kv_heads);
+    TORCH_CHECK(
+        anchor_indices.device() == key.device(),
+        "K anchor scratch must be on the same CUDA device as K");
+    anchor_ptr = anchor_indices.data_ptr<int>();
+  }
+
   CHECK_SHAPE(query_output, query.size(0), query.size(1), query.size(2), query.size(3));
   CHECK_SHAPE(key_output, key.size(0), key.size(1), key.size(2), key.size(3));
   CHECK_SHAPE(query_scale, batch_size, num_qo_heads, query_scale_len);
@@ -2054,7 +2272,8 @@ static void quant_qk_per_warp_int8_cuda_impl(
     query_output.stride(0), stride_seq_qo, stride_h_qo,                        \
     key_output.stride(0), stride_seq_ko, stride_h_ko,                          \
     query_scale.stride(0), query_scale.stride(1),                              \
-    key_scale.stride(0), key_scale.stride(1));
+    key_scale.stride(0), key_scale.stride(1),                                \
+    anchor_ptr);
 
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
     DISPATCH_WARP_BLOCK_SIZE(query_warp_block_size, QUERY_WARP_BLOCK_SIZE, {
@@ -2063,6 +2282,17 @@ static void quant_qk_per_warp_int8_cuda_impl(
           constexpr int THREADS_PER_BLOCK = 256;
           dim3 grid(num_qo_heads * query_scale_len + num_kv_heads * key_scale_len, batch_size);
           dim3 block(THREADS_PER_BLOCK);
+
+          if (anchor_ptr != nullptr)
+          {
+            dim3 anchor_grid(num_kv_heads, batch_size);
+            DetectKAnchorKernel<c_type><<<
+                anchor_grid, K_ANCHOR_THREADS, 0,
+                c10::cuda::getCurrentCUDAStream()>>>(
+                reinterpret_cast<c_type*>(key.data_ptr()), anchor_ptr,
+                kv_len, HEAD_DIM, num_kv_heads,
+                key.stride(0), stride_h_k, stride_seq_k);
+          }
 
           if (rotate)
           {
@@ -2094,7 +2324,7 @@ void quant_qk_per_warp_int8_cuda(
   quant_qk_per_warp_int8_cuda_impl(
       query, key, query_output, key_output, query_scale, key_scale,
       query_block_size, query_warp_block_size, key_block_size, tensor_layout,
-      false);
+      false, at::Tensor());
 }
 
 void quant_qk_per_warp_int8_rotated_cuda(
@@ -2112,7 +2342,26 @@ void quant_qk_per_warp_int8_rotated_cuda(
   quant_qk_per_warp_int8_cuda_impl(
       query, key, query_output, key_output, query_scale, key_scale,
       query_block_size, query_warp_block_size, key_block_size, tensor_layout,
-      true);
+      true, at::Tensor());
+}
+
+void quant_qk_per_warp_int8_rotated_anchored_cuda(
+                at::Tensor query,
+                at::Tensor key,
+                at::Tensor query_output,
+                at::Tensor key_output,
+                at::Tensor query_scale,
+                at::Tensor key_scale,
+                at::Tensor anchor_indices,
+                int query_block_size,
+                int query_warp_block_size,
+                int key_block_size,
+                int tensor_layout)
+{
+  quant_qk_per_warp_int8_cuda_impl(
+      query, key, query_output, key_output, query_scale, key_scale,
+      query_block_size, query_warp_block_size, key_block_size, tensor_layout,
+      true, anchor_indices);
 }
 
 void quant_per_warp_int8_varlen_cuda(
