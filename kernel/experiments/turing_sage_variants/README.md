@@ -22,6 +22,6 @@ COMFYUI_TURING_UTILS_ARCH_LIST=7.5 python -m pip install .
 
 That checkpoint exposes `sage_`, `sage1`, and `sage2`. The production branch
 renames the proven `sage_` implementation to `sage` and builds only that path.
-The guarded CUDA research source remains readable in `csrc/turing/sage`; the
-`COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS` macro is deliberately not
-enabled by the production `setup.py`.
+The research CUDA is intentionally absent from the production `csrc` tree. The
+checkpoint above is the sole reproducible source so retired kernels cannot
+silently return to release builds through a compile flag.

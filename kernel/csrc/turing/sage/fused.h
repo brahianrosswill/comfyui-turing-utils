@@ -31,15 +31,6 @@ void quant_per_block_int8_cuda(
                 int block_size,
                 int tensor_layout);
 
-#ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
-void quant_per_block_int8_fuse_sub_mean_cuda(
-                at::Tensor input,
-                at::Tensor mean,
-                at::Tensor output,
-                at::Tensor scale,
-                int block_size,
-                int tensor_layout);
-#endif
 
 void quant_per_warp_int8_cuda(
                 at::Tensor input,
@@ -95,59 +86,6 @@ void quant_per_warp_int8_varlen_cuda(
                 int block_size,
                 int warp_block_size);
 
-#ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
-void token_block_mean_cuda(
-                at::Tensor input,
-                at::Tensor output,
-                int block_size,
-                int tensor_layout);
-
-void quant_query_per_thread_int4_cuda(
-                at::Tensor input,
-                at::Tensor mean,
-                at::Tensor output,
-                at::Tensor scale,
-                int tensor_layout,
-                bool subtract_mean);
-
-void quant_key_per_thread_int4_cuda(
-                at::Tensor input,
-                at::Tensor mean,
-                at::Tensor output,
-                at::Tensor scale,
-                int tensor_layout,
-                bool subtract_mean);
-
-void quant_query_per_thread_int4_fused_cuda(
-                at::Tensor input,
-                at::Tensor mean,
-                at::Tensor output,
-                at::Tensor scale,
-                int tensor_layout);
-
-void quant_key_per_thread_int4_fused_cuda(
-                at::Tensor input,
-                at::Tensor mean,
-                at::Tensor output,
-                at::Tensor scale,
-                int tensor_layout);
-
-void sage2_score_correction_cuda(
-                at::Tensor query_mean,
-                at::Tensor key,
-                at::Tensor key_mean,
-                at::Tensor output,
-                int tensor_layout,
-                bool subtract_key_mean);
-#endif
-
-#ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
-void sub_mean_cuda(
-                at::Tensor input,
-                at::Tensor mean,
-                at::Tensor output,
-                int tensor_layout);
-#endif
 
 void transpose_pad_permute_cuda(
                 at::Tensor input,

@@ -26,12 +26,4 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("sol_w8a8_precompute_summaries", &sol_w8a8_precompute_summaries, "Precompute Sol W8A8 correction summaries before releasing floating-point V");
   m.def("sol_sparse_online_w8a8_prequantized_attn", &sol_sparse_online_w8a8_prequantized_attn, "Sol W8A8 attention from prequantized Q/K/V and correction summaries");
   m.def("quantize_v_int8_sm75", &quantize_v_int8_sm75, "Channel-wise signed INT8 V quantization for sm75 W8A8 attention");
-#ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
-  m.def("qk_int8_sv_f16_accum_f16_attn", &qk_int8_sv_f16_accum_f16_attn, "Experimental QK int8/PV f16 attention");
-  m.def("qk_int8_sv_f16_accum_f16_fuse_v_mean_attn", &qk_int8_sv_f16_accum_f16_fuse_v_mean_attn, "Experimental QK int8/PV f16 attention with V mean");
-  m.def("qk_int8_sv_f16_accum_f16_attn_inst_buf", &qk_int8_sv_f16_accum_f16_attn_inst_buf, "Experimental mixed PV accumulator");
-  m.def("qk_int4_sv_f16_accum_f16_f32_attn", &qk_int4_sv_f16_accum_f16_f32_attn, "Packed QK int4 per-thread, PV f16 tile with f32 running accumulation for sm75");
-  m.def("qk_int4_sv_f16_accum_f16_f32_precomputed_attn", &qk_int4_sv_f16_accum_f16_f32_precomputed_attn, "Packed QK int4 with precomputed FP32 score correction for sm75");
-  m.def("qk_int4_sv_f16_accum_f16_attn", &qk_int4_sv_f16_accum_f16_f32_attn, "Compatibility alias for stable packed QK int4 attention");
-#endif
 }

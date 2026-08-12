@@ -81,6 +81,18 @@ class KernelSetupTest(unittest.TestCase):
             "comfyui_turing_utils_kernel.turing_sage",
         })
 
+    def test_retired_sage_variants_are_absent_from_production_sources(self):
+        csrc = PLUGIN_ROOT / "kernel" / "csrc" / "turing" / "sage"
+        production_source = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in csrc.rglob("*")
+            if path.is_file()
+        )
+        self.assertNotIn(
+            "COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS",
+            production_source,
+        )
+
     def test_setup_and_pyproject_versions_match(self):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
@@ -134,7 +146,10 @@ class KernelSetupTest(unittest.TestCase):
         current_stream = "c10::cuda::getCurrentCUDAStream()"
         self.assertIn(current_stream, fixed)
         self.assertIn(current_stream, varlen)
-        self.assertGreaterEqual(fused.count(current_stream), 20)
+        # Retired Sage1/Sage2 launch sites are not part of the production
+        # source count; every remaining fused family still names the current
+        # PyTorch stream explicitly.
+        self.assertGreaterEqual(fused.count(current_stream), 10)
         self.assertNotIn("<<<grid, block>>>", fused)
 
     def test_windows_conda_target_specific_cccl_path_is_added(self):

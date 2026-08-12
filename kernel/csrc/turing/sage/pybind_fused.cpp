@@ -26,14 +26,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("quant_qk_per_warp_int8_rotated_cuda", &quant_qk_per_warp_int8_rotated_cuda, "Fused randomized Hadamard Q/K INT8 quantization");
   m.def("quant_qk_per_warp_int8_rotated_anchored_cuda", &quant_qk_per_warp_int8_rotated_anchored_cuda, "Fused randomized Hadamard Q/K INT8 quantization with conditional K anchoring");
   m.def("quant_per_warp_int8_varlen_cuda", &quant_per_warp_int8_varlen_cuda, "quant_per_warp_int8_varlen_cuda");
-#ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
-  m.def("token_block_mean_cuda", &token_block_mean_cuda, "token_block_mean_cuda");
-  m.def("quant_query_per_thread_int4_cuda", &quant_query_per_thread_int4_cuda, "quant_query_per_thread_int4_cuda");
-  m.def("quant_key_per_thread_int4_cuda", &quant_key_per_thread_int4_cuda, "quant_key_per_thread_int4_cuda");
-  m.def("quant_query_per_thread_int4_fused_cuda", &quant_query_per_thread_int4_fused_cuda, "Fused Q block smoothing and official-layout per-thread INT4 quantization");
-  m.def("quant_key_per_thread_int4_fused_cuda", &quant_key_per_thread_int4_fused_cuda, "Fused centered-K official-layout per-thread INT4 quantization");
-  m.def("sage2_score_correction_cuda", &sage2_score_correction_cuda, "FP16 Tensor Core Sage2 score correction with FP32 output");
-#endif
 
   m.def("varlen_attention_fwd_cuda", &varlen_attention_fwd_cuda, "varlen_attention_fwd_cuda");
 }

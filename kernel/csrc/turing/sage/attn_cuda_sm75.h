@@ -81,44 +81,6 @@ void quantize_v_int8_sm75(at::Tensor value,
                     at::Tensor quantized,
                     at::Tensor scale);
 
-#ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
-at::Tensor qk_int8_sv_f16_accum_f16_attn(at::Tensor query,
-                    at::Tensor key,
-                    at::Tensor value,
-                    at::Tensor output,
-                    at::Tensor query_scale,
-                    at::Tensor key_scale,
-                    int tensor_layout,
-                    int is_causal,
-                    int qk_quant_gran,
-                    float sm_scale,
-                    int return_lse);
-
-at::Tensor qk_int8_sv_f16_accum_f16_attn_inst_buf(at::Tensor query,
-                    at::Tensor key,
-                    at::Tensor value,
-                    at::Tensor output,
-                    at::Tensor query_scale,
-                    at::Tensor key_scale,
-                    int tensor_layout,
-                    int is_causal,
-                    int qk_quant_gran,
-                    float sm_scale,
-                    int return_lse);
-
-at::Tensor qk_int8_sv_f16_accum_f16_fuse_v_mean_attn(at::Tensor query,
-                    at::Tensor key,
-                    at::Tensor value,
-                    at::Tensor output,
-                    at::Tensor query_scale,
-                    at::Tensor key_scale,
-                    at::Tensor value_mean,
-                    int tensor_layout,
-                    int is_causal,
-                    int qk_quant_gran,
-                    float sm_scale,
-                    int return_lse);
-#endif
 
 at::Tensor qk_int8_sv_f16_varlen_accum_f32_attn(at::Tensor query,
                     at::Tensor key,
@@ -132,37 +94,3 @@ at::Tensor qk_int8_sv_f16_varlen_accum_f32_attn(at::Tensor query,
                     int max_seqlen_k,
                     int is_causal,
                     float sm_scale);
-
-#ifdef COMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS
-at::Tensor qk_int4_sv_f16_accum_f16_f32_attn(
-                    at::Tensor query,
-                    at::Tensor key,
-                    at::Tensor value,
-                    at::Tensor output,
-                    at::Tensor query_scale,
-                    at::Tensor key_scale,
-                    at::Tensor key_original,
-                    at::Tensor query_mean,
-                    at::Tensor key_mean,
-                    int tensor_layout,
-                    int is_causal,
-                    float sm_scale,
-                    int return_lse,
-                    int smooth_q,
-                    int smooth_k);
-
-at::Tensor qk_int4_sv_f16_accum_f16_f32_precomputed_attn(
-                    at::Tensor query,
-                    at::Tensor key,
-                    at::Tensor value,
-                    at::Tensor output,
-                    at::Tensor query_scale,
-                    at::Tensor key_scale,
-                    at::Tensor score_correction,
-                    int tensor_layout,
-                    int is_causal,
-                    float sm_scale,
-                    int return_lse,
-                    int q_block_start,
-                    int q_block_count);
-#endif
