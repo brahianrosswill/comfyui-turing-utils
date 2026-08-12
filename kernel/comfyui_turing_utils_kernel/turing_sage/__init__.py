@@ -217,23 +217,36 @@ def preflight_sparse(device: torch.device) -> None:
     if not sparse_available():
         raise RuntimeError("the experimental Turing sparse extension is not built")
 
-    with torch.cuda.device(device):
-        q_values = torch.arange(4 * 129 * 128, device=device, dtype=torch.float32)
-        kv_values = torch.arange(2 * 151 * 128, device=device, dtype=torch.float32)
-        q = (((q_values % 29) - 14) / 16).reshape(1, 4, 129, 128).to(torch.bfloat16)
-        k = ((((kv_values * 3) % 31) - 15) / 16).reshape(1, 2, 151, 128).to(torch.bfloat16)
-        v = ((((kv_values * 5) % 37) - 18) / 16).reshape_as(k).to(torch.bfloat16)
-        output = sol_sparse_sageattn(q, k, v, threshold_sigma=-1000.0)
-        reference = torch.nn.functional.scaled_dot_product_attention(
-            q.float(), k.float(), v.float(), enable_gqa=True
-        )
-        if (
-            output.dtype != torch.bfloat16
-            or output.shape != q.shape
-            or not torch.isfinite(output).all()
-            or not torch.allclose(output.float(), reference, rtol=0.08, atol=0.06)
-        ):
-            raise RuntimeError("Turing sparse attention BF16 self-test failed")
+    with torch.inference_mode(), torch.cuda.device(device):
+        for head_dim in (64, 128):
+            q_values = torch.arange(
+                4 * 129 * head_dim, device=device, dtype=torch.float32
+            )
+            kv_values = torch.arange(
+                2 * 151 * head_dim, device=device, dtype=torch.float32
+            )
+            q = (((q_values % 29) - 14) / 16).reshape(
+                1, 4, 129, head_dim
+            ).to(torch.bfloat16)
+            k = ((((kv_values * 3) % 31) - 15) / 16).reshape(
+                1, 2, 151, head_dim
+            ).to(torch.bfloat16)
+            v = ((((kv_values * 5) % 37) - 18) / 16).reshape_as(k).to(
+                torch.bfloat16
+            )
+            output = sol_sparse_sageattn(q, k, v, threshold_sigma=-1000.0)
+            reference = torch.nn.functional.scaled_dot_product_attention(
+                q.float(), k.float(), v.float(), enable_gqa=True
+            )
+            if (
+                output.dtype != torch.bfloat16
+                or output.shape != q.shape
+                or not torch.isfinite(output).all()
+                or not torch.allclose(output.float(), reference, rtol=0.08, atol=0.06)
+            ):
+                raise RuntimeError(
+                    f"Turing sparse attention BF16 D={head_dim} self-test failed"
+                )
         torch.cuda.synchronize(device)
 
 
@@ -246,22 +259,35 @@ def preflight_w8a8(device: torch.device) -> None:
         raise RuntimeError("the Turing W8A8 attention extension is not built")
 
     with torch.inference_mode(), torch.cuda.device(device):
-        q_values = torch.arange(4 * 129 * 128, device=device, dtype=torch.float32)
-        kv_values = torch.arange(2 * 151 * 128, device=device, dtype=torch.float32)
-        q = (((q_values % 29) - 14) / 16).reshape(1, 4, 129, 128).to(torch.bfloat16)
-        k = ((((kv_values * 3) % 31) - 15) / 16).reshape(1, 2, 151, 128).to(torch.bfloat16)
-        v = ((((kv_values * 5) % 37) - 18) / 16).reshape_as(k).to(torch.bfloat16)
-        output = w8a8attn(q, k, v)
-        reference = torch.nn.functional.scaled_dot_product_attention(
-            q.float(), k.float(), v.float(), enable_gqa=True
-        )
-        if (
-            output.dtype != torch.bfloat16
-            or output.shape != q.shape
-            or not torch.isfinite(output).all()
-            or not torch.allclose(output.float(), reference, rtol=0.12, atol=0.09)
-        ):
-            raise RuntimeError("Turing W8A8 attention BF16 self-test failed")
+        for head_dim in (64, 128):
+            q_values = torch.arange(
+                4 * 129 * head_dim, device=device, dtype=torch.float32
+            )
+            kv_values = torch.arange(
+                2 * 151 * head_dim, device=device, dtype=torch.float32
+            )
+            q = (((q_values % 29) - 14) / 16).reshape(
+                1, 4, 129, head_dim
+            ).to(torch.bfloat16)
+            k = ((((kv_values * 3) % 31) - 15) / 16).reshape(
+                1, 2, 151, head_dim
+            ).to(torch.bfloat16)
+            v = ((((kv_values * 5) % 37) - 18) / 16).reshape_as(k).to(
+                torch.bfloat16
+            )
+            output = w8a8attn(q, k, v)
+            reference = torch.nn.functional.scaled_dot_product_attention(
+                q.float(), k.float(), v.float(), enable_gqa=True
+            )
+            if (
+                output.dtype != torch.bfloat16
+                or output.shape != q.shape
+                or not torch.isfinite(output).all()
+                or not torch.allclose(output.float(), reference, rtol=0.12, atol=0.09)
+            ):
+                raise RuntimeError(
+                    f"Turing W8A8 attention BF16 D={head_dim} self-test failed"
+                )
         torch.cuda.synchronize(device)
 
 

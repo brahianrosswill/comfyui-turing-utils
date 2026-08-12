@@ -315,9 +315,11 @@ def _expected_int8_sol_route_count(
 
 def validate_sparse(device: torch.device) -> None:
     from comfyui_turing_utils_kernel.turing_sage import (
+        prequantize_sol_sageattn,
         run_attention_correctness_gate,
         sageattn,
         sol_sparse_sageattn,
+        sol_sparse_sageattn_from_prequantized,
         w8a8attn,
     )
     from comfyui_turing_utils_kernel.turing_sage.quant import (
@@ -331,7 +333,20 @@ def validate_sparse(device: torch.device) -> None:
         reference = torch.nn.functional.scaled_dot_product_attention(
             q.float(), k.float(), v.float(), enable_gqa=True
         )
-        dense_w8a8 = w8a8attn(q, k, v)
+        dense_state = prequantize_sol_sageattn(
+            q, k, v, use_w8a8=True, force_dense=True
+        )
+        expected_kernel_dim = 64 if head_dim <= 64 else 128
+        if (
+            dense_state.query_int8.size(-1) != expected_kernel_dim
+            or dense_state.key_int8.size(-1) != expected_kernel_dim
+            or dense_state.value_int8.size(2) != expected_kernel_dim
+            or dense_state.value_scale.size(-1) != expected_kernel_dim
+        ):
+            raise RuntimeError(
+                f"W8A8 D={head_dim} used the wrong native kernel dimension"
+            )
+        dense_w8a8 = sol_sparse_sageattn_from_prequantized(dense_state)
         _assert_close(
             f"W8A8 padded D={head_dim}",
             dense_w8a8,
@@ -604,8 +619,10 @@ def benchmark_sage(device: torch.device, iterations: int) -> None:
 
 def benchmark_sparse(device: torch.device, iterations: int) -> None:
     from comfyui_turing_utils_kernel.turing_sage import (
+        prequantize_sol_sageattn,
         sageattn,
         sol_sparse_sageattn,
+        sol_sparse_sageattn_from_prequantized,
         w8a8attn,
     )
 
@@ -644,6 +661,39 @@ def benchmark_sparse(device: torch.device, iterations: int) -> None:
             f"W8A8 1x64 {sparse_w8a8_ms:.3f} ms, "
             f"sage {dense_ms:.3f} ms, dense W8A8 {dense_w8a8_ms:.3f} ms, "
             f"{dense_ms / sparse_w8a8_ms:.3f}x sparse-W8A8 speedup"
+        )
+
+    # Compare the native D64 CTA with the previous behavior using the exact
+    # same inputs, zero-padded to D128 while retaining the D64 softmax scale.
+    # This is directional A40 validation, not a substitute for sm75 profiling.
+    q64 = torch.randn((1, 8, 4096, 64), device=device, dtype=torch.bfloat16)
+    k64 = torch.randn((1, 4, 4096, 64), device=device, dtype=torch.bfloat16)
+    v64 = torch.randn_like(k64)
+    for label, q, k, v in (
+        ("native D64", q64, k64, v64),
+        (
+            "D64 padded to D128",
+            torch.nn.functional.pad(q64, (0, 64)),
+            torch.nn.functional.pad(k64, (0, 64)),
+            torch.nn.functional.pad(v64, (0, 64)),
+        ),
+    ):
+        dense_state = prequantize_sol_sageattn(
+            q, k, v, use_w8a8=True, force_dense=True, sm_scale=64**-0.5
+        )
+        sparse_state = prequantize_sol_sageattn(
+            q, k, v, use_w8a8=True, threshold_sigma=1.0, sm_scale=64**-0.5
+        )
+        dense_ms = _elapsed_ms(
+            lambda: sol_sparse_sageattn_from_prequantized(dense_state), iterations
+        )
+        sparse_ms = _elapsed_ms(
+            lambda: sol_sparse_sageattn_from_prequantized(sparse_state), iterations
+        )
+        print(
+            f"native-head check {label} "
+            f"kernel D={dense_state.query_int8.size(-1)}: "
+            f"dense W8A8 core {dense_ms:.3f} ms, Sol-W8A8 core {sparse_ms:.3f} ms"
         )
 
 

@@ -126,8 +126,9 @@ metadata; unknown models remain fully generic.
 The explicit `w8a8` backend and Sol's `use_w8a8` option require kernel 0.20.0.
 They are specialized for exact sm75, head dimensions 1--128, and unmasked
 non-causal attention. `auto` continues to select stable Sage. The W8A8 path
-keeps the same Q64 and 32 KiB shared-memory shape as Sol: V is quantized
-once per call into a channel-major, 16-token-permuted signed-INT8 tensor;
+keeps the same Q64 tile shape as Sol: native D64 uses 16 KiB shared memory and
+native D128 uses 32 KiB. V is quantized once per call into a channel-major,
+16-token-permuted signed-INT8 tensor;
 softmax probabilities are packed to unsigned INT8; PV uses SM75 U8xS8 Tensor
 Core MMA and the output remains FP32 until normalization and dtype writeback.
 The route-free dense specialization omits centroid summaries and route state.
@@ -177,8 +178,9 @@ The CUDA kernel builds no global route map. Query/key/value summaries remain
 separate compact preprocessing tensors, while threshold routing executes inside
 each sparse Query CTA immediately before skipped-residual and selected-block
 online-softmax updates. The temporary route occupies CTA-local shared memory and
-four route words per lane, then survives in registers while the normal 32 KiB
-shared-memory tiles are reused. The kernel accepts at most 4096 K/V blocks
+four route words per lane, then survives in registers while the normal D64
+16 KiB or D128 32 KiB shared-memory tiles are reused. The kernel accepts at
+most 4096 K/V blocks
 (262144 tokens) per call.
 
 Sol derives Q/K centroids from the same prequantized INT8 tensors and scales as
@@ -197,16 +199,21 @@ correction. One Q-to-K-centroid Tensor Core traversal supplies both the routing
 score and the online-softmax correction, with conflict-free per-warp shared
 partials instead of shared atomics. The compact route is then copied into four
 32-bit registers per lane before the arena is reused for exact K/V tiles. The
-FP16-PV compute_75 cubin reports 214 BF16 / 222 FP16 registers per main thread, a
-16-byte stack frame, zero local-memory spill, and 32 KiB dynamic shared memory.
+D128 FP16-PV compute_75 cubin reports 214 BF16 / 222 FP16 registers per main
+thread, with a 16-byte stack frame, zero local-memory spill, and 32 KiB dynamic
+shared memory.
 Register and shared-memory limits permit two 128-thread CTAs per SM75; actual
-occupancy and bank behavior still need Nsight confirmation on Turing.
+occupancy and bank behavior still need Nsight confirmation on Turing. Native
+D64 FP16-PV uses 152 BF16 / 159 FP16 registers, no stack or local spill, and
+16 KiB dynamic shared memory.
 
-The W8A8 sparse specialization uses 253 registers per thread
+The D128 W8A8 sparse specialization uses 252 registers per thread
 with a 16-byte stack frame but reports zero local-memory spill; 128 threads use
 32768 registers per CTA, so the 32 KiB shared-memory and register budgets still
-permit two CTAs on a 64 KiB/65536-register Turing SM. The route-free dense W8A8
-specialization uses 193 registers and no stack/local spill. These resource
+permit two CTAs on a 64 KiB/65536-register Turing SM. The route-free dense D128
+W8A8 specialization uses 193 registers and no stack/local spill. Native D64
+W8A8 uses 176/183 registers for sparse BF16/FP16 and 134 registers for the
+route-free dense kernel, with no stack/local spill. These resource
 figures are static compute_75 reports; resident-CTA throughput still requires a
 real Turing profile.
 
@@ -218,6 +225,13 @@ Official-style `1x64` measured 0.186, 0.483, and 1.553 ms versus dense Sage at
 measured 279.8 ms at 15.9% route density versus 769.3 ms for dense Sage (2.75x
 attention speedup). These are directional A40 compute_75/PTX compatibility
 results, not Turing end-to-end or visual-quality measurements.
+
+Kernel 0.21 adds native D64 dense W8A8 and Sol kernels rather than padding D64
+to D128. On the same A40 compute_75/PTX directional run at BF16, N=4096,
+Hq/Hkv=8/4, the prequantized dense core measured 0.409 ms for native D64 versus
+0.866 ms for the same input zero-padded to D128; Sol-W8A8 measured 0.166 versus
+0.257 ms. D64 uses 16 KiB shared memory and remains below the D128 register
+footprint. Final speed and CTA residency still require exact-sm75 measurement.
 
 For the new W8A8 path, an H3-like BF16 shape (`N=52,842`, 56 heads,
 `threshold=1.0`, 15.9% route density) measured 715.5 ms for route-free dense
@@ -254,7 +268,7 @@ event, synchronization, or allocation.
 ## Validation boundary
 
 Release builds target sm75 for bundled Sage. Static tests validate dispatch,
-fallbacks, loader independence, shapes, dtypes, the 32 KiB sparse policy, the public
+fallbacks, loader independence, shapes, dtypes, the 16/32 KiB D64/D128 sparse policy, the public
 symbol boundary, and exclusion of the retired Sage1/Sage2 variants. For compatible A40
 validation, build with:
 

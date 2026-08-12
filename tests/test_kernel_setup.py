@@ -75,7 +75,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertNotIn("-DCOMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS", flags)
         self.assertIn("csrc/turing/sage/sol_sparse_cuda_sm75.cu", extensions[1].kwargs["sources"])
         self.assertIn("csrc/turing/sage/quant_v_int8_cuda_sm75.cu", extensions[1].kwargs["sources"])
-        self.assertEqual(setup.call_args.kwargs["version"], "0.20.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.21.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -85,7 +85,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.20.0")
+        self.assertEqual(metadata["project"]["version"], "0.21.0")
 
     def test_sparse_source_does_not_require_optional_cuda_library_headers(self):
         source = (
@@ -97,11 +97,17 @@ class KernelSetupTest(unittest.TestCase):
         self.assertNotIn("cusparse", source.lower())
         self.assertIn("key_score_summary", source)
         self.assertIn("dequantize_int8_tile", source)
-        self.assertIn("compute_fp16_qk<1>", source)
+        self.assertIn("compute_fp16_qk<HeadDim, 1>", source)
         self.assertIn("shared_proxy", source)
         self.assertIn("kRouteStorageOffset", source)
         self.assertIn("key_int8", source)
-        self.assertIn("kAttentionSharedBytes == 32 * 1024", source)
+        self.assertIn(
+            "AttentionGeometry<64>::kAttentionSharedBytes == 16 * 1024", source
+        )
+        self.assertIn(
+            "AttentionGeometry<128>::kAttentionSharedBytes == 32 * 1024", source
+        )
+        self.assertIn("HeadDim / 32", source)
         self.assertNotIn("__global__ void block_summary_kernel(", source)
         self.assertNotIn("query_threshold_kernel", source)
         self.assertNotIn("at::Tensor thresholds", source)

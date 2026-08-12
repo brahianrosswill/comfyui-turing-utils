@@ -131,9 +131,9 @@ quantizes V channel-wise to signed INT8, packs online-softmax probabilities to
 unsigned INT8, and evaluates both QK and PV with Turing Tensor Cores. It is
 currently specialized for unmasked, non-causal heads in the range 1--128 with
 FP16/BF16 storage, GQA, unequal sequence lengths, and HND/NHD layouts. The
-dense/sparse core pads smaller heads internally while retaining the original
-softmax scale and output width. The
-dense kernel uses a route-free specialization of the Sol exact-token core;
+dense/sparse core has native D64 and D128 specializations, pads 1--63 only to
+D64 and 65--127 only to D128, and retains the original softmax scale and output
+width. The dense kernel uses a route-free specialization of the Sol exact-token core;
 unsupported calls fall back through the pre-existing attention override.
 
 Sparse attention is not a loader option and `auto` never selects it. Connect
@@ -145,8 +145,8 @@ metadata for unequal sequences; ambiguous single-sequence metadata falls back
 instead of applying the wrong ranges.
 
 Online Sol routing, its optional W8A8 mode, and the explicit dense W8A8 backend
-require kernel package 0.20.0. Adapter-protected Query
-blocks run through the selected exact dense backend, while every sparse Query
+require kernel package 0.20.0. Adapter-protected Query blocks run through the
+selected exact dense backend, while every sparse Query
 keeps protected modality blocks as exact K/V sinks. Selected blocks reuse stable Sage's INT8
 Tensor Core QK path. Routing and exact selected-block QK both derive from the
 same prequantized INT8 Q/K tensors and scales. Each Q-to-K-centroid Tensor Core
@@ -155,9 +155,10 @@ correction, while original V means remain in the value approximation.
 Official-style `1x64` is the default; optional `2x32` improves bimodal
 skipped-block fidelity without changing routing.
 
-Kernel 0.20.0 integrates current ComfyUI's attention tensor-container
-lifecycle. Supported bundled Sage, W8A8, and Sol calls quantize
-before output allocation and release their original Q/K/V storage as soon as
+Kernel 0.21.0 adds native D64 W8A8/Sol execution while retaining the current
+ComfyUI attention tensor-container lifecycle. Supported bundled Sage, W8A8,
+and Sol calls quantize before output allocation and release their original
+Q/K/V storage as soon as
 the selected path permits. Older kernel packages continue through the
 compatible one-call path, but do not receive this peak-memory improvement.
 
@@ -166,8 +167,9 @@ When enabled, selected exact blocks and protected dense steps/layers use the
 same signed-V/unsigned-probability Tensor Core path. Skipped-block correction
 keeps original V centroids and FP32 online state, so the switch changes exact
 PV throughput rather than the routing policy. Both variants keep a 64-query
-tile and 32 KiB dynamic shared-memory budget. The automatic logical K schedule
-uses 64 tokens for short K and two sequential 64-token stages for K above 1024.
+tile. Native D64 uses 16 KiB dynamic shared memory, while D128 uses 32 KiB. The
+automatic logical K schedule uses 64 tokens for short K and two sequential
+64-token stages for K above 1024.
 The latter does not hold 128 K/V tokens in shared memory, preserving CTA density.
 
 The threshold and fixed +/- one-block local neighborhood execute inside each
@@ -177,7 +179,8 @@ materialized. MiniMax H3 publishes complete text, reference-image, reference-
 video-anchor, reference-video-interior, reference-audio, target-audio, and
 target-video spans. Reference-video first/last latent frames follow the image
 sparsity switch; its interior follows the video switch. Defaults remain
-image=false, video=true, audio=false. The CTA remains at 32 KiB shared memory. A40 compute_75 direction
+image=false, video=true, audio=false. D64/D128 CTAs remain at 16/32 KiB shared
+memory respectively. A40 compute_75 direction
 tests validate numerical behavior and speed; final quality, occupancy, and
 throughput still require an actual Turing GPU.
 

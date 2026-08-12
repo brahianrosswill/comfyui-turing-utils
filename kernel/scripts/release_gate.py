@@ -13,7 +13,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = ROOT / "kernel"
-EXPECTED_VERSION = "0.20.0"
+EXPECTED_VERSION = "0.21.0"
 
 
 def _run(command: list[str], *, cwd: Path = ROOT, env=None) -> None:
@@ -45,7 +45,8 @@ def _static_gate() -> None:
 
     cuda = (KERNEL / "csrc/turing/sage/sol_sparse_cuda_sm75.cu").read_text(encoding="utf-8")
     for marker in (
-        "kAttentionSharedBytes == 32 * 1024",
+        "AttentionGeometry<64>::kAttentionSharedBytes == 16 * 1024",
+        "AttentionGeometry<128>::kAttentionSharedBytes == 32 * 1024",
         "key_tile_tokens == 64 || key_tile_tokens == 128",
         "key_tile_tokens / kBlockTokens",
     ):

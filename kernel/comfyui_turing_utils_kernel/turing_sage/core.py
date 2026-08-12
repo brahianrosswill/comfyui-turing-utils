@@ -492,8 +492,9 @@ def prequantize_sol_sageattn(
         key_tile_tokens = 128 if k.size(2) > 1024 else 64
 
     scale = float(sm_scale) if sm_scale is not None else head_dim**-0.5
-    if head_dim < 128:
-        padding = 128 - head_dim
+    kernel_head_dim = 64 if head_dim <= 64 else 128
+    if head_dim < kernel_head_dim:
+        padding = kernel_head_dim - head_dim
         q = torch.nn.functional.pad(q, (0, padding))
         k = torch.nn.functional.pad(k, (0, padding))
         v = torch.nn.functional.pad(v, (0, padding))
