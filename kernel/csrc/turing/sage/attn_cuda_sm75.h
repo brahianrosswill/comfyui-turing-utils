@@ -75,16 +75,6 @@ at::Tensor sol_sparse_online_w8a8_prequantized_attn(
                     int return_stats,
                     int force_dense);
 
-at::Tensor frame_sparse_int8_f16_attn(at::Tensor query_int8,
-                    at::Tensor key_int8,
-                    at::Tensor value,
-                    at::Tensor output,
-                    at::Tensor query_scale,
-                    at::Tensor key_scale,
-                    at::Tensor row_offsets,
-                    at::Tensor key_blocks,
-                    float softmax_scale);
-
 void quantize_v_int8_sm75(at::Tensor value,
                     at::Tensor quantized,
                     at::Tensor scale);

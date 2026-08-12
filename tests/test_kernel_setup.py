@@ -75,7 +75,6 @@ class KernelSetupTest(unittest.TestCase):
         self.assertNotIn("-DCOMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS", flags)
         self.assertIn("csrc/turing/sage/sol_sparse_cuda_sm75.cu", extensions[1].kwargs["sources"])
         self.assertIn("csrc/turing/sage/quant_v_int8_cuda_sm75.cu", extensions[1].kwargs["sources"])
-        self.assertIn("csrc/turing/sage/frame_sparse_cuda_sm75.cu", extensions[1].kwargs["sources"])
         self.assertEqual(setup.call_args.kwargs["version"], "0.19.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
@@ -117,27 +116,6 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn("UseW8A8", source)
         self.assertIn("ForceDense", source)
         self.assertIn("compute_int8_sv_permuted", source)
-
-    def test_frame_sparse_source_uses_static_csr_without_optional_cuda_headers(self):
-        source = (
-            PLUGIN_ROOT
-            / "kernel"
-            / "csrc"
-            / "turing"
-            / "sage"
-            / "frame_sparse_cuda_sm75.cu"
-        ).read_text(encoding="utf-8")
-        self.assertIn('#include "torch_compat.h"', source)
-        self.assertNotIn("ATen/cuda/CUDAContext", source)
-        self.assertNotIn("CUDAGuard", source)
-        self.assertNotIn("cusparse", source.lower())
-        self.assertIn("row_offsets", source)
-        self.assertIn("key_blocks", source)
-        self.assertIn("constexpr int kWarps = 4", source)
-        self.assertIn("kAttentionSharedBytes == 32 * 1024", source)
-        self.assertNotIn("q128", source.lower())
-        self.assertNotIn("key_score_summary", source)
-        self.assertNotIn("route_threshold", source)
 
     def test_attention_launches_use_pytorch_current_cuda_stream(self):
         sage_dir = PLUGIN_ROOT / "kernel" / "csrc" / "turing" / "sage"

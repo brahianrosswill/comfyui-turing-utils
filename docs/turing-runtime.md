@@ -178,38 +178,6 @@ four route words per lane, then survives in registers while the normal 32 KiB
 shared-memory tiles are reused. The kernel accepts at most 4096 K/V blocks
 (262144 tokens) per call.
 
-The independent `Patch Sage Frame Sparse Attention (Experimental)` node uses the
-same integer dense-step and first/last-layer safeguards, but removes Sol's
-input-adaptive routing, summaries, threshold, density budgets, and skipped-block
-residuals. Video Query rows attend every token in the configured neighboring
-latent frames, the first `sink_frames`, periodic global anchor frames, and the
-resolved semantic K/V prefix. Periodic anchors can rotate by transformer-layer
-index so information propagates through different long-range connections instead
-of one fixed temporal grid. Non-video Query rows always remain globally dense,
-which preserves H3 audio-to-video and reference-to-target attention. A model
-adapter must publish a contiguous video-tail boundary and exact tokens per latent
-frame; missing or inconsistent topology selects stable Sage.
-
-The structured schedule is cached as two compact CUDA INT32 tensors and shared by
-all batches and heads. It is created once per shape and rotated anchor offset, has
-no device synchronization in the steady path, and selects 64-token blocks so the
-CUDA kernel can reuse the production Sage tile loaders and Tensor Core MMA. Both
-the attention kernel and dense fallbacks use the bundled stable Sage backend; a
-previous attention override is replaced when this explicit patch is connected.
-The defaults are a two-frame radius, one anchor every 12 frames, rotating anchors,
-one sink frame, zero dense prefix/suffix steps, and one dense layer at each model
-boundary. The compute_75 cubin reports 176 BF16 / 183 FP16 registers per thread,
-zero stack and local-memory spill, and 32 KiB dynamic shared memory; both register
-and shared-memory limits permit two 128-thread CTAs per SM75 SM.
-
-For H3-like BF16 inputs on an A40 restricted to compute_75 PTX, the default static
-route measured 20.13% density at 46,773 tokens and 15.11% at 100,483 tokens. With
-56 heads, sparse attention measured 187 ms and 580 ms respectively; dense Sage
-measured 600 ms and 2773 ms. The 720p-like sparse attention component was 0.97x
-the 480p-like dense component. This does not make the complete 720p transformer
-step equal to 480p: projections and MLPs still process roughly the full token
-ratio. Exact-sm75 end-to-end quality and occupancy testing remains required.
-
 Sol derives Q/K centroids from the same prequantized INT8 tensors and scales as
 selected-block Sage. The K/V preprocessing scan produces one or two such K
 centroids and matching original V means for skipped-block reconstruction.
@@ -280,29 +248,6 @@ and possible blocks, min/mean/max layer density, sampling step, layer range,
 protected Query count, and residual profile. Debug-off adds no counter atomic,
 event, synchronization, or allocation.
 
-The independent frame-sparse patch uses a different debug path: its route is a
-cached CPU-built CSR schedule, so density is already a host scalar. Enabling
-its `debug_route_density` only logs that static value and never reads a CUDA
-tensor or tracks a denoising step when both dense step guards are zero.
-
-Frame-sparse parameters are grouped around two policies:
-
-- `quality_profile=custom` preserves all explicit controls and is the default.
-  `conservative`, `balanced`, and `fast` replace the sparse policy controls and
-  protected layer counts as one tested set.
-- `frame_window` reads all spatial tokens in local, sink, and periodic anchor
-  frames. `radial` reads all nearby frames, then only matching 8x8 spatial-token
-  tiles from progressively subsampled distant frames.
-- `temporal_window_frames` is the complete-frame radius;
-  `global_anchor_stride=0` disables full periodic anchors.
-- `radial_spatial_radius` expands the distant 8x8 tile neighborhood;
-  `radial_max_temporal_stride` caps distant temporal subsampling.
-- `rotate_global_anchors` also rotates the radial sampling phase by transformer
-  layer, even when full-frame anchors are disabled.
-- dense prefix/suffix steps and layers always call bundled stable Turing Sage.
-  They do not call the pre-patch ComfyUI backend or a slower private dense
-  implementation.
-
 ## Validation boundary
 
 Release builds target sm75 for bundled Sage. Static tests validate dispatch,
@@ -315,7 +260,6 @@ COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX" \
 python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-sparse
-python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-frame-sparse
 python kernel/scripts/validate_wan_fusions.py --device cuda:0
 ```
 

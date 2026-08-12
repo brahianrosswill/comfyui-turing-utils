@@ -13,12 +13,6 @@ Q-to-K-centroid Tensor Core pass now drives both routing and skipped-block
 online-softmax correction, so no duplicate Q/K centroid scan or full global
 route map is materialized. The local neighborhood is fixed to the official
 +/- one block. Original V means remain dedicated to value approximation.
-It also adds an experimental static frame-sparse Sage path. Cached
-head-independent CSR schedules provide complete-frame windows or a radial
-policy with 8x8 spatial-token locality and logarithmic temporal sampling,
-without online summaries or per-head routing. The kernel retains production
-INT8 QK, FP16/BF16 V, and FP32 softmax/accumulation in a 32 KiB CTA. The tested
-40 KiB Q128 CTA is intentionally excluded because it regressed throughput.
 It contains no model-weight format or model loader.
 
 ## Install
@@ -65,7 +59,6 @@ COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX" \
 python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-sparse
-python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-frame-sparse
 python kernel/scripts/validate_wan_fusions.py --device cuda:0
 ```
 
@@ -94,7 +87,6 @@ print("kernel:", comfyui_turing_utils_kernel.__file__)
 print("Turing Sage:", comfyui_turing_utils_kernel.turing_sage.available())
 print("Turing sparse:", comfyui_turing_utils_kernel.turing_sage.sparse_available())
 print("Turing W8A8 attention:", comfyui_turing_utils_kernel.turing_sage.w8a8_available())
-print("Turing frame sparse:", comfyui_turing_utils_kernel.turing_sage.frame_sparse_available())
 print("Turing W4A8:", callable(comfyui_turing_utils_kernel.turing_w4a8_linear))
 print("Turing SwiGLU:", callable(comfyui_turing_utils_kernel.turing_swiglu_int8_convrot_quantize))
 print("Turing norm:", callable(comfyui_turing_utils_kernel.turing_segmented_rms_adaln))

@@ -1,4 +1,4 @@
-"""Experimental Sol and frame-structured sparse attention policies."""
+"""Experimental Sol sparse attention policies."""
 
 from __future__ import annotations
 
@@ -13,13 +13,6 @@ from .layout import (
     has_complete_attention_layout,
 )
 from .stable import (
-    FRAME_SPARSE_GLOBAL_ANCHOR_STRIDE,
-    FRAME_SPARSE_PATTERN,
-    FRAME_SPARSE_QUALITY_PROFILE,
-    FRAME_SPARSE_RADIAL_MAX_TEMPORAL_STRIDE,
-    FRAME_SPARSE_RADIAL_SPATIAL_RADIUS,
-    FRAME_SPARSE_SINK_FRAMES,
-    FRAME_SPARSE_TEMPORAL_WINDOW_FRAMES,
     LOG,
     SPARSE_AUTO_MIN_SEQUENCE,
     SPARSE_LAYOUT_KEY,
@@ -31,10 +24,8 @@ from .stable import (
     SPARSE_SKIPPED_RESIDUAL,
     AttentionCall,
     PrequantizedAttentionCall,
-    _LOGGED_FRAME_SPARSE_KERNELS,
     _LOGGED_SPARSE_DENSE_REASONS,
     _LOGGED_SPARSE_KERNELS,
-    _frame_sparse_sageattn,
     _sol_sparse_sageattn,
     finish_turing_attention_output,
     inspect_turing_attention_call,
@@ -51,18 +42,6 @@ class SolAttentionCall:
     effective_min_sequence: int
     protected_ranges: tuple[tuple[int, int], ...]
     residual_subblocks: int
-
-
-@dataclasses.dataclass(frozen=True, slots=True)
-class FrameAttentionCall:
-    attention: AttentionCall
-    prefix_tokens: int
-    topology_start: int
-    topology_tokens: int
-    tokens_per_frame: int
-    spatial_tokens_height: int
-    spatial_tokens_width: int
-    anchor_offset: int
 
 
 def _sparse_dense_baseline(
@@ -162,52 +141,6 @@ def _sparse_protected_ranges(
     )
 
 
-def _sparse_temporal_topology(transformer_options, sequence_limit: int):
-    layout = (
-        transformer_options.get(SPARSE_LAYOUT_KEY)
-        if isinstance(transformer_options, dict)
-        else None
-    )
-    if not isinstance(layout, dict):
-        return 0, 0, 0
-    values = tuple(
-        layout.get(key, 0)
-        for key in ("topology_start_tokens", "topology_tokens", "tokens_per_frame")
-    )
-    if any(not isinstance(value, int) or isinstance(value, bool) for value in values):
-        return 0, 0, 0
-    start, tokens, frame_tokens = values
-    if (
-        start < 0
-        or tokens <= 0
-        or frame_tokens <= 0
-        or start + tokens > sequence_limit
-        or tokens % frame_tokens != 0
-    ):
-        return 0, 0, 0
-    return start, tokens, frame_tokens
-
-
-def _sparse_spatial_topology(transformer_options, tokens_per_frame: int):
-    layout = (
-        transformer_options.get(SPARSE_LAYOUT_KEY)
-        if isinstance(transformer_options, dict)
-        else None
-    )
-    if not isinstance(layout, dict):
-        return 0, 0
-    height = layout.get("spatial_tokens_height", 0)
-    width = layout.get("spatial_tokens_width", 0)
-    if any(
-        not isinstance(value, int) or isinstance(value, bool)
-        for value in (height, width)
-    ):
-        return 0, 0
-    if height <= 0 or width <= 0 or height * width != tokens_per_frame:
-        return 0, 0
-    return height, width
-
-
 def _required_sparse_layout_missing(transformer_options, sequence_length: int) -> bool:
     if not isinstance(transformer_options, dict):
         return False
@@ -219,55 +152,6 @@ def _required_sparse_layout_missing(transformer_options, sequence_length: int) -
         sequence_length,
         provider=requirement,
     )
-
-
-_FRAME_SPARSE_QUALITY_PROFILES = {
-    "conservative": {
-        "sparse_pattern": "frame_window",
-        "temporal_window_frames": 3,
-        "global_anchor_stride": 8,
-        "rotate_global_anchors": True,
-        "sink_frames": 2,
-        "radial_spatial_radius": 1,
-        "radial_max_temporal_stride": 8,
-        "dense_prefix_layers": 2,
-        "dense_suffix_layers": 2,
-    },
-    "balanced": {
-        "sparse_pattern": "radial",
-        "temporal_window_frames": 2,
-        "global_anchor_stride": 0,
-        "rotate_global_anchors": True,
-        "sink_frames": 1,
-        "radial_spatial_radius": 0,
-        "radial_max_temporal_stride": 16,
-        "dense_prefix_layers": 1,
-        "dense_suffix_layers": 1,
-    },
-    "fast": {
-        "sparse_pattern": "radial",
-        "temporal_window_frames": 1,
-        "global_anchor_stride": 0,
-        "rotate_global_anchors": True,
-        "sink_frames": 1,
-        "radial_spatial_radius": 0,
-        "radial_max_temporal_stride": 32,
-        "dense_prefix_layers": 1,
-        "dense_suffix_layers": 1,
-    },
-}
-
-
-def _resolve_frame_sparse_quality_profile(quality_profile: str, **settings):
-    quality_profile = str(quality_profile).strip().lower()
-    if quality_profile == "custom":
-        return settings
-    try:
-        return {**settings, **_FRAME_SPARSE_QUALITY_PROFILES[quality_profile]}
-    except KeyError as error:
-        raise ValueError(
-            "quality_profile must be custom, conservative, balanced, or fast"
-        ) from error
 
 
 def _sparse_dense_schedule(
@@ -473,158 +357,6 @@ def turing_sol_attention_from_prequantized(
         output = output.transpose(1, 2)
     output = finish_turing_attention_output(output, quantized.call)
     return (output, selected, possible_blocks) if return_stats else output
-
-
-def inspect_frame_attention_call(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    heads: int,
-    *,
-    mask,
-    skip_reshape: bool,
-    skip_output_reshape: bool,
-    prefix_policy: str,
-    manual_prefix_tokens: int,
-    global_anchor_stride: int,
-    rotate_global_anchors: bool,
-    sparse_pattern: str,
-    radial_max_temporal_stride: int,
-    transformer_options,
-    kwargs: dict,
-) -> tuple[FrameAttentionCall | None, str | None]:
-    call, reason = inspect_turing_attention_call(
-        q,
-        k,
-        v,
-        heads,
-        mask=mask,
-        skip_reshape=skip_reshape,
-        skip_output_reshape=skip_output_reshape,
-        enable_gqa=bool(kwargs.get("enable_gqa", False)),
-        low_precision_attention=kwargs.get("low_precision_attention", True),
-        is_causal=bool(kwargs.get("is_causal", False)),
-        kernel="frame",
-        require_long_sequence=True,
-    )
-    if reason is not None:
-        return None, reason
-    if call.query_tokens != call.key_tokens:
-        return None, "frame sparsity requires equal Q/K sequence lengths"
-    if call.query_tokens < SPARSE_AUTO_MIN_SEQUENCE:
-        return None, f"sequences shorter than {SPARSE_AUTO_MIN_SEQUENCE} tokens"
-    if _required_sparse_layout_missing(transformer_options, call.query_tokens):
-        return None, "required MiniMax H3 attention layout metadata is unavailable"
-    topology_start, topology_tokens, tokens_per_frame = _sparse_temporal_topology(
-        transformer_options,
-        call.query_tokens,
-    )
-    if topology_tokens <= 0 or topology_start + topology_tokens != call.query_tokens:
-        return None, "contiguous video-tail topology metadata is unavailable"
-    spatial_tokens_height, spatial_tokens_width = _sparse_spatial_topology(
-        transformer_options,
-        tokens_per_frame,
-    )
-    if sparse_pattern == "radial" and (
-        spatial_tokens_height <= 0 or spatial_tokens_width <= 0
-    ):
-        return None, "radial spatial topology metadata is unavailable"
-    prefix_tokens = _sparse_prefix_tokens(
-        prefix_policy,
-        manual_prefix_tokens,
-        transformer_options,
-        call.query_tokens,
-    )
-    layout = (
-        transformer_options.get(SPARSE_LAYOUT_KEY)
-        if isinstance(transformer_options, dict)
-        else None
-    )
-    layer_index = layout.get("layer_index") if isinstance(layout, dict) else None
-    rotation_period = (
-        global_anchor_stride
-        if global_anchor_stride > 0
-        else radial_max_temporal_stride if sparse_pattern == "radial" else 0
-    )
-    anchor_offset = (
-        layer_index % rotation_period
-        if rotate_global_anchors
-        and rotation_period > 0
-        and isinstance(layer_index, int)
-        and not isinstance(layer_index, bool)
-        else 0
-    )
-    return FrameAttentionCall(
-        attention=call,
-        prefix_tokens=prefix_tokens,
-        topology_start=topology_start,
-        topology_tokens=topology_tokens,
-        tokens_per_frame=tokens_per_frame,
-        spatial_tokens_height=spatial_tokens_height,
-        spatial_tokens_width=spatial_tokens_width,
-        anchor_offset=anchor_offset,
-    ), None
-
-
-def prequantize_turing_frame_attention(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    call: FrameAttentionCall,
-    *,
-    scale: float | None,
-    temporal_window_frames: int,
-    global_anchor_stride: int,
-    sink_frames: int,
-    sparse_pattern: str,
-    radial_spatial_radius: int,
-    radial_max_temporal_stride: int,
-) -> PrequantizedAttentionCall:
-    q, k, v = normalize_turing_attention_tensors(q, k, v, call.attention)
-    if call.attention.tensor_layout == "NHD":
-        q = q.transpose(1, 2).contiguous()
-        k = k.transpose(1, 2).contiguous()
-        v = v.transpose(1, 2).contiguous()
-    state = load_turing_sage().prequantize_frame_sparse_sageattn(
-        q,
-        k,
-        v,
-        tensor_layout="HND",
-        sm_scale=scale,
-        prefix_tokens=call.prefix_tokens,
-        topology_start_tokens=call.topology_start,
-        topology_tokens=call.topology_tokens,
-        tokens_per_frame=call.tokens_per_frame,
-        temporal_window_frames=temporal_window_frames,
-        global_anchor_stride=global_anchor_stride,
-        global_anchor_offset=call.anchor_offset,
-        sink_frames=sink_frames,
-        sparse_pattern=sparse_pattern,
-        spatial_tokens_height=call.spatial_tokens_height,
-        spatial_tokens_width=call.spatial_tokens_width,
-        radial_spatial_radius=radial_spatial_radius,
-        radial_max_temporal_stride=radial_max_temporal_stride,
-    )
-    return PrequantizedAttentionCall(state, call.attention)
-
-
-def turing_frame_attention_from_prequantized(
-    quantized: PrequantizedAttentionCall,
-    *,
-    return_schedule_density: bool,
-):
-    result = load_turing_sage().frame_sparse_sageattn_from_prequantized(
-        quantized.kernel_state,
-        return_schedule_density=return_schedule_density,
-    )
-    if return_schedule_density:
-        output, density = result
-    else:
-        output = result
-    if quantized.call.tensor_layout == "NHD":
-        output = output.transpose(1, 2)
-    output = finish_turing_attention_output(output, quantized.call)
-    return (output, density) if return_schedule_density else output
 
 
 def turing_sol_sparse_attention(
@@ -861,180 +593,6 @@ def turing_sol_sparse_attention(
             LOG.warning("[Turing sparse debug] route density unavailable: %s", error)
         if not aggregate_route_stats:
             route_keys.add(kernel_key)
-    else:
-        output = sparse_result
-    result = output if call.skip_output_reshape else output.transpose(1, 2).reshape(
-        call.batch, -1, call.heads * call.head_dim
-    )
-    return result.to(input_dtype) if input_dtype == torch.float32 else result
-
-
-def turing_frame_sparse_attention(
-    fallback: Callable,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    heads: int,
-    mask=None,
-    attn_precision=None,
-    skip_reshape: bool = False,
-    skip_output_reshape: bool = False,
-    prefix_policy: str = SPARSE_PREFIX_POLICY,
-    manual_prefix_tokens: int = 0,
-    temporal_window_frames: int = FRAME_SPARSE_TEMPORAL_WINDOW_FRAMES,
-    global_anchor_stride: int = FRAME_SPARSE_GLOBAL_ANCHOR_STRIDE,
-    rotate_global_anchors: bool = True,
-    sink_frames: int = FRAME_SPARSE_SINK_FRAMES,
-    sparse_pattern: str = FRAME_SPARSE_PATTERN,
-    radial_spatial_radius: int = FRAME_SPARSE_RADIAL_SPATIAL_RADIUS,
-    radial_max_temporal_stride: int = FRAME_SPARSE_RADIAL_MAX_TEMPORAL_STRIDE,
-    debug_route_density: bool = False,
-    **kwargs,
-) -> torch.Tensor:
-    """Structured video-tail sparsity with the stable SM75 Sage math path."""
-    original_q, original_k, original_v = q, k, v
-    common = {
-        "mask": mask,
-        "attn_precision": attn_precision,
-        "skip_reshape": skip_reshape,
-        "skip_output_reshape": skip_output_reshape,
-        **kwargs,
-    }
-
-    def dense(reason: str):
-        return _sparse_dense_baseline(
-            reason,
-            fallback,
-            original_q,
-            original_k,
-            original_v,
-            heads,
-            **common,
-        )
-
-    transformer_options = kwargs.get("transformer_options")
-    frame_call, reason = inspect_frame_attention_call(
-        q,
-        k,
-        v,
-        heads,
-        mask=mask,
-        skip_reshape=skip_reshape,
-        skip_output_reshape=skip_output_reshape,
-        prefix_policy=prefix_policy,
-        manual_prefix_tokens=manual_prefix_tokens,
-        global_anchor_stride=global_anchor_stride,
-        rotate_global_anchors=rotate_global_anchors,
-        sparse_pattern=sparse_pattern,
-        radial_max_temporal_stride=radial_max_temporal_stride,
-        transformer_options=transformer_options,
-        kwargs=kwargs,
-    )
-    if reason is not None:
-        return dense(reason)
-    call = frame_call.attention
-    input_dtype = call.input_dtype
-    prefix_tokens = frame_call.prefix_tokens
-    topology_start = frame_call.topology_start
-    topology_tokens = frame_call.topology_tokens
-    tokens_per_frame = frame_call.tokens_per_frame
-    spatial_tokens_height = frame_call.spatial_tokens_height
-    spatial_tokens_width = frame_call.spatial_tokens_width
-    anchor_offset = frame_call.anchor_offset
-    layout = (
-        transformer_options.get(SPARSE_LAYOUT_KEY)
-        if isinstance(transformer_options, dict)
-        else None
-    )
-    layer_index = layout.get("layer_index") if isinstance(layout, dict) else None
-    q_shape = (call.batch, call.heads, call.query_tokens, call.head_dim)
-    k_shape = (call.batch, call.kv_heads, call.key_tokens, call.head_dim)
-    kernel_key = (
-        q.device.index,
-        input_dtype,
-        q_shape,
-        k_shape,
-        prefix_tokens,
-        topology_start,
-        topology_tokens,
-        tokens_per_frame,
-        temporal_window_frames,
-        global_anchor_stride,
-        anchor_offset,
-        sink_frames,
-        sparse_pattern,
-        spatial_tokens_height,
-        spatial_tokens_width,
-        radial_spatial_radius,
-        radial_max_temporal_stride,
-    )
-    first_kernel_use = kernel_key not in _LOGGED_FRAME_SPARSE_KERNELS
-    collect_density = debug_route_density or first_kernel_use
-    q, k, v = normalize_turing_attention_tensors(q, k, v, call)
-    if call.tensor_layout == "NHD":
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-    sparse_result = _frame_sparse_sageattn(
-        q,
-        k,
-        v,
-        tensor_layout="HND",
-        sm_scale=kwargs.get("scale"),
-        prefix_tokens=prefix_tokens,
-        topology_start_tokens=topology_start,
-        topology_tokens=topology_tokens,
-        tokens_per_frame=tokens_per_frame,
-        temporal_window_frames=temporal_window_frames,
-        global_anchor_stride=global_anchor_stride,
-        global_anchor_offset=anchor_offset,
-        sink_frames=sink_frames,
-        sparse_pattern=sparse_pattern,
-        spatial_tokens_height=spatial_tokens_height,
-        spatial_tokens_width=spatial_tokens_width,
-        radial_spatial_radius=radial_spatial_radius,
-        radial_max_temporal_stride=radial_max_temporal_stride,
-        return_schedule_density=collect_density,
-    )
-    if collect_density:
-        output, density = sparse_result
-        if first_kernel_use:
-            LOG.info(
-                "Experimental Turing frame-sparse Sage active: dtype=%s Q=%s K=%s "
-                "prefix_policy=%s dense_prefix_k=%d dense_prefix_q=%d "
-                "video=(tokens=%d frame_tokens=%d frames=%d) window=%d "
-                "pattern=%s anchor_stride=%d anchor_offset=%d sink_frames=%d "
-                "radial_radius=%d radial_max_stride=%d density=%.4f",
-                input_dtype,
-                q_shape,
-                k_shape,
-                prefix_policy,
-                prefix_tokens,
-                topology_start,
-                topology_tokens,
-                tokens_per_frame,
-                topology_tokens // tokens_per_frame,
-                temporal_window_frames,
-                sparse_pattern,
-                global_anchor_stride,
-                anchor_offset,
-                sink_frames,
-                radial_spatial_radius,
-                radial_max_temporal_stride,
-                density,
-            )
-            _LOGGED_FRAME_SPARSE_KERNELS.add(kernel_key)
-        if debug_route_density and first_kernel_use:
-            LOG.warning(
-                "[Turing frame sparse debug] layer=%s window=%d anchor_stride=%d "
-                "anchor_offset=%d sink_frames=%d density=%.4f",
-                layer_index,
-                temporal_window_frames,
-                global_anchor_stride,
-                anchor_offset,
-                sink_frames,
-                density,
-            )
     else:
         output = sparse_result
     result = output if call.skip_output_reshape else output.transpose(1, 2).reshape(

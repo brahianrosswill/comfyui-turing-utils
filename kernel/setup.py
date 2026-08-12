@@ -394,7 +394,6 @@ if _includes_sm75():
                     "csrc/turing/sage/qk_int_sv_f16_cuda_sm75.cu",
                     "csrc/turing/sage/qk_int_sv_f16_varlen_cuda_sm75.cu",
                     "csrc/turing/sage/sol_sparse_cuda_sm75.cu",
-                    "csrc/turing/sage/frame_sparse_cuda_sm75.cu",
                     "csrc/turing/sage/quant_v_int8_cuda_sm75.cu",
                 ],
                 include_dirs=sage_include_dirs,

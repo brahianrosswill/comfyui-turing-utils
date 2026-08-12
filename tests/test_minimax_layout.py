@@ -320,40 +320,5 @@ class MiniMaxLayoutProviderTest(unittest.TestCase):
         self.assertFalse(model.object_patches)
         self.assertFalse(model.wrappers)
 
-    def test_frame_sparse_patch_uses_the_same_official_loader_provider(self):
-        model = FakePatcher()
-        override = SimpleNamespace(
-            turing_utils_frame_sparse_settings={
-                "quality_profile": "custom",
-                "sparse_pattern": "frame_window",
-                "temporal_window_frames": 2,
-                "global_anchor_stride": 12,
-                "rotate_global_anchors": True,
-                "sink_frames": 1,
-                "radial_spatial_radius": 1,
-                "radial_max_temporal_stride": 16,
-                "dense_prefix_layers": 1,
-                "dense_suffix_layers": 1,
-            }
-        )
-        with (
-            self._minimax_type_patch(),
-            mock.patch(
-                "attention.make_frame_sparse_attention_override",
-                return_value=override,
-            ),
-        ):
-            patched = attention.apply_frame_sparse_attention_patch(model)
-
-        options = patched.model_options["transformer_options"]
-        self.assertEqual(
-            options[minimax_layout.ATTENTION_LAYOUT_REQUIREMENT_KEY],
-            minimax_layout.MINIMAX_H3_LAYOUT_KIND,
-        )
-        self.assertIs(options["optimized_attention_override"], override)
-        self.assertEqual(len(patched.object_patches), 3)
-        self.assertEqual(len(patched.wrappers), 1)
-
-
 if __name__ == "__main__":
     unittest.main()

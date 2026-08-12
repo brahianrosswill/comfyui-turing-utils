@@ -253,8 +253,6 @@ def publish_minimax_attention_layout(
     expected_layout = {
         "provider": MINIMAX_H3_LAYOUT_KIND,
         # H3's current PackedLayout ends in target audio then target video.
-        # This legacy boundary remains useful to the independent frame-sparse
-        # backend; Sol consumes the complete semantic segment table below.
         "dense_prefix_tokens": int(mod_segments[-1][0]),
         "layer_index": int(layer_index),
         "layer_count": int(layer_count),

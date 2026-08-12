@@ -28,7 +28,7 @@ built-in adapters without importing ComfyUI node definitions.
 | Package | Responsibility |
 |---|---|
 | `attention/stable.py` | backend registry, stable bundled Sage/W8A8, dtype/layout facade |
-| `attention/sparse.py` | explicit experimental Sol and frame-sparse policies, including optional W8A8 PV dispatch |
+| `attention/sparse.py` | explicit experimental Sol policy, including optional W8A8 PV dispatch |
 | `attention/layout.py` | model-independent packed-video topology contract and provider registry |
 | `attention/patches.py` | attention overrides and loader-independent ModelPatcher installation |
 | `quantization/convrot.py` | ConvRot metadata parsing and model/CLIP loading services |

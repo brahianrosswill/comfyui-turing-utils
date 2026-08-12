@@ -34,23 +34,14 @@ SPARSE_DENSE_PREFIX_STEPS = 0
 SPARSE_DENSE_SUFFIX_STEPS = 0
 SPARSE_DENSE_PREFIX_LAYERS = 2
 SPARSE_DENSE_SUFFIX_LAYERS = 0
-FRAME_SPARSE_TEMPORAL_WINDOW_FRAMES = 2
-FRAME_SPARSE_GLOBAL_ANCHOR_STRIDE = 12
-FRAME_SPARSE_SINK_FRAMES = 1
-FRAME_SPARSE_PATTERN = "frame_window"
-FRAME_SPARSE_QUALITY_PROFILE = "custom"
-FRAME_SPARSE_RADIAL_SPATIAL_RADIUS = 1
-FRAME_SPARSE_RADIAL_MAX_TEMPORAL_STRIDE = 16
 SPARSE_LAYOUT_KEY = ATTENTION_LAYOUT_KEY
 _PREFLIGHTED_DEVICES: set[int] = set()
 _PREFLIGHTED_SPARSE_DEVICES: set[int] = set()
-_PREFLIGHTED_FRAME_SPARSE_DEVICES: set[int] = set()
 _PREFLIGHTED_W8A8_DEVICES: set[int] = set()
 _LOGGED_FP32_COMPAT = False
 _LOGGED_TURING_KERNELS: set[tuple] = set()
 _LOGGED_TURING_FALLBACKS: set[str] = set()
 _LOGGED_SPARSE_KERNELS: set[tuple] = set()
-_LOGGED_FRAME_SPARSE_KERNELS: set[tuple] = set()
 _LOGGED_SPARSE_DENSE_REASONS: set[str] = set()
 
 
@@ -97,7 +88,7 @@ def inspect_turing_attention_call(
     kernel: str = "sage",
     require_long_sequence: bool = False,
 ) -> tuple[AttentionCall | None, str | None]:
-    if kernel not in {"sage", "w8a8", "sol", "frame"}:
+    if kernel not in {"sage", "w8a8", "sol"}:
         raise ValueError(f"unsupported Turing attention kernel: {kernel}")
     if not isinstance(q, torch.Tensor) or not isinstance(k, torch.Tensor) or not isinstance(v, torch.Tensor):
         return None, "Q/K/V are not tensors"
@@ -107,7 +98,7 @@ def inspect_turing_attention_call(
         return None, "an attention mask was supplied"
     if not low_precision_attention:
         return None, "low_precision_attention=False"
-    if kernel in {"w8a8", "sol", "frame"} and is_causal:
+    if kernel in {"w8a8", "sol"} and is_causal:
         return None, f"causal attention is not supported by Turing {kernel}"
     if q.dtype != k.dtype or q.dtype != v.dtype:
         return None, "Q/K/V dtypes do not match"
@@ -149,7 +140,7 @@ def inspect_turing_attention_call(
 
     if query_tokens <= 0 or key_tokens <= 0:
         return None, "empty Q/K sequences are unsupported"
-    required_head_dim = kernel in {"w8a8", "sol", "frame"}
+    required_head_dim = kernel in {"w8a8", "sol"}
     if (required_head_dim and head_dim != 128) or (not required_head_dim and not 0 < head_dim <= 128):
         return None, f"head_dim={head_dim} is unsupported by Turing {kernel}"
     if require_long_sequence and (query_tokens < 64 or key_tokens < 64):
@@ -352,19 +343,6 @@ def bundled_sparse_available() -> bool:
     return version_tuple >= (0, 17, 0) and turing_sage.sparse_available()
 
 
-def bundled_frame_sparse_available() -> bool:
-    try:
-        turing_sage = load_turing_sage()
-    except (ImportError, OSError):
-        return False
-    version = kernel_version()
-    try:
-        version_tuple = tuple(int(part) for part in version.split(".")[:3])
-    except ValueError:
-        return False
-    return version_tuple >= (0, 15, 0) and turing_sage.frame_sparse_available()
-
-
 def bundled_w8a8_available() -> bool:
     try:
         turing_sage = load_turing_sage()
@@ -389,10 +367,6 @@ def _w8a8attn(*args, **kwargs):
 
 def _sol_sparse_sageattn(*args, **kwargs):
     return load_turing_sage().sol_sparse_sageattn(*args, **kwargs)
-
-
-def _frame_sparse_sageattn(*args, **kwargs):
-    return load_turing_sage().frame_sparse_sageattn(*args, **kwargs)
 
 
 def split_prequantization_available() -> bool:
@@ -483,16 +457,6 @@ def preflight_bundled_sparse(device: torch.device) -> None:
         return
     load_turing_sage().preflight_sparse(device)
     _PREFLIGHTED_SPARSE_DEVICES.add(index)
-
-
-def preflight_bundled_frame_sparse(device: torch.device) -> None:
-    if not is_supported_turing_device(device):
-        raise RuntimeError(f"unsupported Turing device {device}")
-    index = device.index if device.index is not None else torch.cuda.current_device()
-    if index in _PREFLIGHTED_FRAME_SPARSE_DEVICES:
-        return
-    load_turing_sage().preflight_frame_sparse(device)
-    _PREFLIGHTED_FRAME_SPARSE_DEVICES.add(index)
 
 
 def preflight_bundled_w8a8(device: torch.device) -> None:

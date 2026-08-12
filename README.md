@@ -152,7 +152,7 @@ Official-style `1x64` is the default; optional `2x32` improves bimodal
 skipped-block fidelity without changing routing.
 
 Kernel 0.19.0 integrates current ComfyUI's attention tensor-container
-lifecycle. Supported bundled Sage, W8A8, Sol, and frame-sparse calls quantize
+lifecycle. Supported bundled Sage, W8A8, and Sol calls quantize
 before output allocation and release their original Q/K/V storage as soon as
 the selected path permits. Older kernel packages continue through the
 compatible one-call path, but do not receive this peak-memory improvement.
@@ -174,35 +174,6 @@ configurable. The CTA remains at 32 KiB shared memory. A40 compute_75 direction
 tests validate numerical behavior and speed; final quality, occupancy, and
 throughput still require an actual Turing GPU.
 
-The frame-sparse ABI requires kernel package 0.15.0. It consumes a cached,
-head-independent CSR schedule and evaluates only complete selected 64-token K/V
-blocks with the stable Sage math path. `frame_window` selects complete local,
-sink, and periodic anchor frames. `radial` keeps complete nearby frames, then
-uses exact 8x8 spatial-token neighborhoods at logarithmically increasing
-temporal strides. On MiniMax H3 the patch automatically installs a lightweight
-runtime layout provider on the standard ComfyUI `MODEL`, independent of which
-loader created it. The provider publishes the packed target-video boundary,
-tokens-per-frame, exact spatial-token height/width, and layer index. If that
-contract cannot be installed or validated, H3 falls back to stable Sage instead
-of sparsifying the mixed text/reference/audio/video sequence by guesswork.
-
-The node defaults to `custom` plus the established `frame_window` policy, so an
-old workflow does not silently change. `conservative`, `balanced`, and `fast`
-are coherent presets; selecting one intentionally overrides pattern, coverage,
-anchors, sinks, radial controls, and protected layer counts. On an A40 executing
-compute_75 code, 56-head BF16 attention measured 187/577 ms for 480p/720p-like
-`frame_window` shapes and 178/442 ms for the balanced radial settings. Their
-720p block densities were 15.1% and 11.4%. The radial attention component was
-about 0.74x the earlier ~600 ms 480p dense Sage component, but total model-step
-time still includes QKV, MLP, normalization, and activation traffic proportional
-to the larger sequence. Exact-sm75 end-to-end and visual validation remains
-required.
-
-The retained CUDA CTA handles one Q64 block, uses 32 KiB dynamic shared memory,
-and has zero stack/local spill. An evaluated Q128/40 KiB design kept the same
-eight resident warps per SM75 but regressed the 720p-like main kernel from
-73.67 ms to 85.87 ms at eight heads, so it is not shipped.
-
 See [`docs/turing-runtime.md`](docs/turing-runtime.md) for the dispatch and
 validation matrix and [`docs/architecture.md`](docs/architecture.md) for the
 Python/kernel layering. Experimental Sage1/Sage2 sources are not installed or
@@ -215,7 +186,6 @@ COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX" \
 python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-sparse
-python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-frame-sparse
 ```
 
 Compatible A40 runs validate numerical behavior and allocation shapes but do

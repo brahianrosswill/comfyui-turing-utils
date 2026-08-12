@@ -165,33 +165,6 @@ class AttentionBackendsTest(unittest.TestCase):
         ):
             self.assertTrue(attention_backends.bundled_sparse_available())
 
-    def test_frame_sparse_backend_requires_015_kernel_abi(self):
-        sage_module = SimpleNamespace(frame_sparse_available=lambda: True)
-        with mock.patch.dict(
-            sys.modules,
-            {
-                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.13.0"),
-                "comfyui_turing_utils_kernel.turing_sage": sage_module,
-            },
-        ):
-            self.assertFalse(attention_backends.bundled_frame_sparse_available())
-        with mock.patch.dict(
-            sys.modules,
-            {
-                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.14.0"),
-                "comfyui_turing_utils_kernel.turing_sage": sage_module,
-            },
-        ):
-            self.assertFalse(attention_backends.bundled_frame_sparse_available())
-        with mock.patch.dict(
-            sys.modules,
-            {
-                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.15.0"),
-                "comfyui_turing_utils_kernel.turing_sage": sage_module,
-            },
-        ):
-            self.assertTrue(attention_backends.bundled_frame_sparse_available())
-
     def test_w8a8_backend_requires_018_kernel_abi(self):
         sage_module = SimpleNamespace(w8a8_available=lambda: True)
         with mock.patch.dict(
@@ -663,81 +636,6 @@ class AttentionBackendsTest(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "sm75 Turing"),
         ):
             attention_backends.make_sparse_attention_override(torch.device("cuda", 0))
-
-    def test_frame_sparse_override_preflights_and_forwards_parameters(self):
-        q = torch.zeros((1, 2, 4096, 128), dtype=torch.bfloat16)
-        with (
-            mock.patch("attention.is_supported_turing_device", return_value=True),
-            mock.patch("attention.bundled_frame_sparse_available", return_value=True),
-            mock.patch("attention.preflight_bundled") as stable_preflight,
-            mock.patch("attention.preflight_bundled_frame_sparse") as preflight,
-            mock.patch("attention._sparse_dense_schedule", return_value=False) as schedule,
-            mock.patch("attention.turing_frame_sparse_attention", return_value=q) as sparse,
-        ):
-            override = attention_backends.make_frame_sparse_attention_override(
-                torch.device("cuda", 0),
-                prefix_policy="manual",
-                manual_prefix_tokens=256,
-                temporal_window_frames=3,
-                global_anchor_stride=16,
-                rotate_global_anchors=False,
-                sink_frames=2,
-                dense_prefix_steps=2,
-                dense_suffix_steps=1,
-                dense_prefix_layers=3,
-                dense_suffix_layers=4,
-                debug_route_density=True,
-            )
-            output = override(mock.Mock(), q, q, q, 2, skip_reshape=True)
-
-        self.assertIs(output, q)
-        self.assertNotIn("track_step", schedule.call_args.kwargs)
-        stable_preflight.assert_called_once_with(torch.device("cuda", 0))
-        preflight.assert_called_once_with(torch.device("cuda", 0))
-        self.assertEqual(sparse.call_args.kwargs["prefix_policy"], "manual")
-        self.assertEqual(sparse.call_args.kwargs["manual_prefix_tokens"], 256)
-        self.assertEqual(sparse.call_args.kwargs["temporal_window_frames"], 3)
-        self.assertEqual(sparse.call_args.kwargs["global_anchor_stride"], 16)
-        self.assertFalse(sparse.call_args.kwargs["rotate_global_anchors"])
-        self.assertEqual(sparse.call_args.kwargs["sink_frames"], 2)
-        self.assertTrue(sparse.call_args.kwargs["debug_route_density"])
-        self.assertEqual(
-            override.turing_utils_attention_implementation,
-            "bundled_turing_frame_sparse_experimental",
-        )
-
-    def test_frame_sparse_override_uses_stable_sage_for_protected_layers(self):
-        q = torch.zeros((1, 2, 4096, 128), dtype=torch.bfloat16)
-        with (
-            mock.patch("attention.is_supported_turing_device", return_value=True),
-            mock.patch("attention.bundled_frame_sparse_available", return_value=True),
-            mock.patch("attention.preflight_bundled"),
-            mock.patch("attention.preflight_bundled_frame_sparse"),
-            mock.patch("attention.turing_sage_attention", return_value=q) as stable,
-            mock.patch("attention.turing_frame_sparse_attention", return_value=q) as sparse,
-        ):
-            override = attention_backends.make_frame_sparse_attention_override(
-                torch.device("cuda", 0)
-            )
-            for layer_index in (0, 1, 49):
-                override(
-                    mock.Mock(),
-                    q,
-                    q,
-                    q,
-                    2,
-                    skip_reshape=True,
-                    transformer_options={
-                        "turing_utils_attention_layout": {
-                            "layer_index": layer_index,
-                            "layer_count": 50,
-                        }
-                    },
-                )
-
-        self.assertEqual(stable.call_count, 2)
-        self.assertEqual(sparse.call_count, 1)
-
 
 if __name__ == "__main__":
     unittest.main()

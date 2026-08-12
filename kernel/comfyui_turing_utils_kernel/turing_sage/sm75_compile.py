@@ -28,7 +28,6 @@ def qk_int8_sv_f16_accum_f32_attn(
         return_lse,
     )
 
-
 def qk_int8_sv_f16_varlen_accum_f32_attn(
     query,
     key,
@@ -177,32 +176,4 @@ def sol_sparse_online_w8a8_prequantized_attn(
         sm_scale,
         return_stats,
         force_dense,
-    )
-
-
-def frame_sparse_int8_f16_attn(
-    query_int8,
-    key_int8,
-    value,
-    output,
-    query_scale,
-    key_scale,
-    row_offsets,
-    key_blocks,
-    sm_scale,
-):
-    if not hasattr(_qattn_sm75, "frame_sparse_int8_f16_attn"):
-        raise RuntimeError(
-            "frame-sparse attention requires comfyui-turing-utils-kernel 0.15.0 or newer"
-        )
-    return _qattn_sm75.frame_sparse_int8_f16_attn(
-        query_int8,
-        key_int8,
-        value,
-        output,
-        query_scale,
-        key_scale,
-        row_offsets,
-        key_blocks,
-        sm_scale,
     )
