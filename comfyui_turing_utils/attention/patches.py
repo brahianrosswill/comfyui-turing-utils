@@ -163,7 +163,7 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
         if option == "w8a8" and not bundled_w8a8_available():
             raise RuntimeError(
                 "The bundled Turing W8A8 extension is unavailable. "
-                "Rebuild comfyui-turing-utils-kernel 0.18.0 or newer with sm75 enabled."
+                "Rebuild comfyui-turing-utils-kernel 0.20.0 or newer with sm75 enabled."
             )
         if not bundled_available():
             raise RuntimeError(
@@ -263,14 +263,14 @@ def make_sparse_attention_override(
     if not bundled_sparse_available():
         raise RuntimeError(
             "The experimental Turing sparse extension is unavailable. "
-            "Rebuild comfyui-turing-utils-kernel 0.17.0 or newer with sm75 enabled."
+            "Rebuild comfyui-turing-utils-kernel 0.20.0 or newer with sm75 enabled."
         )
     preflight_bundled(device)
     preflight_bundled_sparse(device)
     if use_w8a8:
         if not bundled_w8a8_available():
             raise RuntimeError(
-                "Sol W8A8 requires comfyui-turing-utils-kernel 0.18.0 or newer"
+                "Sol W8A8 requires comfyui-turing-utils-kernel 0.20.0 or newer"
             )
         preflight_bundled_w8a8(device)
     schedule_state: dict[str, object] = {}

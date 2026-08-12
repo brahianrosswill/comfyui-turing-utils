@@ -12,7 +12,7 @@ Wan/Bernini context-window utilities.
 - Python 3.10 or newer
 - PyTorch with CUDA and ComfyUI
 - `comfy-kitchen>=0.2.26` for ConvRot model integration
-- the independently installed `comfyui-turing-utils-kernel>=0.8.0` on exact sm75
+- the independently installed `comfyui-turing-utils-kernel>=0.20.0` on exact sm75
 
 ## Installation
 
@@ -72,11 +72,10 @@ only after its CUDA sources or required version change.
   multimodal layout metadata, and exposes integer dense-step safeguards,
   dense first/last-layer protection, an optional SM75 W8A8 PV path, and an
   internal automatic short-sequence crossover.
-- `Patch Sage Frame Sparse Attention (Experimental)` applies a lower-overhead
-  structured video path. Non-video queries remain on stable Sage; video queries
-  attend the exact semantic prefix, complete local latent frames, fixed sink
-  frames, and layer-rotated periodic anchor frames. It has no online routing or
-  centroid residuals and is never selected by a loader or `auto`.
+- `Patch Turing Attention Kernel Tuning (Experimental)` overrides the logical
+  CTA-K schedule and the fused Hadamard/adaptive-anchor quality controls for
+  dense W8A8 and Sol. Its defaults are the production policy; explicit values
+  are intended for target-card profiling and do not affect stable Sage.
 
 ## Turing behavior
 
@@ -130,18 +129,23 @@ The explicit experimental `w8a8` attention backend is exact-sm75-only and is
 never selected by `auto`. It retains stable Sage's INT8 Q/K score domain,
 quantizes V channel-wise to signed INT8, packs online-softmax probabilities to
 unsigned INT8, and evaluates both QK and PV with Turing Tensor Cores. It is
-currently specialized for unmasked, non-causal, 128-dimensional heads with
+currently specialized for unmasked, non-causal heads in the range 1--128 with
 FP16/BF16 storage, GQA, unequal sequence lengths, and HND/NHD layouts. The
+dense/sparse core pads smaller heads internally while retaining the original
+softmax scale and output width. The
 dense kernel uses a route-free specialization of the Sol exact-token core;
 unsupported calls fall back through the pre-existing attention override.
 
 Sparse attention is not a loader option and `auto` never selects it. Connect
 the model through the experimental Sol patch node to enable it explicitly. The
-kernel accepts FP16/BF16/FP32 Q/K/V, GQA, 128-dimensional heads, and unmasked
-non-causal sequences; incompatible or short calls use bundled stable Sage.
+kernel accepts FP16/BF16/FP32 Q/K/V, GQA, head dimensions 1--128, unequal Q/K,
+and unmasked non-causal sequences; incompatible or short calls use bundled
+stable Sage. Automatic semantic protection requires separate Query/K layout
+metadata for unequal sequences; ambiguous single-sequence metadata falls back
+instead of applying the wrong ranges.
 
-Online Sol routing requires kernel package 0.17.0; its optional W8A8 mode and
-the explicit dense W8A8 backend require 0.18.0. Adapter-protected Query
+Online Sol routing, its optional W8A8 mode, and the explicit dense W8A8 backend
+require kernel package 0.20.0. Adapter-protected Query
 blocks run through the selected exact dense backend, while every sparse Query
 keeps protected modality blocks as exact K/V sinks. Selected blocks reuse stable Sage's INT8
 Tensor Core QK path. Routing and exact selected-block QK both derive from the
@@ -151,7 +155,7 @@ correction, while original V means remain in the value approximation.
 Official-style `1x64` is the default; optional `2x32` improves bimodal
 skipped-block fidelity without changing routing.
 
-Kernel 0.19.0 integrates current ComfyUI's attention tensor-container
+Kernel 0.20.0 integrates current ComfyUI's attention tensor-container
 lifecycle. Supported bundled Sage, W8A8, and Sol calls quantize
 before output allocation and release their original Q/K/V storage as soon as
 the selected path permits. Older kernel packages continue through the
@@ -161,8 +165,10 @@ Sol's `use_w8a8` switch is disabled by default for backward-compatible quality.
 When enabled, selected exact blocks and protected dense steps/layers use the
 same signed-V/unsigned-probability Tensor Core path. Skipped-block correction
 keeps original V centroids and FP32 online state, so the switch changes exact
-PV throughput rather than the routing policy. Both variants keep the same
-64-query/64-key tile and 32 KiB dynamic shared-memory budget.
+PV throughput rather than the routing policy. Both variants keep a 64-query
+tile and 32 KiB dynamic shared-memory budget. The automatic logical K schedule
+uses 64 tokens for short K and two sequential 64-token stages for K above 1024.
+The latter does not hold 128 K/V tokens in shared memory, preserving CTA density.
 
 The threshold and fixed +/- one-block local neighborhood execute inside each
 attention CTA. Only compact, head-independent dense-Query and exact-KV policy
@@ -187,6 +193,7 @@ COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX" \
 python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-sparse
+python kernel/scripts/release_gate.py --build --device cuda:0
 ```
 
 Compatible A40 runs validate numerical behavior and allocation shapes but do

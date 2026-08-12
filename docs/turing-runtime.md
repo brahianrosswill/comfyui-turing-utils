@@ -102,7 +102,6 @@ normalize invisibly to `sage_attn` and are not displayed by either loader.
 | `sage_attn` on Turing | INT8, per-16-token Q-warp scales | disabled | FP16 V tiles with direct FP32 accumulation |
 | explicit `w8a8` on Turing | stable-Sage INT8 score domain | disabled | channel-wise signed INT8 V and unsigned INT8 probabilities, INT32 Tensor Core PV, FP32 online state |
 | `Patch Sol Sparse Attention` | fused 64-token centroid routing; selected tiles reuse stable Sage INT8 QK | input-adaptive `mean + tau * std` threshold | exact FP16 V tiles plus skipped-block V centroids, FP32 online accumulation |
-| `Patch Sage Frame Sparse Attention` | cached head-independent frame schedule; selected tiles reuse stable Sage INT8 QK | fixed local/sink/rotating-anchor structure | exact selected FP16 V tiles, FP32 online accumulation |
 
 Integer Q/K MMA accumulates into INT32. The stable facade supports FP16 and
 BF16 Q/K/V, HND/NHD, GQA, causal mode, unequal Q/KV lengths, head dimensions
@@ -117,17 +116,17 @@ and cannot reproduce the large-sequence SDPA allocation failure.
 The sparse backend is installed only by the independent
 `Patch Sol Sparse Attention (Experimental)` node and is never part of a loader's
 `auto` priority list. Dispatch depends only on the attention call: matching
-FP16, BF16, or FP32 Q/K/V; 128-dimensional heads; unmasked non-causal attention;
+FP16, BF16, or FP32 Q/K/V; head dimensions 1--128; unmasked non-causal attention;
 and both Q and K meeting the configurable minimum sequence length. HND and
 ComfyUI's unreshaped layout, GQA, unequal Q/K lengths, and incomplete final
 blocks are supported. Other calls use bundled stable Sage without model-family,
 sampling-step checks. A model adapter may publish semantic layer and topology
 metadata; unknown models remain fully generic.
 
-The explicit `w8a8` backend and Sol's `use_w8a8` option require kernel 0.18.0.
-They are specialized for exact sm75, head dimension 128, and unmasked
+The explicit `w8a8` backend and Sol's `use_w8a8` option require kernel 0.20.0.
+They are specialized for exact sm75, head dimensions 1--128, and unmasked
 non-causal attention. `auto` continues to select stable Sage. The W8A8 path
-keeps the same Q64/K64 and 32 KiB shared-memory shape as Sol: V is quantized
+keeps the same Q64 and 32 KiB shared-memory shape as Sol: V is quantized
 once per call into a channel-major, 16-token-permuted signed-INT8 tensor;
 softmax probabilities are packed to unsigned INT8; PV uses SM75 U8xS8 Tensor
 Core MMA and the output remains FP32 until normalization and dtype writeback.
@@ -135,7 +134,7 @@ The route-free dense specialization omits centroid summaries and route state.
 Short calls can lose to stable Sage because the extra V scan is not amortized,
 which is why W8A8 remains explicit.
 
-Kernel 0.19.0 adds the split prequantize/execute ABI used by current ComfyUI's
+Kernel 0.20.0 provides the split prequantize/execute ABI used by current ComfyUI's
 `AttentionTensorContainer`. Q/K quantization, optional V quantization, and Sol
 correction summaries are completed before allocating the output. The original
 Q/K/V tensors are then released; stable Sage and FP16-PV sparse paths retain
@@ -143,7 +142,9 @@ only the contiguous V buffer required by the main kernel, while W8A8 retains
 only quantized V. Older kernels remain supported through the one-call ABI.
 All bundled attention kernels launch on PyTorch's current CUDA stream, which
 also makes the graph-leaf dense Sage/W8A8 operations safe for CUDA Graph
-capture.
+capture. It also exposes logical CTA-K64/128 scheduling and fused
+Hadamard/adaptive-anchor quality controls through a separate experimental
+tuning patch. Logical K128 processes two K64 stages using the same shared tile.
 
 The node keeps the measured 4096-token crossover internally; shorter calls use
 stable Sage. `routing_threshold=1.0` matches the official mean-plus-one-standard-
@@ -196,16 +197,16 @@ correction. One Q-to-K-centroid Tensor Core traversal supplies both the routing
 score and the online-softmax correction, with conflict-free per-warp shared
 partials instead of shared atomics. The compact route is then copied into four
 32-bit registers per lane before the arena is reused for exact K/V tiles. The
-FP16-PV compute_75 cubin reports 221 BF16 / 233 FP16 registers per main thread, a
+FP16-PV compute_75 cubin reports 214 BF16 / 222 FP16 registers per main thread, a
 16-byte stack frame, zero local-memory spill, and 32 KiB dynamic shared memory.
 Register and shared-memory limits permit two 128-thread CTAs per SM75; actual
 occupancy and bank behavior still need Nsight confirmation on Turing.
 
-The W8A8 sparse specialization reaches the SM75 compiler's 255-register limit
+The W8A8 sparse specialization uses 253 registers per thread
 with a 16-byte stack frame but reports zero local-memory spill; 128 threads use
 32768 registers per CTA, so the 32 KiB shared-memory and register budgets still
 permit two CTAs on a 64 KiB/65536-register Turing SM. The route-free dense W8A8
-specialization uses about 180 registers and no stack/local spill. These resource
+specialization uses 193 registers and no stack/local spill. These resource
 figures are static compute_75 reports; resident-CTA throughput still requires a
 real Turing profile.
 
@@ -242,7 +243,7 @@ The loader log reports `sage_attn via bundled_turing_sage` when `auto` or
 ranges, three reference switches, threshold, residual profile, and fixed local
 radius. MiniMax additionally emits its fused block/MLP dispatch counters.
 
-`debug_route_density` is disabled by default. With kernel package 0.17.0 or
+`debug_route_density` is disabled by default. With kernel package 0.20.0 or
 newer, the already-running sparse CTA accumulates one selected-block counter;
 there is no route allocation or popcount kernel. Counts remain on-device across
 layers and synchronize once for the end-of-step log. The log reports selected
