@@ -246,15 +246,13 @@ class TuringAttentionContractTest(unittest.TestCase):
         baseline.assert_called_once()
         sparse.assert_not_called()
 
-    def test_experimental_sparse_keeps_cross_attention_with_prefix_dense(self):
+    def test_experimental_sparse_supports_cross_attention_with_prefix_dense(self):
         q = torch.zeros((1, 4, 4096, 128), dtype=torch.bfloat16)
         k = torch.zeros((1, 2, 4608, 128), dtype=torch.bfloat16)
         v = torch.zeros_like(k)
-        baseline = mock.Mock(return_value=q)
         with (
             mock.patch("attention.is_supported_turing_device", return_value=True),
-            mock.patch("attention.turing_sage_attention", baseline),
-            mock.patch("attention._sol_sparse_sageattn") as sparse,
+            mock.patch("attention._sol_sparse_sageattn", return_value=q) as sparse,
         ):
             output = turing_attention.turing_sol_sparse_attention(
                 mock.Mock(),
@@ -263,14 +261,33 @@ class TuringAttentionContractTest(unittest.TestCase):
                 v,
                 4,
                 skip_reshape=True,
+                skip_output_reshape=True,
                 min_sequence_tokens=4096,
                 transformer_options={
                     "turing_utils_attention_layout": {"dense_prefix_tokens": 320}
                 },
             )
         self.assertIs(output, q)
-        baseline.assert_called_once()
-        sparse.assert_not_called()
+        self.assertEqual(sparse.call_args.kwargs["dense_query_ranges"], ((0, 320),))
+        self.assertEqual(sparse.call_args.kwargs["exact_kv_ranges"], ((0, 320),))
+
+    def test_w8a8_and_sol_accept_head_dims_through_128(self):
+        for kernel in ("w8a8", "sol"):
+            for head_dim in (1, 32, 63, 64, 65, 96, 127, 128):
+                q = torch.zeros((1, 2, 4096, head_dim), dtype=torch.bfloat16)
+                with mock.patch("attention.is_supported_turing_device", return_value=True):
+                    call, reason = turing_attention.inspect_turing_attention_call(
+                        q,
+                        q,
+                        q,
+                        2,
+                        skip_reshape=True,
+                        skip_output_reshape=True,
+                        kernel=kernel,
+                        require_long_sequence=True,
+                    )
+                self.assertIsNone(reason, (kernel, head_dim, reason))
+                self.assertEqual(call.head_dim, head_dim)
 
     def test_experimental_sparse_debug_counts_route_only_once_per_shape(self):
         q = torch.zeros((1, 4, 4096, 128), dtype=torch.bfloat16)

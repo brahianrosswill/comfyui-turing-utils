@@ -324,6 +324,32 @@ def validate_sparse(device: torch.device) -> None:
         per_warp_int8_hadamard,
     )
 
+    for head_dim in (1, 32, 63, 64, 65, 96, 127, 128):
+        q = torch.randn((1, 4, 129, head_dim), device=device, dtype=torch.bfloat16)
+        k = torch.randn((1, 2, 151, head_dim), device=device, dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        reference = torch.nn.functional.scaled_dot_product_attention(
+            q.float(), k.float(), v.float(), enable_gqa=True
+        )
+        dense_w8a8 = w8a8attn(q, k, v)
+        _assert_close(
+            f"W8A8 padded D={head_dim}",
+            dense_w8a8,
+            reference,
+            rtol=0.15,
+            atol=0.12,
+        )
+        exact_sol = sol_sparse_sageattn(
+            q, k, v, threshold_sigma=-1000.0, use_w8a8=True
+        )
+        _assert_close(
+            f"Sol W8A8 padded D={head_dim}",
+            exact_sol,
+            dense_w8a8,
+            rtol=0.02,
+            atol=0.01,
+        )
+
     for dtype in (torch.float16, torch.bfloat16):
         for query_length, key_length in ((129, 151), (151, 129)):
             q = torch.randn((1, 4, query_length, 128), device=device, dtype=dtype)

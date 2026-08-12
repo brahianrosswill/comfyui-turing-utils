@@ -54,6 +54,7 @@ class PrequantizedSolAttention:
     possible_blocks: int
     use_w8a8: bool
     force_dense: bool
+    original_head_dim: int
 
 
 def _normalize_token_ranges(ranges, sequence_length: int) -> tuple[tuple[int, int], ...]:
@@ -421,8 +422,9 @@ def w8a8attn(
         raise TypeError("Turing W8A8 Q/K/V must be float16 or bfloat16")
     if q_hnd.dtype != k_hnd.dtype or q_hnd.dtype != v_hnd.dtype:
         raise TypeError("Turing W8A8 Q/K/V must have matching dtypes")
-    if q_hnd.size(-1) != 128:
-        raise ValueError("Turing W8A8 currently requires head_dim=128")
+    head_dim = q_hnd.size(-1)
+    if not 0 < head_dim <= 128:
+        raise ValueError("Turing W8A8 requires head_dim in [1, 128]")
     quantized = prequantize_sol_sageattn.__wrapped__(
         q_hnd,
         k_hnd,
@@ -465,12 +467,18 @@ def prequantize_sol_sageattn(
     if q.dtype != k.dtype or q.dtype != v.dtype:
         raise TypeError("Q/K/V must have matching dtypes")
     _validate_fixed_qkv(q, k, v, tensor_layout)
-    if q.size(-1) != 128:
-        raise ValueError("experimental sparse attention requires head_dim=128")
+    head_dim = q.size(-1)
+    if not 0 < head_dim <= 128:
+        raise ValueError("experimental sparse attention requires head_dim in [1, 128]")
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("the last Q/K/V dimension must be contiguous")
 
-    scale = float(sm_scale) if sm_scale is not None else 128**-0.5
+    scale = float(sm_scale) if sm_scale is not None else head_dim**-0.5
+    if head_dim < 128:
+        padding = 128 - head_dim
+        q = torch.nn.functional.pad(q, (0, padding))
+        k = torch.nn.functional.pad(k, (0, padding))
+        v = torch.nn.functional.pad(v, (0, padding))
     residual_subblocks = int(residual_subblocks)
     if residual_subblocks not in (1, 2):
         raise ValueError("residual_subblocks must be 1 or 2")
@@ -542,6 +550,7 @@ def prequantize_sol_sageattn(
         possible_blocks=possible_blocks,
         use_w8a8=bool(use_w8a8),
         force_dense=bool(force_dense),
+        original_head_dim=head_dim,
     )
 
 
@@ -593,6 +602,7 @@ def sol_sparse_sageattn_from_prequantized(
                 0,
                 0,
             )
+    output = output[..., : quantized.original_head_dim]
     return (output, selected, quantized.possible_blocks) if return_stats else output
 
 

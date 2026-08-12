@@ -40,7 +40,8 @@ from ..kernel_api import load_turing_sage
 class SolAttentionCall:
     attention: AttentionCall
     effective_min_sequence: int
-    protected_ranges: tuple[tuple[int, int], ...]
+    dense_query_ranges: tuple[tuple[int, int], ...]
+    exact_kv_ranges: tuple[tuple[int, int], ...]
     residual_subblocks: int
 
 
@@ -292,21 +293,41 @@ def inspect_sol_attention_call(
     )
     if residual_subblocks is None:
         raise ValueError("skipped_residual must be 1x64 or 2x32")
-    protected_ranges = _sparse_protected_ranges(
+    layout = (
+        transformer_options.get(SPARSE_LAYOUT_KEY)
+        if isinstance(transformer_options, dict)
+        else None
+    )
+    if (
+        call.query_tokens != call.key_tokens
+        and prefix_policy == "auto"
+        and isinstance(layout, dict)
+        and isinstance(layout.get("segments"), tuple)
+    ):
+        return None, "asymmetric Q/K requires separate semantic layout metadata"
+    dense_query_ranges = _sparse_protected_ranges(
         prefix_policy,
         manual_prefix_tokens,
         transformer_options,
-        min(call.query_tokens, call.key_tokens),
+        call.query_tokens,
         sparse_reference_image=bool(sparse_reference_image),
         sparse_reference_video=bool(sparse_reference_video),
         sparse_reference_audio=bool(sparse_reference_audio),
     )
-    if protected_ranges and call.query_tokens != call.key_tokens:
-        return None, "protected Query/KV ranges require equal Q/K sequence lengths"
+    exact_kv_ranges = _sparse_protected_ranges(
+        prefix_policy,
+        manual_prefix_tokens,
+        transformer_options,
+        call.key_tokens,
+        sparse_reference_image=bool(sparse_reference_image),
+        sparse_reference_video=bool(sparse_reference_video),
+        sparse_reference_audio=bool(sparse_reference_audio),
+    )
     return SolAttentionCall(
         attention=call,
         effective_min_sequence=effective_min_sequence,
-        protected_ranges=protected_ranges,
+        dense_query_ranges=dense_query_ranges,
+        exact_kv_ranges=exact_kv_ranges,
         residual_subblocks=residual_subblocks,
     ), None
 
@@ -332,8 +353,8 @@ def prequantize_turing_sol_attention(
         v,
         tensor_layout="HND",
         sm_scale=scale,
-        dense_query_ranges=call.protected_ranges,
-        exact_kv_ranges=call.protected_ranges,
+        dense_query_ranges=call.dense_query_ranges,
+        exact_kv_ranges=call.exact_kv_ranges,
         threshold_sigma=routing_threshold,
         residual_subblocks=call.residual_subblocks,
         use_w8a8=bool(use_w8a8),
@@ -429,7 +450,8 @@ def turing_sol_sparse_attention(
     call = sol_call.attention
     input_dtype = call.input_dtype
     effective_min_sequence = sol_call.effective_min_sequence
-    protected_ranges = sol_call.protected_ranges
+    dense_query_ranges = sol_call.dense_query_ranges
+    exact_kv_ranges = sol_call.exact_kv_ranges
     residual_subblocks = sol_call.residual_subblocks
     skipped_residual = "1x64" if residual_subblocks == 1 else "2x32"
     q_shape = (call.batch, call.heads, call.query_tokens, call.head_dim)
@@ -440,7 +462,8 @@ def turing_sol_sparse_attention(
         q_shape,
         k_shape,
         effective_min_sequence,
-        protected_ranges,
+        dense_query_ranges,
+        exact_kv_ranges,
         routing_threshold,
         residual_subblocks,
         bool(sparse_reference_image),
@@ -451,7 +474,7 @@ def turing_sol_sparse_attention(
     if kernel_key not in _LOGGED_SPARSE_KERNELS:
         LOG.info(
             "Experimental Turing Sol sparse attention active: dtype=%s Q=%s K=%s "
-            "min_sequence=%d prefix_policy=%s protected_ranges=%s "
+            "min_sequence=%d prefix_policy=%s dense_query_ranges=%s exact_kv_ranges=%s "
             "selected_qk=int8 score_domain=int8_consistent threshold=%.2f "
             "skipped_residual=%s local_radius=1 "
             "sparse_reference=(image=%s,video=%s,audio=%s) pv=%s",
@@ -460,7 +483,8 @@ def turing_sol_sparse_attention(
             k_shape,
             effective_min_sequence,
             prefix_policy,
-            protected_ranges,
+            dense_query_ranges,
+            exact_kv_ranges,
             routing_threshold,
             skipped_residual,
             bool(sparse_reference_image),
@@ -508,8 +532,8 @@ def turing_sol_sparse_attention(
         v,
         tensor_layout="HND",
         sm_scale=kwargs.get("scale"),
-        dense_query_ranges=protected_ranges,
-        exact_kv_ranges=protected_ranges,
+        dense_query_ranges=dense_query_ranges,
+        exact_kv_ranges=exact_kv_ranges,
         threshold_sigma=routing_threshold,
         residual_subblocks=residual_subblocks,
         return_stats=collect_route_stats,
@@ -518,7 +542,9 @@ def turing_sol_sparse_attention(
     if collect_route_stats:
         output, selected_device, possible_blocks = sparse_result
         try:
-            protected_query_tokens = sum(stop - start for start, stop in protected_ranges)
+            protected_query_tokens = sum(
+                stop - start for start, stop in dense_query_ranges
+            )
             sparse_query_tokens = call.query_tokens - protected_query_tokens
             if aggregate_route_stats:
                 aggregate_key = (step, context.get("sampling_steps"), kernel_key)

@@ -140,8 +140,7 @@ def inspect_turing_attention_call(
 
     if query_tokens <= 0 or key_tokens <= 0:
         return None, "empty Q/K sequences are unsupported"
-    required_head_dim = kernel in {"w8a8", "sol"}
-    if (required_head_dim and head_dim != 128) or (not required_head_dim and not 0 < head_dim <= 128):
+    if not 0 < head_dim <= 128:
         return None, f"head_dim={head_dim} is unsupported by Turing {kernel}"
     if require_long_sequence and (query_tokens < 64 or key_tokens < 64):
         return None, "split attention requires Q/K sequences of at least 64 tokens"
