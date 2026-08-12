@@ -3,6 +3,7 @@ from __future__ import annotations
 from .nodes.attention import AttentionKernelTuningPatch, SolSparseAttentionPatch
 from .nodes.bernini import BerniniContextWindowsCore, BerniniInpaintCondition
 from .nodes.loaders import ConvRotCLIPLoader, ConvRotDiffusionModelLoader
+from .nodes.media import VideoMotionContactSheet
 from .nodes.minimax import (
     H3ConcatAVLatent,
     H3SeparateAVLatent,
@@ -22,6 +23,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsH3SeparateAVLatent": H3SeparateAVLatent,
     "TuringUtilsSolSparseAttentionPatch": SolSparseAttentionPatch,
     "TuringUtilsAttentionKernelTuningPatch": AttentionKernelTuningPatch,
+    "TuringUtilsVideoMotionContactSheet": VideoMotionContactSheet,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -35,4 +37,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsH3SeparateAVLatent": "H3 Separate AV Latent",
     "TuringUtilsSolSparseAttentionPatch": "Patch Sol Sparse Attention (Experimental)",
     "TuringUtilsAttentionKernelTuningPatch": "Patch Turing Attention Kernel Tuning (Experimental)",
+    "TuringUtilsVideoMotionContactSheet": "Video Motion Contact Sheet (Experimental)",
 }

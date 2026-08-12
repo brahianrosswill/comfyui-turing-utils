@@ -43,6 +43,10 @@ only after its CUDA sources or required version change.
 - `H3 Concat AV Latent` combines standalone H3 video and audio latents into the
   model's native nested AV latent. `H3 Separate AV Latent` splits the streams
   again; both nodes preserve matching video/audio noise masks.
+- `Video Motion Contact Sheet (Experimental)` samples an `N x N` chronological
+  storyboard from a loaded `VIDEO` or decoded `IMAGE` frame batch. It can use
+  uniform or motion-weighted sampling and optionally wraps each panel in
+  annotated film rails so frame numbers and timestamps stay outside the image.
 - `Patch Sol Sparse Attention (Experimental)` applies the model-generic,
   loader-independent
   long-sequence sparse backend. It uses an input-adaptive statistical threshold,
