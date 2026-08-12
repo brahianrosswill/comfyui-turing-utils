@@ -289,6 +289,36 @@ class TuringAttentionContractTest(unittest.TestCase):
                 self.assertIsNone(reason, (kernel, head_dim, reason))
                 self.assertEqual(call.head_dim, head_dim)
 
+    def test_dense_w8a8_accepts_causal_while_sol_rejects_it(self):
+        q = torch.zeros((1, 2, 4096, 128), dtype=torch.bfloat16)
+        with mock.patch("attention.is_supported_turing_device", return_value=True):
+            call, reason = turing_attention.inspect_turing_attention_call(
+                q,
+                q,
+                q,
+                2,
+                skip_reshape=True,
+                skip_output_reshape=True,
+                is_causal=True,
+                kernel="w8a8",
+                require_long_sequence=True,
+            )
+            sol_call, sol_reason = turing_attention.inspect_turing_attention_call(
+                q,
+                q,
+                q,
+                2,
+                skip_reshape=True,
+                skip_output_reshape=True,
+                is_causal=True,
+                kernel="sol",
+                require_long_sequence=True,
+            )
+        self.assertIsNone(reason)
+        self.assertIsNotNone(call)
+        self.assertIsNone(sol_call)
+        self.assertIn("causal", sol_reason)
+
     def test_experimental_sparse_debug_counts_route_only_once_per_shape(self):
         q = torch.zeros((1, 4, 4096, 128), dtype=torch.bfloat16)
         route_keys = set()

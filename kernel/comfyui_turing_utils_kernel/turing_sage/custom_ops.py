@@ -117,6 +117,7 @@ def w8a8_attention(
     key: torch.Tensor,
     value: torch.Tensor,
     tensor_layout: str,
+    is_causal: bool,
     sm_scale: float,
     key_tile_tokens: int,
     rotate_qk: bool,
@@ -129,6 +130,7 @@ def w8a8_attention(
         key,
         value,
         tensor_layout=tensor_layout,
+        is_causal=is_causal,
         sm_scale=sm_scale if sm_scale > 0.0 else None,
         key_tile_tokens=key_tile_tokens,
         rotate_qk=rotate_qk,
@@ -138,7 +140,15 @@ def w8a8_attention(
 
 @w8a8_attention.register_fake
 def _w8a8_attention_fake(
-    query, key, value, tensor_layout, sm_scale, key_tile_tokens, rotate_qk, stabilize_k
+    query,
+    key,
+    value,
+    tensor_layout,
+    is_causal,
+    sm_scale,
+    key_tile_tokens,
+    rotate_qk,
+    stabilize_k,
 ):
     return torch.empty_like(query)
 
@@ -182,6 +192,52 @@ def _sage_attention_varlen_fake(
     max_seqlen_k,
     is_causal,
     sm_scale,
+):
+    return torch.empty_like(query)
+
+
+@torch.library.custom_op("turing_utils::w8a8_attention_varlen", mutates_args=())
+def w8a8_attention_varlen(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    is_causal: bool,
+    sm_scale: float,
+    rotate_qk: bool,
+) -> torch.Tensor:
+    from .core import w8a8attn_varlen
+
+    return w8a8attn_varlen(
+        query,
+        key,
+        value,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        is_causal=is_causal,
+        sm_scale=sm_scale if sm_scale > 0.0 else None,
+        rotate_qk=rotate_qk,
+        stabilize_k=False,
+    )
+
+
+@w8a8_attention_varlen.register_fake
+def _w8a8_attention_varlen_fake(
+    query,
+    key,
+    value,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_q,
+    max_seqlen_k,
+    is_causal,
+    sm_scale,
+    rotate_qk,
 ):
     return torch.empty_like(query)
 

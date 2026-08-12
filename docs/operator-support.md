@@ -39,6 +39,7 @@ implementation.
 | Attention | `sage_attention` | Stable dense INT8-QK, FP16/BF16-PV SM75 attention |
 | Attention | `sage_attention_varlen` | Packed variable-length stable Sage attention |
 | Attention | `w8a8_attention` | Dense INT8-QK and INT8-PV SM75 attention |
+| Attention | `w8a8_attention_varlen` | Packed variable-length dense W8A8 attention |
 | Attention | `sol_attention` | Online Sol routing with FP16/BF16-PV or INT8-PV |
 
 W4A4 and the main W8A8 linear contraction deliberately reuse Comfy Kitchen or
@@ -59,9 +60,9 @@ duplicate full W4A4 and W8A8 GEMM implementations.
 | HND / NHD | yes / yes | yes / yes | HND only | HND only |
 | GQA | yes | yes | yes | yes |
 | Unequal Q/K length | yes | yes | yes | yes |
-| Causal | yes | no | no | no |
+| Causal | yes | yes (upper-left) | no | no |
 | Arbitrary attention mask | no | no | no | no |
-| Variable length | yes | no | no | no |
+| Variable length | yes | yes (packed) | no | no |
 | Split prequantization | Q/K; V retained | Q/K/V | Q/K; V retained | Q/K/V plus summaries |
 | Q/K Hadamard rotation | no | optional, default on | optional, default on | optional, default on |
 | Adaptive K anchor | no | optional, default on | optional, default on | optional, default on |

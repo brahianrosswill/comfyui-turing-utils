@@ -331,18 +331,26 @@ class AttentionBackendsTest(unittest.TestCase):
         with mock.patch.dict(
             sys.modules,
             {
-                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.20.0"),
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.22.3"),
+                "comfyui_turing_utils_kernel.turing_sage": sage_module,
+            },
+        ):
+            self.assertFalse(attention_backends.bundled_sparse_available())
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.23.0"),
                 "comfyui_turing_utils_kernel.turing_sage": sage_module,
             },
         ):
             self.assertTrue(attention_backends.bundled_sparse_available())
 
-    def test_w8a8_backend_requires_020_kernel_abi(self):
+    def test_w8a8_backend_requires_023_kernel_abi(self):
         sage_module = SimpleNamespace(w8a8_available=lambda: True)
         with mock.patch.dict(
             sys.modules,
             {
-                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.17.0"),
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.22.3"),
                 "comfyui_turing_utils_kernel.turing_sage": sage_module,
             },
         ):
@@ -350,7 +358,7 @@ class AttentionBackendsTest(unittest.TestCase):
         with mock.patch.dict(
             sys.modules,
             {
-                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.20.0"),
+                "comfyui_turing_utils_kernel": SimpleNamespace(__version__="0.23.0"),
                 "comfyui_turing_utils_kernel.turing_sage": sage_module,
             },
         ):
@@ -594,7 +602,7 @@ class AttentionBackendsTest(unittest.TestCase):
         preflight.assert_called_once_with(torch.device("cuda", 0))
         self.assertNotIn("variant", kernel.call_args.kwargs)
 
-    def test_turing_explicit_w8a8_selects_experimental_bundled_backend(self):
+    def test_turing_explicit_w8a8_selects_production_bundled_backend(self):
         model = FakeModel()
         q = torch.randn(1, 2, 4, 128, dtype=torch.bfloat16)
         with (
@@ -624,7 +632,7 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertEqual(transformer_options["turing_utils_attention_backend"], "w8a8")
         self.assertEqual(
             transformer_options["turing_utils_attention_implementation"],
-            "bundled_turing_w8a8_experimental",
+            "bundled_turing_w8a8",
         )
 
     def test_explicit_w8a8_rejects_non_turing_device(self):

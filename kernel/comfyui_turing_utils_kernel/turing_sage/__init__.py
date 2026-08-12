@@ -25,13 +25,33 @@ def sparse_available() -> bool:
 
 
 def w8a8_available() -> bool:
-    if not sparse_available():
+    # Dense W8A8 is a production backend with its own ABI.  Do not couple its
+    # availability to the experimental Sol entry point merely because both
+    # kernels currently share one extension module.
+    if not available():
         return False
     try:
         module = importlib.import_module("comfyui_turing_utils_kernel._sage_qattn_sm75")
     except (ImportError, OSError):
         return False
     return hasattr(module, "quantize_v_int8_sm75")
+
+
+def w8a8_varlen_available() -> bool:
+    """Return whether the packed variable-length W8A8 ABI is installed."""
+    if not w8a8_available():
+        return False
+    try:
+        module = importlib.import_module("comfyui_turing_utils_kernel._sage_qattn_sm75")
+    except (ImportError, OSError):
+        return False
+    return all(
+        hasattr(module, name)
+        for name in (
+            "quantize_v_int8_varlen_sm75",
+            "qk_int8_sv_int8_varlen_accum_f32_attn",
+        )
+    )
 
 
 def split_prequantization_available() -> bool:
@@ -178,6 +198,7 @@ def w8a8attn_compiled(
     v: torch.Tensor,
     *,
     tensor_layout: str = "HND",
+    is_causal: bool = False,
     sm_scale: float | None = None,
     key_tile_tokens: int = 0,
     rotate_qk: bool = True,
@@ -190,10 +211,46 @@ def w8a8attn_compiled(
         k,
         v,
         tensor_layout,
+        bool(is_causal),
         float(sm_scale) if sm_scale is not None else -1.0,
         int(key_tile_tokens),
         bool(rotate_qk),
         bool(stabilize_k),
+    )
+
+
+def w8a8attn_varlen(*args, **kwargs):
+    from .core import w8a8attn_varlen as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def w8a8attn_varlen_compiled(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    *,
+    is_causal: bool = False,
+    sm_scale: float | None = None,
+    rotate_qk: bool = True,
+):
+    from .custom_ops import w8a8_attention_varlen
+
+    return w8a8_attention_varlen(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        bool(is_causal),
+        float(sm_scale) if sm_scale is not None else -1.0,
+        bool(rotate_qk),
     )
 
 
@@ -403,5 +460,8 @@ __all__ = [
     "sparse_available",
     "w8a8attn",
     "w8a8attn_compiled",
+    "w8a8attn_varlen",
+    "w8a8attn_varlen_compiled",
     "w8a8_available",
+    "w8a8_varlen_available",
 ]

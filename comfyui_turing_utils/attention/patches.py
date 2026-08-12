@@ -114,7 +114,7 @@ def _prepared_call_mismatch(request: PreparedAttention, call) -> str | None:
 
 def _make_dense_prepared_executor(kernel: str) -> Callable:
     capabilities = AttentionBackendCapabilities(
-        supports_causal=kernel == "sage",
+        supports_causal=kernel in {"sage", "w8a8"},
     )
 
     def executor(request: PreparedAttention) -> AttentionExecutionOutcome:
@@ -284,14 +284,14 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
     bundled_turing = _uses_bundled_turing_sage(option, device)
     if option == "w8a8" and not bundled_turing:
         raise RuntimeError(
-            "The W8A8 attention backend is an experimental exact-sm75 kernel; "
+            "The W8A8 attention backend requires the bundled exact-sm75 kernel; "
             "select sage_attn, flash_attn, or sdpa on other GPUs."
         )
     if bundled_turing:
         if option == "w8a8" and not bundled_w8a8_available():
             raise RuntimeError(
                 "The bundled Turing W8A8 extension is unavailable. "
-                "Rebuild comfyui-turing-utils-kernel 0.20.0 or newer with sm75 enabled."
+                "Rebuild comfyui-turing-utils-kernel 0.23.0 or newer with sm75 enabled."
             )
         if not bundled_available():
             raise RuntimeError(
@@ -305,7 +305,7 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
         backend = _BACKENDS[option if option == "w8a8" else "sage_attn"]
         target = turing_w8a8_attention if option == "w8a8" else turing_sage_attention
         implementation = (
-            "bundled_turing_w8a8_experimental"
+            "bundled_turing_w8a8"
             if option == "w8a8"
             else "bundled_turing_sage"
         )
@@ -395,14 +395,14 @@ def make_sparse_attention_override(
     if not bundled_sparse_available():
         raise RuntimeError(
             "The experimental Turing sparse extension is unavailable. "
-            "Rebuild comfyui-turing-utils-kernel 0.20.0 or newer with sm75 enabled."
+            "Rebuild comfyui-turing-utils-kernel 0.23.0 or newer with sm75 enabled."
         )
     preflight_bundled(device)
     preflight_bundled_sparse(device)
     if use_w8a8:
         if not bundled_w8a8_available():
             raise RuntimeError(
-                "Sol W8A8 requires comfyui-turing-utils-kernel 0.20.0 or newer"
+                "Sol W8A8 requires comfyui-turing-utils-kernel 0.23.0 or newer"
             )
         preflight_bundled_w8a8(device)
     schedule_state: dict[str, object] = {}
@@ -415,6 +415,132 @@ def make_sparse_attention_override(
     sparse_capabilities = AttentionBackendCapabilities(
         supports_semantic_sparse=True,
     )
+
+    def route_debug_context(transformer_options, kernel_key: tuple):
+        layer_index, layer_count = _attention_layer_metadata(transformer_options)
+        step = schedule_state.get("step")
+        sampling_steps = schedule_state.get("sampling_steps")
+        last_sparse_layer = (
+            layer_count - dense_suffix_layers - 1
+            if isinstance(layer_count, int)
+            and not isinstance(layer_count, bool)
+            else None
+        )
+        aggregate = (
+            debug_route_density
+            and isinstance(step, int)
+            and not isinstance(step, bool)
+            and isinstance(layer_index, int)
+            and not isinstance(layer_index, bool)
+            and isinstance(layer_count, int)
+            and not isinstance(layer_count, bool)
+            and layer_count > 0
+            and 0 <= layer_index < layer_count
+            and isinstance(last_sparse_layer, int)
+            and 0 <= last_sparse_layer < layer_count
+        )
+        return {
+            "collect": debug_route_density and (
+                aggregate or kernel_key not in debug_route_keys
+            ),
+            "aggregate": aggregate,
+            "step": step,
+            "sampling_steps": sampling_steps,
+            "layer_index": layer_index,
+            "layer_count": layer_count,
+            "last_sparse_layer": last_sparse_layer,
+        }
+
+    def record_route_stats(
+        selected_device: torch.Tensor,
+        possible_blocks: int,
+        sol_call,
+        kernel_key: tuple,
+        context: dict,
+    ) -> None:
+        protected_query_tokens = sum(
+            stop - start for start, stop in sol_call.dense_query_ranges
+        )
+        sparse_query_tokens = (
+            sol_call.attention.query_tokens - protected_query_tokens
+        )
+        if context["aggregate"]:
+            aggregate_key = (
+                context["step"],
+                context["sampling_steps"],
+                kernel_key,
+            )
+            entries = debug_route_state.setdefault(aggregate_key, [])
+            entries.append(
+                (selected_device, possible_blocks, context["layer_index"])
+            )
+            if context["layer_index"] != context["last_sparse_layer"]:
+                return
+            selected = torch.cat([entry[0] for entry in entries]).float()
+            possible = torch.tensor(
+                [entry[1] for entry in entries],
+                device=selected.device,
+                dtype=torch.float32,
+            )
+            density = selected / possible.clamp_min(1.0)
+            summary = torch.stack(
+                (
+                    selected.sum(),
+                    possible.sum(),
+                    density.min(),
+                    density.mean(),
+                    density.max(),
+                )
+            ).cpu().tolist()
+            LOG.warning(
+                "[Turing sparse debug] step=%s/%s layers=%d-%d calls=%d "
+                "selected=%d/%d density[min/mean/max]=%.4f/%.4f/%.4f "
+                "Q=%d Qsparse=%d K=%d Hq=%d Hkv=%d threshold=%.2f "
+                "protected_q=%d local=1 residual=%s",
+                context["step"],
+                context["sampling_steps"],
+                min(entry[2] for entry in entries),
+                max(entry[2] for entry in entries),
+                len(entries),
+                int(summary[0]),
+                int(summary[1]),
+                summary[2],
+                summary[3],
+                summary[4],
+                sol_call.attention.query_tokens,
+                sparse_query_tokens,
+                sol_call.attention.key_tokens,
+                sol_call.attention.heads,
+                sol_call.attention.kv_heads,
+                routing_threshold,
+                protected_query_tokens,
+                skipped_residual,
+            )
+            del debug_route_state[aggregate_key]
+            return
+
+        selected_blocks = int(selected_device.item())
+        LOG.warning(
+            "[Turing sparse debug] Q=%d Qsparse=%d K=%d Hq=%d Hkv=%d "
+            "selected=%d/%d density=%.4f threshold=%.2f protected_q=%d "
+            "local=1 residual=%s step=%s/%s layer=%s/%s",
+            sol_call.attention.query_tokens,
+            sparse_query_tokens,
+            sol_call.attention.key_tokens,
+            sol_call.attention.heads,
+            sol_call.attention.kv_heads,
+            selected_blocks,
+            possible_blocks,
+            selected_blocks / possible_blocks if possible_blocks else 0.0,
+            routing_threshold,
+            protected_query_tokens,
+            skipped_residual,
+            context["step"],
+            context["sampling_steps"],
+            context["layer_index"],
+            context["layer_count"],
+        )
+        debug_route_keys.add(kernel_key)
 
     def prepared_executor(request: PreparedAttention) -> AttentionExecutionOutcome:
         reason = sparse_capabilities.unsupported_reason(request)
@@ -496,7 +622,8 @@ def make_sparse_attention_override(
             sol_call.residual_subblocks,
             use_w8a8,
         )
-        collect_stats = debug_route_density and debug_key not in debug_route_keys
+        debug_context = route_debug_context(transformer_options, debug_key)
+        collect_stats = debug_context["collect"]
         result = _profiled(
             "attention.execute",
             turing_sol_attention_from_prequantized,
@@ -506,19 +633,7 @@ def make_sparse_attention_override(
         if not collect_stats:
             return AttentionExecutionOutcome(result)
         output, selected, possible = result
-        selected_blocks = int(selected.item())
-        LOG.warning(
-            "[Turing sparse debug] selected=%d/%d density=%.4f Q=%d K=%d "
-            "threshold=%.2f residual=%s",
-            selected_blocks,
-            possible,
-            selected_blocks / possible if possible else 0.0,
-            sol_call.attention.query_tokens,
-            sol_call.attention.key_tokens,
-            routing_threshold,
-            skipped_residual,
-        )
-        debug_route_keys.add(debug_key)
+        record_route_stats(selected, possible, sol_call, debug_key, debug_context)
         return AttentionExecutionOutcome(output)
 
     prepared_executor.capabilities = sparse_capabilities
@@ -690,25 +805,17 @@ def make_sparse_attention_override(
                 sol_call.residual_subblocks,
                 use_w8a8,
             )
-            collect_stats = debug_route_density and debug_key not in debug_route_keys
+            debug_context = route_debug_context(transformer_options, debug_key)
+            collect_stats = debug_context["collect"]
             result = turing_sol_attention_from_prequantized(
                 quantized,
                 return_stats=collect_stats,
             )
             if collect_stats:
                 output, selected, possible = result
-                selected_blocks = int(selected.item())
-                LOG.warning(
-                    "[Turing sparse debug] selected=%d/%d density=%.4f Q=%d K=%d threshold=%.2f residual=%s",
-                    selected_blocks,
-                    possible,
-                    selected_blocks / possible if possible else 0.0,
-                    sol_call.attention.query_tokens,
-                    sol_call.attention.key_tokens,
-                    routing_threshold,
-                    skipped_residual,
+                record_route_stats(
+                    selected, possible, sol_call, debug_key, debug_context
                 )
-                debug_route_keys.add(debug_key)
                 return output
             return result
 

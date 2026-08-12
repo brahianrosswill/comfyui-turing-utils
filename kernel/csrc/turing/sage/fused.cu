@@ -638,7 +638,8 @@ __global__ void QuantQKInt8Kernel(T *__restrict__ query,
   }
 }
 
-template <uint32_t head_dim, uint32_t TOKEN_BLOCK_SIZE, uint32_t num_pack_per_thread = 1, typename IndexT, typename T>
+template <uint32_t head_dim, uint32_t TOKEN_BLOCK_SIZE,
+          uint32_t num_pack_per_thread, bool Rotate, typename IndexT, typename T>
 __global__ void QuantInt8VarlenKernel(T *__restrict__ input,
                                       const IndexT *__restrict__ cu_seqlens,
                                       int8_t *__restrict__ output,
@@ -694,6 +695,11 @@ __global__ void QuantInt8VarlenKernel(T *__restrict__ input,
       {
         x_val_float[i][j] = 0.0f;
       }
+    }
+    if constexpr (Rotate)
+    {
+      attention_hadamard8<head_dim>(
+          x_val_float[i], thread_id % num_threads_per_token);
     }
   }
 
@@ -1454,7 +1460,8 @@ void quant_per_warp_int8_varlen_cuda(
                 at::Tensor scale,
                 int max_seqlen,
                 int block_size,
-                int warp_block_size)
+                int warp_block_size,
+                bool rotate)
 {
   CHECK_CUDA(input);
   CHECK_CUDA(cu_seqlens);
@@ -1490,6 +1497,17 @@ void quant_per_warp_int8_varlen_cuda(
   auto input_dtype = input.scalar_type();
   auto index_dtype = cu_seqlens.scalar_type();
 
+#define LAUNCH_VARLEN_QUANT(INDEX_TYPE, ROTATE)                              \
+  QuantInt8VarlenKernel<HEAD_DIM, WARP_BLOCK_SIZE,                          \
+      num_pack_per_thread, ROTATE, INDEX_TYPE, c_type><<<                   \
+      grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(                 \
+      reinterpret_cast<c_type *>(input.data_ptr()),                         \
+      reinterpret_cast<INDEX_TYPE *>(cu_seqlens.data_ptr()),                \
+      output.data_ptr<int8_t>(), scale.data_ptr<float>(),                    \
+      stride_seq_input, stride_h_input,                                      \
+      stride_seq_output, stride_h_output,                                    \
+      scale.stride(0), scale.stride(1));
+
   DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(input_dtype, c_type, {
     DISPATCH_BLOCK_SIZE(block_size, BLOCK_SIZE, {
       DISPATCH_WARP_BLOCK_SIZE(warp_block_size, WARP_BLOCK_SIZE, {
@@ -1500,27 +1518,25 @@ void quant_per_warp_int8_varlen_cuda(
 
           if (index_dtype == at::ScalarType::Int)
           {
-            QuantInt8VarlenKernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, int32_t, c_type><<<
-                grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
-                reinterpret_cast<c_type *>(input.data_ptr()),
-                reinterpret_cast<int32_t *>(cu_seqlens.data_ptr()),
-                output.data_ptr<int8_t>(),
-                reinterpret_cast<float *>(scale.data_ptr()),
-                stride_seq_input, stride_h_input,
-                stride_seq_output, stride_h_output,
-                scale.stride(0), scale.stride(1));
+            if (rotate)
+            {
+              LAUNCH_VARLEN_QUANT(int32_t, true)
+            }
+            else
+            {
+              LAUNCH_VARLEN_QUANT(int32_t, false)
+            }
           }
           else if (index_dtype == at::ScalarType::Long)
           {
-            QuantInt8VarlenKernel<HEAD_DIM, WARP_BLOCK_SIZE, num_pack_per_thread, int64_t, c_type><<<
-                grid, block, 0, c10::cuda::getCurrentCUDAStream()>>>(
-                reinterpret_cast<c_type *>(input.data_ptr()),
-                reinterpret_cast<int64_t *>(cu_seqlens.data_ptr()),
-                output.data_ptr<int8_t>(),
-                reinterpret_cast<float *>(scale.data_ptr()),
-                stride_seq_input, stride_h_input,
-                stride_seq_output, stride_h_output,
-                scale.stride(0), scale.stride(1));
+            if (rotate)
+            {
+              LAUNCH_VARLEN_QUANT(int64_t, true)
+            }
+            else
+            {
+              LAUNCH_VARLEN_QUANT(int64_t, false)
+            }
           }
           else
           {
@@ -1530,6 +1546,7 @@ void quant_per_warp_int8_varlen_cuda(
       });
     });
   });
+#undef LAUNCH_VARLEN_QUANT
 
   (void)total_tokens;
 }

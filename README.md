@@ -12,7 +12,7 @@ Wan/Bernini context-window utilities.
 - Python 3.10 or newer
 - PyTorch with CUDA and ComfyUI
 - `comfy-kitchen>=0.2.26` for ConvRot model integration
-- the independently installed `comfyui-turing-utils-kernel>=0.22.0` on exact sm75
+- the independently installed `comfyui-turing-utils-kernel>=0.23.0` on exact sm75
 
 ## Installation
 
@@ -125,13 +125,14 @@ callers use BF16 boundary storage and receive FP32 output. On non-Turing GPUs,
 the plugin prefers an installed SageAttention backend and then follows ComfyUI's
 normal fallback order.
 
-The explicit experimental `w8a8` attention backend is exact-sm75-only and is
+The explicit `w8a8` attention backend is exact-sm75-only and is
 never selected by `auto`. It retains stable Sage's INT8 Q/K score domain,
 quantizes V channel-wise to signed INT8, packs online-softmax probabilities to
-unsigned INT8, and evaluates both QK and PV with Turing Tensor Cores. It is
-currently specialized for unmasked, non-causal heads in the range 1--128 with
-FP16/BF16 storage, GQA, unequal sequence lengths, and HND/NHD layouts. The
-dense/sparse core has native D64 and D128 specializations, pads 1--63 only to
+unsigned INT8, and evaluates both QK and PV with Turing Tensor Cores. It
+supports FP16/BF16 storage, GQA, unequal sequence lengths, head dimensions
+1--128, fixed HND/NHD layouts, upper-left causal masking, and native packed
+varlen `[total_tokens, heads, dim]` inputs. Arbitrary masks remain unsupported.
+The dense/sparse core has native D64 and D128 specializations, pads 1--63 only to
 D64 and 65--127 only to D128, and retains the original softmax scale and output
 width. The dense kernel uses a route-free specialization of the Sol exact-token core;
 unsupported calls fall back through the pre-existing attention override.
@@ -145,17 +146,22 @@ metadata for unequal sequences; ambiguous single-sequence metadata falls back
 instead of applying the wrong ranges.
 
 Online Sol routing, its optional W8A8 mode, and the explicit dense W8A8 backend
-require kernel package 0.20.0. Adapter-protected Query blocks run through the
+require kernel package 0.23.0. Adapter-protected Query blocks run through the
 selected exact dense backend, while every sparse Query
 keeps protected modality blocks as exact K/V sinks. Selected blocks reuse stable Sage's INT8
 Tensor Core QK path. Routing and exact selected-block QK both derive from the
-same prequantized INT8 Q/K tensors and scales. Each Q-to-K-centroid Tensor Core
-score is reused for route selection and skipped-block online-softmax
-correction, while original V means remain in the value approximation.
+same prequantized INT8 Q/K tensors and scales. Exact proxy/correction scores
+remain in the post-Hadamard INT8 score domain, while route centroids are
+inverse-transformed to the pre-Hadamard basis before diagonal threshold
+statistics are formed. The orthogonal transform preserves centroid dot
+products without estimating per-channel variance in the mixed basis. Each
+Q-to-K-centroid Tensor Core score is reused for route selection and
+skipped-block online-softmax correction, while original V means remain in the
+value approximation.
 Official-style `1x64` is the default; optional `2x32` improves bimodal
 skipped-block fidelity without changing routing.
 
-Kernel 0.22.3 retains the current ComfyUI attention tensor-container lifecycle
+Kernel 0.23.0 retains the current ComfyUI attention tensor-container lifecycle
 and adds adapter-owned fused Q/K preprocessing. H3 per-head RMSNorm plus
 split-half RoPE, and Wan/Bernini whole-row RMSNorm plus interleaved RoPE, feed
 the production INT8 Q/K representation without materializing normalized BF16

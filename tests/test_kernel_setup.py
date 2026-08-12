@@ -90,7 +90,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(
             "csrc/turing/sage/qk_preprocess.cu", extensions[2].kwargs["sources"]
         )
-        self.assertEqual(setup.call_args.kwargs["version"], "0.22.3")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.23.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -112,7 +112,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.22.3")
+        self.assertEqual(metadata["project"]["version"], "0.23.0")
 
     def test_sparse_source_does_not_require_optional_cuda_library_headers(self):
         source = (

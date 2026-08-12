@@ -253,6 +253,7 @@ def per_warp_int8_varlen(
     BLKQ: int = 64,
     WARPQ: int = 16,
     BLKK: int = 64,
+    rotate_qk: bool = False,
 ):
     q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
     k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
@@ -268,9 +269,23 @@ def per_warp_int8_varlen(
         dtype=torch.float32,
     )
     _fused.quant_per_warp_int8_varlen_cuda(
-        q, cu_seqlens_q, q_int8, q_scale, max_seqlen_q, BLKQ, WARPQ
+        q,
+        cu_seqlens_q,
+        q_int8,
+        q_scale,
+        max_seqlen_q,
+        BLKQ,
+        WARPQ,
+        bool(rotate_qk),
     )
     _fused.quant_per_warp_int8_varlen_cuda(
-        k, cu_seqlens_k, k_int8, k_scale, max_seqlen_k, BLKK, BLKK
+        k,
+        cu_seqlens_k,
+        k_int8,
+        k_scale,
+        max_seqlen_k,
+        BLKK,
+        BLKK,
+        bool(rotate_qk),
     )
     return q_int8, q_scale, k_int8, k_scale

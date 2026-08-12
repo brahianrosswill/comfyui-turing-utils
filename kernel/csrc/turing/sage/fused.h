@@ -108,7 +108,8 @@ void quant_per_warp_int8_varlen_cuda(
                 at::Tensor scale,
                 int max_seqlen,
                 int block_size,
-                int warp_block_size);
+                int warp_block_size,
+                bool rotate);
 
 
 void transpose_pad_permute_cuda(

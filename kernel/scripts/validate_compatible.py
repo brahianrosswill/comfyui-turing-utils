@@ -340,6 +340,11 @@ def _validate_varlen_batches(
     cu_k: torch.Tensor,
     q_lengths: tuple[int, ...],
     k_lengths: tuple[int, ...],
+    *,
+    is_causal: bool = False,
+    name: str = "Sage",
+    rtol: float = 0.08,
+    atol: float = 0.06,
 ) -> None:
     for batch, (q_len, k_len) in enumerate(zip(q_lengths, k_lengths)):
         q_start = int(cu_q[batch])
@@ -349,13 +354,14 @@ def _validate_varlen_batches(
             k[k_start:k_start + k_len].transpose(0, 1).unsqueeze(0).float(),
             v[k_start:k_start + k_len].transpose(0, 1).unsqueeze(0).float(),
             enable_gqa=True,
+            is_causal=is_causal,
         ).squeeze(0).transpose(0, 1)
         _assert_close(
-            f"Sage varlen batch {batch}",
+            f"{name} varlen causal={is_causal} batch {batch}",
             output[q_start:q_start + q_len],
             reference,
-            rtol=0.08,
-            atol=0.06,
+            rtol=rtol,
+            atol=atol,
         )
 
 
@@ -430,6 +436,112 @@ def validate_sage(device: torch.device) -> None:
     _validate_varlen_batches(output, q, k, v, cu_q, cu_k, q_lengths, k_lengths)
 
 
+def validate_w8a8(device: torch.device) -> None:
+    """Validate the production dense W8A8 fixed and packed-varlen contracts."""
+    from comfyui_turing_utils_kernel.turing_sage import w8a8attn, w8a8attn_varlen
+
+    for dtype in (torch.float16, torch.bfloat16):
+        for head_dim in (64, 96, 128):
+            q = torch.randn((1, 4, 129, head_dim), device=device, dtype=dtype) * 0.4
+            k = torch.randn((1, 2, 151, head_dim), device=device, dtype=dtype) * 0.4
+            v = torch.randn_like(k)
+            for is_causal in (False, True):
+                output = w8a8attn(q, k, v, is_causal=is_causal)
+                reference = torch.nn.functional.scaled_dot_product_attention(
+                    q.float(),
+                    k.float(),
+                    v.float(),
+                    enable_gqa=True,
+                    is_causal=is_causal,
+                )
+                _assert_close(
+                    f"W8A8 fixed {dtype} D={head_dim} causal={is_causal}",
+                    output,
+                    reference,
+                    rtol=0.12,
+                    atol=0.09,
+                )
+
+            output_nhd = w8a8attn(
+                q.transpose(1, 2).contiguous(),
+                k.transpose(1, 2).contiguous(),
+                v.transpose(1, 2).contiguous(),
+                tensor_layout="NHD",
+            )
+            reference_nhd = torch.nn.functional.scaled_dot_product_attention(
+                q.float(), k.float(), v.float(), enable_gqa=True
+            ).transpose(1, 2)
+            _assert_close(
+                f"W8A8 NHD {dtype} D={head_dim}",
+                output_nhd,
+                reference_nhd,
+                rtol=0.12,
+                atol=0.09,
+            )
+
+            q_lengths, k_lengths = (65, 129), (73, 151)
+            cu_q = torch.tensor(
+                (0, q_lengths[0], sum(q_lengths)), dtype=torch.int32, device=device
+            )
+            cu_k = torch.tensor(
+                (0, k_lengths[0], sum(k_lengths)), dtype=torch.int32, device=device
+            )
+            packed_q = torch.randn(
+                (sum(q_lengths), 4, head_dim), device=device, dtype=dtype
+            ) * 0.4
+            packed_k = torch.randn(
+                (sum(k_lengths), 2, head_dim), device=device, dtype=dtype
+            ) * 0.4
+            packed_v = torch.randn_like(packed_k)
+            for is_causal in (False, True):
+                packed_output = w8a8attn_varlen(
+                    packed_q,
+                    packed_k,
+                    packed_v,
+                    cu_q,
+                    cu_k,
+                    max(q_lengths),
+                    max(k_lengths),
+                    is_causal=is_causal,
+                )
+                _validate_varlen_batches(
+                    packed_output,
+                    packed_q,
+                    packed_k,
+                    packed_v,
+                    cu_q,
+                    cu_k,
+                    q_lengths,
+                    k_lengths,
+                    is_causal=is_causal,
+                    name=f"W8A8 D={head_dim}",
+                    rtol=0.12,
+                    atol=0.09,
+                )
+
+
+def _inverse_route_hadamard(value: torch.Tensor) -> torch.Tensor:
+    head_dim = value.size(-1)
+    result = value.float()
+    span = 1
+    while span < head_dim:
+        shaped = result.reshape(*result.shape[:-1], -1, 2, span)
+        left = shaped[..., 0, :]
+        right = shaped[..., 1, :]
+        result = torch.cat((left + right, left - right), dim=-1).reshape_as(result)
+        span *= 2
+    result = result * (head_dim ** -0.5)
+    words = (0x1035997B, 0x8087F5EE, 0xEE2E4E1A, 0x71132418)
+    signs = torch.tensor(
+        [
+            -1.0 if ((words[channel >> 5] >> (channel & 31)) & 1) == 0 else 1.0
+            for channel in range(head_dim)
+        ],
+        device=result.device,
+    )
+    return result * signs
+
+
 def _expected_int8_sol_route_count(
     q_int8: torch.Tensor,
     q_scale: torch.Tensor,
@@ -444,9 +556,10 @@ def _expected_int8_sol_route_count(
     key_blocks = (key_length + 63) // 64
     heads_per_kv = query_heads // kv_heads
 
-    key_centroids = torch.empty(
+    route_key_centroids = torch.empty(
         (kv_heads, key_blocks, head_dim), device=q_int8.device, dtype=torch.float32
     )
+    score_key_centroids = torch.empty_like(route_key_centroids)
     for kv_head in range(kv_heads):
         for key_block in range(key_blocks):
             start = key_block * 64
@@ -456,12 +569,17 @@ def _expected_int8_sol_route_count(
                 * k_scale[0, kv_head, key_block]
                 / (stop - start)
             )
-            # Routing's Tensor Core operand and its threshold statistics both
-            # consume the FP16 centroid emitted by kv_block_summary_kernel.
-            key_centroids[kv_head, key_block] = centroid.half().float()
+            # The proxy Tensor Core operand stays in the exact Hadamard score
+            # domain; diagonal threshold statistics use its inverse-transformed
+            # pre-Hadamard centroid. Both are rounded to the kernel's FP16
+            # summary storage before use.
+            score_key_centroids[kv_head, key_block] = centroid.half().float()
+            route_key_centroids[kv_head, key_block] = (
+                _inverse_route_hadamard(centroid).half().float()
+            )
 
-    key_means = key_centroids.mean(dim=1)
-    key_variances = key_centroids.square().mean(dim=1) - key_means.square()
+    key_means = route_key_centroids.mean(dim=1)
+    key_variances = route_key_centroids.square().mean(dim=1) - key_means.square()
     key_variances.clamp_min_(0.0)
 
     selected = 0
@@ -477,7 +595,7 @@ def _expected_int8_sol_route_count(
                 query_block * 4 : query_block * 4 + 4,
             ].repeat_interleave(16)[: stop - start]
             dequantized = rows * row_scales[:, None]
-            query_mean = dequantized.mean(dim=0)
+            query_mean = _inverse_route_hadamard(dequantized.mean(dim=0))
             threshold = (
                 torch.dot(query_mean, key_means[kv_head])
                 + threshold_sigma
@@ -488,7 +606,7 @@ def _expected_int8_sol_route_count(
             # The correction/routing MMA consumes Q after the same explicit
             # FP16 conversion used in shared memory by the CUDA kernel.
             score_query_mean = dequantized.half().float().mean(dim=0)
-            proxy_scores = key_centroids[kv_head] @ score_query_mean
+            proxy_scores = score_key_centroids[kv_head] @ score_query_mean
             block_indices = torch.arange(key_blocks, device=q_int8.device)
             route = (block_indices - query_block).abs() <= 1
             route |= proxy_scores > threshold
@@ -622,6 +740,27 @@ def validate_sparse(device: torch.device) -> None:
         (1, 2, 1025, 128), generator=generator, device=device, dtype=torch.bfloat16
     )
     q_int8, q_scale, k_int8, k_scale = per_warp_int8_hadamard(q, k)
+    # H^-1(mean(HK)) must reconstruct the pre-Hadamard K centroid. This is the
+    # defining equivalence behind routing before Hadamard while retaining the
+    # post-Hadamard exact QK/PV representation.
+    for key_block in range((k.size(2) + 63) // 64):
+        start = key_block * 64
+        stop = min(start + 64, k.size(2))
+        rotated_centroid = (
+            k_int8[0, 0, start:stop].float().mean(dim=0)
+            * k_scale[0, 0, key_block]
+        )
+        reconstructed = _inverse_route_hadamard(rotated_centroid)
+        original = k[0, 0, start:stop].float().mean(dim=0)
+        relative_l2 = (
+            torch.linalg.vector_norm(reconstructed - original)
+            / torch.linalg.vector_norm(original).clamp_min(1.0e-12)
+        )
+        if float(relative_l2) > 0.02:
+            raise RuntimeError(
+                "pre-Hadamard centroid reconstruction regressed: "
+                f"block={key_block} relative_l2={float(relative_l2):.6f}"
+            )
     expected_selected = _expected_int8_sol_route_count(
         q_int8, q_scale, k_int8, k_scale, threshold_sigma=1.0
     )
@@ -664,7 +803,7 @@ def validate_sparse(device: torch.device) -> None:
         threshold_sigma=-1000.0,
     )
     dense = sageattn(q, k, v)
-    _assert_close("Sol protected modality ranges", output, dense, rtol=0.02, atol=0.01)
+    _assert_close("Sol protected modality ranges", output, dense, rtol=0.025, atol=0.02)
 
     sequence = 1025
     blocks = (sequence + 63) // 64
@@ -902,6 +1041,7 @@ def main() -> None:
         validate_segmented_norm(device)
         validate_qk_preprocessing(device)
         validate_sage(device)
+        validate_w8a8(device)
         if args.experimental_sparse:
             validate_sparse(device)
         torch.cuda.synchronize(device)

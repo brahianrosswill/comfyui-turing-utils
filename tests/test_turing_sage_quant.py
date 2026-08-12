@@ -209,7 +209,10 @@ class TuringSageQuantContractTest(unittest.TestCase):
                 "sparse_available",
                 "w8a8attn",
                 "w8a8attn_compiled",
+                "w8a8attn_varlen",
+                "w8a8attn_varlen_compiled",
                 "w8a8_available",
+                "w8a8_varlen_available",
             ],
         )
         self.assertFalse(hasattr(turing_sage, "sageattn_sage1"))

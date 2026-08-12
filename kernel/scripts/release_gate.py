@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = ROOT / "kernel"
 COMFYUI_ROOT = ROOT.parents[1]
-EXPECTED_VERSION = "0.22.3"
+EXPECTED_VERSION = "0.23.0"
 
 
 def _run(command: list[str], *, cwd: Path = ROOT, env=None) -> None:
@@ -59,6 +59,9 @@ def _static_gate() -> None:
         "AttentionGeometry<128>::kAttentionSharedBytes == 32 * 1024",
         "key_tile_tokens == 64 || key_tile_tokens == 128",
         "key_tile_tokens / kBlockTokens",
+        "quantize_varlen_value_kernel",
+        "build_varlen_value_offsets_kernel",
+        "RouteWords local_route",
     ):
         if marker not in cuda:
             raise RuntimeError(f"missing SM75 attention resource/ABI gate: {marker}")

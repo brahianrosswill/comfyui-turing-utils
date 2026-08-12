@@ -92,7 +92,7 @@ def inspect_turing_attention_call(
         return None, "an attention mask was supplied"
     if not low_precision_attention:
         return None, "low_precision_attention=False"
-    if kernel in {"w8a8", "sol"} and is_causal:
+    if kernel == "sol" and is_causal:
         return None, f"causal attention is not supported by Turing {kernel}"
     if q.dtype != k.dtype or q.dtype != v.dtype:
         return None, "Q/K/V dtypes do not match"
@@ -333,7 +333,7 @@ def bundled_sparse_available() -> bool:
         version_tuple = tuple(int(part) for part in version.split(".")[:3])
     except ValueError:
         return False
-    return version_tuple >= (0, 20, 0) and turing_sage.sparse_available()
+    return version_tuple >= (0, 23, 0) and turing_sage.sparse_available()
 
 
 def bundled_w8a8_available() -> bool:
@@ -345,7 +345,7 @@ def bundled_w8a8_available() -> bool:
         version_tuple = tuple(int(part) for part in kernel_version().split(".")[:3])
     except ValueError:
         return False
-    return version_tuple >= (0, 20, 0) and turing_sage.w8a8_available()
+    return version_tuple >= (0, 23, 0) and turing_sage.w8a8_available()
 
 
 def _sageattn(*args, **kwargs):
@@ -439,6 +439,7 @@ def prequantize_turing_attention_from_qk(
             use_w8a8=True,
             force_dense=True,
             key_tile_tokens=tuning.key_tile_tokens,
+            is_causal=bool(is_causal),
         )
     else:
         raise ValueError(f"unsupported split Turing attention kernel: {kernel}")
@@ -487,6 +488,7 @@ def prequantize_turing_attention(
             key_tile_tokens=tuning.key_tile_tokens,
             rotate_qk=tuning.rotate_qk,
             stabilize_k=tuning.stabilize_k,
+            is_causal=bool(is_causal),
         )
     else:
         raise ValueError(f"unsupported split Turing attention kernel: {kernel}")
@@ -678,6 +680,7 @@ def turing_sage_attention(
                 "key_tile_tokens": tuning.key_tile_tokens,
                 "rotate_qk": tuning.rotate_qk,
                 "stabilize_k": tuning.stabilize_k,
+                "is_causal": bool(kwargs.get("is_causal", False)),
             }
             if turing_kernel == "w8a8"
             else {

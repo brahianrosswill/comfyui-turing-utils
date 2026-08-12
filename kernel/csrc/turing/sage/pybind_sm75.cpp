@@ -26,4 +26,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("sol_w8a8_precompute_summaries", &sol_w8a8_precompute_summaries, "Precompute Sol W8A8 correction summaries before releasing floating-point V");
   m.def("sol_sparse_online_w8a8_prequantized_attn", &sol_sparse_online_w8a8_prequantized_attn, "Sol W8A8 attention from prequantized Q/K/V and correction summaries");
   m.def("quantize_v_int8_sm75", &quantize_v_int8_sm75, "Channel-wise signed INT8 V quantization for sm75 W8A8 attention");
+  m.def("quantize_v_int8_varlen_sm75", &quantize_v_int8_varlen_sm75, "Per-sequence channel-wise INT8 V quantization for packed sm75 W8A8 attention");
+  m.def("qk_int8_sv_int8_varlen_accum_f32_attn", &qk_int8_sv_int8_varlen_accum_f32_attn, "Packed variable-length W8A8 attention for sm75");
 }

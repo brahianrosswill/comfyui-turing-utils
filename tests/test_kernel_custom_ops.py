@@ -90,6 +90,10 @@ class KernelCustomOpContractTest(unittest.TestCase):
             qv, kv, kv, cu, cu, 129, 151
         )
         self.assertEqual(output.shape, qv.shape)
+        w8a8_output = kernel.turing_sage.w8a8attn_varlen_compiled(
+            qv, kv, kv, cu, cu, 129, 151, is_causal=True
+        )
+        self.assertEqual(w8a8_output.shape, qv.shape)
 
 
 if __name__ == "__main__":

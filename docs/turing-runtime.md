@@ -124,9 +124,12 @@ blocks are supported. Other calls use bundled stable Sage without model-family,
 sampling-step checks. A model adapter may publish semantic layer and topology
 metadata; unknown models remain fully generic.
 
-The explicit `w8a8` backend and Sol's `use_w8a8` option require kernel 0.20.0.
-They are specialized for exact sm75, head dimensions 1--128, and unmasked
-non-causal attention. `auto` continues to select stable Sage. The W8A8 path
+The explicit `w8a8` backend and Sol's `use_w8a8` option require kernel 0.23.0.
+They are specialized for exact sm75 and head dimensions 1--128. Dense W8A8
+supports fixed HND/NHD and native packed-varlen inputs, GQA, unequal Q/K
+lengths, and an upper-left causal diagonal; arbitrary masks remain unsupported.
+Sol remains fixed-shape, unmasked, and non-causal. `auto` continues to select
+stable Sage. The W8A8 path
 keeps the same Q64 tile shape as Sol: native D64 uses 16 KiB shared memory and
 native D128 uses 32 KiB. V is quantized once per call into a channel-major,
 16-token-permuted signed-INT8 tensor;
@@ -135,6 +138,15 @@ Core MMA and the output remains FP32 until normalization and dtype writeback.
 The route-free dense specialization omits centroid summaries and route state.
 Short calls can lose to stable Sage because the extra V scan is not amortized,
 which is why W8A8 remains explicit.
+
+For packed varlen, Q/K/output and cumulative sequence metadata remain compact;
+the implementation does not pad every sequence to the batch maximum or launch
+one attention kernel per sequence. Q/K Hadamard rotation is fused into their
+packed quantizers. V uses a per-sequence, per-head, per-channel signed-INT8
+scale and pads each sequence internally by at most 63 tokens, preserving
+aligned 128-bit V tile reads without a `batch * max_length` allocation.
+Adaptive K-anchor subtraction is intentionally unavailable in this contract
+because finding an anchor would add a separate per-sequence scan.
 
 Kernel 0.20.0 provides the split prequantize/execute ABI used by current ComfyUI's
 `AttentionTensorContainer`. Q/K quantization, optional V quantization, and Sol
@@ -170,6 +182,23 @@ BF16 B1/H8/N8192/D128 measured 0.25 ms and about 16 MiB peak allocation for the
 fused path versus 2.44 ms and 112 MiB for an unfused PyTorch reference. This is
 not a comparison against Kitchen's fused model op and does not replace an
 exact-SM75 end-to-end profile.
+
+Kernel 0.23 separates Sol's route-statistics basis from its exact score basis.
+The selected-block QK and skipped-block correction MMA remain post-Hadamard and
+therefore reuse W8A8's exact INT8 representation. Only the Q/K block centroids
+used by the diagonal `mean + tau * std` threshold are inverse-transformed to
+the pre-Hadamard basis. D64 needs one cross-warp butterfly and D128 needs two;
+they reuse the existing route scratch. No complete Q/K tensor is reread, no
+route map is materialized, and dynamic shared memory remains 16/32 KiB. One
+separate FP16 K centroid is retained for `1x64`, because the post-Hadamard copy
+continues to serve skipped-block correction.
+At N=4096, Hq=8/Hkv=4, D128 BF16 on the A40 compute_75 path, five 500-call
+runs measured -0.45% for FP16-PV and +0.19% for W8A8 versus the old rotated
+threshold domain, with identical selected-block counts; both are measurement
+noise rather than observable overhead. Selected-block outputs are unchanged
+when every block is exact. The route words are explicitly scalarized into four
+registers per lane; the resource gate verifies zero local/stack spill after
+enabling the transform.
 
 Optional phase timing is process-local and disabled unless
 `COMFYUI_TURING_UTILS_PROFILE_CALLS` is a positive integer. The disabled path
@@ -227,23 +256,33 @@ correction. One Q-to-K-centroid Tensor Core traversal supplies both the routing
 score and the online-softmax correction, with conflict-free per-warp shared
 partials instead of shared atomics. The compact route is then copied into four
 32-bit registers per lane before the arena is reused for exact K/V tiles. The
-D128 FP16-PV compute_75 cubin reports 214 BF16 / 222 FP16 registers per main
-thread, with a 16-byte stack frame, zero local-memory spill, and 32 KiB dynamic
-shared memory.
+D128 FP16-PV compute_75 cubin reports 218 BF16 / 200 FP16 registers per main
+thread, with zero stack/local-memory spill and 32 KiB dynamic shared memory.
 Register and shared-memory limits permit two 128-thread CTAs per SM75; actual
 occupancy and bank behavior still need Nsight confirmation on Turing. Native
 D64 FP16-PV uses 152 BF16 / 159 FP16 registers, no stack or local spill, and
 16 KiB dynamic shared memory.
 
-The D128 W8A8 sparse specialization uses 252 registers per thread
-with a 16-byte stack frame but reports zero local-memory spill; 128 threads use
-32768 registers per CTA, so the 32 KiB shared-memory and register budgets still
+The D128 W8A8 sparse specialization uses 254 BF16 / 255 FP16 registers per
+thread with zero stack/local-memory spill; 128 threads use at most 32640
+registers per CTA, so the 32 KiB shared-memory and register budgets still
 permit two CTAs on a 64 KiB/65536-register Turing SM. The route-free dense D128
 W8A8 specialization uses 180 registers and no stack/local spill. Native D64
-W8A8 uses 176/183 registers for sparse BF16/FP16 and 134 registers for the
+W8A8 uses 176/175 registers for sparse BF16/FP16 and 134 registers for the
 route-free dense kernel, with no stack/local spill. These resource
 figures are static compute_75 reports; resident-CTA throughput still requires a
 real Turing profile.
+
+With the 0.23 causal/varlen specializations, compute_75 reports zero local and
+stack storage for all dense W8A8 variants. D128 uses 180 registers for fixed
+non-causal, 244 for fixed causal, 245 for packed non-causal, and 246--247 for
+packed causal; D64 stays at or below 175. All retain the existing 32/16 KiB
+dynamic shared-memory budgets. On an A40 executing the compute_75 path, a BF16
+GQA batch with Q lengths 3072/4096, K lengths 3201/4096, Hq=8, Hkv=4, D128
+measured 1.145 ms packed versus 1.253 ms for two fixed calls (non-causal), and
+0.700 versus 0.765 ms (causal). Packed V quantization measured 0.075 ms, down
+from 1.146 ms in the discarded serial prototype. These are direction tests,
+not a substitute for exact-sm75 profiling.
 
 On an A40 JITing compute_75 PTX, four-head FP16 synthetic tests at threshold 1.0
 selected 20.0%, 17.6%, and 16.7% of blocks at 4096, 8192, and 16384 tokens.
@@ -292,7 +331,7 @@ The loader log reports `sage_attn via bundled_turing_sage` when `auto` or
 ranges, three reference switches, threshold, residual profile, and fixed local
 radius. MiniMax additionally emits its fused block/MLP dispatch counters.
 
-`debug_route_density` is disabled by default. With kernel package 0.20.0 or
+`debug_route_density` is disabled by default. With kernel package 0.23.0 or
 newer, the already-running sparse CTA accumulates one selected-block counter;
 there is no route allocation or popcount kernel. Counts remain on-device across
 layers and synchronize once for the end-of-step log. The log reports selected

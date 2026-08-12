@@ -76,15 +76,39 @@ def main() -> None:
             raise RuntimeError(f"SM75 register limit exceeded: {metrics}")
         if metrics.get("LOCAL", 1) != 0:
             raise RuntimeError(f"SM75 attention spilled to local memory: {metrics}")
+        if metrics.get("STACK", 1) != 0:
+            raise RuntimeError(f"SM75 attention spilled to stack memory: {metrics}")
     for metrics in dimensions[64]:
-        if metrics.get("REG", 256) > 192 or metrics.get("STACK", 1) != 0:
+        if metrics.get("REG", 256) > 192:
             raise RuntimeError(f"native D64 resource regression: {metrics}")
+
+    varlen_value_records = []
+    for index, line in enumerate(lines):
+        if "quantize_varlen_value_kernel" not in line or index + 1 >= len(lines):
+            continue
+        metrics = _metrics(lines[index + 1])
+        if metrics:
+            varlen_value_records.append(metrics)
+    if len(varlen_value_records) != 2:
+        raise RuntimeError(
+            "expected FP16/BF16 packed-V quantizers, "
+            f"found {len(varlen_value_records)}"
+        )
+    for metrics in varlen_value_records:
+        if (
+            metrics.get("REG", 256) > 96
+            or metrics.get("STACK", 1) != 0
+            or metrics.get("LOCAL", 1) != 0
+            or metrics.get("SHARED", 1025) > 1024
+        ):
+            raise RuntimeError(f"packed V quantizer resource regression: {metrics}")
     print(
         "attention resource audit passed: "
         f"variants=D64:{len(dimensions[64])}/D128:{len(dimensions[128])} "
         f"registers=D64:{sorted({item['REG'] for item in dimensions[64]})}/"
         f"D128:{sorted({item['REG'] for item in dimensions[128]})} "
-        "local=0 dynamic_shared=D64:16384/D128:32768(source-gated)"
+        f"packed_v_registers:{sorted({item['REG'] for item in varlen_value_records})} "
+        "local=0 stack=0 dynamic_shared=D64:16384/D128:32768(source-gated)"
     )
 
     preprocessing_output = _resource_output(fused)
