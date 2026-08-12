@@ -16,6 +16,10 @@ sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from comfyui_turing_utils.adapters.minimax import acceleration as minimax_adapter  # noqa: E402
+from comfyui_turing_utils.attention.protocol import (  # noqa: E402
+    ATTENTION_EXECUTOR_KEY,
+    AttentionExecutionOutcome,
+)
 
 
 def _convrot_weight(kind: str):
@@ -89,28 +93,26 @@ class MiniMaxAdapterTest(unittest.TestCase):
         attention = FakeAttention()
         seen = {}
 
-        def processor(q, k, v, heads, spec, *, transformer_options):
-            seen["shapes"] = (q.peek().shape, k.peek().shape, v.peek().shape)
-            seen["heads"] = heads
-            seen["spec"] = spec
-            q.take()
-            k.take()
-            v.take()
-            return torch.zeros((1, 64, 128), dtype=torch.bfloat16)
+        def processor(request):
+            seen["shapes"] = tuple(value.shape for value in request.peek_qkv())
+            seen["heads"] = request.heads
+            seen["spec"] = request.qk_transform
+            request.consume_qkv()
+            return AttentionExecutionOutcome(
+                torch.zeros((1, 64, 128), dtype=torch.bfloat16)
+            )
 
         patched = minimax_adapter._make_attention_forward(
             attention, AttentionTensorContainer
         )
         x = torch.randn(64, 128, dtype=torch.bfloat16)
         freqs = torch.randn(1, 64, 1, 32, 2, 2, dtype=torch.bfloat16)
-        with (
-            torch.inference_mode(),
-            mock.patch(
-                "comfyui_turing_utils.adapters.minimax.acceleration.qk_preprocessor",
-                return_value=processor,
-            ),
-        ):
-            output = patched(x, rope_freqs=freqs, transformer_options={})
+        with torch.inference_mode():
+            output = patched(
+                x,
+                rope_freqs=freqs,
+                transformer_options={ATTENTION_EXECUTOR_KEY: processor},
+            )
 
         self.assertEqual(output.shape, (64, 128))
         self.assertEqual(

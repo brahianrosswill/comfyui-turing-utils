@@ -50,15 +50,23 @@ class AttentionBackendsTest(unittest.TestCase):
             comfy_attention.AttentionTensorContainer(tensor) for tensor in tensors
         )
         del tensors
-        call = SimpleNamespace(head_dim=128)
-        spec = attention_backends.QKPreprocessSpec(
-            query_norm=torch.ones(128, dtype=torch.bfloat16),
-            key_norm=torch.ones(128, dtype=torch.bfloat16),
-            freqs=None,
-            epsilon=1e-6,
-            rot_dim=0,
-            norm_scope="head",
-            split_half=True,
+        call = SimpleNamespace(
+            heads=2,
+            kv_heads=2,
+            head_dim=128,
+            query_tokens=64,
+            key_tokens=64,
+            tensor_layout="HND",
+            skip_output_reshape=False,
+        )
+        spec = attention_backends.QKTransformSpec(
+            attention_backends.RMSNormSpec(
+                torch.ones(128, dtype=torch.bfloat16), 1e-6, "head"
+            ),
+            attention_backends.RMSNormSpec(
+                torch.ones(128, dtype=torch.bfloat16), 1e-6, "head"
+            ),
+            attention_backends.RotaryEmbeddingSpec(None, 0, "none"),
         )
 
         qk_calls = []
@@ -96,10 +104,13 @@ class AttentionBackendsTest(unittest.TestCase):
                 new=execute,
             ),
         ):
-            processor = attention_backends._make_dense_qk_preprocessor("sage")
-            output = processor(q, k, v, 2, spec, transformer_options={})
+            processor = attention_backends._make_dense_prepared_executor("sage")
+            request = attention_backends.PreparedAttention.from_hnd(
+                q, k, v, heads=2, qk_transform=spec, transformer_options={}
+            )
+            outcome = processor(request)
 
-        self.assertEqual(output, "output")
+        self.assertEqual(outcome.output, "output")
         self.assertEqual(len(qk_calls), 1)
         self.assertIsNone(q.tensor)
         self.assertIsNone(k.tensor)
@@ -116,10 +127,14 @@ class AttentionBackendsTest(unittest.TestCase):
         )
         del tensors
         attention_call = SimpleNamespace(
+            heads=2,
+            kv_heads=2,
             head_dim=128,
             input_dtype=torch.bfloat16,
             query_tokens=4096,
             key_tokens=4096,
+            tensor_layout="HND",
+            skip_output_reshape=False,
         )
         sol_call = SimpleNamespace(
             attention=attention_call,
@@ -127,14 +142,14 @@ class AttentionBackendsTest(unittest.TestCase):
             exact_kv_ranges=(),
             residual_subblocks=1,
         )
-        spec = attention_backends.QKPreprocessSpec(
-            query_norm=torch.ones(128, dtype=torch.bfloat16),
-            key_norm=torch.ones(128, dtype=torch.bfloat16),
-            freqs=None,
-            epsilon=1e-6,
-            rot_dim=0,
-            norm_scope="head",
-            split_half=True,
+        spec = attention_backends.QKTransformSpec(
+            attention_backends.RMSNormSpec(
+                torch.ones(128, dtype=torch.bfloat16), 1e-6, "head"
+            ),
+            attention_backends.RMSNormSpec(
+                torch.ones(128, dtype=torch.bfloat16), 1e-6, "head"
+            ),
+            attention_backends.RotaryEmbeddingSpec(None, 0, "none"),
         )
 
         def finish(qk, value, inspected, **kwargs):
@@ -173,11 +188,12 @@ class AttentionBackendsTest(unittest.TestCase):
                 torch.device("cuda", 0),
                 dense_prefix_layers=0,
             )
-            output = override.qk_preprocessor(
-                q, k, v, 2, spec, transformer_options={}
+            request = attention_backends.PreparedAttention.from_hnd(
+                q, k, v, heads=2, qk_transform=spec, transformer_options={}
             )
+            outcome = override.prepared_attention_executor(request)
 
-        self.assertEqual(output, "sol-output")
+        self.assertEqual(outcome.output, "sol-output")
         self.assertIsNone(q.tensor)
         self.assertIsNone(k.tensor)
         self.assertIsNone(v.tensor)

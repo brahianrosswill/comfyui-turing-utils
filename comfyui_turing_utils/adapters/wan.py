@@ -10,7 +10,13 @@ from collections import Counter
 
 import torch
 
-from ..attention.preprocessing import QKPreprocessSpec, qk_preprocessor
+from ..attention.integration import AttentionSiteStatus, execute_projected_attention
+from ..attention.protocol import (
+    QKTransformSpec,
+    RMSNormSpec,
+    RotaryEmbeddingSpec,
+    prepared_attention_executor,
+)
 from ..attention.stable import fused_qk_preprocessing_available
 from ..profiling import CUDA_PHASE_PROFILER
 from ..quantization.dispatch import is_supported_turing_device, turing_int8_workspace_bytes
@@ -27,6 +33,7 @@ _SELF_ATTENTION_FORWARD_PARAMETERS = (
     "freqs",
     "transformer_options",
 )
+_PREPARED_ATTENTION_FORWARD_ATTR = "_turing_utils_wan_prepared_attention"
 
 
 def _compatible_self_attention_forward(attention_type) -> bool:
@@ -34,18 +41,18 @@ def _compatible_self_attention_forward(attention_type) -> bool:
     return parameters == ("self", *_SELF_ATTENTION_FORWARD_PARAMETERS)
 
 
-def _make_self_attention_forward(attention, attention_container):
-    original = attention.forward
+def _make_self_attention_forward(attention, attention_container, original=None):
+    original = attention.forward if original is None else original
 
     def forward(self, x, freqs, transformer_options={}):
-        processor = qk_preprocessor(transformer_options)
+        executor = prepared_attention_executor(transformer_options)
         patches = (
             transformer_options.get("patches", {})
             if isinstance(transformer_options, dict)
             else {}
         )
         if (
-            processor is None
+            executor is None
             or "attn1_patch" in patches
             or not self.qk_norm
             or x.ndim != 3
@@ -85,26 +92,24 @@ def _make_self_attention_forward(attention, attention_container):
         key_norm = comfy.model_management.cast_to(
             self.norm_k.weight, device=x.device, dtype=key.dtype
         )
-        spec = QKPreprocessSpec(
-            query_norm=query_norm,
-            key_norm=key_norm,
-            freqs=freqs,
-            epsilon=float(self.eps),
-            rot_dim=self.head_dim,
-            norm_scope="row",
-            split_half=False,
+        transform = QKTransformSpec(
+            query_norm=RMSNormSpec(query_norm, float(self.eps), "row"),
+            key_norm=RMSNormSpec(key_norm, float(self.eps), "row"),
+            rotary=RotaryEmbeddingSpec(freqs, self.head_dim, "interleaved"),
         )
-        query = attention_container(query.transpose(1, 2))
-        key = attention_container(key.transpose(1, 2))
-        value = attention_container(value.transpose(1, 2))
-        output = processor(
-            query,
-            key,
-            value,
-            self.num_heads,
-            spec,
+        outcome = execute_projected_attention(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            value.transpose(1, 2),
+            heads=self.num_heads,
+            qk_transform=transform,
             transformer_options=transformer_options,
+            container_factory=attention_container,
         )
+        if not outcome.supported:
+            del query, key, value
+            return original(x, freqs, transformer_options=transformer_options)
+        output = outcome.output
         if profiling:
             output = CUDA_PHASE_PROFILER.call("wan.out_projection", self.o, output)
             CUDA_PHASE_PROFILER.complete_attention(
@@ -113,7 +118,54 @@ def _make_self_attention_forward(attention, attention_container):
             return output
         return self.o(output)
 
+    setattr(forward, _PREPARED_ATTENTION_FORWARD_ATTR, True)
     return types.MethodType(forward, attention)
+
+
+def _has_prepared_attention_forward(forward) -> bool:
+    function = getattr(forward, "__func__", forward)
+    return bool(getattr(function, _PREPARED_ATTENTION_FORWARD_ATTR, False))
+
+
+def install_wan_attention_sites(model, device: torch.device) -> AttentionSiteStatus:
+    """Install only the Wan/Bernini handoff to generic attention backends."""
+    try:
+        from comfy.ldm.modules.attention import AttentionTensorContainer
+        from comfy.ldm.wan.model import WanModel, WanSelfAttention
+    except ImportError:
+        return AttentionSiteStatus(None, 0, "wan_unavailable")
+    base_model = getattr(model, "model", model)
+    diffusion_model = getattr(base_model, "diffusion_model", None)
+    if not isinstance(diffusion_model, WanModel):
+        return AttentionSiteStatus(None, 0, "not_wan")
+    if not is_supported_turing_device(device):
+        return AttentionSiteStatus("wan", 0, "not_supported_turing")
+    if not callable(getattr(model, "add_object_patch", None)):
+        return AttentionSiteStatus("wan", 0, "model_patcher_api_unavailable")
+    if not fused_qk_preprocessing_available():
+        return AttentionSiteStatus("wan", 0, "fused_qk_unavailable")
+    if not _compatible_self_attention_forward(WanSelfAttention):
+        return AttentionSiteStatus("wan", 0, "attention_contract_changed")
+
+    object_patches = getattr(model, "object_patches", {})
+    installed = 0
+    for name, module in base_model.named_modules():
+        if not name or type(module) is not WanSelfAttention:
+            continue
+        key = f"{name}.forward"
+        current = object_patches.get(key, module.forward)
+        if _has_prepared_attention_forward(current):
+            continue
+        model.add_object_patch(
+            key,
+            _make_self_attention_forward(
+                module,
+                AttentionTensorContainer,
+                current,
+            ),
+        )
+        installed += 1
+    return AttentionSiteStatus("wan", installed, None)
 
 
 def _context_latents_from_kwargs(kwargs):
@@ -333,8 +385,7 @@ def apply_wan_adapter(model, device: torch.device) -> int:
         return 0
 
     try:
-        from comfy.ldm.modules.attention import AttentionTensorContainer
-        from comfy.ldm.wan.model import WanModel, WanSelfAttention
+        from comfy.ldm.wan.model import WanModel
     except ImportError:
         return 0
 
@@ -346,8 +397,6 @@ def apply_wan_adapter(model, device: torch.device) -> int:
         return 0
 
     formats, w8_output_channels = _quantized_wan_summary(diffusion_model)
-    if not formats:
-        return 0
 
     patch_size = tuple(int(value) for value in diffusion_model.patch_size)
     base_model.extra_conds = _make_extra_conds(base_model, patch_size)
@@ -360,19 +409,7 @@ def apply_wan_adapter(model, device: torch.device) -> int:
     )
     base_model._turing_utils_wan_adapter = True
 
-    attention_fusions = 0
-    if (
-        hasattr(model, "add_object_patch")
-        and fused_qk_preprocessing_available()
-        and _compatible_self_attention_forward(WanSelfAttention)
-    ):
-        for name, module in base_model.named_modules():
-            if name and type(module) is WanSelfAttention:
-                model.add_object_patch(
-                    f"{name}.forward",
-                    _make_self_attention_forward(module, AttentionTensorContainer),
-                )
-                attention_fusions += 1
+    attention_fusions = install_wan_attention_sites(model, device).installed
 
     if hasattr(model, "add_wrapper_with_key"):
         import comfy.patcher_extension
@@ -390,4 +427,4 @@ def apply_wan_adapter(model, device: torch.device) -> int:
         ",".join(map(str, w8_output_channels)) or "none",
         attention_fusions,
     )
-    return max(sum(formats.values()), attention_fusions)
+    return max(sum(formats.values()), attention_fusions, 1)

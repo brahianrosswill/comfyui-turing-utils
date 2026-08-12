@@ -24,11 +24,12 @@ not skip attention or quantized-kernel preflight.
 | Module | Scope |
 |---|---|
 | `comfyui_turing_utils/precision.py` | BF16 selection, Kitchen contract, exact-sm75 preflight |
-| `comfyui_turing_utils/attention/` | stable Sage, sparse policies, topology contract, and patch installation |
+| `comfyui_turing_utils/attention/` | prepared-attention protocol, stable Sage, sparse policies, semantic layout, and patches |
 | `comfyui_turing_utils/nodes/attention.py` | model-independent experimental sparse-attention patch UI |
 | `comfyui_turing_utils/quantization/` | exact-sm75 W8/W4 dispatch, ConvRot loading, and generic fusions |
 | `comfyui_turing_utils/adapters/minimax/` | MiniMax layout, packed-sequence planning, fusions, and progressive experiment |
-| `comfyui_turing_utils/adapters/wan.py` | Wan/Bernini context-aware memory planning hooks |
+| `comfyui_turing_utils/adapters/wan.py` | Wan/Bernini context-aware planning and Q/K preprocessing hooks |
+| `comfyui_turing_utils/adapters/wan_layout.py` | Wan/Bernini semantic attention-layout provider |
 | `comfyui_turing_utils/kernel_api.py` | sole lazy boundary to the independently installed kernel package |
 | `kernel/csrc/turing` | separately installed Turing kernels, including bundled Sage |
 
@@ -156,6 +157,11 @@ consumed by dense Sage, dense W8A8, Sol FP16-PV, and Sol W8A8 for supported H3
 and Wan/Bernini self-attention calls. It therefore
 avoids materializing normalized/rotated BF16 Q/K. Protected Sol steps and layers
 use the corresponding dense finalizer without repeating preprocessing.
+The handoff is installed through a model-neutral attention-site registry, so
+an explicit Sol patch on an official ComfyUI-loaded H3 or Bernini model can use
+the same fused path as the ConvRot loader. Capability rejection occurs before
+Q/K/V ownership transfers; a rejecting backend is forbidden from consuming a
+tensor and the model safely retains its original attention path.
 
 The compute_75 cubin reports at most 21,128 bytes static shared memory and 76
 registers/thread for D128 preprocessing, or 10,632 bytes and 59

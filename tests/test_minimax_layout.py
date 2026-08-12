@@ -16,6 +16,10 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 
 import attention  # noqa: E402
 from comfyui_turing_utils.adapters.minimax import layout as minimax_layout  # noqa: E402
+from comfyui_turing_utils.attention.layout import (  # noqa: E402
+    ATTENTION_LAYOUT_REQUIREMENT_KEY,
+    attention_semantic_layout,
+)
 
 
 class FakeBlock(torch.nn.Module):
@@ -151,24 +155,20 @@ class MiniMaxLayoutProviderTest(unittest.TestCase):
         )
 
         self.assertIs(output, x)
+        wire = options[minimax_layout.ATTENTION_LAYOUT_KEY]
+        self.assertEqual(wire["protocol_version"], 1)
+        self.assertEqual(wire["dense_prefix_tokens"], 88)
+        semantic = attention_semantic_layout(options)
+        self.assertEqual(semantic.provider, "minimax_h3")
+        self.assertEqual(semantic.layer_index, 1)
+        self.assertEqual(semantic.layer_count, 2)
         self.assertEqual(
-            options[minimax_layout.ATTENTION_LAYOUT_KEY],
-            {
-                "provider": "minimax_h3",
-                "dense_prefix_tokens": 88,
-                "layer_index": 1,
-                "layer_count": 2,
-                "topology_start_tokens": 88,
-                "topology_tokens": 140,
-                "tokens_per_frame": 20,
-                "spatial_tokens_height": 4,
-                "spatial_tokens_width": 5,
-                "segments": (
-                    (0, 64, "text"),
-                    (64, 88, "target_audio"),
-                    (88, 228, "target_video"),
-                ),
-            },
+            tuple((item.start, item.stop, item.role) for item in semantic.query_segments),
+            (
+                (0, 64, "text"),
+                (64, 88, "target_audio"),
+                (88, 228, "target_video"),
+            ),
         )
         self.assertTrue(
             minimax_layout.has_complete_minimax_attention_layout(options, 228)
@@ -313,7 +313,7 @@ class MiniMaxLayoutProviderTest(unittest.TestCase):
 
         options = patched.model_options["transformer_options"]
         self.assertEqual(
-            options[minimax_layout.ATTENTION_LAYOUT_REQUIREMENT_KEY],
+            options[ATTENTION_LAYOUT_REQUIREMENT_KEY],
             minimax_layout.MINIMAX_H3_LAYOUT_KIND,
         )
         self.assertIs(options["optimized_attention_override"], override)

@@ -2,18 +2,22 @@
 
 from __future__ import annotations
 
-import contextvars
 import inspect
 import logging
 import math
 import types
 from collections import Counter
 from collections.abc import Sequence
-from dataclasses import dataclass
 
 import torch
 
-from ...attention.preprocessing import QKPreprocessSpec, qk_preprocessor
+from ...attention.integration import AttentionSiteStatus, execute_projected_attention
+from ...attention.protocol import (
+    QKTransformSpec,
+    RMSNormSpec,
+    RotaryEmbeddingSpec,
+    prepared_attention_executor,
+)
 from ...attention.stable import fused_qk_preprocessing_available
 from ...kernel_api import load_kernel_package
 from ...profiling import CUDA_PHASE_PROFILER
@@ -50,6 +54,7 @@ _ATTENTION_FORWARD_PARAMETERS = (
     "rope_freqs",
     "transformer_options",
 )
+_PREPARED_ATTENTION_FORWARD_ATTR = "_turing_utils_minimax_prepared_attention"
 _MEMORY_SHAPE_KEY = "turing_utils_minimax_packed_sequence"
 _MEMORY_CONTEXT_ATTR = RUNTIME_CONTEXT_ATTR
 _MEMORY_ADAPTER_ATTR = "_turing_utils_minimax_memory_adapter"
@@ -405,13 +410,13 @@ def _compatible_attention_forward(attention_type: type[torch.nn.Module]) -> bool
     return parameters == ("self", *_ATTENTION_FORWARD_PARAMETERS)
 
 
-def _make_attention_forward(attention, attention_container):
-    original = attention.forward
+def _make_attention_forward(attention, attention_container, original=None):
+    original = attention.forward if original is None else original
 
     def forward(self, x, rope_freqs=None, transformer_options={}):
-        processor = qk_preprocessor(transformer_options)
+        executor = prepared_attention_executor(transformer_options)
         if (
-            processor is None
+            executor is None
             or x.ndim != 2
             or x.shape[0] < 64
             or x.dtype not in (torch.float16, torch.bfloat16)
@@ -452,27 +457,37 @@ def _make_attention_forward(attention, attention_container):
             self.k_norm.weight, device=x.device, dtype=key.dtype
         )
         rot_dim = int(rope_freqs.shape[-3] * 2) if rope_freqs is not None else 0
-        spec = QKPreprocessSpec(
-            query_norm=query_norm,
-            key_norm=key_norm,
-            freqs=rope_freqs,
-            epsilon=float(self.q_norm.eps),
-            rot_dim=rot_dim,
-            norm_scope="head",
-            split_half=True,
+        transform = QKTransformSpec(
+            query_norm=RMSNormSpec(
+                query_norm, float(self.q_norm.eps), "head"
+            ),
+            key_norm=RMSNormSpec(
+                key_norm, float(self.k_norm.eps), "head"
+            ),
+            rotary=RotaryEmbeddingSpec(
+                rope_freqs,
+                rot_dim,
+                "split_half" if rope_freqs is not None else "none",
+            ),
         )
-        query = attention_container(query.transpose(0, 1).unsqueeze(0))
-        key = attention_container(key.transpose(0, 1).unsqueeze(0))
-        value = attention_container(value.transpose(0, 1).unsqueeze(0))
         del qkv
-        output = processor(
-            query,
-            key,
-            value,
-            self.heads,
-            spec,
+        outcome = execute_projected_attention(
+            query.transpose(0, 1).unsqueeze(0),
+            key.transpose(0, 1).unsqueeze(0),
+            value.transpose(0, 1).unsqueeze(0),
+            heads=self.heads,
+            qk_transform=transform,
             transformer_options=transformer_options,
-        ).squeeze(0)
+            container_factory=attention_container,
+        )
+        if not outcome.supported:
+            del query, key, value
+            return original(
+                x,
+                rope_freqs=rope_freqs,
+                transformer_options=transformer_options,
+            )
+        output = outcome.output.squeeze(0)
         if profiling:
             output = CUDA_PHASE_PROFILER.call(
                 "minimax.out_projection", self.out_proj, output
@@ -483,7 +498,60 @@ def _make_attention_forward(attention, attention_container):
             return output
         return self.out_proj(output)
 
+    setattr(forward, _PREPARED_ATTENTION_FORWARD_ATTR, True)
     return types.MethodType(forward, attention)
+
+
+def _has_prepared_attention_forward(forward) -> bool:
+    function = getattr(forward, "__func__", forward)
+    return bool(getattr(function, _PREPARED_ATTENTION_FORWARD_ATTR, False))
+
+
+def install_minimax_attention_sites(model, device: torch.device) -> AttentionSiteStatus:
+    """Install only the model-side H3 handoff to generic attention backends."""
+    try:
+        from comfy.ldm.minimax.model import Attention, DiTBlock
+        from comfy.ldm.modules.attention import AttentionTensorContainer
+    except ImportError:
+        return AttentionSiteStatus(None, 0, "minimax_unavailable")
+    root = getattr(model, "model", model)
+    if not callable(getattr(root, "named_modules", None)):
+        return AttentionSiteStatus(None, 0, "not_minimax_h3")
+    candidates = [
+        (name, block)
+        for name, block in root.named_modules()
+        if name and isinstance(block, DiTBlock)
+    ]
+    if not candidates:
+        return AttentionSiteStatus(None, 0, "not_minimax_h3")
+    if not is_supported_turing_device(device):
+        return AttentionSiteStatus("minimax_h3", 0, "not_supported_turing")
+    if not callable(getattr(model, "add_object_patch", None)):
+        return AttentionSiteStatus("minimax_h3", 0, "model_patcher_api_unavailable")
+    if not fused_qk_preprocessing_available():
+        return AttentionSiteStatus("minimax_h3", 0, "fused_qk_unavailable")
+    if not _compatible_attention_forward(Attention):
+        return AttentionSiteStatus("minimax_h3", 0, "attention_contract_changed")
+
+    object_patches = getattr(model, "object_patches", {})
+    installed = 0
+    for name, block in candidates:
+        if type(block.attn) is not Attention:
+            continue
+        key = f"{name}.attn.forward"
+        current = object_patches.get(key, block.attn.forward)
+        if _has_prepared_attention_forward(current):
+            continue
+        model.add_object_patch(
+            key,
+            _make_attention_forward(
+                block.attn,
+                AttentionTensorContainer,
+                current,
+            ),
+        )
+        installed += 1
+    return AttentionSiteStatus("minimax_h3", installed, None)
 
 
 def _block_fusion_blocker(
@@ -581,8 +649,7 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
         raise RuntimeError("MiniMax Turing integration requires a ComfyUI ModelPatcher")
 
     try:
-        from comfy.ldm.minimax.model import Attention, DiTBlock, _mod_gate
-        from comfy.ldm.modules.attention import AttentionTensorContainer
+        from comfy.ldm.minimax.model import DiTBlock, _mod_gate
     except ImportError:
         return 0
     if not _compatible_block_forward(DiTBlock):
@@ -613,11 +680,7 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
     index = device.index if device.index is not None else torch.cuda.current_device()
     block_fusions = 0
     mlp_fusions = 0
-    attention_fusions = 0
-    fuse_attention = (
-        fused_qk_preprocessing_available()
-        and _compatible_attention_forward(Attention)
-    )
+    attention_fusions = install_minimax_attention_sites(model, device).installed
     try:
         turing_segmented_rms_adaln = getattr(
             load_kernel_package(), "turing_segmented_rms_adaln"
@@ -629,12 +692,6 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
     audit = _RuntimeDispatchAudit(expected_blocks, eligible_fc2)
 
     for layer_index, (name, block) in enumerate(candidates):
-        if fuse_attention and type(block.attn) is Attention:
-            model.add_object_patch(
-                f"{name}.attn.forward",
-                _make_attention_forward(block.attn, AttentionTensorContainer),
-            )
-            attention_fusions += 1
         if hasattr(block.mlp, "fc2") and is_turing_convrot_linear(block.mlp.fc2):
             model.add_object_patch(
                 f"{name}.mlp.forward",

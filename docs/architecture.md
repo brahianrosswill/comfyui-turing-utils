@@ -61,8 +61,9 @@ built-in adapters without importing ComfyUI node definitions.
 |---|---|
 | `attention/stable.py` | backend registry, stable bundled Sage/W8A8, dtype/layout facade |
 | `attention/sparse.py` | explicit experimental Sol policy, including optional W8A8 PV dispatch |
-| `attention/layout.py` | model-independent packed-video topology contract and provider registry |
-| `attention/preprocessing.py` | adapter-owned Q/K normalization and RoPE semantic contract |
+| `attention/protocol.py` | versioned tensor ownership, transform, capability, and execution contract |
+| `attention/integration.py` | model-neutral projected-QKV handoff and attention-site registry |
+| `attention/layout.py` | versioned Query/KV modality topology contract and provider registry |
 | `attention/patches.py` | attention overrides and loader-independent ModelPatcher installation |
 | `attention/tuning.py` | explicit experimental SM75 launch/quantization policy metadata |
 | `quantization/convrot.py` | ConvRot metadata parsing and model/CLIP loading services |
@@ -70,6 +71,7 @@ built-in adapters without importing ComfyUI node definitions.
 | `quantization/fusions.py` | model-independent fused activation and normalization operations |
 | `adapters/minimax/` | H3 layout publication, VRAM planning, block fusions, and explicit progressive experiment |
 | `adapters/wan.py` | Wan/Bernini packed-context planning and supported self-attention preprocessing |
+| `adapters/wan_layout.py` | loader-independent Wan/Bernini self-attention sequence semantics |
 | `adapters/bernini.py` | Bernini context-window and absolute-RoPE integration |
 | `media/` | reference sets, resizing transforms, and shared video padding |
 | `nodes/` | thin ComfyUI schemas and calls into the implementation packages |
@@ -90,3 +92,6 @@ to `comfyui_turing_utils.attention`.
 Sparse attention remains explicit and is never selected by loader `auto`.
 Model-specific topology is installed through the attention-layout provider
 registry, so the official ComfyUI loader and ConvRot loader follow the same path.
+Model-side fused Q/K handoff is installed through a separate attention-site
+registry. This lets dense and Sol backends request the same H3 or Wan/Bernini
+integration without importing either model family into generic attention code.

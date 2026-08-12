@@ -16,9 +16,74 @@ sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from comfyui_turing_utils.adapters import wan as wan_adapter  # noqa: E402
+from comfyui_turing_utils.attention.protocol import (  # noqa: E402
+    ATTENTION_EXECUTOR_KEY,
+    AttentionExecutionOutcome,
+)
 
 
 class WanMemoryPlanningTest(unittest.TestCase):
+    def test_prepared_attention_sites_install_without_quantized_weights(self):
+        import comfy.ldm.wan.model as wan_model
+
+        class FakeSelfAttention(torch.nn.Module):
+            def forward(self, x, freqs, transformer_options={}):
+                return x
+
+        class FakeWanModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.first = FakeSelfAttention()
+                self.second = FakeSelfAttention()
+
+        class Base(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.diffusion_model = FakeWanModel()
+
+        class Patcher:
+            def __init__(self):
+                self.model = Base()
+                self.object_patches = {}
+
+            def add_object_patch(self, key, value):
+                self.object_patches[key] = value
+
+        patcher = Patcher()
+        with (
+            mock.patch.object(wan_model, "WanModel", FakeWanModel),
+            mock.patch.object(wan_model, "WanSelfAttention", FakeSelfAttention),
+            mock.patch.object(
+                wan_adapter,
+                "is_supported_turing_device",
+                return_value=True,
+            ),
+            mock.patch.object(
+                wan_adapter,
+                "fused_qk_preprocessing_available",
+                return_value=True,
+            ),
+        ):
+            first = wan_adapter.install_wan_attention_sites(
+                patcher,
+                torch.device("cuda", 0),
+            )
+            second = wan_adapter.install_wan_attention_sites(
+                patcher,
+                torch.device("cuda", 0),
+            )
+
+        self.assertEqual(first.model_kind, "wan")
+        self.assertEqual(first.installed, 2)
+        self.assertEqual(second.installed, 0)
+        self.assertEqual(
+            set(patcher.object_patches),
+            {
+                "diffusion_model.first.forward",
+                "diffusion_model.second.forward",
+            },
+        )
+
     def test_self_attention_forward_uses_row_norm_fused_preprocessor(self):
         from comfy.ldm.modules.attention import AttentionTensorContainer
 
@@ -43,28 +108,26 @@ class WanMemoryPlanningTest(unittest.TestCase):
         attention = FakeAttention()
         seen = {}
 
-        def processor(q, k, v, heads, spec, *, transformer_options):
-            seen["shapes"] = (q.peek().shape, k.peek().shape, v.peek().shape)
-            seen["heads"] = heads
-            seen["spec"] = spec
-            q.take()
-            k.take()
-            v.take()
-            return torch.zeros((1, 64, 128), dtype=torch.bfloat16)
+        def processor(request):
+            seen["shapes"] = tuple(value.shape for value in request.peek_qkv())
+            seen["heads"] = request.heads
+            seen["spec"] = request.qk_transform
+            request.consume_qkv()
+            return AttentionExecutionOutcome(
+                torch.zeros((1, 64, 128), dtype=torch.bfloat16)
+            )
 
         patched = wan_adapter._make_self_attention_forward(
             attention, AttentionTensorContainer
         )
         x = torch.randn(1, 64, 128, dtype=torch.bfloat16)
         freqs = torch.randn(1, 64, 1, 32, 2, 2, dtype=torch.bfloat16)
-        with (
-            torch.inference_mode(),
-            mock.patch(
-                "comfyui_turing_utils.adapters.wan.qk_preprocessor",
-                return_value=processor,
-            ),
-        ):
-            output = patched(x, freqs, transformer_options={})
+        with torch.inference_mode():
+            output = patched(
+                x,
+                freqs,
+                transformer_options={ATTENTION_EXECUTOR_KEY: processor},
+            )
 
         self.assertEqual(output.shape, (1, 64, 128))
         self.assertEqual(

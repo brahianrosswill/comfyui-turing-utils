@@ -7,8 +7,18 @@ from collections.abc import Callable
 
 import torch
 
-from .layout import ATTENTION_LAYOUT_REQUIREMENT_KEY, ensure_attention_layout_provider
-from .preprocessing import QK_PREPROCESSOR_KEY, QKPreprocessSpec
+from .layout import (
+    ATTENTION_LAYOUT_REQUIREMENT_KEY,
+    attention_semantic_layout,
+    ensure_attention_layout_provider,
+)
+from .integration import ensure_prepared_attention_sites
+from .protocol import (
+    ATTENTION_EXECUTOR_KEY,
+    AttentionBackendCapabilities,
+    AttentionExecutionOutcome,
+    PreparedAttention,
+)
 from .sparse import (
     _sparse_dense_layer,
     _sparse_dense_schedule,
@@ -24,7 +34,6 @@ from .stable import (
     SPARSE_DENSE_PREFIX_STEPS,
     SPARSE_DENSE_SUFFIX_LAYERS,
     SPARSE_DENSE_SUFFIX_STEPS,
-    SPARSE_LAYOUT_KEY,
     SPARSE_PREFIX_POLICY,
     SPARSE_REFERENCE_AUDIO,
     SPARSE_REFERENCE_IMAGE,
@@ -62,50 +71,86 @@ def _profiled(phase: str, function: Callable, /, *args, **kwargs):
     return function(*args, **kwargs)
 
 
-def _consume_qkv(q, k, v):
-    query = q.take()
-    key = k.take()
-    value = v.take()
-    return query, key, value
+def _attention_layer_metadata(transformer_options) -> tuple[int | None, int | None]:
+    layout = attention_semantic_layout(transformer_options)
+    if layout is not None:
+        return layout.layer_index, layout.layer_count
+    raw = (
+        transformer_options.get("turing_utils_attention_layout")
+        if isinstance(transformer_options, dict)
+        else None
+    )
+    if not isinstance(raw, dict):
+        return None, None
+    layer_index = raw.get("layer_index")
+    layer_count = raw.get("layer_count")
+    return (
+        layer_index if isinstance(layer_index, int) and not isinstance(layer_index, bool) else None,
+        layer_count if isinstance(layer_count, int) and not isinstance(layer_count, bool) else None,
+    )
 
 
-def _make_dense_qk_preprocessor(kernel: str) -> Callable:
-    def processor(
-        q,
-        k,
-        v,
-        heads: int,
-        spec: QKPreprocessSpec,
-        *,
-        transformer_options=None,
-    ):
+def _prepared_call_mismatch(request: PreparedAttention, call) -> str | None:
+    expected = (
+        request.heads,
+        request.kv_heads,
+        request.head_dim,
+        request.query_tokens,
+        request.key_tokens,
+        request.tensor_layout,
+        request.skip_output_reshape,
+    )
+    actual = (
+        call.heads,
+        call.kv_heads,
+        call.head_dim,
+        call.query_tokens,
+        call.key_tokens,
+        call.tensor_layout,
+        call.skip_output_reshape,
+    )
+    return None if expected == actual else "prepared-attention metadata does not match Q/K/V"
+
+
+def _make_dense_prepared_executor(kernel: str) -> Callable:
+    capabilities = AttentionBackendCapabilities(
+        supports_causal=kernel == "sage",
+    )
+
+    def executor(request: PreparedAttention) -> AttentionExecutionOutcome:
+        reason = capabilities.unsupported_reason(request)
+        if reason is not None:
+            return AttentionExecutionOutcome.unsupported(reason)
+        query_view, key_view, value_view = request.peek_qkv()
         call, reason = inspect_turing_attention_call(
-            q.peek(),
-            k.peek(),
-            v.peek(),
-            heads,
-            mask=None,
+            query_view,
+            key_view,
+            value_view,
+            request.heads,
+            mask=request.mask,
             skip_reshape=True,
-            skip_output_reshape=False,
-            low_precision_attention=True,
-            is_causal=False,
+            skip_output_reshape=request.skip_output_reshape,
+            enable_gqa=request.heads != request.kv_heads,
+            low_precision_attention=request.low_precision_attention,
+            is_causal=request.is_causal,
             kernel=kernel,
             require_long_sequence=True,
         )
-        if reason is not None or call.head_dim not in (64, 128):
-            raise RuntimeError(
-                "adapter selected unsupported fused Q/K attention input: "
-                f"{reason or f'head_dim={call.head_dim}'}"
-            )
-        query, key, value = _consume_qkv(q, k, v)
+        if reason is not None:
+            return AttentionExecutionOutcome.unsupported(reason)
+        reason = _prepared_call_mismatch(request, call)
+        if reason is not None:
+            return AttentionExecutionOutcome.unsupported(reason)
+        del query_view, key_view, value_view
+        query, key, value = request.consume_qkv()
         qk = _profiled(
             "attention.qk_norm_rope_quant",
             prequantize_turing_qk,
             query,
             key,
-            spec,
+            request.qk_transform,
             kernel=kernel,
-            transformer_options=transformer_options,
+            transformer_options=request.transformer_options,
         )
         del query, key
         quantized = _profiled(
@@ -115,18 +160,22 @@ def _make_dense_qk_preprocessor(kernel: str) -> Callable:
             value,
             call,
             kernel=kernel,
-            scale=None,
-            transformer_options=transformer_options,
+            scale=request.scale,
+            is_causal=request.is_causal,
+            transformer_options=request.transformer_options,
         )
         del qk, value
-        return _profiled(
-            "attention.execute",
-            turing_attention_from_prequantized,
-            quantized,
-            kernel=kernel,
+        return AttentionExecutionOutcome(
+            _profiled(
+                "attention.execute",
+                turing_attention_from_prequantized,
+                quantized,
+                kernel=kernel,
+            )
         )
 
-    return processor
+    executor.capabilities = capabilities
+    return executor
 
 
 def _default_attention_fallback() -> Callable:
@@ -286,7 +335,7 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
             "w8a8" if option == "w8a8" else "sage"
         )
     if bundled_turing and fused_qk_preprocessing_available():
-        attention_override.qk_preprocessor = _make_dense_qk_preprocessor(
+        attention_override.prepared_attention_executor = _make_dense_prepared_executor(
             "w8a8" if option == "w8a8" else "sage"
         )
     return attention_override
@@ -360,19 +409,18 @@ def make_sparse_attention_override(
     debug_route_keys: set[tuple] = set()
     debug_route_state: dict[tuple, list[tuple[torch.Tensor, int, int]]] = {}
     debug_dense_reasons: set[str] = set()
-    dense_qk_preprocessor = _make_dense_qk_preprocessor(
+    dense_prepared_executor = _make_dense_prepared_executor(
         "w8a8" if use_w8a8 else "sage"
     )
+    sparse_capabilities = AttentionBackendCapabilities(
+        supports_semantic_sparse=True,
+    )
 
-    def qk_preprocessor(
-        q,
-        k,
-        v,
-        heads: int,
-        spec: QKPreprocessSpec,
-        *,
-        transformer_options=None,
-    ):
+    def prepared_executor(request: PreparedAttention) -> AttentionExecutionOutcome:
+        reason = sparse_capabilities.unsupported_reason(request)
+        if reason is not None:
+            return AttentionExecutionOutcome.unsupported(reason)
+        transformer_options = request.transformer_options
         if _sparse_dense_schedule(
             transformer_options,
             dense_prefix_steps,
@@ -383,23 +431,17 @@ def make_sparse_attention_override(
             dense_prefix_layers,
             dense_suffix_layers,
         ):
-            return dense_qk_preprocessor(
-                q,
-                k,
-                v,
-                heads,
-                spec,
-                transformer_options=transformer_options,
-            )
+            return dense_prepared_executor(request)
 
+        query_view, key_view, value_view = request.peek_qkv()
         sol_call, reason = inspect_sol_attention_call(
-            q.peek(),
-            k.peek(),
-            v.peek(),
-            heads,
-            mask=None,
+            query_view,
+            key_view,
+            value_view,
+            request.heads,
+            mask=request.mask,
             skip_reshape=True,
-            skip_output_reshape=False,
+            skip_output_reshape=request.skip_output_reshape,
             min_sequence_tokens=min_sequence_tokens,
             prefix_policy=prefix_policy,
             manual_prefix_tokens=manual_prefix_tokens,
@@ -408,29 +450,26 @@ def make_sparse_attention_override(
             sparse_reference_video=sparse_reference_video,
             sparse_reference_audio=sparse_reference_audio,
             transformer_options=transformer_options,
-            kwargs={},
+            kwargs={
+                "enable_gqa": request.heads != request.kv_heads,
+                "low_precision_attention": request.low_precision_attention,
+                "is_causal": request.is_causal,
+            },
         )
         if reason is not None:
-            return dense_qk_preprocessor(
-                q,
-                k,
-                v,
-                heads,
-                spec,
-                transformer_options=transformer_options,
-            )
-        if sol_call.attention.head_dim not in (64, 128):
-            raise RuntimeError(
-                "fused Sol Q/K preprocessing requires head_dim 64 or 128"
-            )
+            return dense_prepared_executor(request)
+        reason = _prepared_call_mismatch(request, sol_call.attention)
+        if reason is not None:
+            return AttentionExecutionOutcome.unsupported(reason)
 
-        query, key, value = _consume_qkv(q, k, v)
+        del query_view, key_view, value_view
+        query, key, value = request.consume_qkv()
         qk = _profiled(
             "attention.qk_norm_rope_quant",
             prequantize_turing_qk,
             query,
             key,
-            spec,
+            request.qk_transform,
             kernel="sol",
             transformer_options=transformer_options,
         )
@@ -442,7 +481,7 @@ def make_sparse_attention_override(
             value,
             sol_call,
             routing_threshold=routing_threshold,
-            scale=None,
+            scale=request.scale,
             use_w8a8=use_w8a8,
             transformer_options=transformer_options,
         )
@@ -465,7 +504,7 @@ def make_sparse_attention_override(
             return_stats=collect_stats,
         )
         if not collect_stats:
-            return result
+            return AttentionExecutionOutcome(result)
         output, selected, possible = result
         selected_blocks = int(selected.item())
         LOG.warning(
@@ -480,7 +519,9 @@ def make_sparse_attention_override(
             skipped_residual,
         )
         debug_route_keys.add(debug_key)
-        return output
+        return AttentionExecutionOutcome(output)
+
+    prepared_executor.capabilities = sparse_capabilities
 
     def attention_override(original: Callable, *args, **kwargs):
         fallback = lambda *fallback_args, **fallback_kwargs: _dtype_compatible_fallback(
@@ -511,13 +552,13 @@ def make_sparse_attention_override(
                 )
                 debug_dense_reasons.add(debug_key)
         if debug_route_density and dense_layer:
-            layout = transformer_options.get(SPARSE_LAYOUT_KEY, {})
-            debug_key = f"layer:{layout.get('layer_index')}"
+            layer_index, layer_count = _attention_layer_metadata(transformer_options)
+            debug_key = f"layer:{layer_index}"
             if debug_key not in debug_dense_reasons:
                 LOG.warning(
                     "[Turing sparse debug] stable Sage selected for protected layer %s/%s",
-                    layout.get("layer_index"),
-                    layout.get("layer_count"),
+                    layer_index,
+                    layer_count,
                 )
                 debug_dense_reasons.add(debug_key)
         if dense_schedule or dense_layer:
@@ -525,20 +566,16 @@ def make_sparse_attention_override(
             return dense_attention(fallback, *args, **kwargs)
         debug_context = None
         if debug_route_density:
-            layout = (
-                transformer_options.get(SPARSE_LAYOUT_KEY, {})
-                if isinstance(transformer_options, dict)
-                else {}
-            )
+            layer_index, layer_count = _attention_layer_metadata(transformer_options)
             debug_context = {
                 "step": schedule_state.get("step"),
                 "sampling_steps": schedule_state.get("sampling_steps"),
-                "layer_index": layout.get("layer_index"),
-                "layer_count": layout.get("layer_count"),
+                "layer_index": layer_index,
+                "layer_count": layer_count,
                 "last_sparse_layer": (
-                    layout.get("layer_count") - dense_suffix_layers - 1
-                    if isinstance(layout.get("layer_count"), int)
-                    and not isinstance(layout.get("layer_count"), bool)
+                    layer_count - dense_suffix_layers - 1
+                    if isinstance(layer_count, int)
+                    and not isinstance(layer_count, bool)
                     else None
                 ),
             }
@@ -680,7 +717,7 @@ def make_sparse_attention_override(
     attention_override.turing_utils_attention_backend = "sol_sparse_attn"
     attention_override.turing_utils_attention_implementation = "bundled_turing_sol_sparse_experimental"
     if fused_qk_preprocessing_available():
-        attention_override.qk_preprocessor = qk_preprocessor
+        attention_override.prepared_attention_executor = prepared_executor
     return attention_override
 
 
@@ -731,11 +768,18 @@ def apply_sparse_attention_patch(
                 layout_status.reason,
             )
     transformer_options["optimized_attention_override"] = override
-    qk_processor = getattr(override, "qk_preprocessor", None)
-    if callable(qk_processor):
-        transformer_options[QK_PREPROCESSOR_KEY] = qk_processor
+    prepared_executor = getattr(override, "prepared_attention_executor", None)
+    if callable(prepared_executor):
+        transformer_options[ATTENTION_EXECUTOR_KEY] = prepared_executor
+        site_status = ensure_prepared_attention_sites(patched, patched.load_device)
+        if site_status.matched and site_status.reason is not None:
+            LOG.info(
+                "%s prepared-attention fusion was not installed: %s",
+                site_status.model_kind,
+                site_status.reason,
+            )
     else:
-        transformer_options.pop(QK_PREPROCESSOR_KEY, None)
+        transformer_options.pop(ATTENTION_EXECUTOR_KEY, None)
     transformer_options["turing_utils_attention_backend"] = "sol_sparse_attn"
     transformer_options["turing_utils_attention_implementation"] = (
         "bundled_turing_sol_sparse_experimental"
@@ -772,11 +816,20 @@ def apply_attention_backend(model, option: str, device: torch.device | None = No
     selected = override.turing_utils_attention_backend
     implementation = override.turing_utils_attention_implementation
     transformer_options["optimized_attention_override"] = override
-    qk_processor = getattr(override, "qk_preprocessor", None)
-    if callable(qk_processor):
-        transformer_options[QK_PREPROCESSOR_KEY] = qk_processor
+    prepared_executor = getattr(override, "prepared_attention_executor", None)
+    if callable(prepared_executor):
+        transformer_options[ATTENTION_EXECUTOR_KEY] = prepared_executor
+        target_device = device if device is not None else getattr(model, "load_device", None)
+        if isinstance(target_device, torch.device):
+            site_status = ensure_prepared_attention_sites(model, target_device)
+            if site_status.matched and site_status.reason is not None:
+                LOG.info(
+                    "%s prepared-attention fusion was not installed: %s",
+                    site_status.model_kind,
+                    site_status.reason,
+                )
     else:
-        transformer_options.pop(QK_PREPROCESSOR_KEY, None)
+        transformer_options.pop(ATTENTION_EXECUTOR_KEY, None)
     transformer_options["turing_utils_attention_backend"] = selected
     transformer_options["turing_utils_attention_implementation"] = implementation
     LOG.info(

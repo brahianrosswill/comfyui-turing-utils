@@ -15,7 +15,9 @@ import types
 
 from ...attention.layout import (
     ATTENTION_LAYOUT_KEY,
-    ATTENTION_LAYOUT_REQUIREMENT_KEY,
+    AttentionSegment,
+    AttentionSemanticLayout,
+    AttentionTopology,
     LayoutProviderStatus,
     has_complete_attention_layout,
 )
@@ -37,7 +39,11 @@ _BLOCK_FORWARD_PARAMETERS = (
     "transformer_options",
 )
 _LAYOUT_FIELDS = {
+    "protocol_version",
     "provider",
+    "query_segments",
+    "key_segments",
+    "topologies",
     "dense_prefix_tokens",
     "topology_start_tokens",
     "topology_tokens",
@@ -275,17 +281,46 @@ def publish_minimax_attention_layout(
     """Publish exact H3 packed-sequence semantics for one transformer block."""
     if not isinstance(transformer_options, dict) or not mod_segments:
         return False
-    expected_layout = {
-        "provider": MINIMAX_H3_LAYOUT_KIND,
-        # H3's current PackedLayout ends in target audio then target video.
-        "dense_prefix_tokens": int(mod_segments[-1][0]),
-        "layer_index": int(layer_index),
-        "layer_count": int(layer_count),
-        **minimax_temporal_topology(base_model, diffusion_model, mod_segments),
-    }
-    segments = minimax_attention_segments(base_model)
-    if segments:
-        expected_layout["segments"] = segments
+    topology = minimax_temporal_topology(base_model, diffusion_model, mod_segments)
+    raw_segments = minimax_attention_segments(base_model)
+    if not topology or not raw_segments:
+        expected_layout = {
+            "provider": MINIMAX_H3_LAYOUT_KIND,
+            "dense_prefix_tokens": int(mod_segments[-1][0]),
+            "layer_index": int(layer_index),
+            "layer_count": int(layer_count),
+        }
+    else:
+        topology_id = "target_video"
+        segments = tuple(
+            AttentionSegment.for_role(
+                start,
+                stop,
+                role,
+                topology_id=topology_id if role == "target_video" else None,
+            )
+            for start, stop, role in raw_segments
+        )
+        semantic = AttentionSemanticLayout(
+            provider=MINIMAX_H3_LAYOUT_KIND,
+            query_segments=segments,
+            key_segments=segments,
+            topologies=(
+                AttentionTopology(
+                    topology_id,
+                    "video_grid",
+                    int(topology["topology_start_tokens"]),
+                    int(topology["topology_start_tokens"])
+                    + int(topology["topology_tokens"]),
+                    int(topology["tokens_per_frame"]),
+                    int(topology["spatial_tokens_height"]),
+                    int(topology["spatial_tokens_width"]),
+                ),
+            ),
+            layer_index=int(layer_index),
+            layer_count=int(layer_count),
+        )
+        expected_layout = semantic.to_wire()
     layout = transformer_options.get(ATTENTION_LAYOUT_KEY)
     # Never retain topology from an earlier prompt/window when current shapes
     # cannot be validated. Unknown extension fields may compose, but every
@@ -298,7 +333,7 @@ def publish_minimax_attention_layout(
     updated = {**preserved, **expected_layout}
     if layout != updated:
         transformer_options[ATTENTION_LAYOUT_KEY] = updated
-    return "topology_tokens" in expected_layout
+    return "topologies" in expected_layout
 
 
 def has_complete_minimax_attention_layout(

@@ -4,21 +4,14 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import math
 from collections.abc import Callable
 
 import torch
 
-from .layout import (
-    ATTENTION_LAYOUT_KEY,
-    ATTENTION_LAYOUT_REQUIREMENT_KEY,
-    ensure_attention_layout_provider,
-    has_complete_attention_layout,
-)
 from ..kernel_api import kernel_version, load_turing_sage
 from ..quantization.dispatch import is_supported_turing_device
 from .tuning import attention_kernel_tuning
-from .preprocessing import QKPreprocessSpec
+from .protocol import QKTransformSpec
 
 
 LOG = logging.getLogger("comfyui-turing-utils")
@@ -36,7 +29,6 @@ SPARSE_DENSE_PREFIX_STEPS = 0
 SPARSE_DENSE_SUFFIX_STEPS = 0
 SPARSE_DENSE_PREFIX_LAYERS = 2
 SPARSE_DENSE_SUFFIX_LAYERS = 0
-SPARSE_LAYOUT_KEY = ATTENTION_LAYOUT_KEY
 _PREFLIGHTED_DEVICES: set[int] = set()
 _PREFLIGHTED_SPARSE_DEVICES: set[int] = set()
 _PREFLIGHTED_W8A8_DEVICES: set[int] = set()
@@ -392,7 +384,7 @@ def fused_qk_preprocessing_available() -> bool:
 def prequantize_turing_qk(
     q: torch.Tensor,
     k: torch.Tensor,
-    spec: QKPreprocessSpec,
+    spec: QKTransformSpec,
     *,
     kernel: str,
     transformer_options=None,
@@ -405,8 +397,8 @@ def prequantize_turing_qk(
     return load_turing_sage().prequantize_rms_rope_qk(
         q,
         k,
-        spec.query_norm,
-        spec.key_norm,
+        spec.query_norm_weight,
+        spec.key_norm_weight,
         spec.freqs,
         epsilon=spec.epsilon,
         rot_dim=spec.rot_dim,
@@ -629,7 +621,6 @@ def turing_sage_attention(
             fallback_kwargs,
         )
     input_dtype = call.input_dtype
-    batch = call.batch
     head_dim = call.head_dim
     tensor_layout = call.tensor_layout
     q, k, v = normalize_turing_attention_tensors(q, k, v, call)

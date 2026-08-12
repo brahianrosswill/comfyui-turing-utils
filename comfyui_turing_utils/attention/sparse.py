@@ -3,19 +3,19 @@
 from __future__ import annotations
 
 import dataclasses
-import math
 from collections.abc import Callable
 
 import torch
 
 from .layout import (
+    ATTENTION_LAYOUT_KEY,
     ATTENTION_LAYOUT_REQUIREMENT_KEY,
+    attention_semantic_layout,
     has_complete_attention_layout,
 )
 from .stable import (
     LOG,
     SPARSE_AUTO_MIN_SEQUENCE,
-    SPARSE_LAYOUT_KEY,
     SPARSE_PREFIX_POLICY,
     SPARSE_REFERENCE_AUDIO,
     SPARSE_REFERENCE_IMAGE,
@@ -29,7 +29,6 @@ from .stable import (
     _sol_sparse_sageattn,
     finish_turing_attention_output,
     inspect_turing_attention_call,
-    is_supported_turing_device,
     normalize_turing_attention_tensors,
     turing_sage_attention,
 )
@@ -71,17 +70,28 @@ def _sparse_prefix_tokens(
         return 0
     if policy == "manual":
         return min(manual_tokens, sequence_limit)
-    layout = (
-        transformer_options.get(SPARSE_LAYOUT_KEY)
-        if isinstance(transformer_options, dict)
-        else None
+    layout = attention_semantic_layout(transformer_options)
+    if layout is None:
+        raw = (
+            transformer_options.get(ATTENTION_LAYOUT_KEY)
+            if isinstance(transformer_options, dict)
+            else None
+        )
+        prefix = raw.get("dense_prefix_tokens", 0) if isinstance(raw, dict) else 0
+        return (
+            min(max(prefix, 0), sequence_limit)
+            if isinstance(prefix, int) and not isinstance(prefix, bool)
+            else 0
+        )
+    first_sparse = next(
+        (
+            segment.start
+            for segment in layout.query_segments
+            if segment.sparse_query_allowed
+        ),
+        sequence_limit,
     )
-    if not isinstance(layout, dict):
-        return 0
-    prefix_tokens = layout.get("dense_prefix_tokens", 0)
-    if not isinstance(prefix_tokens, int) or isinstance(prefix_tokens, bool):
-        return 0
-    return min(max(prefix_tokens, 0), sequence_limit)
+    return min(max(first_sparse, 0), sequence_limit)
 
 
 def _coalesce_token_ranges(ranges, sequence_limit: int) -> tuple[tuple[int, int], ...]:
@@ -108,6 +118,7 @@ def _sparse_protected_ranges(
     sparse_reference_image: bool,
     sparse_reference_video: bool,
     sparse_reference_audio: bool,
+    axis: str = "query",
 ) -> tuple[tuple[int, int], ...]:
     """Return token spans whose Query stays dense and whose KV stays exact."""
     if policy == "none":
@@ -115,36 +126,55 @@ def _sparse_protected_ranges(
     if policy == "manual":
         stop = min(max(int(manual_tokens), 0), sequence_limit)
         return ((0, stop),) if stop else ()
-    layout = (
-        transformer_options.get(SPARSE_LAYOUT_KEY)
-        if isinstance(transformer_options, dict)
-        else None
-    )
-    segments = layout.get("segments") if isinstance(layout, dict) else None
-    if not isinstance(segments, tuple):
+    layout = attention_semantic_layout(transformer_options)
+    if layout is None:
         prefix = _sparse_prefix_tokens(
             policy, manual_tokens, transformer_options, sequence_limit
         )
         return ((0, prefix),) if prefix else ()
-    sparse_roles = {"target_video"}
-    if sparse_reference_image:
-        sparse_roles.add("reference_image")
-        sparse_roles.add("reference_video_anchor")
-    if sparse_reference_video:
-        sparse_roles.add("reference_video")
-    if sparse_reference_audio:
-        sparse_roles.add("reference_audio")
+    if axis not in {"query", "key"}:
+        raise ValueError("sparse protected-range axis must be query or key")
+    segments = layout.query_segments if axis == "query" else layout.key_segments
+
+    def is_protected(segment) -> bool:
+        reference_override = None
+        if segment.role in {"reference_image", "reference_video_anchor"}:
+            reference_override = sparse_reference_image
+        elif segment.role in {"reference_video", "context_video"}:
+            reference_override = sparse_reference_video
+        elif segment.role == "reference_audio":
+            reference_override = sparse_reference_audio
+        allowed = (
+            bool(reference_override)
+            if reference_override is not None
+            else (
+                segment.sparse_query_allowed
+                if axis == "query"
+                else segment.sparse_key_allowed
+            )
+        )
+        exact_kv = (
+            not bool(reference_override)
+            if reference_override is not None
+            else segment.exact_kv
+        )
+        return not allowed if axis == "query" else exact_kv or not allowed
+
     return _coalesce_token_ranges(
         (
-            (start, stop)
-            for start, stop, role in segments
-            if role not in sparse_roles
+            (segment.start, segment.stop)
+            for segment in segments
+            if is_protected(segment)
         ),
         sequence_limit,
     )
 
 
-def _required_sparse_layout_missing(transformer_options, sequence_length: int) -> bool:
+def _required_sparse_layout_missing(
+    transformer_options,
+    query_length: int,
+    key_length: int,
+) -> bool:
     if not isinstance(transformer_options, dict):
         return False
     requirement = transformer_options.get(ATTENTION_LAYOUT_REQUIREMENT_KEY)
@@ -152,7 +182,8 @@ def _required_sparse_layout_missing(transformer_options, sequence_length: int) -
         return False
     return not has_complete_attention_layout(
         transformer_options,
-        sequence_length,
+        query_length,
+        key_sequence_length=key_length,
         provider=requirement,
     )
 
@@ -227,13 +258,20 @@ def _sparse_dense_layer(
         transformer_options, dict
     ):
         return False
-    layout = transformer_options.get(SPARSE_LAYOUT_KEY)
-    if not isinstance(layout, dict):
-        return False
-    layer_index = layout.get("layer_index")
-    layer_count = layout.get("layer_count")
-    if not isinstance(layer_index, int) or isinstance(layer_index, bool):
-        return False
+    layout = attention_semantic_layout(transformer_options)
+    if layout is None:
+        raw = (
+            transformer_options.get(ATTENTION_LAYOUT_KEY)
+            if isinstance(transformer_options, dict)
+            else None
+        )
+        if not isinstance(raw, dict):
+            return False
+        layer_index = raw.get("layer_index", -1)
+        layer_count = raw.get("layer_count", 0)
+    else:
+        layer_index = layout.layer_index
+        layer_count = layout.layer_count
     if 0 <= layer_index < dense_prefix_layers:
         return True
     return (
@@ -286,26 +324,15 @@ def inspect_sol_attention_call(
         return None, f"sequences shorter than {effective_min_sequence} tokens"
     if _required_sparse_layout_missing(
         transformer_options,
-        min(call.query_tokens, call.key_tokens),
+        call.query_tokens,
+        call.key_tokens,
     ):
-        return None, "required MiniMax H3 attention layout metadata is unavailable"
+        return None, "required semantic attention layout metadata is unavailable"
     residual_subblocks = {"1x64": 1, "2x32": 2}.get(
         str(skipped_residual).strip().lower()
     )
     if residual_subblocks is None:
         raise ValueError("skipped_residual must be 1x64 or 2x32")
-    layout = (
-        transformer_options.get(SPARSE_LAYOUT_KEY)
-        if isinstance(transformer_options, dict)
-        else None
-    )
-    if (
-        call.query_tokens != call.key_tokens
-        and prefix_policy == "auto"
-        and isinstance(layout, dict)
-        and isinstance(layout.get("segments"), tuple)
-    ):
-        return None, "asymmetric Q/K requires separate semantic layout metadata"
     dense_query_ranges = _sparse_protected_ranges(
         prefix_policy,
         manual_prefix_tokens,
@@ -314,6 +341,7 @@ def inspect_sol_attention_call(
         sparse_reference_image=bool(sparse_reference_image),
         sparse_reference_video=bool(sparse_reference_video),
         sparse_reference_audio=bool(sparse_reference_audio),
+        axis="query",
     )
     exact_kv_ranges = _sparse_protected_ranges(
         prefix_policy,
@@ -323,6 +351,7 @@ def inspect_sol_attention_call(
         sparse_reference_image=bool(sparse_reference_image),
         sparse_reference_video=bool(sparse_reference_video),
         sparse_reference_audio=bool(sparse_reference_audio),
+        axis="key",
     )
     return SolAttentionCall(
         attention=call,
