@@ -15,6 +15,13 @@ route map is materialized. The local neighborhood is fixed to the official
 +/- one block. Original V means remain dedicated to value approximation.
 It contains no model-weight format or model loader.
 
+Every stable public tensor operator is registered through
+`torch.library.custom_op` with a fake/meta implementation: W4A8 GEMM, BF16
+epilogue, ConvRot activation fusions, normalization fusions, fixed and varlen
+Sage, dense W8A8, and Sol. Prequantized Python state objects deliberately stay
+outside this boundary because they are ComfyUI tensor-lifetime coordination,
+not graph-level tensor operators.
+
 ## Install
 
 ```bash

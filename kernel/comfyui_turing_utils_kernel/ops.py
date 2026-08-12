@@ -5,6 +5,7 @@ import torch
 from . import _C
 
 
+@torch.library.custom_op("turing_utils::w4a8_linear", mutates_args=())
 def turing_w4a8_linear(
     activation: torch.Tensor,
     weight: torch.Tensor,
@@ -25,6 +26,16 @@ def turing_w4a8_linear(
     )
 
 
+@turing_w4a8_linear.register_fake
+def _turing_w4a8_linear_fake(activation, weight, activation_scale, weight_scale, bias=None):
+    return torch.empty(
+        (activation.size(0), weight.size(0)),
+        dtype=torch.bfloat16,
+        device=activation.device,
+    )
+
+
+@torch.library.custom_op("turing_utils::dequantize_int8_bf16", mutates_args=())
 def turing_dequantize_int8_bf16(
     accumulator: torch.Tensor,
     activation_scale: torch.Tensor,
@@ -46,6 +57,19 @@ def turing_dequantize_int8_bf16(
     )
 
 
+@turing_dequantize_int8_bf16.register_fake
+def _turing_dequantize_int8_bf16_fake(
+    accumulator, activation_scale, weight_scale, output_columns=-1
+):
+    columns = accumulator.size(1) if output_columns < 0 else output_columns
+    return torch.empty(
+        (accumulator.size(0), columns),
+        dtype=torch.bfloat16,
+        device=accumulator.device,
+    )
+
+
+@torch.library.custom_op("turing_utils::swiglu_int8_convrot_quantize", mutates_args=())
 def turing_swiglu_int8_convrot_quantize(
     x: torch.Tensor,
     group_size: int = 256,
@@ -62,6 +86,16 @@ def turing_swiglu_int8_convrot_quantize(
     return _C.turing_swiglu_int8_convrot_quantize(x.contiguous(), group_size)
 
 
+@turing_swiglu_int8_convrot_quantize.register_fake
+def _turing_swiglu_int8_convrot_quantize_fake(x, group_size=256):
+    hidden = x.size(1) // 2
+    return (
+        torch.empty((x.size(0), hidden), dtype=torch.int8, device=x.device),
+        torch.empty((x.size(0), 1), dtype=torch.float32, device=x.device),
+    )
+
+
+@torch.library.custom_op("turing_utils::swiglu_int4_convrot_quantize", mutates_args=())
 def turing_swiglu_int4_convrot_quantize(
     x: torch.Tensor,
     group_size: int = 256,
@@ -78,6 +112,16 @@ def turing_swiglu_int4_convrot_quantize(
     return _C.turing_swiglu_int4_convrot_quantize(x.contiguous(), group_size)
 
 
+@turing_swiglu_int4_convrot_quantize.register_fake
+def _turing_swiglu_int4_convrot_quantize_fake(x, group_size=256):
+    hidden = x.size(1) // 2
+    return (
+        torch.empty((x.size(0), hidden // 2), dtype=torch.int8, device=x.device),
+        torch.empty((x.size(0), 1), dtype=torch.float32, device=x.device),
+    )
+
+
+@torch.library.custom_op("turing_utils::gelu_int8_convrot_quantize", mutates_args=())
 def turing_gelu_int8_convrot_quantize(
     x: torch.Tensor,
     group_size: int = 256,
@@ -90,6 +134,15 @@ def turing_gelu_int8_convrot_quantize(
     return _C.turing_gelu_int8_convrot_quantize(x.contiguous(), group_size)
 
 
+@turing_gelu_int8_convrot_quantize.register_fake
+def _turing_gelu_int8_convrot_quantize_fake(x, group_size=256):
+    return (
+        torch.empty(x.shape, dtype=torch.int8, device=x.device),
+        torch.empty((x.size(0), 1), dtype=torch.float32, device=x.device),
+    )
+
+
+@torch.library.custom_op("turing_utils::gelu_int4_convrot_quantize", mutates_args=())
 def turing_gelu_int4_convrot_quantize(
     x: torch.Tensor,
     group_size: int = 256,
@@ -102,6 +155,15 @@ def turing_gelu_int4_convrot_quantize(
     return _C.turing_gelu_int4_convrot_quantize(x.contiguous(), group_size)
 
 
+@turing_gelu_int4_convrot_quantize.register_fake
+def _turing_gelu_int4_convrot_quantize_fake(x, group_size=256):
+    return (
+        torch.empty((x.size(0), x.size(1) // 2), dtype=torch.int8, device=x.device),
+        torch.empty((x.size(0), 1), dtype=torch.float32, device=x.device),
+    )
+
+
+@torch.library.custom_op("turing_utils::bf16_int8_convrot_quantize", mutates_args=())
 def turing_bf16_int8_convrot_quantize(
     x: torch.Tensor,
     group_size: int = 256,
@@ -120,6 +182,16 @@ def turing_bf16_int8_convrot_quantize(
     return _C.turing_bf16_int8_convrot_quantize(x.contiguous(), group_size, swiglu)
 
 
+@turing_bf16_int8_convrot_quantize.register_fake
+def _turing_bf16_int8_convrot_quantize_fake(x, group_size=256, *, swiglu=False):
+    hidden = x.size(1) // 2 if swiglu else x.size(1)
+    return (
+        torch.empty((x.size(0), hidden), dtype=torch.int8, device=x.device),
+        torch.empty((x.size(0), 1), dtype=torch.float32, device=x.device),
+    )
+
+
+@torch.library.custom_op("turing_utils::bf16_int4_convrot_quantize", mutates_args=())
 def turing_bf16_int4_convrot_quantize(
     x: torch.Tensor,
     group_size: int = 256,
@@ -138,6 +210,16 @@ def turing_bf16_int4_convrot_quantize(
     return _C.turing_bf16_int4_convrot_quantize(x.contiguous(), group_size, swiglu)
 
 
+@turing_bf16_int4_convrot_quantize.register_fake
+def _turing_bf16_int4_convrot_quantize_fake(x, group_size=256, *, swiglu=False):
+    hidden = x.size(1) // 2 if swiglu else x.size(1)
+    return (
+        torch.empty((x.size(0), hidden // 2), dtype=torch.int8, device=x.device),
+        torch.empty((x.size(0), 1), dtype=torch.float32, device=x.device),
+    )
+
+
+@torch.library.custom_op("turing_utils::bf16_gelu_int8_convrot_quantize", mutates_args=())
 def turing_bf16_gelu_int8_convrot_quantize(
     x: torch.Tensor,
     group_size: int = 256,
@@ -150,6 +232,15 @@ def turing_bf16_gelu_int8_convrot_quantize(
     return _C.turing_bf16_gelu_int8_convrot_quantize(x.contiguous(), group_size)
 
 
+@turing_bf16_gelu_int8_convrot_quantize.register_fake
+def _turing_bf16_gelu_int8_convrot_quantize_fake(x, group_size=256):
+    return (
+        torch.empty(x.shape, dtype=torch.int8, device=x.device),
+        torch.empty((x.size(0), 1), dtype=torch.float32, device=x.device),
+    )
+
+
+@torch.library.custom_op("turing_utils::bf16_gelu_int4_convrot_quantize", mutates_args=())
 def turing_bf16_gelu_int4_convrot_quantize(
     x: torch.Tensor,
     group_size: int = 256,
@@ -162,6 +253,15 @@ def turing_bf16_gelu_int4_convrot_quantize(
     return _C.turing_bf16_gelu_int4_convrot_quantize(x.contiguous(), group_size)
 
 
+@turing_bf16_gelu_int4_convrot_quantize.register_fake
+def _turing_bf16_gelu_int4_convrot_quantize_fake(x, group_size=256):
+    return (
+        torch.empty((x.size(0), x.size(1) // 2), dtype=torch.int8, device=x.device),
+        torch.empty((x.size(0), 1), dtype=torch.float32, device=x.device),
+    )
+
+
+@torch.library.custom_op("turing_utils::segmented_rms_adaln", mutates_args=())
 def turing_segmented_rms_adaln(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -200,6 +300,12 @@ def turing_segmented_rms_adaln(
     )
 
 
+@turing_segmented_rms_adaln.register_fake
+def _turing_segmented_rms_adaln_fake(x, weight, scale, shift, segments, epsilon=1.0e-5):
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op("turing_utils::layer_norm_adaln", mutates_args=())
 def turing_layer_norm_adaln(
     x: torch.Tensor,
     scale: torch.Tensor,
@@ -214,3 +320,8 @@ def turing_layer_norm_adaln(
     scale = scale.to(device=x.device, dtype=x.dtype).contiguous()
     shift = shift.to(device=x.device, dtype=x.dtype).contiguous()
     return _C.turing_layer_norm_adaln(x.contiguous(), scale, shift, epsilon)
+
+
+@turing_layer_norm_adaln.register_fake
+def _turing_layer_norm_adaln_fake(x, scale, shift, epsilon=1.0e-5):
+    return torch.empty_like(x)

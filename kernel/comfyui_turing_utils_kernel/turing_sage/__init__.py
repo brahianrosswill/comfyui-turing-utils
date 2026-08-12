@@ -84,10 +84,68 @@ def sageattn_varlen(*args, **kwargs):
     return implementation(*args, **kwargs)
 
 
+def sageattn_varlen_compiled(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    *,
+    is_causal: bool = False,
+    sm_scale: float | None = None,
+):
+    from .custom_ops import sage_attention_varlen
+
+    return sage_attention_varlen(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        int(max_seqlen_q),
+        int(max_seqlen_k),
+        bool(is_causal),
+        float(sm_scale) if sm_scale is not None else -1.0,
+    )
+
+
 def sol_sparse_sageattn(*args, **kwargs):
     from .core import sol_sparse_sageattn as implementation
 
     return implementation(*args, **kwargs)
+
+
+def sol_sparse_sageattn_compiled(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    dense_query_ranges=(),
+    exact_kv_ranges=(),
+    threshold_sigma: float = 1.0,
+    residual_subblocks: int = 1,
+    use_w8a8: bool = False,
+    sm_scale: float | None = None,
+):
+    from .custom_ops import sol_attention
+
+    dense_query_ranges = tuple(dense_query_ranges)
+    exact_kv_ranges = tuple(exact_kv_ranges)
+    return sol_attention(
+        q,
+        k,
+        v,
+        [int(item[0]) for item in dense_query_ranges],
+        [int(item[1]) for item in dense_query_ranges],
+        [int(item[0]) for item in exact_kv_ranges],
+        [int(item[1]) for item in exact_kv_ranges],
+        float(threshold_sigma),
+        int(residual_subblocks),
+        bool(use_w8a8),
+        float(sm_scale) if sm_scale is not None else -1.0,
+    )
 
 
 def w8a8attn(*args, **kwargs):
@@ -268,7 +326,9 @@ __all__ = [
     "sageattn_compiled",
     "sageattn_from_prequantized",
     "sageattn_varlen",
+    "sageattn_varlen_compiled",
     "sol_sparse_sageattn",
+    "sol_sparse_sageattn_compiled",
     "sol_sparse_sageattn_from_prequantized",
     "split_prequantization_available",
     "sparse_available",
