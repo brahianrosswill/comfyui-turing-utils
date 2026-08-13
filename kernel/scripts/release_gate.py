@@ -61,6 +61,9 @@ def _static_gate() -> None:
         "quantize_varlen_value_kernel",
         "build_varlen_value_offsets_kernel",
         "RouteWords local_route",
+        "ResidualSubblocks == 1 || ResidualSubblocks == 2",
+        "KeyStages == 1 || KeyStages == 2",
+        "key_tile_tokens / kBlockTokens == KeyStages",
     ):
         if marker not in cuda:
             raise RuntimeError(f"missing SM75 attention resource/ABI gate: {marker}")
@@ -74,12 +77,23 @@ def _static_gate() -> None:
     setup_source = (KERNEL / "setup.py").read_text(encoding="utf-8")
     for marker in (
         "CUDA_TOOLKIT_VERSION = _cuda_toolkit_version()",
+        "def _normalize_cxx_standard(",
         'return "c++20" if cuda_version is None or cuda_version >= (12, 0) else "c++17"',
         '"COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD", DEFAULT_CXX_STANDARD',
     ):
         if marker not in setup_source:
             raise RuntimeError(
                 "CUDA-aware CUTLASS C++ language selection is incomplete"
+            )
+    wheel_builder = (KERNEL / "scripts/build_wheel.py").read_text(encoding="utf-8")
+    for marker in (
+        "def configure_cuda_home(",
+        'prefix / "Library" if platform.system() == "Windows" else prefix',
+        'env.setdefault("CUDA_HOME", str(root.resolve()))',
+    ):
+        if marker not in wheel_builder:
+            raise RuntimeError(
+                "the standalone wheel builder cannot discover Conda NVCC"
             )
     fused_header = (KERNEL / "csrc/turing/sage/fused.h").read_text(encoding="utf-8")
     fused_binding = (KERNEL / "csrc/turing/sage/pybind_fused.cpp").read_text(
