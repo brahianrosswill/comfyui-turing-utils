@@ -46,7 +46,7 @@ class MiniMaxH3VideoVAEDecode:
                     DECODER_TILING_MODES,
                     {
                         "default": "official",
-                        "tooltip": "official matches ComfyUI. official_multiband keeps independent windows but replaces final linear seams with normalized low/high-frequency stitching. shared_core computes each image-token Q/output/MLP once while reading a full 256px K/V halo. shared_overlap is the older per-layer averaging experiment and may blur detail.",
+                        "tooltip": "official matches ComfyUI. official_multiband keeps independent windows but replaces final linear seams with normalized low/high-frequency stitching. shared_core computes each image-token Q/output/MLP once with a full 256px K/V halo. shared_core_multiband adds a one-token dual-context feather, restores independent windows for the last two blocks, then uses multiband stitching. shared_overlap is the older per-layer averaging experiment and may blur detail.",
                     },
                 ),
             }

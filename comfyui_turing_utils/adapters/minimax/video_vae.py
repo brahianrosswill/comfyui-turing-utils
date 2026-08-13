@@ -39,6 +39,7 @@ DECODER_TILING_MODES = (
     "official",
     "official_multiband",
     "shared_core",
+    "shared_core_multiband",
     "shared_overlap",
 )
 _AUTO_DECODE_TILE_BATCH_LIMIT = 4
@@ -50,6 +51,8 @@ _DECODE_SAFETY_FACTOR = 1.08
 _ENCODE_SAFETY_FACTOR = 1.05
 _MULTIBAND_DOWNSAMPLE = 8
 _MULTIBAND_HIGH_WEIGHT_POWER = 4
+_SHARED_CORE_FEATHER_TOKENS = 1
+_SHARED_CORE_INDEPENDENT_TAIL_BLOCKS = 2
 
 
 def require_h3_video_vae(vae):
@@ -95,6 +98,7 @@ def _decode_memory_requirement(
     dtype,
     shared_tokens=False,
     multiband=False,
+    shared_tail=False,
 ):
     model = vae.first_stage_model
     height = latent_shape[-2] * model.vae_ratio
@@ -145,6 +149,13 @@ def _decode_memory_requirement(
             unique_tokens * decoder_dim * comfy.model_management.dtype_size(dtype) * 7
         )
         transformer_workspace += unique_workspace
+    if shared_tail:
+        window_count = _spatial_tile_count(height, width, tile_size)
+        decoder_dim = model.decoder.transformer_blocks[0].scale1.numel()
+        window_state_tokens = latent_shape[0] * window_count * (sequence)
+        transformer_workspace += (
+            window_state_tokens * decoder_dim * comfy.model_management.dtype_size(dtype)
+        )
     pixel_elements = (
         latent_shape[0] * model.decoder.out_channels * resident_frames * height * width
     )
@@ -738,6 +749,135 @@ class _SharedWindowLayout:
             self.core_group_local_indices[core_tokens] = torch.stack(
                 [self.core_local_indices[index] for index in windows]
             )
+        self._query_group_cache = {}
+
+    @staticmethod
+    def _axis_feather_weights(length, starts, lengths, feather_tokens, device):
+        centers = torch.tensor(
+            [start + extent / 2 for start, extent in zip(starts, lengths)],
+            dtype=torch.float32,
+            device=device,
+        )
+        positions = torch.arange(length, dtype=torch.float32, device=device).add_(0.5)
+        owners = (positions[:, None] - centers[None, :]).abs().argmin(dim=1)
+        weights = torch.zeros(len(starts), length, dtype=torch.float32, device=device)
+        weights[owners, torch.arange(length, device=device)] = 1.0
+        if feather_tokens <= 0:
+            return weights
+
+        for index in range(len(starts) - 1):
+            boundary = (centers[index] + centers[index + 1]) / 2
+            phase = (
+                (positions - (boundary - feather_tokens)) / (2 * feather_tokens)
+            ).clamp(0.0, 1.0)
+            transition = (phase > 0.0) & (phase < 1.0)
+            if not bool(transition.any()):
+                continue
+            left = torch.cos(phase[transition] * (math.pi / 2)).square()
+            right = 1.0 - left
+            weights[:, transition] = 0.0
+            weights[index, transition] = left
+            weights[index + 1, transition] = right
+
+        coordinates = torch.arange(length, device=device)
+        for index, (start, extent) in enumerate(zip(starts, lengths)):
+            covered = (coordinates >= start) & (coordinates < start + extent)
+            weights[index].mul_(covered)
+        return weights / weights.sum(dim=0, keepdim=True).clamp_min_(1e-12)
+
+    def query_groups(self, feather_tokens=0):
+        feather_tokens = int(feather_tokens)
+        cached = self._query_group_cache.get(feather_tokens)
+        if cached is not None:
+            return cached
+
+        if feather_tokens <= 0:
+            grouped = {}
+            for query_tokens in self.core_groups:
+                global_indices = self.core_group_global_indices[query_tokens]
+                grouped[query_tokens] = (
+                    self.core_group_windows[query_tokens],
+                    global_indices,
+                    self.core_group_local_indices[query_tokens],
+                    torch.ones(
+                        global_indices.shape,
+                        dtype=torch.float32,
+                        device=global_indices.device,
+                    ),
+                )
+            self._query_group_cache[feather_tokens] = grouped
+            return grouped
+
+        device = self.token_indices.device
+        y_weights = self._axis_feather_weights(
+            self.latent_h,
+            self.y_idx,
+            self.y_len,
+            feather_tokens,
+            device,
+        )
+        x_weights = self._axis_feather_weights(
+            self.latent_w,
+            self.x_idx,
+            self.x_len,
+            feather_tokens,
+            device,
+        )
+        global_indices_by_window = []
+        local_indices_by_window = []
+        weights_by_window = []
+        spatial_weight_sum = torch.zeros(
+            self.latent_h,
+            self.latent_w,
+            dtype=torch.float32,
+            device=device,
+        )
+        for i, j, yi, _yl, xi, _xl in self.descriptors:
+            spatial_weights = y_weights[i, :, None] * x_weights[j, None, :]
+            coordinates = torch.nonzero(spatial_weights > 0.0, as_tuple=False)
+            rows, columns = coordinates[:, 0], coordinates[:, 1]
+            token_weights = spatial_weights[rows, columns]
+            spatial_weight_sum.index_put_(
+                (rows, columns), token_weights, accumulate=True
+            )
+            temporal = torch.arange(self.latent_t, device=device)[:, None]
+            spatial_global = rows * self.latent_w + columns
+            spatial_local = (rows - yi) * self.window_w + (columns - xi)
+            global_indices_by_window.append(
+                (
+                    temporal * self.latent_h * self.latent_w + spatial_global[None, :]
+                ).reshape(-1)
+            )
+            local_indices_by_window.append(
+                (
+                    temporal * self.window_h * self.window_w + spatial_local[None, :]
+                ).reshape(-1)
+            )
+            weights_by_window.append(token_weights.repeat(self.latent_t))
+
+        if not torch.allclose(
+            spatial_weight_sum,
+            torch.ones_like(spatial_weight_sum),
+            rtol=1e-5,
+            atol=1e-6,
+        ):
+            raise RuntimeError("shared-core feather weights do not sum to one")
+
+        windows_by_count = {}
+        for window_index, global_indices in enumerate(global_indices_by_window):
+            windows_by_count.setdefault(int(global_indices.numel()), []).append(
+                window_index
+            )
+        grouped = {}
+        for query_tokens, windows in windows_by_count.items():
+            grouped[query_tokens] = (
+                torch.tensor(windows, dtype=torch.long, device=device),
+                torch.stack([global_indices_by_window[index] for index in windows]),
+                torch.stack([local_indices_by_window[index] for index in windows]),
+                torch.stack([weights_by_window[index] for index in windows]),
+            )
+        self._query_group_cache[feather_tokens] = grouped
+        return grouped
 
     @property
     def window_count(self):
@@ -1082,6 +1222,24 @@ def _project_decoder_pixels(
         output[:, token_start:token_end].copy_(
             decoder.proj_out(decoder.norm_out(h[:, token_start:token_end]))
         )
+    return _reshape_decoder_patches(
+        decoder,
+        output,
+        batch,
+        latent_t,
+        latent_h,
+        latent_w,
+    )
+
+
+def _reshape_decoder_patches(
+    decoder,
+    output,
+    batch,
+    latent_t,
+    latent_h,
+    latent_w,
+):
     output = output.view(
         batch,
         latent_t,
@@ -1109,6 +1267,8 @@ def _shared_core_decoder_forward(
     block_session,
     tiles_per_batch,
     progress,
+    feather_tokens=0,
+    independent_tail_blocks=0,
 ):
     decoder = model.decoder
     batch, _, latent_t, latent_h, latent_w = x.shape
@@ -1156,8 +1316,24 @@ def _shared_core_decoder_forward(
     )
     linear_chunk = max(layout.window_tokens, tiles_per_batch * layout.window_tokens)
     blocks = list(decoder.transformer_blocks)
+    independent_tail_blocks = min(max(0, int(independent_tail_blocks)), len(blocks))
+    shared_block_count = len(blocks) - independent_tail_blocks
+    query_groups = {
+        query_tokens: (
+            windows,
+            global_indices,
+            local_indices,
+            weights.to(h.dtype),
+        )
+        for query_tokens, (
+            windows,
+            global_indices,
+            local_indices,
+            weights,
+        ) in layout.query_groups(feather_tokens).items()
+    }
 
-    for block_index, block in enumerate(blocks):
+    for block_index, block in enumerate(blocks[:shared_block_count]):
         if block_index > 0:
             block_session.before_stage(block_index)
         attention = block.attn
@@ -1184,9 +1360,14 @@ def _shared_core_decoder_forward(
             )
             qkv_image[:, token_start:token_end].copy_(projected)
 
-        image_attention = torch.empty_like(h)
-        for core_tokens in sorted(layout.core_groups):
-            grouped_windows = layout.core_group_windows[core_tokens]
+        image_attention = torch.zeros_like(h)
+        for core_tokens in sorted(query_groups):
+            (
+                grouped_windows,
+                grouped_global_indices,
+                grouped_local_indices,
+                grouped_weights,
+            ) = query_groups[core_tokens]
             for group_start in range(0, grouped_windows.numel(), tiles_per_batch):
                 window_tensor = grouped_windows[
                     group_start : group_start + tiles_per_batch
@@ -1194,12 +1375,9 @@ def _shared_core_decoder_forward(
                 group_slice = slice(group_start, group_start + window_tensor.numel())
                 window_count = window_tensor.numel()
                 key_indices = layout.token_indices.index_select(0, window_tensor)
-                query_global_indices = layout.core_group_global_indices[core_tokens][
-                    group_slice
-                ]
-                query_local_indices = layout.core_group_local_indices[core_tokens][
-                    group_slice
-                ]
+                query_global_indices = grouped_global_indices[group_slice]
+                query_local_indices = grouped_local_indices[group_slice]
+                query_weights = grouped_weights[group_slice]
 
                 window_qkv = qkv_image[:, key_indices].reshape(
                     batch * window_count,
@@ -1282,9 +1460,10 @@ def _shared_core_decoder_forward(
                 )
 
                 for local_index, global_indices in enumerate(query_global_indices):
-                    image_attention[:, global_indices] = attended[
-                        :, local_index, :core_tokens
-                    ]
+                    weighted = attended[:, local_index, :core_tokens].mul(
+                        query_weights[local_index].view(1, -1, 1)
+                    )
+                    image_attention.index_add_(1, global_indices, weighted)
 
                 suffix_attention = attended[:, :, core_tokens:].reshape(
                     batch * window_count, suffix_tokens, dim
@@ -1330,6 +1509,21 @@ def _shared_core_decoder_forward(
             )
         del image_attention
 
+    if independent_tail_blocks:
+        return _independent_window_tail(
+            decoder,
+            h,
+            suffix,
+            rotary,
+            layout,
+            blocks,
+            shared_block_count,
+            transformer_options,
+            block_session,
+            tiles_per_batch,
+            progress,
+        )
+
     return _project_decoder_pixels(
         decoder,
         h,
@@ -1339,6 +1533,107 @@ def _shared_core_decoder_forward(
         latent_w,
         linear_chunk,
     )
+
+
+def _independent_window_tail(
+    decoder,
+    h,
+    suffix,
+    rotary,
+    layout,
+    blocks,
+    first_block,
+    transformer_options,
+    block_session,
+    tiles_per_batch,
+    progress,
+):
+    batch = h.shape[0]
+    dim = h.shape[-1]
+    suffix_tokens = suffix.shape[2]
+    window_states = torch.cat(
+        (
+            h[:, layout.token_indices],
+            suffix,
+        ),
+        dim=2,
+    ).contiguous()
+    sequence = layout.window_tokens + suffix_tokens
+
+    for block_index in range(first_block, len(blocks)):
+        if block_index > 0:
+            block_session.before_stage(block_index)
+        block = blocks[block_index]
+        for window_start in range(0, layout.window_count, tiles_per_batch):
+            window_end = min(window_start + tiles_per_batch, layout.window_count)
+            window_count = window_end - window_start
+            state = window_states[:, window_start:window_end].reshape(
+                batch * window_count, sequence, dim
+            )
+            normed = comfy.rmsnorm.rms_norm(
+                state,
+                block.norm1.weight,
+                block.norm1.eps,
+            )
+            state.addcmul_(
+                _attention_forward(
+                    block.attn,
+                    normed,
+                    rotary.expand(batch * window_count, *rotary.shape[1:]),
+                    transformer_options,
+                ),
+                comfy.ops.cast_to_input(block.scale1, state),
+            )
+            normed = comfy.rmsnorm.rms_norm(
+                state,
+                block.norm2.weight,
+                block.norm2.eps,
+            )
+            state.addcmul_(
+                _feed_forward(block.ff, normed),
+                comfy.ops.cast_to_input(block.scale2, state),
+            )
+            if progress is not None:
+                progress.update(window_count)
+
+    pixel_y_idx = [value * decoder.patch_size for value in layout.y_idx]
+    pixel_y_len = [value * decoder.patch_size for value in layout.y_len]
+    pixel_x_idx = [value * decoder.patch_size for value in layout.x_idx]
+    pixel_x_len = [value * decoder.patch_size for value in layout.x_len]
+    assembler = _MultibandPixelAssembler(
+        pixel_y_idx,
+        pixel_y_len,
+        pixel_x_idx,
+        pixel_x_len,
+        layout.latent_h * decoder.patch_size,
+        layout.latent_w * decoder.patch_size,
+        h.device,
+    )
+    for window_start in range(0, layout.window_count, tiles_per_batch):
+        window_end = min(window_start + tiles_per_batch, layout.window_count)
+        window_count = window_end - window_start
+        image_states = window_states[
+            :, window_start:window_end, : layout.window_tokens
+        ].reshape(batch * window_count, layout.window_tokens, dim)
+        projected = decoder.proj_out(decoder.norm_out(image_states))
+        decoded = _reshape_decoder_patches(
+            decoder,
+            projected,
+            batch * window_count,
+            layout.latent_t,
+            layout.window_h,
+            layout.window_w,
+        ).view(
+            batch,
+            window_count,
+            decoder.out_channels,
+            layout.latent_t * decoder.patch_size_t,
+            layout.window_h * decoder.patch_size,
+            layout.window_w * decoder.patch_size,
+        )
+        for local_index, window_index in enumerate(range(window_start, window_end)):
+            assembler.add(window_index, decoded[:, local_index])
+    return assembler.finish()
 
 
 def _decoder_token_ids(patch_dims, device, dtype, canonical_spatial=False):
@@ -1468,6 +1763,7 @@ def _decode_shared_core(
     block_session,
     tiles_per_batch,
     progress,
+    multiband=False,
 ):
     block_session.before_stage(0)
     z = model.post_quant_conv(z)
@@ -1478,6 +1774,8 @@ def _decode_shared_core(
         block_session,
         tiles_per_batch,
         progress,
+        (_SHARED_CORE_FEATHER_TOKENS if multiband else 0),
+        (_SHARED_CORE_INDEPENDENT_TAIL_BLOCKS if multiband else 0),
     )
 
 
@@ -1501,7 +1799,7 @@ def _decode_spatial(
             tiles_per_batch,
             progress,
         )
-    if decoder_tiling == "shared_core":
+    if decoder_tiling in {"shared_core", "shared_core_multiband"}:
         return _decode_shared_core(
             model,
             z,
@@ -1509,6 +1807,7 @@ def _decode_spatial(
             block_session,
             tiles_per_batch,
             progress,
+            decoder_tiling == "shared_core_multiband",
         )
     args = (
         model,
@@ -1617,6 +1916,83 @@ def _spatial_lowpass(tile):
     return low.view(batch, frames, channels, height, width).permute(0, 2, 1, 3, 4)
 
 
+class _MultibandPixelAssembler:
+    def __init__(
+        self,
+        y_starts,
+        y_lengths,
+        x_starts,
+        x_lengths,
+        height,
+        width,
+        device,
+    ):
+        self.y_starts = y_starts
+        self.y_lengths = y_lengths
+        self.x_starts = x_starts
+        self.x_lengths = x_lengths
+        self.height = height
+        self.width = width
+        self.columns = len(x_starts)
+        descriptors = [
+            (i, j, 0, 0, 0, 0)
+            for i in range(len(y_starts))
+            for j in range(len(x_starts))
+        ]
+        self.low_sum, self.high_sum = _multiband_denominators(
+            descriptors,
+            y_starts,
+            y_lengths,
+            x_starts,
+            x_lengths,
+            height,
+            width,
+            torch.float32,
+            device,
+        )
+        self.canvas = None
+
+    def add(self, window_index, tile):
+        i, j = divmod(window_index, self.columns)
+        y, x = self.y_starts[i], self.x_starts[j]
+        if self.canvas is None:
+            self.canvas = torch.zeros(
+                *tile.shape[:-2],
+                self.height,
+                self.width,
+                dtype=torch.float32,
+                device=tile.device,
+            )
+        low_weight, high_weight = _multiband_window_weights(
+            i,
+            j,
+            self.y_starts,
+            self.y_lengths,
+            self.x_starts,
+            self.x_lengths,
+            torch.float32,
+            tile.device,
+        )
+        low_weight = (
+            low_weight
+            / self.low_sum[y : y + self.y_lengths[i], x : x + self.x_lengths[j]]
+        )
+        high_weight = (
+            high_weight
+            / self.high_sum[y : y + self.y_lengths[i], x : x + self.x_lengths[j]]
+        )
+        low = _spatial_lowpass(tile)
+        high = tile.float() - low.float()
+        contribution = low.float().mul(low_weight)
+        contribution.addcmul_(high, high_weight)
+        self.canvas[..., y : y + tile.shape[-2], x : x + tile.shape[-1]].add_(
+            contribution
+        )
+
+    def finish(self):
+        return self.canvas
+
+
 def _tiled_decode(
     model,
     z,
@@ -1654,18 +2030,14 @@ def _tiled_decode(
     last_height = 0
     source_batch = z.shape[0]
     canonical_spatial = tile_size != TILE_SIZE
-    multiband_low_sum = None
-    multiband_high_sum = None
     if multiband:
-        multiband_low_sum, multiband_high_sum = _multiband_denominators(
-            descriptors,
+        multiband_assembler = _MultibandPixelAssembler(
             y_idx,
             y_len,
             x_idx,
             x_len,
             height,
             width,
-            torch.float32,
             z.device,
         )
     for start in range(0, len(descriptors), tiles_per_batch):
@@ -1685,39 +2057,7 @@ def _tiled_decode(
 
         for (i, j, _zi, _zl, _zj, _zw), tile in zip(group, decoded_tiles):
             if multiband:
-                if canvas is None:
-                    canvas = torch.zeros(
-                        *tile.shape[:-2],
-                        height,
-                        width,
-                        dtype=torch.float32,
-                        device=tile.device,
-                    )
-                low_weight, high_weight = _multiband_window_weights(
-                    i,
-                    j,
-                    y_idx,
-                    y_len,
-                    x_idx,
-                    x_len,
-                    torch.float32,
-                    tile.device,
-                )
-                y = y_idx[i]
-                x = x_idx[j]
-                low_weight = (
-                    low_weight / multiband_low_sum[y : y + y_len[i], x : x + x_len[j]]
-                )
-                high_weight = (
-                    high_weight / multiband_high_sum[y : y + y_len[i], x : x + x_len[j]]
-                )
-                low = _spatial_lowpass(tile)
-                high = tile - low
-                contribution = low.float().mul_(low_weight)
-                contribution.addcmul_(high, high_weight)
-                canvas[..., y : y + tile.shape[-2], x : x + tile.shape[-1]].add_(
-                    contribution
-                )
+                multiband_assembler.add(i * len(x_idx) + j, tile)
                 continue
             if i != current_row:
                 row_tails = new_tails
@@ -1755,6 +2095,8 @@ def _tiled_decode(
             last_height = tile.shape[-2]
         if progress is not None:
             progress.update(len(group))
+    if multiband:
+        return multiband_assembler.finish()
     return canvas
 
 
@@ -2004,7 +2346,11 @@ def decode_video(
         raise ValueError(f"Unknown H3 VAE decoder tile size: {decoder_tile_size}")
     if decoder_tiling not in DECODER_TILING_MODES:
         raise ValueError(f"Unknown H3 VAE decoder tiling mode: {decoder_tiling}")
-    shared_token_modes = {"shared_overlap", "shared_core"}
+    shared_token_modes = {
+        "shared_overlap",
+        "shared_core",
+        "shared_core_multiband",
+    }
     if decoder_tiling in shared_token_modes and tile_size != TILE_SIZE:
         raise ValueError(
             f"{decoder_tiling} decoder tiling requires the official 256px tile size"
@@ -2055,7 +2401,12 @@ def decode_video(
             count,
             compute_dtype,
             effective_tiling in shared_token_modes,
-            effective_tiling == "official_multiband",
+            effective_tiling
+            in {
+                "official_multiband",
+                "shared_core_multiband",
+            },
+            effective_tiling == "shared_core_multiband",
         ),
         _AUTO_DECODE_TILE_BATCH_LIMIT,
     )

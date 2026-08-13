@@ -61,6 +61,14 @@ does not disable cross-tile weight retention.
   the complete 256px owner window plus that window's independent register and
   suffix states. It uses true asymmetric Q/K attention without masks or padded
   queries. Local RoPE remains the original coordinate inside the owner window.
+- `shared_core_multiband` combines the token-saving path with boundary repair.
+  During shared blocks, one latent token (16 output pixels) on each side of an
+  ownership boundary is queried in both adjacent full K/V windows and its
+  attention delta is cosine blended. The final two transformer blocks then
+  fork the global state back into independent 256px windows. Their separately
+  projected pixels use the same FP32 multiband stitch as
+  `official_multiband`. The feather and two-block tail are intentionally fixed
+  experimental policy rather than extra node controls.
 - `shared_overlap` remains available only as the earlier comparison path. It
   blends window attention outputs after every transformer block and can visibly
   soften detail. Both shared modes require 256px windows. `tiles_per_batch`
@@ -136,6 +144,34 @@ visual testing for fixed ownership seams.
 `shared_core` uses existing asymmetric support in SDPA and the bundled Turing
 Sage/W8A8 kernels. It changes Python scheduling only and does not require a
 kernel rebuild.
+
+### Shared-core multiband boundary repair
+
+`shared_core_multiband` avoids trying to multiband-filter the single final
+image produced by plain shared-core; that image has no second boundary
+prediction to blend. Instead it introduces alternatives at two controlled
+points:
+
+1. for the first 34 decoder blocks of the normal 36-block H3 VAE, core tokens
+   outside the feather keep one owner query, while the one-token boundary band
+   executes in both neighboring windows;
+2. horizontal and vertical cosine weights form a normalized 2D partition, so
+   corner tokens may receive four contexts without becoming brighter or
+   darker;
+3. only attention deltas are blended into the unique global state; output
+   projection and MLP remain once per unique token during these blocks;
+4. before the final two blocks, the current global image state is gathered into
+   independent windows and no longer merged; and
+5. those independent final predictions are projected and passed to normalized
+   FP32 multiband pixel stitching.
+
+At 480x848 with five temporal latent tokens, the one-token feather raises a
+shared block from 7,950 to 9,280 image queries, versus 19,200 for official
+windows. Including the two independent tail blocks, total image-Q work is about
+51% of official and image MLP work about 45%. K/V still retains every complete
+256px halo. The intended tradeoff is a small amount of duplicate boundary work
+and roughly one extra window-state buffer in exchange for removing the hard
+owner seam without the all-layer averaging blur of `shared_overlap`.
 
 ## Official multiband stitching
 
@@ -216,6 +252,13 @@ allocated peaks. The per-block image-query count fell from 19,200 to 7,950 and
 outputs were finite and invariant to compatible window batch grouping. This
 tests scheduling and structural work reduction only; visual quality and SM75
 throughput still require the real checkpoint on the target Turing card.
+
+With the same 480x848 structural setup, `shared_core_multiband` used 9,280
+image queries in each shared block and full window queries only in the final
+two blocks. A warmed A40 SDPA run took 1.014 s and peaked near 5.15 GiB, versus
+the earlier 1.517 s official baseline. Output was finite, FP32-accumulated at
+the final stitch, and invariant to compatible window batch grouping. This is
+again a scheduling check rather than target-checkpoint quality validation.
 
 Dense SwiGLU routing was bitwise identical but slightly slower, so automatic
 fusion is restricted to compatible W8A8 weights. Sage and SDPA did not beat the
