@@ -81,6 +81,8 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsSolSparseAttentionPatch",
                 "TuringUtilsAttentionKernelTuningPatch",
                 "TuringUtilsVideoMotionContactSheet",
+                "TuringUtilsMiniMaxH3VideoVAEDecode",
+                "TuringUtilsMiniMaxH3VideoVAEEncode",
             ),
         )
 

@@ -10,6 +10,7 @@ from .nodes.minimax import (
     MiniMaxH3BlockCachePatch,
     MiniMaxH3VideoFramesPadding,
 )
+from .nodes.minimax_vae import MiniMaxH3VideoVAEDecode, MiniMaxH3VideoVAEEncode
 from .nodes.wan import WanVideoFramesPadding
 
 
@@ -26,6 +27,8 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsSolSparseAttentionPatch": SolSparseAttentionPatch,
     "TuringUtilsAttentionKernelTuningPatch": AttentionKernelTuningPatch,
     "TuringUtilsVideoMotionContactSheet": VideoMotionContactSheet,
+    "TuringUtilsMiniMaxH3VideoVAEDecode": MiniMaxH3VideoVAEDecode,
+    "TuringUtilsMiniMaxH3VideoVAEEncode": MiniMaxH3VideoVAEEncode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -41,4 +44,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsSolSparseAttentionPatch": "Patch Sol Sparse Attention",
     "TuringUtilsAttentionKernelTuningPatch": "Patch Turing Attention Kernel Tuning (Experimental)",
     "TuringUtilsVideoMotionContactSheet": "Video Motion Contact Sheet (Experimental)",
+    "TuringUtilsMiniMaxH3VideoVAEDecode": "MiniMax H3 Video VAE Decode (Experimental)",
+    "TuringUtilsMiniMaxH3VideoVAEEncode": "MiniMax H3 Video VAE Encode (Experimental)",
 }
