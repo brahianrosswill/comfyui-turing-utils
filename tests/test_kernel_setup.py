@@ -92,7 +92,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(
             "csrc/turing/sage/qk_preprocess.cu", extensions[2].kwargs["sources"]
         )
-        self.assertEqual(setup.call_args.kwargs["version"], "0.24.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.25.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -114,7 +114,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.24.0")
+        self.assertEqual(metadata["project"]["version"], "0.25.0")
 
     def test_sparse_source_does_not_require_optional_cuda_library_headers(self):
         source = (
@@ -221,6 +221,20 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn("cudaStreamIsCapturing", source)
         self.assertIn("codebook_tile_cache", source)
         self.assertIn("--tile-sweep", benchmark)
+
+    def test_legacy_w4a8_edges_remain_on_tensor_cores(self):
+        bindings = (PLUGIN_ROOT / "kernel" / "csrc" / "bindings.cpp").read_text(
+            encoding="utf-8"
+        )
+        source = (
+            PLUGIN_ROOT / "kernel" / "csrc" / "turing" / "w4a8.cu"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("__dp4a", source)
+        self.assertNotIn("w4a8_compatibility_kernel", source)
+        self.assertIn("run_k_tail_tile", source)
+        self.assertIn("InputAlignment", source)
+        self.assertIn("tail_weight", bindings)
+        self.assertIn("tensor_core_channels", bindings)
 
     def test_windows_conda_target_specific_cccl_path_is_added(self):
         with tempfile.TemporaryDirectory() as temp_dir:

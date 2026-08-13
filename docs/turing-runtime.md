@@ -67,20 +67,28 @@ CUTLASS's SM75 crosswise INT8 shared-memory layout, and executes the contraction
 with `m8n8k16` INT8 Tensor Core instructions. Scaling, optional bias, and BF16
 storage stay in the epilogue. It never creates a persistent W8 weight copy and
 rejects only tiles that exceed the actual per-device launch limit.
-Non-Tensor-Core-compatible edge dimensions retain a small DP4A compatibility
-kernel so the public API does not silently narrow its accepted shapes.
+Legacy W4A8 edge dimensions no longer fall back to a full-matrix DP4A kernel.
+K values divisible by four use relaxed, predicated global iterators while the
+contraction remains `m8n8k16` Tensor Core MMA. For N tails, the aligned output
+channels use the normal long-sequence kernel and only the final one-to-seven
+packed rows are zero-padded into an eight-row temporary before a small Tensor
+Core launch. No persistent expanded weight or full padded-weight copy is made.
+On an A40 JITing compute-75 PTX, `M=4096,N=5376,K=5372` fell from 49.52 ms on
+the former DP4A fallback to 1.21 ms on the predicated Tensor Core path. This is
+a directional result; exact-sm75 acceptance still requires real Turing.
 
-Kernel 0.24 also accepts the symmetric `asym_w4a8_int8` layout used by the
-current MiniMax-H3 experimental W4A8 checkpoints. Unlike the legacy signed
-nibble format, each stored nibble is a codebook index and must be combined
-with an E4M3 per-group relative scale before INT8 MMA. The SM75 implementation
-loads one packed 16-value group per thread, combines it with the E4M3 scale and
-codebook in registers, and writes the decoded values directly into CUTLASS's
-normal crosswise S8 shared-memory tile. The long-sequence path therefore has no
-decoded-weight workspace; short sequences and non-g16 compatibility cases keep
-the bounded staged implementation. Neither path expands the checkpoint at load
-time or creates an MxN INT32 accumulator. Asymmetric correction files
-remain a Kitchen fallback and are not silently accepted by this path.
+Since kernel 0.24, the runtime also accepts the symmetric `asym_w4a8_int8`
+layout used by the current MiniMax-H3 experimental W4A8 checkpoints. Unlike
+the legacy signed nibble format, each stored nibble is a codebook index and
+must be combined with an E4M3 per-group relative scale before INT8 MMA. The
+SM75 implementation loads one packed 16-value group per thread, combines it
+with the E4M3 scale and codebook in registers, and writes the decoded values
+directly into CUTLASS's normal crosswise S8 shared-memory tile. The
+long-sequence path therefore has no decoded-weight workspace; short sequences
+and non-g16 compatibility cases keep the bounded staged implementation.
+Neither path expands the checkpoint at load time or creates an MxN INT32
+accumulator. Asymmetric correction files remain a Kitchen fallback and are not
+silently accepted by this path.
 
 The benchmark uses H3's actual fc2 contracted width 14336 rather than treating
 the full 28672-wide fc1 output as the fc2 contraction. On an A40 running the

@@ -85,6 +85,18 @@ def _validate_no_spill(name: str, metrics: dict[str, int]) -> None:
 
 
 def main() -> None:
+    w4a8_source = (KERNEL / "csrc" / "turing" / "w4a8.cu").read_text(
+        encoding="utf-8"
+    )
+    if "__dp4a" in w4a8_source or "w4a8_compatibility_kernel" in w4a8_source:
+        raise RuntimeError(
+            "legacy W4A8 edge shapes must stay on predicated/padded Tensor Core paths"
+        )
+    if "run_k_tail_tile" not in w4a8_source or "tail_weight" not in (
+        KERNEL / "csrc" / "bindings.cpp"
+    ).read_text(encoding="utf-8"):
+        raise RuntimeError("W4A8 K/N Tensor Core edge handling is missing")
+
     package = KERNEL / "comfyui_turing_utils_kernel"
     suffix = sysconfig.get_config_var("EXT_SUFFIX")
     qattn = package / f"_sage_qattn_sm75{suffix}" if suffix else None
@@ -206,7 +218,6 @@ def main() -> None:
         ("segmented RMSNorm+AdaLN", "segmented_rms_adaln_kernel", 3, 96),
         ("LayerNorm+AdaLN", "layer_norm_adaln_kernel", 3, 96),
         ("codebook W4 decoder", "decode_codebook_w4_to_s8", 1, 64),
-        ("W4A8 compatibility", "w4a8_compatibility_kernel", 1, 96),
     )
     family_summary = []
     for label, marker, expected, register_limit in expected_families:

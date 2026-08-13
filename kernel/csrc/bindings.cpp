@@ -202,17 +202,61 @@ at::Tensor turing_w4a8_linear(at::Tensor activation,
                     (properties->major == 7 && properties->minor >= 5),
                 "turing_w4a8_linear requires sm75 or newer");
 
+    const int64_t output_channels = weight.size(0);
+    const int64_t padded_output_channels =
+        ((output_channels + 7) / 8) * 8;
     at::Tensor output = at::empty(
-        {activation.size(0), weight.size(0)}, activation.options().dtype(at::kBFloat16));
+        {activation.size(0), padded_output_channels},
+        activation.options().dtype(at::kBFloat16));
     TorchOpContext ctx;
-    comfyui_turing_utils::kernels::turing_w4a8_linear(from_torch(activation),
-                                          from_torch(weight),
-                                          from_torch(activation_scale),
-                                          from_torch(weight_scale),
-                                          maybe_tensor(bias),
-                                          from_torch(output),
-                                          int_cast<int>(tile_policy));
-    return output;
+    const int64_t tensor_core_channels = (output_channels / 8) * 8;
+    if (tensor_core_channels > 0) {
+        auto bulk_weight = weight.narrow(0, 0, tensor_core_channels);
+        auto bulk_scale = weight_scale.narrow(0, 0, tensor_core_channels);
+        auto bulk_bias = bias.has_value()
+            ? std::optional<at::Tensor>(bias.value().narrow(0, 0, tensor_core_channels))
+            : std::nullopt;
+        auto bulk_output = output.narrow(1, 0, tensor_core_channels);
+        comfyui_turing_utils::kernels::turing_w4a8_linear(
+            from_torch(activation),
+            from_torch(bulk_weight),
+            from_torch(activation_scale),
+            from_torch(bulk_scale),
+            maybe_tensor(bulk_bias),
+            from_torch(bulk_output),
+            int_cast<int>(tile_policy));
+    }
+    if (tensor_core_channels != output_channels) {
+        const int64_t tail_channels = output_channels - tensor_core_channels;
+        auto tail_weight = at::constant_pad_nd(
+            weight.narrow(0, tensor_core_channels, tail_channels),
+            {0, 0, 0, 8 - tail_channels},
+            0);
+        auto tail_scale = at::constant_pad_nd(
+            weight_scale.narrow(0, tensor_core_channels, tail_channels),
+            {0, 8 - tail_channels},
+            0);
+        std::optional<at::Tensor> tail_bias = std::nullopt;
+        if (bias.has_value()) {
+            tail_bias = at::constant_pad_nd(
+                bias.value().narrow(0, tensor_core_channels, tail_channels),
+                {0, 8 - tail_channels},
+                0);
+        }
+        auto tail_output = output.narrow(1, tensor_core_channels, 8);
+        comfyui_turing_utils::kernels::turing_w4a8_linear(
+            from_torch(activation),
+            from_torch(tail_weight),
+            from_torch(activation_scale),
+            from_torch(tail_scale),
+            maybe_tensor(tail_bias),
+            from_torch(tail_output),
+            1);
+    }
+    if (padded_output_channels == output_channels) {
+        return output;
+    }
+    return output.narrow(1, 0, output_channels).contiguous();
 }
 
 at::Tensor turing_codebook_w4a8_linear(at::Tensor activation,

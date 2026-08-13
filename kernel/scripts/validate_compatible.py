@@ -76,8 +76,8 @@ def validate_convrot(device: torch.device) -> None:
 
 
 def validate_w4a8(device: torch.device) -> None:
-    # The first two cases exercise the compatibility path. The remaining
-    # cases cover every production Tensor Core tile and predicated edge tiles.
+    # The first two cases exercise N/K Tensor Core edge handling. The remaining
+    # cases cover the normal production tiles, including the long K-tail policy.
     cases = (
         (7, 13, 64),
         (3, 16, 12),
@@ -85,6 +85,7 @@ def validate_w4a8(device: torch.device) -> None:
         (17, 72, 80),
         (33, 128, 128),
         (129, 264, 256),
+        (513, 520, 508),
         (513, 520, 64),
         (8193, 8, 16),
     )

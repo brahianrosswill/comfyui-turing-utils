@@ -1,7 +1,7 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's exact-sm75
-runtime. Version 0.24.0 contains legacy packed W4A8 and grouped-codebook W4A8
+runtime. Version 0.25.0 contains legacy packed W4A8 and grouped-codebook W4A8
 Tensor Core GEMMs, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, bundled Sage attention, pure-INT8 W8A8 attention,
@@ -14,6 +14,8 @@ Q-to-K-centroid Tensor Core pass now drives both routing and skipped-block
 online-softmax correction, so no duplicate Q/K centroid scan or full global
 route map is materialized. The local neighborhood is fixed to the official
 +/- one block. Original V means remain dedicated to value approximation.
+Legacy W4A8 K/N edge dimensions use predicated or tail-padded Tensor Core
+launches; the former full-matrix DP4A compatibility kernel has been removed.
 It contains no model-weight format or model loader.
 
 Every stable public tensor operator is registered through

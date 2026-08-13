@@ -106,10 +106,10 @@ sequence length or that an A40 PTX result can choose a Turing launch policy.
 | Production default | Dense W8A8 attention; ConvRot W8A8/W4A8/W4A4 activation paths; BF16 epilogue; normalization fusions | Selected by the loader/adapter after preflight; exact-sm75 tile choices are cached per device and contraction shape |
 | Production alternative | Stable Sage; SDPA FP16 bridge; legacy and grouped-codebook W4A8 | Explicit backend/weight-format choice with deterministic fallback |
 | Production patch | Sol FP16-PV and Sol W8A8 | Enabled only by the independent Sol node so workflow-specific routing and modality controls remain explicit; W8A8 is the node default |
-| Compatibility only | DP4A W4A8 edges and staged codebook decode | Preserves supported shapes when the fast Tensor Core/inline contract is unavailable |
+| Compatibility only | Staged codebook decode | Preserves grouped-codebook formats that cannot use the inline g16 decoder |
 
 The resource release gate covers all compiled production and compatibility
-families, not only attention: 50 core kernels, 48 native D64/D128 attention
+families, not only attention: 51 core kernels, 48 native D64/D128 attention
 variants, and 24 D64/D128 Q/K preprocessing variants in the current exact-sm75
 image. All report zero stack/local memory. Register count and shared-memory use
 are recorded rather than constrained to the obsolete "two CTAs per SM" rule;

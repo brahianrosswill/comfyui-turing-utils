@@ -31,109 +31,6 @@ namespace {
 using cute::_0;
 using cute::_1;
 
-constexpr int FALLBACK_TILE_M = 16;
-constexpr int FALLBACK_TILE_N = 16;
-constexpr int FALLBACK_TILE_K = 64;
-
-__device__ __forceinline__ int8_t unpack_int4(uint8_t value) {
-    return static_cast<int8_t>(static_cast<int>(value ^ 0x08u) - 8);
-}
-
-__global__ void w4a8_compatibility_kernel(const int8_t *__restrict__ activation,
-                                          const int8_t *__restrict__ weight,
-                                          const float *__restrict__ activation_scale,
-                                          const float *__restrict__ weight_scale,
-                                          const float *__restrict__ bias,
-                                          __nv_bfloat16 *__restrict__ output,
-                                          int m,
-                                          int n,
-                                          int k) {
-    __shared__ alignas(16) int8_t activation_tile[FALLBACK_TILE_M][FALLBACK_TILE_K];
-    __shared__ alignas(16) int8_t weight_tile[FALLBACK_TILE_N][FALLBACK_TILE_K];
-
-    const int lane_m = threadIdx.y;
-    const int lane_n = threadIdx.x;
-    const int row = blockIdx.y * FALLBACK_TILE_M + lane_m;
-    const int col = blockIdx.x * FALLBACK_TILE_N + lane_n;
-    const int tid = lane_m * FALLBACK_TILE_N + lane_n;
-    int accumulator = 0;
-
-    for (int tile_k = 0; tile_k < k; tile_k += FALLBACK_TILE_K) {
-        for (int index = tid;
-             index < FALLBACK_TILE_M * FALLBACK_TILE_K;
-             index += FALLBACK_TILE_M * FALLBACK_TILE_N) {
-            const int local_m = index / FALLBACK_TILE_K;
-            const int local_k = index % FALLBACK_TILE_K;
-            const int global_m = blockIdx.y * FALLBACK_TILE_M + local_m;
-            const int global_k = tile_k + local_k;
-            activation_tile[local_m][local_k] =
-                global_m < m && global_k < k ? activation[global_m * k + global_k] : 0;
-        }
-
-        for (int index = tid;
-             index < FALLBACK_TILE_N * FALLBACK_TILE_K;
-             index += FALLBACK_TILE_M * FALLBACK_TILE_N) {
-            const int local_n = index / FALLBACK_TILE_K;
-            const int local_k = index % FALLBACK_TILE_K;
-            const int global_n = blockIdx.x * FALLBACK_TILE_N + local_n;
-            const int global_k = tile_k + local_k;
-            int8_t unpacked = 0;
-            if (global_n < n && global_k < k) {
-                const uint8_t packed = reinterpret_cast<const uint8_t *>(weight)[
-                    global_n * (k / 2) + global_k / 2];
-                unpacked = unpack_int4((packed >> ((global_k & 1) * 4)) & 0x0fu);
-            }
-            weight_tile[local_n][local_k] = unpacked;
-        }
-        __syncthreads();
-
-        if (row < m && col < n) {
-#pragma unroll
-            for (int local_k = 0; local_k < FALLBACK_TILE_K; local_k += 4) {
-                const int packed_activation =
-                    *reinterpret_cast<const int *>(&activation_tile[lane_m][local_k]);
-                const int packed_weight =
-                    *reinterpret_cast<const int *>(&weight_tile[lane_n][local_k]);
-                accumulator = __dp4a(packed_activation, packed_weight, accumulator);
-            }
-        }
-        __syncthreads();
-    }
-
-    if (row < m && col < n) {
-        float value = static_cast<float>(accumulator) *
-                      activation_scale[row] * weight_scale[col];
-        if (bias != nullptr) {
-            value += bias[col];
-        }
-        output[row * n + col] = __float2bfloat16_rn(value);
-    }
-}
-
-void launch_compatibility_kernel(const int8_t *activation,
-                                 const int8_t *weight,
-                                 const float *activation_scale,
-                                 const float *weight_scale,
-                                 const float *bias,
-                                 __nv_bfloat16 *output,
-                                 int m,
-                                 int n,
-                                 int k,
-                                 cudaStream_t stream) {
-    const dim3 block(FALLBACK_TILE_N, FALLBACK_TILE_M);
-    const dim3 grid(ceilDiv(n, FALLBACK_TILE_N), ceilDiv(m, FALLBACK_TILE_M));
-    w4a8_compatibility_kernel<<<grid, block, 0, stream>>>(
-        activation,
-        weight,
-        activation_scale,
-        weight_scale,
-        bias,
-        output,
-        m,
-        n,
-        k);
-}
-
 template <int N>
 struct TuringW4ToS8 {
     static_assert(N % 8 == 0, "Turing W4 conversion requires groups of eight values");
@@ -476,7 +373,14 @@ bool run_auto_tuned_tile(TileTuneCache &cache,
     return run_policy(selected);
 }
 
-template <typename Output, WeightKind Kind, int TBM, int TBN, int WM, int WN>
+template <typename Output,
+          WeightKind Kind,
+          int TBM,
+          int TBN,
+          int WM,
+          int WN,
+          int InputAlignment = 16,
+          int WeightAlignment = 16>
 struct TuringW4A8Gemm {
     static constexpr bool PackedWeight = Kind != WeightKind::kInt8;
     static constexpr bool CodebookWeight = Kind == WeightKind::kCodebookW4;
@@ -493,8 +397,8 @@ struct TuringW4A8Gemm {
     using WarpShape = cutlass::gemm::GemmShape<WM, WN, 64>;
     using InstructionShape = cutlass::gemm::GemmShape<8, 8, 16>;
     using ThreadblockSwizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
-    static constexpr int AlignmentA = 16;
-    static constexpr int AlignmentB = 16;
+    static constexpr int AlignmentA = InputAlignment;
+    static constexpr int AlignmentB = WeightAlignment;
     static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
     static constexpr int EpilogueStages = 1;
 
@@ -723,6 +627,7 @@ bool run_tile(const int8_t *activation,
               int m,
               int n,
               int k,
+              int output_stride,
               cudaStream_t stream) {
     return TuringW4A8Gemm<
         cutlass::bfloat16_t, WeightKind::kSignedW4, TBM, TBN, WM, WN>::run(
@@ -735,7 +640,41 @@ bool run_tile(const int8_t *activation,
         m,
         n,
         k,
+        output_stride,
+        stream);
+}
+
+template <int TBM, int TBN, int WM, int WN>
+bool run_k_tail_tile(const int8_t *activation,
+                     const int8_t *weight,
+                     const float *activation_scale,
+                     const float *weight_scale,
+                     const float *bias,
+                     __nv_bfloat16 *output,
+                     int m,
+                     int n,
+                     int k,
+                     int output_stride,
+                     cudaStream_t stream) {
+    return TuringW4A8Gemm<
+        cutlass::bfloat16_t,
+        WeightKind::kSignedW4,
+        TBM,
+        TBN,
+        WM,
+        WN,
+        4,
+        4>::run(
+        activation,
+        weight,
+        activation_scale,
+        weight_scale,
+        bias,
+        reinterpret_cast<cutlass::bfloat16_t *>(output),
+        m,
         n,
+        k,
+        output_stride,
         stream);
 }
 
@@ -805,25 +744,31 @@ bool dispatch(const int8_t *activation,
               int m,
               int n,
               int k,
+              int output_stride,
               cudaStream_t stream,
               int tile_policy) {
     const auto run_policy = [&](int policy) {
         switch (policy) {
         case 1:
             return run_tile<16, 64, 16, 32>(
-                activation, weight, activation_scale, weight_scale, bias, output, m, n, k, stream);
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
         case 2:
             return run_tile<32, 64, 32, 32>(
-                activation, weight, activation_scale, weight_scale, bias, output, m, n, k, stream);
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
         case 3:
             return run_tile<64, 128, 32, 64>(
-                activation, weight, activation_scale, weight_scale, bias, output, m, n, k, stream);
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
         case 4:
             return run_tile<256, 128, 64, 64>(
-                activation, weight, activation_scale, weight_scale, bias, output, m, n, k, stream);
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
         case 5:
             return run_tile<128, 256, 64, 64>(
-                activation, weight, activation_scale, weight_scale, bias, output, m, n, k, stream);
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
         default:
             throw std::runtime_error("invalid Turing W4A8 tile policy");
         }
@@ -1080,23 +1025,44 @@ void turing_w4a8_linear(Tensor activation,
     const int k = static_cast<int>(k64);
     const cudaStream_t stream = getCurrentCUDAStream();
 
-    // The Tensor Core epilogue writes 128-bit vectors and the packed iterator
-    // consumes complete m8n8k16 instructions. Preserve the old API for edge
-    // shapes without routing normal model dimensions through a padding copy.
-    if (k % 16 != 0 || n % 8 != 0) {
-        launch_compatibility_kernel(
-            activation_ptr,
-            weight_ptr,
-            activation_scale_ptr,
-            weight_scale_ptr,
-            bias_ptr,
-            output_ptr,
-            m,
-            n,
-            k,
-            stream);
+    // The public binding pads K to the m8n8k16 instruction boundary. Keep this
+    // guard at the CUDA ABI boundary so direct callers cannot silently enter a
+    // scalar full-matrix fallback.
+    if (k % 16 != 0) {
+        const bool launched = m <= 2048
+            ? run_k_tail_tile<64, 128, 32, 64>(
+                activation_ptr,
+                weight_ptr,
+                activation_scale_ptr,
+                weight_scale_ptr,
+                bias_ptr,
+                output_ptr,
+                m,
+                n,
+                k,
+                static_cast<int>(output.stride(0)),
+                stream)
+            : run_k_tail_tile<256, 128, 64, 64>(
+                activation_ptr,
+                weight_ptr,
+                activation_scale_ptr,
+                weight_scale_ptr,
+                bias_ptr,
+                output_ptr,
+                m,
+                n,
+                k,
+                static_cast<int>(output.stride(0)),
+                stream);
+        if (!launched) {
+            throw std::runtime_error("CUTLASS SM75 W4A8 K-tail kernel rejected the problem");
+        }
         checkCUDA(cudaGetLastError());
         return;
+    }
+
+    if (n % 8 != 0) {
+        throw std::runtime_error("Turing W4A8 requires N padded to a multiple of 8");
     }
 
     const bool launched = dispatch(
@@ -1109,6 +1075,7 @@ void turing_w4a8_linear(Tensor activation,
         m,
         n,
         k,
+        static_cast<int>(output.stride(0)),
         stream,
         tile_policy);
     if (!launched) {
