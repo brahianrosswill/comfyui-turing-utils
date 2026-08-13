@@ -109,17 +109,22 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         from comfy.ldm.minimax.vae import ViT3DDecoder
 
         torch.manual_seed(5)
-        decoder = ViT3DDecoder(
-            patch_size=2,
-            patch_size_t=1,
-            in_channels=4,
-            out_channels=3,
-            num_layers=1,
-            heads=1,
-            dim_head=64,
-            rope_dim_ratio=0.75,
-            operations=torch.nn,
-        ).cuda().half().eval()
+        decoder = (
+            ViT3DDecoder(
+                patch_size=2,
+                patch_size_t=1,
+                in_channels=4,
+                out_channels=3,
+                num_layers=1,
+                heads=1,
+                dim_head=64,
+                rope_dim_ratio=0.75,
+                operations=torch.nn,
+            )
+            .cuda()
+            .half()
+            .eval()
+        )
         for parameter in decoder.parameters():
             torch.nn.init.uniform_(parameter, -0.02, 0.02)
         model = SimpleNamespace(decoder=decoder, vae_ratio=2, blend=blend)
@@ -148,17 +153,22 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         from comfy.ldm.minimax.vae import ViT3DDecoder
 
         torch.manual_seed(6)
-        decoder = ViT3DDecoder(
-            patch_size=2,
-            patch_size_t=1,
-            in_channels=4,
-            out_channels=3,
-            num_layers=2,
-            heads=1,
-            dim_head=64,
-            rope_dim_ratio=0.75,
-            operations=torch.nn,
-        ).cuda().half().eval()
+        decoder = (
+            ViT3DDecoder(
+                patch_size=2,
+                patch_size_t=1,
+                in_channels=4,
+                out_channels=3,
+                num_layers=2,
+                heads=1,
+                dim_head=64,
+                rope_dim_ratio=0.75,
+                operations=torch.nn,
+            )
+            .cuda()
+            .half()
+            .eval()
+        )
         for parameter in decoder.parameters():
             torch.nn.init.uniform_(parameter, -0.01, 0.01)
         model = SimpleNamespace(decoder=decoder, vae_ratio=2, blend=blend)
@@ -265,9 +275,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
 
     def test_shared_window_assembler_preserves_identical_overlap_values(self):
         model = SimpleNamespace(vae_ratio=2, blend=blend)
-        value = torch.arange(2 * 4 * 5 * 3, dtype=torch.float32).view(
-            1, 2, 4, 5, 3
-        )
+        value = torch.arange(2 * 4 * 5 * 3, dtype=torch.float32).view(1, 2, 4, 5, 3)
         flattened = value.reshape(1, -1, 3)
         with (
             mock.patch.object(video_vae, "TILE_SIZE", 4),
@@ -292,6 +300,166 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 assembler.add(index, flattened[:, indices])
             actual = assembler.finish()
         self.assertTrue(torch.equal(actual, flattened))
+
+    def test_shared_core_owns_every_token_once(self):
+        model = SimpleNamespace(vae_ratio=2)
+        with (
+            mock.patch.object(video_vae, "TILE_SIZE", 4),
+            mock.patch.object(video_vae, "TILE_OVERLAP", 2),
+        ):
+            layout = video_vae._SharedWindowLayout(
+                model,
+                2,
+                4,
+                5,
+                torch.device("cpu"),
+            )
+        owned = torch.cat(layout.core_global_indices).sort().values
+        self.assertTrue(torch.equal(owned, torch.arange(layout.image_tokens)))
+        for window_index, local_indices in enumerate(layout.core_local_indices):
+            self.assertGreater(local_indices.numel(), 0)
+            self.assertGreaterEqual(int(local_indices.min()), 0)
+            self.assertLess(int(local_indices.max()), layout.window_tokens)
+            global_indices = layout.core_global_indices[window_index]
+            self.assertEqual(global_indices.numel(), local_indices.numel())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_shared_core_window_batching_is_invariant(self):
+        from comfy.ldm.minimax.vae import ViT3DDecoder
+
+        torch.manual_seed(16)
+        decoder = (
+            ViT3DDecoder(
+                patch_size=2,
+                patch_size_t=1,
+                in_channels=4,
+                out_channels=3,
+                num_layers=2,
+                heads=1,
+                dim_head=64,
+                rope_dim_ratio=0.75,
+                operations=torch.nn,
+            )
+            .cuda()
+            .half()
+            .eval()
+        )
+        for parameter in decoder.parameters():
+            torch.nn.init.uniform_(parameter, -0.01, 0.01)
+        model = SimpleNamespace(decoder=decoder, vae_ratio=2)
+        x = torch.randn(2, 4, 2, 4, 5, device="cuda", dtype=torch.float16)
+        options = video_vae._attention_options("sdpa", x.device)
+        session = SimpleNamespace(before_stage=lambda _index: None)
+        progress = mock.Mock()
+        with (
+            mock.patch.object(video_vae, "TILE_SIZE", 4),
+            mock.patch.object(video_vae, "TILE_OVERLAP", 2),
+            torch.inference_mode(),
+        ):
+            expected = video_vae._shared_core_decoder_forward(
+                model,
+                x.clone(),
+                options,
+                session,
+                1,
+                None,
+            )
+            actual = video_vae._shared_core_decoder_forward(
+                model,
+                x.clone(),
+                options,
+                session,
+                3,
+                progress,
+            )
+            layout = video_vae._SharedWindowLayout(model, 2, 4, 5, x.device)
+        torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)
+        self.assertEqual(
+            sum(call.args[0] for call in progress.update.call_args_list),
+            layout.window_count * len(decoder.transformer_blocks),
+        )
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_single_tensor_rope_fallback_matches_kitchen(self):
+        torch.manual_seed(19)
+        value = torch.randn(2, 7, 3, 64, device="cuda", dtype=torch.float16)
+        ids = video_vae.h3_vae.create_token_ids((1, 1, 7), value.device, value.dtype)
+        rotary = video_vae.h3_vae.RotaryEmbeddingND(48, n_dim=3).to(value.device)(ids)
+        expected = video_vae._apply_split_half_rope(value, rotary)
+        with mock.patch.object(
+            video_vae.comfy.quant_ops.ck,
+            "apply_rope_split_half1",
+            None,
+        ):
+            actual = video_vae._apply_split_half_rope(value, rotary)
+        torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)
+
+    def test_multiband_weights_form_normalized_partition(self):
+        starts_y, lengths_y, _ = video_vae.split_tiles(10, 4, 2, 2)
+        starts_x, lengths_x, _ = video_vae.split_tiles(8, 4, 2, 2)
+        descriptors = [
+            (i, j, 0, 0, 0, 0)
+            for i in range(len(starts_y))
+            for j in range(len(starts_x))
+        ]
+        low_sum, high_sum = video_vae._multiband_denominators(
+            descriptors,
+            starts_y,
+            lengths_y,
+            starts_x,
+            lengths_x,
+            10,
+            8,
+            torch.float32,
+            torch.device("cpu"),
+        )
+        normalized_low = torch.zeros_like(low_sum)
+        normalized_high = torch.zeros_like(high_sum)
+        for i, j, *_unused in descriptors:
+            low, high = video_vae._multiband_window_weights(
+                i,
+                j,
+                starts_y,
+                lengths_y,
+                starts_x,
+                lengths_x,
+                torch.float32,
+                torch.device("cpu"),
+            )
+            y, x = starts_y[i], starts_x[j]
+            normalized_low[y : y + lengths_y[i], x : x + lengths_x[j]].add_(
+                low / low_sum[y : y + lengths_y[i], x : x + lengths_x[j]]
+            )
+            normalized_high[y : y + lengths_y[i], x : x + lengths_x[j]].add_(
+                high / high_sum[y : y + lengths_y[i], x : x + lengths_x[j]]
+            )
+        torch.testing.assert_close(normalized_low, torch.ones_like(normalized_low))
+        torch.testing.assert_close(normalized_high, torch.ones_like(normalized_high))
+
+    def test_multiband_tiled_decode_preserves_constant_tiles(self):
+        model = SimpleNamespace(vae_ratio=2, post_quant_conv=lambda x: x)
+        z = torch.zeros(1, 1, 1, 4, 5)
+
+        def fake_decode(_model, value, *_args):
+            return torch.full(
+                (value.shape[0], 1, 1, value.shape[-2] * 2, value.shape[-1] * 2),
+                0.375,
+                dtype=value.dtype,
+                device=value.device,
+            )
+
+        with mock.patch.object(video_vae, "_decode_pixels", side_effect=fake_decode):
+            actual = video_vae._tiled_decode(
+                model,
+                z,
+                4,
+                2,
+                {},
+                None,
+                tiles_per_batch=3,
+                multiband=True,
+            )
+        torch.testing.assert_close(actual, torch.full_like(actual, 0.375))
 
     def test_decoder_node_uses_optimized_runtime(self):
         vae = mock.Mock()
@@ -339,9 +507,9 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 return_value=nullcontext(),
             ),
         ):
-            output = nodes.MiniMaxH3VideoVAEEncode().encode(
-                pixels, vae, "auto"
-            )[0]["samples"]
+            output = nodes.MiniMaxH3VideoVAEEncode().encode(pixels, vae, "auto")[0][
+                "samples"
+            ]
         run.assert_called_once_with(vae, pixels, "auto")
         self.assertEqual(output.shape, (1, 24, 2, 1, 1))
 
@@ -432,6 +600,8 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         self.assertEqual(encoder["tiles_per_batch"][1]["default"], "auto")
         self.assertEqual(decoder["decoder_tile_size"][1]["default"], "256")
         self.assertEqual(decoder["decoder_tiling"][1]["default"], "official")
+        self.assertIn("official_multiband", decoder["decoder_tiling"][0])
+        self.assertIn("shared_core", decoder["decoder_tiling"][0])
         self.assertNotIn("tile_preset", decoder)
         self.assertNotIn("tile_preset", encoder)
         self.assertNotIn("tile_overlap", decoder)

@@ -48,11 +48,24 @@ does not disable cross-tile weight retention.
   16-token step and extend its endpoints to `+/-1.0625`; neither matches the
   trained 16-token/256px distribution. Encoder geometry is never changed.
 - Decoder `decoder_tiling=official` preserves ComfyUI's independent-window
-  equations. `shared_overlap` is an explicit experimental mode available only
-  with 256px tiles. It keeps every attention window and local RoPE exactly
-  256px while merging redundant image-token state between transformer blocks.
-  `tiles_per_batch` then controls how many local windows enter one attention
-  launch; it does not change the merged result.
+  equations and final linear pixel ramps exactly.
+- `official_multiband` preserves every independent 256px decoder window but
+  replaces the order-dependent final ramps with normalized two-dimensional
+  overlap-add. Low frequencies use a broad cosine transition; high frequencies
+  use a center-biased transition so color/illumination can agree without
+  averaging fine texture as aggressively. It does not reduce transformer token
+  work and is the seam-quality control mode.
+- `shared_core` is the primary token-saving experiment. Every physical image
+  token belongs to the nearest window center and computes Q, attention output,
+  output projection, residual, and MLP exactly once. Its K/V context remains
+  the complete 256px owner window plus that window's independent register and
+  suffix states. It uses true asymmetric Q/K attention without masks or padded
+  queries. Local RoPE remains the original coordinate inside the owner window.
+- `shared_overlap` remains available only as the earlier comparison path. It
+  blends window attention outputs after every transformer block and can visibly
+  soften detail. Both shared modes require 256px windows. `tiles_per_batch`
+  controls how many compatible windows enter one launch and does not change a
+  mode's result.
 - decoder `attention` selects SDPA, Sage, or W8A8-QK for this VAE call only.
   SDPA is the default. On Turing, container-owned BF16 Q/K/V are converted to
   FP16 before SDPA so PyTorch does not select the BF16 math fallback.
@@ -89,10 +102,53 @@ from a small background consumer only after each batch really finishes; this
 keeps the ETA meaningful without synchronizing the main submission stream or
 disabling transfer/compute overlap.
 
-In `shared_overlap` mode a window is revisited by every decoder transformer
-block, so the progress total additionally includes the decoder block count.
+In either shared mode a window is revisited by every decoder transformer block,
+so the progress total additionally includes the decoder block count.
 This reports completed window-block work rather than holding at zero until the
 entire merged frame finishes.
+
+## Experimental shared-core decoder
+
+The official decoder repeats all work for every overlap copy. For each block,
+shared-core instead:
+
+1. keeps one global image-token state and projects its Q/K/V once;
+2. assigns each token to the spatial window whose center is nearest, producing
+   contiguous non-overlapping query cores;
+3. gathers a full 256px K/V halo for each owner window;
+4. gathers only that window's core Q rows and their matching local RoPE rows;
+5. appends the independent per-window suffix queries and suffix K/V;
+6. runs real `Qcore+suffix x KVwindow+suffix` attention; no attention mask or
+   padded fake queries are materialized;
+7. scatters every core output directly to its unique global tokens and updates
+   output projection/MLP once; and
+8. updates suffix residual/MLP state separately for every window.
+
+For a 480x848 frame with five resident temporal latent tokens, the official
+window grid contains 19,200 image-query tokens per block while shared-core owns
+7,950. K/V still contains the complete window halos, so the score contraction
+is reduced on the Q axis rather than converted into global attention. The
+approximation is the hard owner transition: adjacent cores can use different
+local RoPE coordinates and suffix states. It avoids the repeated hidden-state
+averaging that blurred `shared_overlap`, but still requires target-checkpoint
+visual testing for fixed ownership seams.
+
+`shared_core` uses existing asymmetric support in SDPA and the bundled Turing
+Sage/W8A8 kernels. It changes Python scheduling only and does not require a
+kernel rebuild.
+
+## Official multiband stitching
+
+`official_multiband` runs the same independent decoder windows as `official`.
+Each final pixel tile is split into an 8x-downsampled bilinear low-frequency
+component and a residual high-frequency component. Both components use
+two-dimensional cosine windows normalized over every tile that covers a pixel;
+the high-frequency window is raised to the fourth power to prefer tile centers.
+This handles triple/four-way coverage without depending on traversal order and
+preserves identical tile outputs within floating-point rounding. Normalization
+and the final overlap-add canvas use FP32 even when decoder activations use
+FP16. Its extra interpolation and pixel accumulation are small relative to the
+unchanged transformer work.
 
 ## Experimental shared-overlap decoder
 
@@ -152,6 +208,14 @@ latent temporal tokens, shared overlap changed 480x848 from 2.377 s to 1.461 s
 5.26/5.34 GiB to 5.37/5.72 GiB. Synthetic outputs were finite and invariant to
 window batch size; the expected approximation delta was small for the bounded
 random-weight test but is not a substitute for a real H3 checkpoint comparison.
+
+A separate bounded-random 36-layer A40 simulation with five resident temporal
+tokens at 480x848 measured warmed SDPA at 1.517 s for official independent
+windows and 0.911 s for shared-core (1.67x), with approximately 5.08/5.09 GiB
+allocated peaks. The per-block image-query count fell from 19,200 to 7,950 and
+outputs were finite and invariant to compatible window batch grouping. This
+tests scheduling and structural work reduction only; visual quality and SM75
+throughput still require the real checkpoint on the target Turing card.
 
 Dense SwiGLU routing was bitwise identical but slightly slower, so automatic
 fusion is restricted to compatible W8A8 weights. Sage and SDPA did not beat the

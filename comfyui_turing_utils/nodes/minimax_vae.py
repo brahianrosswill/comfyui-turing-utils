@@ -46,7 +46,7 @@ class MiniMaxH3VideoVAEDecode:
                     DECODER_TILING_MODES,
                     {
                         "default": "official",
-                        "tooltip": "official keeps independent 256px windows. shared_overlap is experimental: it shares image-token QKV/MLP work across overlapping windows while preserving each window's local 256px attention and RoPE.",
+                        "tooltip": "official matches ComfyUI. official_multiband keeps independent windows but replaces final linear seams with normalized low/high-frequency stitching. shared_core computes each image-token Q/output/MLP once while reading a full 256px K/V halo. shared_overlap is the older per-layer averaging experiment and may blur detail.",
                     },
                 ),
             }

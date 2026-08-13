@@ -8,6 +8,7 @@ import queue
 import threading
 
 import torch
+import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 import comfy.memory_management
@@ -34,7 +35,12 @@ TILE_SIZE = 256
 TILE_OVERLAP = 64
 TILES_PER_BATCH = ("auto", "1", "2", "4", "8", "16")
 DECODER_TILE_SIZES = ("256", "288", "320", "384", "480")
-DECODER_TILING_MODES = ("official", "shared_overlap")
+DECODER_TILING_MODES = (
+    "official",
+    "official_multiband",
+    "shared_core",
+    "shared_overlap",
+)
 _AUTO_DECODE_TILE_BATCH_LIMIT = 4
 _AUTO_ENCODE_TILE_BATCH_LIMIT = 2
 _DECODER_BYTES_PER_FP16_TOKEN = 64 * 1024
@@ -42,6 +48,8 @@ _ENCODER_BYTES_PER_FP16_PIXEL_FRAME = 1800
 _ENCODER_FIXED_WORKSPACE = 256 * 1024**2
 _DECODE_SAFETY_FACTOR = 1.08
 _ENCODE_SAFETY_FACTOR = 1.05
+_MULTIBAND_DOWNSAMPLE = 8
+_MULTIBAND_HIGH_WEIGHT_POWER = 4
 
 
 def require_h3_video_vae(vae):
@@ -85,7 +93,8 @@ def _decode_memory_requirement(
     tile_size,
     tiles_per_batch,
     dtype,
-    shared_overlap=False,
+    shared_tokens=False,
+    multiband=False,
 ):
     model = vae.first_stage_model
     height = latent_shape[-2] * model.vae_ratio
@@ -125,33 +134,34 @@ def _decode_memory_requirement(
         * dtype_scale
         * tiles_per_batch
     )
-    if shared_overlap:
+    if shared_tokens:
         decoder_dim = model.decoder.transformer_blocks[0].scale1.numel()
         unique_tokens = (
-            latent_shape[0]
-            * resident_tokens
-            * latent_shape[-2]
-            * latent_shape[-1]
+            latent_shape[0] * resident_tokens * latent_shape[-2] * latent_shape[-1]
         )
         # Persistent image state, global QKV, assembled attention output, and
         # final patch projection coexist at different points of the block loop.
         unique_workspace = (
-            unique_tokens
-            * decoder_dim
-            * comfy.model_management.dtype_size(dtype)
-            * 7
+            unique_tokens * decoder_dim * comfy.model_management.dtype_size(dtype) * 7
         )
         transformer_workspace += unique_workspace
     pixel_elements = (
-        latent_shape[0]
-        * model.decoder.out_channels
-        * resident_frames
-        * height
-        * width
+        latent_shape[0] * model.decoder.out_channels * resident_frames * height * width
     )
-    pixel_workspace = pixel_elements * (
-        comfy.model_management.dtype_size(dtype) + 4
-    )
+    pixel_workspace = pixel_elements * (comfy.model_management.dtype_size(dtype) + 4)
+    if multiband:
+        # Multiband uses an FP32 accumulation canvas, one tile-local low-pass
+        # tensor, and two FP32 scalar normalization maps.
+        pixel_workspace += (
+            pixel_elements * (4 - comfy.model_management.dtype_size(dtype))
+            + latent_shape[0]
+            * model.decoder.out_channels
+            * resident_frames
+            * tile_height
+            * tile_width
+            * comfy.model_management.dtype_size(dtype)
+            + 2 * height * width * 4
+        )
     structural_estimate = int(
         (transformer_workspace + pixel_workspace) * _DECODE_SAFETY_FACTOR
     )
@@ -233,7 +243,9 @@ def _select_tiles_per_batch(
         try:
             selected = int(preset)
         except (TypeError, ValueError) as error:
-            raise ValueError(f"Unknown H3 VAE tiles_per_batch value: {preset}") from error
+            raise ValueError(
+                f"Unknown H3 VAE tiles_per_batch value: {preset}"
+            ) from error
         if selected < 1:
             raise ValueError("H3 VAE tiles_per_batch must be at least one")
         selected = min(selected, tile_count)
@@ -267,7 +279,9 @@ class _TileProgress:
             desc=description,
             disable=not comfy.utils.PROGRESS_BAR_ENABLED,
         )
-        self.device = torch.device(device) if device is not None else torch.device("cpu")
+        self.device = (
+            torch.device(device) if device is not None else torch.device("cpu")
+        )
         self.pending = None
         self.worker = None
         if self.device.type == "cuda" and torch.cuda.is_available():
@@ -382,6 +396,64 @@ def _projected_attention(
         query,
         key,
         value,
+        module.heads,
+        skip_reshape=True,
+        transformer_options=transformer_options,
+    )
+    return out.nan_to_num_(0.0)
+
+
+def _apply_split_half_rope(value, rotary_pos_emb):
+    if rotary_pos_emb is None:
+        return value
+    rot = int(rotary_pos_emb.shape[-3] * 2)
+    apply_one = getattr(comfy.quant_ops.ck, "apply_rope_split_half1", None)
+    if callable(apply_one):
+        rotated = apply_one(value[..., :rot], rotary_pos_emb)
+    else:
+        source = (
+            value[..., :rot]
+            .reshape(*value.shape[:-1], 2, -1)
+            .movedim(-2, -1)
+            .unsqueeze(-2)
+            .to(rotary_pos_emb.dtype)
+        )
+        rotated = (
+            rotary_pos_emb[..., 0] * source[..., 0]
+            + rotary_pos_emb[..., 1] * source[..., 1]
+        )
+        rotated = rotated.movedim(-1, -2).reshape(*value.shape[:-1], rot)
+        rotated = rotated.to(value.dtype)
+    if rot == value.shape[-1]:
+        return rotated
+    return torch.cat((rotated, value[..., rot:]), dim=-1)
+
+
+def _asymmetric_projected_attention(
+    module,
+    query,
+    key,
+    value,
+    query_rotary,
+    key_rotary,
+    transformer_options,
+):
+    """Execute core-query/full-halo attention without padding either side.
+
+    Prepared attention normally fuses a common Q/K RoPE table.  Shared-core Q
+    is a subset of the window while K spans the full window, so normalize and
+    rotate them independently before handing the true asymmetric tensors to
+    the selected SDPA/Sage/W8A8 backend.
+    """
+
+    query = comfy.rmsnorm.rms_norm(query, module.norm_q.weight, module.norm_q.eps)
+    key = comfy.rmsnorm.rms_norm(key, module.norm_k.weight, module.norm_k.eps)
+    query = _apply_split_half_rope(query, query_rotary)
+    key = _apply_split_half_rope(key, key_rotary)
+    out = h3_vae.optimized_attention(
+        AttentionTensorContainer(query.transpose(1, 2)),
+        AttentionTensorContainer(key.transpose(1, 2)),
+        AttentionTensorContainer(value.transpose(1, 2)),
         module.heads,
         skip_reshape=True,
         transformer_options=transformer_options,
@@ -599,6 +671,74 @@ class _SharedWindowLayout:
             token_indices.append(indices.reshape(-1))
         self.token_indices = torch.stack(token_indices)
 
+        # Assign every physical image token to exactly one window.  Because all
+        # windows are axis-aligned and equally sized, nearest-center ownership
+        # is separable and produces contiguous rectangular cores.  A core query
+        # still reads the complete 256px K/V window as its halo.
+        y_centers = torch.tensor(
+            [start + length / 2 for start, length in zip(self.y_idx, self.y_len)],
+            dtype=torch.float32,
+            device=device,
+        )
+        x_centers = torch.tensor(
+            [start + length / 2 for start, length in zip(self.x_idx, self.x_len)],
+            dtype=torch.float32,
+            device=device,
+        )
+        y_positions = torch.arange(
+            self.latent_h, dtype=torch.float32, device=device
+        ).add_(0.5)
+        x_positions = torch.arange(
+            self.latent_w, dtype=torch.float32, device=device
+        ).add_(0.5)
+        y_owner = (y_positions[:, None] - y_centers[None, :]).abs().argmin(dim=1)
+        x_owner = (x_positions[:, None] - x_centers[None, :]).abs().argmin(dim=1)
+
+        self.core_global_indices = []
+        self.core_local_indices = []
+        self.core_groups = {}
+        for window_index, (i, j, yi, _yl, xi, _xl) in enumerate(self.descriptors):
+            global_y = torch.nonzero(y_owner == i, as_tuple=False).flatten()
+            global_x = torch.nonzero(x_owner == j, as_tuple=False).flatten()
+            temporal = torch.arange(self.latent_t, device=device)[:, None, None]
+            rows = global_y[None, :, None]
+            columns = global_x[None, None, :]
+            global_indices = (
+                temporal * self.latent_h * self.latent_w
+                + rows * self.latent_w
+                + columns
+            ).reshape(-1)
+            local_indices = (
+                temporal * self.window_h * self.window_w
+                + (rows - yi) * self.window_w
+                + (columns - xi)
+            ).reshape(-1)
+            self.core_global_indices.append(global_indices)
+            self.core_local_indices.append(local_indices)
+            self.core_groups.setdefault(int(global_indices.numel()), []).append(
+                window_index
+            )
+
+        owned = torch.cat(self.core_global_indices).sort().values
+        expected = torch.arange(self.image_tokens, device=device)
+        if not torch.equal(owned, expected):
+            raise RuntimeError(
+                "shared-core window ownership does not cover each token once"
+            )
+        self.core_group_windows = {}
+        self.core_group_global_indices = {}
+        self.core_group_local_indices = {}
+        for core_tokens, windows in self.core_groups.items():
+            self.core_group_windows[core_tokens] = torch.tensor(
+                windows, dtype=torch.long, device=device
+            )
+            self.core_group_global_indices[core_tokens] = torch.stack(
+                [self.core_global_indices[index] for index in windows]
+            )
+            self.core_group_local_indices[core_tokens] = torch.stack(
+                [self.core_local_indices[index] for index in windows]
+            )
+
     @property
     def window_count(self):
         return len(self.descriptors)
@@ -661,9 +801,7 @@ class _WindowFeatureAssembler:
             self.out_x = 0
             self.current_row = i
         if i < len(self.layout.y_idx) - 1:
-            self.new_tails.append(
-                tile[..., -self.layout.y_overlap[i] :, :, :].clone()
-            )
+            self.new_tails.append(tile[..., -self.layout.y_overlap[i] :, :, :].clone())
         next_left_tail = (
             tile[..., -self.layout.x_overlap[j] :, :].clone()
             if j < len(self.layout.x_idx) - 1
@@ -816,11 +954,15 @@ def _shared_overlap_decoder_forward(
                 attention.heads,
                 3 * attention.dim_head,
             )
-            suffix_group = suffix[:, window_start:window_end].reshape(
-                batch * window_count,
-                suffix_tokens,
-                dim,
-            ).clone()
+            suffix_group = (
+                suffix[:, window_start:window_end]
+                .reshape(
+                    batch * window_count,
+                    suffix_tokens,
+                    dim,
+                )
+                .clone()
+            )
             suffix_normed = comfy.rmsnorm.rms_norm(
                 suffix_group,
                 block.norm1.weight,
@@ -848,17 +990,15 @@ def _shared_overlap_decoder_forward(
                 layout.window_tokens + suffix_tokens,
                 dim,
             )
-            for local_index, window_index in enumerate(
-                range(window_start, window_end)
-            ):
+            for local_index, window_index in enumerate(range(window_start, window_end)):
                 assembler.add(
                     window_index,
                     attended[:, local_index, : layout.window_tokens],
                 )
 
-            suffix_attention = attended[
-                :, :, layout.window_tokens :
-            ].reshape(batch * window_count, suffix_tokens, dim)
+            suffix_attention = attended[:, :, layout.window_tokens :].reshape(
+                batch * window_count, suffix_tokens, dim
+            )
             suffix_group.addcmul_(
                 attention.to_out(suffix_attention),
                 comfy.ops.cast_to_input(block.scale1, suffix_group),
@@ -903,21 +1043,42 @@ def _shared_overlap_decoder_forward(
             )
         del image_attention
 
+    return _project_decoder_pixels(
+        decoder,
+        h,
+        batch,
+        latent_t,
+        latent_h,
+        latent_w,
+        linear_chunk,
+    )
+
+
+def _project_decoder_pixels(
+    decoder,
+    h,
+    batch,
+    latent_t,
+    latent_h,
+    latent_w,
+    linear_chunk,
+):
     projected_size = (
         decoder.out_channels
         * decoder.patch_size_t
         * decoder.patch_size
         * decoder.patch_size
     )
+    image_tokens = latent_t * latent_h * latent_w
     output = torch.empty(
         batch,
-        layout.image_tokens,
+        image_tokens,
         projected_size,
         dtype=h.dtype,
         device=h.device,
     )
-    for token_start in range(0, layout.image_tokens, linear_chunk):
-        token_end = min(token_start + linear_chunk, layout.image_tokens)
+    for token_start in range(0, image_tokens, linear_chunk):
+        token_end = min(token_start + linear_chunk, image_tokens)
         output[:, token_start:token_end].copy_(
             decoder.proj_out(decoder.norm_out(h[:, token_start:token_end]))
         )
@@ -938,6 +1099,245 @@ def _shared_overlap_decoder_forward(
         latent_t * decoder.patch_size_t,
         latent_h * decoder.patch_size,
         latent_w * decoder.patch_size,
+    )
+
+
+def _shared_core_decoder_forward(
+    model,
+    x,
+    transformer_options,
+    block_session,
+    tiles_per_batch,
+    progress,
+):
+    decoder = model.decoder
+    batch, _, latent_t, latent_h, latent_w = x.shape
+    layout = _SharedWindowLayout(
+        model,
+        latent_t,
+        latent_h,
+        latent_w,
+        x.device,
+    )
+    h = decoder.x_embedder(x.flatten(2).transpose(1, 2))
+    dim = h.shape[-1]
+    suffix_tokens = 1 + decoder.num_register_tokens
+    suffix = torch.cat(
+        (
+            comfy.ops.cast_to_input(decoder.register_tokens, h)
+            .view(1, 1, decoder.num_register_tokens, dim)
+            .expand(batch, layout.window_count, -1, -1),
+            torch.zeros(
+                batch,
+                layout.window_count,
+                1,
+                dim,
+                dtype=h.dtype,
+                device=h.device,
+            ),
+        ),
+        dim=2,
+    ).contiguous()
+    image_ids = h3_vae.create_token_ids(
+        (latent_t, layout.window_h, layout.window_w),
+        x.device,
+        x.dtype,
+    )
+    suffix_ids = torch.zeros(
+        (1, suffix_tokens, 3),
+        dtype=image_ids.dtype,
+        device=image_ids.device,
+    )
+    rotary = decoder.pos_embed(torch.cat((image_ids, suffix_ids), dim=1))
+    suffix_rotary_indices = torch.arange(
+        layout.window_tokens,
+        layout.window_tokens + suffix_tokens,
+        device=x.device,
+    )
+    linear_chunk = max(layout.window_tokens, tiles_per_batch * layout.window_tokens)
+    blocks = list(decoder.transformer_blocks)
+
+    for block_index, block in enumerate(blocks):
+        if block_index > 0:
+            block_session.before_stage(block_index)
+        attention = block.attn
+        qkv_image = torch.empty(
+            batch,
+            layout.image_tokens,
+            attention.heads,
+            3 * attention.dim_head,
+            dtype=h.dtype,
+            device=h.device,
+        )
+        for token_start in range(0, layout.image_tokens, linear_chunk):
+            token_end = min(token_start + linear_chunk, layout.image_tokens)
+            normed = comfy.rmsnorm.rms_norm(
+                h[:, token_start:token_end],
+                block.norm1.weight,
+                block.norm1.eps,
+            )
+            projected = attention.to_qkv(normed).view(
+                batch,
+                token_end - token_start,
+                attention.heads,
+                3 * attention.dim_head,
+            )
+            qkv_image[:, token_start:token_end].copy_(projected)
+
+        image_attention = torch.empty_like(h)
+        for core_tokens in sorted(layout.core_groups):
+            grouped_windows = layout.core_group_windows[core_tokens]
+            for group_start in range(0, grouped_windows.numel(), tiles_per_batch):
+                window_tensor = grouped_windows[
+                    group_start : group_start + tiles_per_batch
+                ]
+                group_slice = slice(group_start, group_start + window_tensor.numel())
+                window_count = window_tensor.numel()
+                key_indices = layout.token_indices.index_select(0, window_tensor)
+                query_global_indices = layout.core_group_global_indices[core_tokens][
+                    group_slice
+                ]
+                query_local_indices = layout.core_group_local_indices[core_tokens][
+                    group_slice
+                ]
+
+                window_qkv = qkv_image[:, key_indices].reshape(
+                    batch * window_count,
+                    layout.window_tokens,
+                    attention.heads,
+                    3 * attention.dim_head,
+                )
+                query_q = qkv_image[:, query_global_indices][..., : attention.dim_head]
+                query_q = query_q.reshape(
+                    batch * window_count,
+                    core_tokens,
+                    attention.heads,
+                    attention.dim_head,
+                )
+                suffix_group = (
+                    suffix.index_select(1, window_tensor)
+                    .reshape(
+                        batch * window_count,
+                        suffix_tokens,
+                        dim,
+                    )
+                    .clone()
+                )
+                suffix_normed = comfy.rmsnorm.rms_norm(
+                    suffix_group,
+                    block.norm1.weight,
+                    block.norm1.eps,
+                )
+                suffix_qkv = attention.to_qkv(suffix_normed).view(
+                    batch * window_count,
+                    suffix_tokens,
+                    attention.heads,
+                    3 * attention.dim_head,
+                )
+                suffix_q, suffix_k, suffix_v = torch.chunk(suffix_qkv, 3, dim=-1)
+                query = torch.cat((query_q, suffix_q), dim=1)
+                key = torch.cat(
+                    (
+                        window_qkv[..., attention.dim_head : 2 * attention.dim_head],
+                        suffix_k,
+                    ),
+                    dim=1,
+                )
+                value = torch.cat(
+                    (window_qkv[..., 2 * attention.dim_head :], suffix_v),
+                    dim=1,
+                )
+
+                query_rotary_indices = torch.cat(
+                    (
+                        query_local_indices,
+                        suffix_rotary_indices.expand(window_count, -1),
+                    ),
+                    dim=1,
+                )
+                query_rotary = rotary[0][query_rotary_indices]
+                query_rotary = (
+                    query_rotary.unsqueeze(0)
+                    .expand(batch, *query_rotary.shape)
+                    .reshape(
+                        batch * window_count,
+                        core_tokens + suffix_tokens,
+                        *query_rotary.shape[2:],
+                    )
+                )
+                key_rotary = rotary.expand(batch * window_count, *rotary.shape[1:])
+                attended = _asymmetric_projected_attention(
+                    attention,
+                    query,
+                    key,
+                    value,
+                    query_rotary,
+                    key_rotary,
+                    transformer_options,
+                ).view(
+                    batch,
+                    window_count,
+                    core_tokens + suffix_tokens,
+                    dim,
+                )
+
+                for local_index, global_indices in enumerate(query_global_indices):
+                    image_attention[:, global_indices] = attended[
+                        :, local_index, :core_tokens
+                    ]
+
+                suffix_attention = attended[:, :, core_tokens:].reshape(
+                    batch * window_count, suffix_tokens, dim
+                )
+                suffix_group.addcmul_(
+                    attention.to_out(suffix_attention),
+                    comfy.ops.cast_to_input(block.scale1, suffix_group),
+                )
+                suffix_normed = comfy.rmsnorm.rms_norm(
+                    suffix_group,
+                    block.norm2.weight,
+                    block.norm2.eps,
+                )
+                suffix_group.addcmul_(
+                    _feed_forward(block.ff, suffix_normed),
+                    comfy.ops.cast_to_input(block.scale2, suffix_group),
+                )
+                suffix[:, window_tensor] = suffix_group.view(
+                    batch,
+                    window_count,
+                    suffix_tokens,
+                    dim,
+                )
+                if progress is not None:
+                    progress.update(window_count)
+
+        del qkv_image
+        for token_start in range(0, layout.image_tokens, linear_chunk):
+            token_end = min(token_start + linear_chunk, layout.image_tokens)
+            h_slice = h[:, token_start:token_end]
+            h_slice.addcmul_(
+                attention.to_out(image_attention[:, token_start:token_end]),
+                comfy.ops.cast_to_input(block.scale1, h_slice),
+            )
+            normed = comfy.rmsnorm.rms_norm(
+                h_slice,
+                block.norm2.weight,
+                block.norm2.eps,
+            )
+            h_slice.addcmul_(
+                _feed_forward(block.ff, normed),
+                comfy.ops.cast_to_input(block.scale2, h_slice),
+            )
+        del image_attention
+
+    return _project_decoder_pixels(
+        decoder,
+        h,
+        batch,
+        latent_t,
+        latent_h,
+        latent_w,
+        linear_chunk,
     )
 
 
@@ -1061,6 +1461,26 @@ def _decode_shared_overlap(
     )
 
 
+def _decode_shared_core(
+    model,
+    z,
+    transformer_options,
+    block_session,
+    tiles_per_batch,
+    progress,
+):
+    block_session.before_stage(0)
+    z = model.post_quant_conv(z)
+    return _shared_core_decoder_forward(
+        model,
+        z,
+        transformer_options,
+        block_session,
+        tiles_per_batch,
+        progress,
+    )
+
+
 def _decode_spatial(
     model,
     z,
@@ -1081,7 +1501,16 @@ def _decode_spatial(
             tiles_per_batch,
             progress,
         )
-    return _tiled_decode(
+    if decoder_tiling == "shared_core":
+        return _decode_shared_core(
+            model,
+            z,
+            transformer_options,
+            block_session,
+            tiles_per_batch,
+            progress,
+        )
+    args = (
         model,
         z,
         tile_size,
@@ -1091,6 +1520,101 @@ def _decode_spatial(
         tiles_per_batch,
         progress,
     )
+    if decoder_tiling == "official_multiband":
+        return _tiled_decode(*args, multiband=True)
+    return _tiled_decode(*args)
+
+
+def _axis_multiband_weight(
+    index,
+    starts,
+    lengths,
+    dtype,
+    device,
+):
+    length = lengths[index]
+    weight = torch.ones(length, dtype=dtype, device=device)
+    if index > 0:
+        overlap = starts[index - 1] + lengths[index - 1] - starts[index]
+        phase = (torch.arange(overlap, dtype=dtype, device=device) + 0.5) / overlap
+        weight[:overlap].mul_(0.5 - 0.5 * torch.cos(math.pi * phase))
+    if index + 1 < len(starts):
+        overlap = starts[index] + lengths[index] - starts[index + 1]
+        phase = (torch.arange(overlap, dtype=dtype, device=device) + 0.5) / overlap
+        weight[-overlap:].mul_(
+            torch.flip(0.5 - 0.5 * torch.cos(math.pi * phase), dims=(0,))
+        )
+    return weight
+
+
+def _multiband_window_weights(
+    y_index,
+    x_index,
+    y_starts,
+    y_lengths,
+    x_starts,
+    x_lengths,
+    dtype,
+    device,
+):
+    y_weight = _axis_multiband_weight(y_index, y_starts, y_lengths, dtype, device)
+    x_weight = _axis_multiband_weight(x_index, x_starts, x_lengths, dtype, device)
+    low = y_weight[:, None] * x_weight[None, :]
+    high = low.pow(_MULTIBAND_HIGH_WEIGHT_POWER)
+    return low, high
+
+
+def _multiband_denominators(
+    descriptors,
+    y_starts,
+    y_lengths,
+    x_starts,
+    x_lengths,
+    height,
+    width,
+    dtype,
+    device,
+):
+    low_sum = torch.zeros(height, width, dtype=dtype, device=device)
+    high_sum = torch.zeros_like(low_sum)
+    for i, j, _zi, _zl, _zj, _zw in descriptors:
+        low, high = _multiband_window_weights(
+            i,
+            j,
+            y_starts,
+            y_lengths,
+            x_starts,
+            x_lengths,
+            dtype,
+            device,
+        )
+        y = y_starts[i]
+        x = x_starts[j]
+        low_sum[y : y + y_lengths[i], x : x + x_lengths[j]].add_(low)
+        high_sum[y : y + y_lengths[i], x : x + x_lengths[j]].add_(high)
+    tiny = torch.finfo(dtype).tiny
+    return low_sum.clamp_min_(tiny), high_sum.clamp_min_(tiny)
+
+
+def _spatial_lowpass(tile):
+    batch, channels, frames, height, width = tile.shape
+    frame_batch = tile.permute(0, 2, 1, 3, 4).reshape(
+        batch * frames, channels, height, width
+    )
+    low_height = max(1, math.ceil(height / _MULTIBAND_DOWNSAMPLE))
+    low_width = max(1, math.ceil(width / _MULTIBAND_DOWNSAMPLE))
+    low = F.interpolate(
+        frame_batch,
+        size=(low_height, low_width),
+        mode="area",
+    )
+    low = F.interpolate(
+        low,
+        size=(height, width),
+        mode="bilinear",
+        align_corners=False,
+    )
+    return low.view(batch, frames, channels, height, width).permute(0, 2, 1, 3, 4)
 
 
 def _tiled_decode(
@@ -1102,6 +1626,7 @@ def _tiled_decode(
     block_session,
     tiles_per_batch=1,
     progress=None,
+    multiband=False,
 ):
     height = z.shape[-2] * model.vae_ratio
     width = z.shape[-1] * model.vae_ratio
@@ -1129,11 +1654,24 @@ def _tiled_decode(
     last_height = 0
     source_batch = z.shape[0]
     canonical_spatial = tile_size != TILE_SIZE
+    multiband_low_sum = None
+    multiband_high_sum = None
+    if multiband:
+        multiband_low_sum, multiband_high_sum = _multiband_denominators(
+            descriptors,
+            y_idx,
+            y_len,
+            x_idx,
+            x_len,
+            height,
+            width,
+            torch.float32,
+            z.device,
+        )
     for start in range(0, len(descriptors), tiles_per_batch):
         group = descriptors[start : start + tiles_per_batch]
         inputs = [
-            z[..., zi : zi + zl, zj : zj + zw]
-            for _i, _j, zi, zl, zj, zw in group
+            z[..., zi : zi + zl, zj : zj + zw] for _i, _j, zi, zl, zj, zw in group
         ]
         batched = inputs[0] if len(inputs) == 1 else torch.cat(inputs, dim=0)
         decoded = _decode_pixels(
@@ -1146,6 +1684,41 @@ def _tiled_decode(
         decoded_tiles = decoded.split(source_batch, dim=0)
 
         for (i, j, _zi, _zl, _zj, _zw), tile in zip(group, decoded_tiles):
+            if multiband:
+                if canvas is None:
+                    canvas = torch.zeros(
+                        *tile.shape[:-2],
+                        height,
+                        width,
+                        dtype=torch.float32,
+                        device=tile.device,
+                    )
+                low_weight, high_weight = _multiband_window_weights(
+                    i,
+                    j,
+                    y_idx,
+                    y_len,
+                    x_idx,
+                    x_len,
+                    torch.float32,
+                    tile.device,
+                )
+                y = y_idx[i]
+                x = x_idx[j]
+                low_weight = (
+                    low_weight / multiband_low_sum[y : y + y_len[i], x : x + x_len[j]]
+                )
+                high_weight = (
+                    high_weight / multiband_high_sum[y : y + y_len[i], x : x + x_len[j]]
+                )
+                low = _spatial_lowpass(tile)
+                high = tile - low
+                contribution = low.float().mul_(low_weight)
+                contribution.addcmul_(high, high_weight)
+                canvas[..., y : y + tile.shape[-2], x : x + tile.shape[-1]].add_(
+                    contribution
+                )
+                continue
             if i != current_row:
                 row_tails = new_tails
                 new_tails = []
@@ -1239,9 +1812,7 @@ def _tiled_encode(
         ]
         batched = inputs[0] if len(inputs) == 1 else torch.cat(inputs, dim=0)
         encoded = _encode_moments(model, batched, module_session)
-        for (i, j, *_bounds), tile in zip(
-            group, encoded.split(source_batch, dim=0)
-        ):
+        for (i, j, *_bounds), tile in zip(group, encoded.split(source_batch, dim=0)):
             rows[i][j] = tile
         if progress is not None:
             progress.update(len(group))
@@ -1433,9 +2004,10 @@ def decode_video(
         raise ValueError(f"Unknown H3 VAE decoder tile size: {decoder_tile_size}")
     if decoder_tiling not in DECODER_TILING_MODES:
         raise ValueError(f"Unknown H3 VAE decoder tiling mode: {decoder_tiling}")
-    if decoder_tiling == "shared_overlap" and tile_size != TILE_SIZE:
+    shared_token_modes = {"shared_overlap", "shared_core"}
+    if decoder_tiling in shared_token_modes and tile_size != TILE_SIZE:
         raise ValueError(
-            "shared_overlap decoder tiling requires the official 256px tile size"
+            f"{decoder_tiling} decoder tiling requires the official 256px tile size"
         )
     if tile_size != TILE_SIZE:
         logging.warning(
@@ -1448,26 +2020,29 @@ def decode_video(
         tile_size,
     )
     effective_tiling = decoder_tiling
-    if decoder_tiling == "shared_overlap" and tile_count == 1:
+    if decoder_tiling != "official" and tile_count == 1:
         effective_tiling = "official"
         logging.info(
-            "MiniMax H3 VAE shared_overlap has no overlap to share; using the exact official single-window decoder"
+            "MiniMax H3 VAE %s has no spatial boundary to optimize; using the exact official single-window decoder",
+            decoder_tiling,
         )
-    elif decoder_tiling == "shared_overlap":
+    elif decoder_tiling in shared_token_modes:
         tile_tokens = (
-            min(latent.shape[-2] * model.vae_ratio, TILE_SIZE)
-            // model.vae_ratio
-        ) * (
-            min(latent.shape[-1] * model.vae_ratio, TILE_SIZE)
-            // model.vae_ratio
-        )
+            min(latent.shape[-2] * model.vae_ratio, TILE_SIZE) // model.vae_ratio
+        ) * (min(latent.shape[-1] * model.vae_ratio, TILE_SIZE) // model.vae_ratio)
         duplicate_ratio = (
             tile_count * tile_tokens / (latent.shape[-2] * latent.shape[-1])
         )
         logging.warning(
-            "Experimental H3 VAE shared-overlap decoder active: windows=%d duplicate_spatial_ratio=%.2fx",
+            "Experimental H3 VAE %s decoder active: windows=%d duplicate_spatial_ratio=%.2fx",
+            decoder_tiling.replace("_", "-"),
             tile_count,
             duplicate_ratio,
+        )
+    elif decoder_tiling == "official_multiband":
+        logging.info(
+            "H3 VAE official independent windows with normalized multiband pixel stitching active: windows=%d",
+            tile_count,
         )
     batch_tiles, memory = _select_tiles_per_batch(
         vae,
@@ -1479,7 +2054,8 @@ def decode_video(
             tile_size,
             count,
             compute_dtype,
-            effective_tiling == "shared_overlap",
+            effective_tiling in shared_token_modes,
+            effective_tiling == "official_multiband",
         ),
         _AUTO_DECODE_TILE_BATCH_LIMIT,
     )
@@ -1500,14 +2076,14 @@ def decode_video(
             1 if z.shape[2] == 1 else model._decode_temporal_chunks(z.shape[2])[1]
         )
         progress_units = tile_count * temporal_chunks
-        if effective_tiling == "shared_overlap":
+        if effective_tiling in shared_token_modes:
             progress_units *= len(model.decoder.transformer_blocks)
         progress = _TileProgress(
             progress_units,
             z.device,
             (
                 "H3 VAE Decode Windows"
-                if effective_tiling == "shared_overlap"
+                if effective_tiling in shared_token_modes
                 else "H3 VAE Decode"
             ),
         )
