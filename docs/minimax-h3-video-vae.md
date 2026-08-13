@@ -43,8 +43,8 @@ control is intentionally not exposed in the node UI.
 Both paths retain prefetched weights across spatial windows and temporal chunks
 when memory allows. Decode uses asynchronous FP32 pixel double buffering;
 encode uses asynchronous input buffering when pinned host memory is available.
-The nodes publish progress to both ComfyUI and the terminal, then release the
-VAE weights through ComfyUI's normal dynamic-memory manager.
+The nodes publish completed-tile progress to both ComfyUI and the terminal,
+then release the VAE weights through ComfyUI's normal dynamic-memory manager.
 
 These nodes are experimental. The fixed tiling policy is deliberate: discarded
 arbitrary-size and alternate stitching strategies were removed after producing

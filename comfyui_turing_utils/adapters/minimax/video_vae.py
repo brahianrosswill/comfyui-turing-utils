@@ -1018,9 +1018,6 @@ def _shared_core_multiband_decoder_forward(
                     suffix_tokens,
                     dim,
                 )
-                if progress is not None:
-                    progress.update(window_count)
-
         del qkv_image
         for token_start in range(0, layout.image_tokens, linear_chunk):
             token_end = min(token_start + linear_chunk, layout.image_tokens)
@@ -1113,9 +1110,6 @@ def _independent_window_tail(
                 _feed_forward(block.ff, normed),
                 comfy.ops.cast_to_input(block.scale2, state),
             )
-            if progress is not None:
-                progress.update(window_count)
-
     pixel_y_idx = [value * decoder.patch_size for value in layout.y_idx]
     pixel_y_len = [value * decoder.patch_size for value in layout.y_len]
     pixel_x_idx = [value * decoder.patch_size for value in layout.x_idx]
@@ -1153,6 +1147,8 @@ def _independent_window_tail(
         )
         for local_index, window_index in enumerate(range(window_start, window_end)):
             assembler.add(window_index, decoded[:, local_index])
+        if progress is not None:
+            progress.update(window_count)
     return assembler.finish()
 
 
@@ -1626,11 +1622,11 @@ def decode_video(
         temporal_chunks = (
             1 if z.shape[2] == 1 else model._decode_temporal_chunks(z.shape[2])[1]
         )
-        progress_units = tile_count * temporal_chunks * block_count
+        progress_units = tile_count * temporal_chunks
         progress = _TileProgress(
             progress_units,
             z.device,
-            "H3 VAE Decode Windows",
+            "H3 VAE Decode Tiles",
         )
         block_session = _RetainedWeights(_decoder_weight_stages(model), z.device, True)
         block_session.start()

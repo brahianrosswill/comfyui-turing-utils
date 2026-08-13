@@ -192,7 +192,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 self.assertEqual(actual.dtype, torch.float32)
                 self.assertEqual(
                     sum(call.args[0] for call in progress.update.call_args_list),
-                    layout.window_count * len(decoder.transformer_blocks),
+                    layout.window_count,
                 )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
