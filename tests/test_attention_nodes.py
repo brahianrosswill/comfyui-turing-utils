@@ -55,6 +55,10 @@ class SparseAttentionNodeTest(unittest.TestCase):
         )
 
     def test_schema_exposes_tunable_sparse_parameters(self):
+        self.assertEqual(
+            attention_nodes.SolSparseAttentionPatch.TITLE,
+            "Patch Sol Sparse Attention",
+        )
         inputs = attention_nodes.SolSparseAttentionPatch.INPUT_TYPES()["required"]
         self.assertEqual(
             tuple(inputs),

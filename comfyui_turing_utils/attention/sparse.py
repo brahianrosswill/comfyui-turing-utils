@@ -1,4 +1,4 @@
-"""Experimental Sol sparse attention policies."""
+"""Production Sol sparse-attention policy and exact modality protection."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ def _sparse_dense_baseline(
     **kwargs,
 ) -> torch.Tensor:
     if reason not in _LOGGED_SPARSE_DENSE_REASONS:
-        LOG.info("Experimental sparse attention uses stable Sage for %s", reason)
+        LOG.info("Sol sparse attention uses stable Sage for %s", reason)
         _LOGGED_SPARSE_DENSE_REASONS.add(reason)
     return turing_sage_attention(fallback, q, k, v, heads, **kwargs)
 
@@ -543,7 +543,7 @@ def turing_sol_sparse_attention(
     )
     if kernel_key not in _LOGGED_SPARSE_KERNELS:
         LOG.info(
-            "Experimental Turing Sol sparse attention active: dtype=%s Q=%s K=%s "
+            "Turing Sol sparse attention active: dtype=%s Q=%s K=%s "
             "min_sequence=%d prefix_policy=%s dense_query_ranges=%s exact_kv_ranges=%s "
             "selected_qk=int8 score_domain=int8_consistent threshold=%.2f "
             "skipped_residual=%s local_radius=1 "

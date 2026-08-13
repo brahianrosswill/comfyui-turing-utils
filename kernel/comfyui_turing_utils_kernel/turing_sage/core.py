@@ -735,7 +735,7 @@ def prequantize_sol_sageattn(
     if not q.is_cuda:
         raise ValueError("Input tensors must be on CUDA")
     if tensor_layout != "HND":
-        raise ValueError("experimental sparse attention currently requires HND layout")
+        raise ValueError("Turing Sol sparse attention currently requires HND layout")
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError("Turing sparse Q/K/V must be float16 or bfloat16")
     if q.device != k.device or q.device != v.device:
@@ -745,7 +745,7 @@ def prequantize_sol_sageattn(
     _validate_fixed_qkv(q, k, v, tensor_layout)
     head_dim = q.size(-1)
     if not 0 < head_dim <= 128:
-        raise ValueError("experimental sparse attention requires head_dim in [1, 128]")
+        raise ValueError("Turing Sol sparse attention requires head_dim in [1, 128]")
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("the last Q/K/V dimension must be contiguous")
     kernel_head_dim = 64 if head_dim <= 64 else 128

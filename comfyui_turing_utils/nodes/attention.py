@@ -1,4 +1,4 @@
-"""ComfyUI nodes for explicit experimental attention patches."""
+"""ComfyUI nodes for production attention patches and explicit kernel tuning."""
 
 from __future__ import annotations
 
@@ -185,7 +185,7 @@ class SolSparseAttentionPatch:
     RETURN_NAMES = ("model",)
     FUNCTION = "patch"
     CATEGORY = "Turing Utils/patches"
-    TITLE = "Patch Sol Sparse Attention (Experimental)"
+    TITLE = "Patch Sol Sparse Attention"
 
     def patch(
         self,

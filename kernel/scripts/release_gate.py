@@ -114,6 +114,28 @@ def _static_gate() -> None:
     ):
         if marker not in source:
             raise RuntimeError(f"missing fused Q/K preprocessing ABI marker in {path}")
+    sparse_policy = (ROOT / "comfyui_turing_utils/attention/sparse.py").read_text(
+        encoding="utf-8"
+    )
+    for marker in (
+        'segment.role in {"reference_image", "reference_video_anchor"}',
+    ):
+        if marker not in sparse_policy:
+            raise RuntimeError(f"missing production Sol quality invariant: {marker}")
+    sparse_core = (
+        KERNEL / "comfyui_turing_utils_kernel/turing_sage/core.py"
+    ).read_text(encoding="utf-8")
+    for marker in (
+        "* sparse_block_count\n        * key_block_count",
+        "possible_blocks=possible_blocks",
+    ):
+        if marker not in sparse_core:
+            raise RuntimeError(f"missing full-block Sol route statistic: {marker}")
+    sparse_patch = (ROOT / "comfyui_turing_utils/attention/patches.py").read_text(
+        encoding="utf-8"
+    )
+    if "bundled_turing_sol_sparse_experimental" in sparse_patch:
+        raise RuntimeError("the production Sol patch still advertises an experimental ABI")
     print(f"static release gate passed (kernel ABI {EXPECTED_VERSION})")
 
 
@@ -144,7 +166,7 @@ def main() -> None:
                 "kernel/scripts/validate_compatible.py",
                 "--device",
                 args.device,
-                "--experimental-sparse",
+                "--sol",
             ],
             env=env,
         )

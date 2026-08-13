@@ -26,7 +26,7 @@ def sparse_available() -> bool:
 
 def w8a8_available() -> bool:
     # Dense W8A8 is a production backend with its own ABI.  Do not couple its
-    # availability to the experimental Sol entry point merely because both
+    # availability to the Sol entry point merely because both
     # kernels currently share one extension module.
     if not available():
         return False
@@ -302,7 +302,7 @@ def preflight_sparse(device: torch.device) -> None:
     if torch.cuda.get_device_capability(device) != (7, 5):
         raise RuntimeError(f"Turing sparse attention requires sm75, got {device}")
     if not sparse_available():
-        raise RuntimeError("the experimental Turing sparse extension is not built")
+        raise RuntimeError("the Turing Sol sparse extension is not built")
 
     with torch.inference_mode(), torch.cuda.device(device):
         for head_dim in (64, 128):

@@ -25,7 +25,7 @@ not skip attention or quantized-kernel preflight.
 |---|---|
 | `comfyui_turing_utils/precision.py` | BF16 selection, Kitchen contract, exact-sm75 preflight |
 | `comfyui_turing_utils/attention/` | prepared-attention protocol, stable Sage, sparse policies, semantic layout, and patches |
-| `comfyui_turing_utils/nodes/attention.py` | model-independent experimental sparse-attention patch UI |
+| `comfyui_turing_utils/nodes/attention.py` | model-independent production Sol patch UI and explicit kernel tuning |
 | `comfyui_turing_utils/quantization/` | exact-sm75 W8/W4 dispatch, ConvRot loading, and generic fusions |
 | `comfyui_turing_utils/adapters/minimax/` | MiniMax layout, packed-sequence planning, and fusions |
 | `comfyui_turing_utils/adapters/wan.py` | Wan/Bernini context-aware planning and Q/K preprocessing hooks |
@@ -197,7 +197,9 @@ uses a bounded exact FP32 SDPA path. It contains fewer than 4096 scores per head
 and cannot reproduce the large-sequence SDPA allocation failure.
 
 The sparse backend is installed only by the independent
-`Patch Sol Sparse Attention (Experimental)` node and is never a loader option.
+`Patch Sol Sparse Attention` node and is never a loader option. Keeping a
+separate node is intentional: its routing, modality, step, layer, and residual
+quality parameters do not belong in the loader.
 Dispatch depends only on the attention call: matching
 FP16, BF16, or FP32 Q/K/V; head dimensions 1--128; unmasked non-causal attention;
 and both Q and K meeting the configurable minimum sequence length. HND and
@@ -466,7 +468,7 @@ validation, build with:
 COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX" \
 python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
-python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-sparse
+python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --sol
 python kernel/scripts/validate_wan_fusions.py --device cuda:0
 python kernel/scripts/audit_attention_resources.py
 ```

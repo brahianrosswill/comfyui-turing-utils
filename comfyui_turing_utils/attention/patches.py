@@ -470,7 +470,7 @@ def make_sparse_attention_override(
         raise RuntimeError("Sol sparse attention requires an sm75 Turing GPU")
     if not bundled_sparse_available():
         raise RuntimeError(
-            "The experimental Turing sparse extension is unavailable. "
+            "The Turing Sol sparse extension is unavailable. "
             "Rebuild comfyui-turing-utils-kernel 0.23.0 or newer with sm75 enabled."
         )
     preflight_bundled(device)
@@ -898,7 +898,7 @@ def make_sparse_attention_override(
         attention_override.container_function = container_function
 
     attention_override.turing_utils_attention_backend = "sol_sparse_attn"
-    attention_override.turing_utils_attention_implementation = "bundled_turing_sol_sparse_experimental"
+    attention_override.turing_utils_attention_implementation = "bundled_turing_sol_sparse"
     if fused_qk_preprocessing_available():
         attention_override.prepared_attention_executor = prepared_executor
     return attention_override
@@ -965,7 +965,7 @@ def apply_sparse_attention_patch(
         transformer_options.pop(ATTENTION_EXECUTOR_KEY, None)
     transformer_options["turing_utils_attention_backend"] = "sol_sparse_attn"
     transformer_options["turing_utils_attention_implementation"] = (
-        "bundled_turing_sol_sparse_experimental"
+        "bundled_turing_sol_sparse"
     )
     LOG.info(
         "Sol sparse attention patch enabled: threshold=%.2f "

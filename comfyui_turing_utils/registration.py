@@ -38,7 +38,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsH3ConcatAVLatent": "H3 Concat AV Latent",
     "TuringUtilsH3SeparateAVLatent": "H3 Separate AV Latent",
     "TuringUtilsMiniMaxH3BlockCachePatch": "Patch MiniMax H3 Block Cache (Experimental)",
-    "TuringUtilsSolSparseAttentionPatch": "Patch Sol Sparse Attention (Experimental)",
+    "TuringUtilsSolSparseAttentionPatch": "Patch Sol Sparse Attention",
     "TuringUtilsAttentionKernelTuningPatch": "Patch Turing Attention Kernel Tuning (Experimental)",
     "TuringUtilsVideoMotionContactSheet": "Video Motion Contact Sheet (Experimental)",
 }

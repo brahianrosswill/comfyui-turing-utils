@@ -53,7 +53,7 @@ duplicate full W4A4 and W8A8 GEMM implementations.
 
 | Feature | Stable Sage | Dense W8A8 | Sol FP16-PV | Sol W8A8 |
 |---|---:|---:|---:|---:|
-| Production status | explicit | loader default | experimental patch option | experimental patch default |
+| Production status | explicit | loader default | production patch option | production patch default |
 | Input storage | FP16/BF16 | FP16/BF16 | FP16/BF16 | FP16/BF16 |
 | QK score domain | INT8, FP32 accumulation | INT8, FP32 accumulation | INT8-consistent routing and score | INT8-consistent routing and score |
 | PV path | FP16 Tensor Core, FP32 accumulation | U8 x S8 Tensor Core | FP16 Tensor Core | U8 x S8 Tensor Core |
@@ -105,7 +105,7 @@ sequence length or that an A40 PTX result can choose a Turing launch policy.
 |---|---|---|
 | Production default | Dense W8A8 attention; ConvRot W8A8/W4A8/W4A4 activation paths; BF16 epilogue; normalization fusions | Selected by the loader/adapter after preflight; exact-sm75 tile choices are cached per device and contraction shape |
 | Production alternative | Stable Sage; SDPA FP16 bridge; legacy and grouped-codebook W4A8 | Explicit backend/weight-format choice with deterministic fallback |
-| Explicit experiment | Sol FP16-PV and Sol W8A8 | Never selected merely by loading a model; quality and exact-Turing speed remain workflow acceptance gates |
+| Production patch | Sol FP16-PV and Sol W8A8 | Enabled only by the independent Sol node so workflow-specific routing and modality controls remain explicit; W8A8 is the node default |
 | Compatibility only | DP4A W4A8 edges and staged codebook decode | Preserves supported shapes when the fast Tensor Core/inline contract is unavailable |
 
 The resource release gate covers all compiled production and compatibility

@@ -54,7 +54,7 @@ only after its CUDA sources or required version change.
   storyboard from a loaded `VIDEO` or decoded `IMAGE` frame batch. It can use
   uniform or motion-weighted sampling and optionally wraps each panel in
   annotated film rails so frame numbers and timestamps stay outside the image.
-- `Patch Sol Sparse Attention (Experimental)` applies the model-generic,
+- `Patch Sol Sparse Attention` applies the production model-generic,
   loader-independent
   long-sequence sparse backend. It uses an input-adaptive statistical threshold,
   keeps one 64-token skipped-block centroid by default, accepts semantic
@@ -105,8 +105,9 @@ D64 and 65--127 only to D128, and retains the original softmax scale and output
 width. The dense kernel uses a route-free specialization of the Sol exact-token
 core; unsupported calls fall back through the pre-existing attention override.
 
-Sparse attention is not a loader option. Connect
-the model through the experimental Sol patch node to enable it explicitly. The
+Sol remains an independent patch rather than a loader option because its
+quality/performance policy is intentionally configurable. Connect the model
+through the Sol patch node to enable it explicitly. The
 kernel accepts FP16/BF16/FP32 Q/K/V, GQA, head dimensions 1--128, unequal Q/K,
 and unmasked non-causal sequences; incompatible or short calls use bundled
 stable Sage. Automatic semantic protection requires separate Query/K layout
@@ -189,7 +190,7 @@ exposed by loader nodes.
 COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX" \
 python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
-python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-sparse
+python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --sol
 python kernel/scripts/release_gate.py --build --device cuda:0
 python kernel/scripts/benchmark_backends.py --device cuda:0 --suite all
 ```

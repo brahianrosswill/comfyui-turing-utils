@@ -733,7 +733,7 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertIsInstance(sparse.call_args.kwargs["debug_route_state"], dict)
         self.assertEqual(
             override.turing_utils_attention_implementation,
-            "bundled_turing_sol_sparse_experimental",
+            "bundled_turing_sol_sparse",
         )
 
     def test_sparse_override_uses_stable_sage_for_first_and_last_layers(self):

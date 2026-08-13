@@ -1143,7 +1143,17 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--benchmark", action="store_true")
-    parser.add_argument("--experimental-sparse", action="store_true")
+    parser.add_argument(
+        "--sol",
+        action="store_true",
+        help="Run the production Sol sparse-attention correctness and benchmark gates",
+    )
+    parser.add_argument(
+        "--experimental-sparse",
+        action="store_true",
+        dest="legacy_experimental_sparse",
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--iterations", type=int, default=20)
     args = parser.parse_args()
     device = torch.device(args.device)
@@ -1162,13 +1172,14 @@ def main() -> None:
         validate_qk_preprocessing(device)
         validate_sage(device)
         validate_w8a8(device)
-        if args.experimental_sparse:
+        validate_sol = args.sol or args.legacy_experimental_sparse
+        if validate_sol:
             validate_sparse(device)
         torch.cuda.synchronize(device)
         print("numerical validation passed")
         if args.benchmark:
             benchmark_sage(device, args.iterations)
-            if args.experimental_sparse:
+            if validate_sol:
                 benchmark_sparse(device, args.iterations)
 
 

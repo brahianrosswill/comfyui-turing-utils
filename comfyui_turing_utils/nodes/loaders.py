@@ -45,7 +45,7 @@ class ConvRotDiffusionModelLoader:
                             "Select w8a8, sage, or sdpa. On Turing, w8a8 and sage use the bundled exact-sm75 "
                             "kernels; elsewhere w8a8 uses Comfy Kitchen and sage uses the installed SageAttention "
                             "package. Turing BF16 SDPA inputs are stored as FP16 for the attention call. "
-                            "Experimental sparse attention is configured with the separate Sol patch node."
+                            "Sol sparse attention is configured with the separate Sol patch node."
                         ),
                     },
                 ),

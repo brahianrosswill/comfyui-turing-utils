@@ -59,7 +59,7 @@ built-in adapters without importing ComfyUI node definitions.
 | Package | Responsibility |
 |---|---|
 | `attention/stable.py` | backend registry, stable bundled Sage/W8A8, dtype/layout facade |
-| `attention/sparse.py` | explicit experimental Sol policy, with W8A8 or FP16 PV dispatch |
+| `attention/sparse.py` | production Sol policy, exact modality protection, and W8A8/FP16 PV dispatch |
 | `attention/protocol.py` | versioned tensor ownership, transform, capability, and execution contract |
 | `attention/integration.py` | model-neutral projected-QKV handoff and attention-site registry |
 | `attention/layout.py` | versioned Query/KV modality topology contract and provider registry |

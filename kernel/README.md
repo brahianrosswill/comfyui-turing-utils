@@ -5,7 +5,7 @@ runtime. Version 0.24.0 contains legacy packed W4A8 and grouped-codebook W4A8
 Tensor Core GEMMs, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, bundled Sage attention, pure-INT8 W8A8 attention,
-and an explicitly selected experimental model-independent sparse attention
+and an explicitly patched production model-independent Sol sparse attention
 kernel with input-adaptive
 centroid threshold routing, stable-Sage INT8 QK for selected blocks, compact
 dense-Query/exact-KV modality masks, INT8-consistent routing, native D64/D128
@@ -68,14 +68,14 @@ Ampere-only instructions.
 COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX" \
 python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
-python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-sparse
+python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --sol
 python kernel/scripts/validate_wan_fusions.py --device cuda:0
 python kernel/scripts/benchmark_backends.py --device cuda:0 --suite all
 python kernel/scripts/benchmark_backends.py --device cuda:0 --suite attention \
   --sequences 4096 --heads 56 --kv-heads 56 --head-dim 128
 ```
 
-`--experimental-sparse` also runs the explicit correctness gate. A fully
+`--sol` also runs the explicit correctness gate. A fully
 selected Sol route is compared with stable Sage, while Sol-W8A8 is compared
 with route-free W8A8. The gate checks finite output, maximum absolute error,
 relative L2 error, cosine similarity, and exact selected-block coverage; it is
