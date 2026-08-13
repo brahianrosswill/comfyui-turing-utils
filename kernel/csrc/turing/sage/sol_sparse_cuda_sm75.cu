@@ -572,7 +572,7 @@ __device__ __forceinline__ void load_quantized_value_tile(
 }
 
 template <int HeadDim, typename T, bool UseW8A8, bool ForceDense,
-          bool IsCausal, bool Varlen>
+          bool IsCausal, bool Varlen, int ResidualSubblocks, int KeyStages>
 __global__ void sparse_attention_kernel(
     const int8_t *__restrict__ query_int8,
     const int8_t *__restrict__ key_int8,
@@ -598,7 +598,6 @@ __global__ void sparse_attention_kernel(
     int num_kv_heads,
     int num_query_blocks,
     int num_key_blocks,
-    int residual_subblocks,
     int padded_residual_summaries,
     int64_t stride_batch_q_int8,
     int64_t stride_head_q_int8,
@@ -614,12 +613,18 @@ __global__ void sparse_attention_kernel(
     int64_t stride_batch_o,
     int64_t stride_head_o,
     int64_t stride_sequence_o,
-    int key_blocks_per_stage,
     float threshold_sigma,
     float softmax_scale,
     int route_original_basis)
 {
   using G = AttentionGeometry<HeadDim>;
+  static_assert(
+      ResidualSubblocks == 1 || ResidualSubblocks == 2,
+      "Sol residual geometry must be 1x64 or 2x32");
+  static_assert(
+      KeyStages == 1 || KeyStages == 2,
+      "SM75 exact attention stages must cover 64 or 128 K tokens");
+  static_assert(!ForceDense || KeyStages == 1);
   static_assert(!IsCausal || ForceDense,
                 "causal masking is supported only by dense W8A8");
   static_assert(
@@ -810,7 +815,7 @@ __global__ void sparse_attention_kernel(
   // Route and approximate correction in one pass over 16 summaries. The
   // Tensor Core Q*K-centroid score supplies both per-token correction and the
   // centroid route score, eliminating a separate scalar scan of every K block.
-  const int residual_tokens = kBlockTokens / residual_subblocks;
+  constexpr int residual_tokens = kBlockTokens / ResidualSubblocks;
   const int num_residual_summaries =
       (key_length + residual_tokens - 1) / residual_tokens;
   float *shared_proxy_partials = reinterpret_cast<float *>(
@@ -859,21 +864,20 @@ __global__ void sparse_attention_kernel(
     }
     __syncthreads();
 
-    const int routed_blocks = kSummaryTileTokens / residual_subblocks;
+    constexpr int routed_blocks = kSummaryTileTokens / ResidualSubblocks;
     if (linear_thread < routed_blocks)
     {
-      const int key_block = summary_start / residual_subblocks + linear_thread;
+      const int key_block = summary_start / ResidualSubblocks + linear_thread;
       if (key_block < active_key_blocks)
       {
         float proxy_sum = 0.0f;
         int key_token_count = 0;
 #pragma unroll
-        for (int residual_index = 0; residual_index < 2; ++residual_index)
+        for (int residual_index = 0; residual_index < ResidualSubblocks;
+             ++residual_index)
         {
-          if (residual_index >= residual_subblocks)
-            break;
           const int residual_summary =
-              linear_thread * residual_subblocks + residual_index;
+              linear_thread * ResidualSubblocks + residual_index;
           const int residual_start =
               key_block * kBlockTokens + residual_index * residual_tokens;
           const int residual_count =
@@ -913,7 +917,7 @@ __global__ void sparse_attention_kernel(
       const int local_summary = 2 * (threadIdx.x % 4) +
           8 * (element / 4) + element % 2;
       const int residual_summary = summary_start + local_summary;
-      const int key_block = residual_summary / residual_subblocks;
+      const int key_block = residual_summary / ResidualSubblocks;
       const bool selected = key_block < active_key_blocks &&
           ((shared_route[key_block / kRouteWordBits] >>
             (key_block % kRouteWordBits)) & 1U);
@@ -923,7 +927,7 @@ __global__ void sparse_attention_kernel(
       }
       else
       {
-        const int residual_index = residual_summary % residual_subblocks;
+        const int residual_index = residual_summary % ResidualSubblocks;
         const int residual_start =
             key_block * kBlockTokens + residual_index * residual_tokens;
         const int remaining = key_length - residual_start;
@@ -1014,19 +1018,14 @@ __global__ void sparse_attention_kernel(
   // that runtime loop kept the second-stage state live on SM75 and raised the
   // D128 register footprint.  Make the dense specialization a compile-time
   // one-block loop; sparse variants retain the selectable 64/128-token tile.
-  constexpr int kMaxKeyStages = ForceDense ? 1 : 2;
-  const int key_group_stride = ForceDense ? 1 : key_blocks_per_stage;
+  constexpr int kMaxKeyStages = ForceDense ? 1 : KeyStages;
+  constexpr int key_group_stride = kMaxKeyStages;
   for (int key_group = 0; key_group < active_key_blocks;
        key_group += key_group_stride)
   {
 #pragma unroll
     for (int key_stage = 0; key_stage < kMaxKeyStages; ++key_stage)
     {
-    if constexpr (!ForceDense)
-    {
-      if (key_stage >= key_blocks_per_stage)
-        continue;
-    }
     const int key_block = key_group + key_stage;
     if (key_block >= active_key_blocks)
       continue;
@@ -1225,7 +1224,8 @@ void check_launch(const char *name)
 
 template <int HeadDim, typename T, bool UseW8A8, bool ForceDense,
           bool IsCausal, bool Varlen,
-          bool SummariesReady = false>
+          bool SummariesReady = false, int ResidualSubblocks = 1,
+          int KeyStages = 1>
 void launch_sparse_threshold_attention(
     at::Tensor query_int8,
     at::Tensor key_int8,
@@ -1255,6 +1255,17 @@ void launch_sparse_threshold_attention(
     int route_original_basis)
 {
   using G = AttentionGeometry<HeadDim>;
+  static_assert(
+      ResidualSubblocks == 1 || ResidualSubblocks == 2,
+      "Sol residual geometry must be 1x64 or 2x32");
+  static_assert(KeyStages == 1 || KeyStages == 2);
+  static_assert(!ForceDense || KeyStages == 1);
+  TORCH_INTERNAL_ASSERT(
+      ForceDense || residual_subblocks == ResidualSubblocks,
+      "Sol residual dispatch specialization mismatch");
+  TORCH_INTERNAL_ASSERT(
+      ForceDense || key_tile_tokens / kBlockTokens == KeyStages,
+      "Sol K staging dispatch specialization mismatch");
   const int batch_size = Varlen
       ? cu_seqlens_q.size(0) - 1
       : query_int8.size(0);
@@ -1284,7 +1295,7 @@ void launch_sparse_threshold_attention(
         num_kv_heads,
         key_length,
         padded_key_blocks,
-        residual_subblocks,
+        ResidualSubblocks,
         route_original_basis,
         padded_residual_summaries,
         key_int8.stride(0),
@@ -1311,7 +1322,8 @@ void launch_sparse_threshold_attention(
   dim3 attention_grid(num_query_blocks, num_query_heads, batch_size);
   dim3 attention_block(WARP_SIZE, kWarps);
   auto attention_kernel =
-      sparse_attention_kernel<HeadDim, T, UseW8A8, ForceDense, IsCausal, Varlen>;
+      sparse_attention_kernel<HeadDim, T, UseW8A8, ForceDense, IsCausal,
+                              Varlen, ResidualSubblocks, KeyStages>;
   configure_dynamic_shared_memory(
       attention_kernel, G::kAttentionSharedBytes, "SM75 sparse attention");
   attention_kernel<<<
@@ -1345,7 +1357,6 @@ void launch_sparse_threshold_attention(
       num_kv_heads,
       num_query_blocks,
       num_key_blocks,
-      residual_subblocks,
       padded_residual_summaries,
       query_int8.stride(0),
       query_int8.stride(1),
@@ -1361,7 +1372,6 @@ void launch_sparse_threshold_attention(
       output.stride(0),
       output.stride(1),
       Varlen ? output.stride(0) : output.stride(2),
-      key_tile_tokens / kBlockTokens,
       threshold_sigma,
       softmax_scale,
       route_original_basis);
@@ -1401,9 +1411,10 @@ void dispatch_sparse_threshold_attention(
     bool varlen,
     int route_original_basis)
 {
-#define LAUNCH_VARIANT(HEAD_DIM, SCALAR, USE_W8A8, FORCE_DENSE, CAUSAL, VARLEN, READY) \
+#define LAUNCH_VARIANT(HEAD_DIM, SCALAR, USE_W8A8, FORCE_DENSE, CAUSAL, VARLEN, READY, RESIDUALS, STAGES) \
   launch_sparse_threshold_attention<HEAD_DIM, SCALAR, USE_W8A8,             \
-                                    FORCE_DENSE, CAUSAL, VARLEN, READY>(     \
+                                    FORCE_DENSE, CAUSAL, VARLEN, READY,      \
+                                    RESIDUALS, STAGES>(                      \
       query_int8, key_int8, value, value_int8, value_scale, output,          \
       query_scale, key_scale, key_summary, key_score_summary, value_mean,    \
       key_summary_mean, key_summary_variance, sparse_query_blocks,           \
@@ -1415,19 +1426,52 @@ void dispatch_sparse_threshold_attention(
   do                                                                         \
   {                                                                          \
     if (varlen && is_causal)                                                 \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, true, true, true);        \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, true, true, true, 1, 1);  \
     else if (varlen)                                                         \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, false, true, true);       \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, false, true, true, 1, 1); \
     else if (force_dense && is_causal)                                       \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, true, false, true);       \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, true, false, true, 1, 1); \
     else if (force_dense)                                                    \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, false, false, true);      \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, false, false, true, 1, 1);\
+    else if (residual_subblocks == 2)                                        \
+    {                                                                        \
+      if (use_w8a8 && summaries_ready)                                       \
+      {                                                                      \
+        if (key_tile_tokens == 128)                                          \
+          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 2, 2); \
+        else                                                                 \
+          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 2, 1); \
+      }                                                                      \
+      else if (use_w8a8)                                                     \
+      {                                                                      \
+        if (key_tile_tokens == 128)                                          \
+          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 2, 2); \
+        else                                                                 \
+          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 2, 1); \
+      }                                                                      \
+      else if (key_tile_tokens == 128)                                       \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 2, 2); \
+      else                                                                   \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 2, 1); \
+    }                                                                        \
     else if (use_w8a8 && summaries_ready)                                    \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true);     \
+    {                                                                        \
+      if (key_tile_tokens == 128)                                            \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 1, 2); \
+      else                                                                   \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 1, 1); \
+    }                                                                        \
     else if (use_w8a8)                                                       \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false);    \
+    {                                                                        \
+      if (key_tile_tokens == 128)                                            \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 1, 2); \
+      else                                                                   \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 1, 1); \
+    }                                                                        \
+    else if (key_tile_tokens == 128)                                         \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 1, 2); \
     else                                                                     \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false);   \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 1, 1); \
   } while (false)
 
   const int head_dim = query_int8.size(-1);

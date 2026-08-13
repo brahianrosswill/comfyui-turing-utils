@@ -926,6 +926,37 @@ def validate_sparse(device: torch.device) -> None:
     if not 0.1 < density < 0.9:
         raise RuntimeError(f"Sol route density is implausible: {density:.3f}")
 
+    # The 64- and 128-token K staging specializations change launch geometry,
+    # not routing or online-softmax order. Keep both production images under a
+    # bitwise gate so a future schedule edit cannot silently alter quality.
+    for use_w8a8 in (False, True):
+        staged_64 = sol_sparse_sageattn(
+            q,
+            k,
+            v,
+            exact_kv_ranges=((0, 128),),
+            threshold_sigma=1.0,
+            residual_subblocks=1,
+            use_w8a8=use_w8a8,
+            key_tile_tokens=64,
+        )
+        staged_128 = sol_sparse_sageattn(
+            q,
+            k,
+            v,
+            exact_kv_ranges=((0, 128),),
+            threshold_sigma=1.0,
+            residual_subblocks=1,
+            use_w8a8=use_w8a8,
+            key_tile_tokens=128,
+        )
+        if not torch.equal(staged_64, staged_128):
+            raise RuntimeError(
+                "Sol K staging changed numerical results: "
+                f"use_w8a8={use_w8a8} "
+                f"max_abs={float((staged_64.float() - staged_128.float()).abs().max())}"
+            )
+
     # Exercise the default mixed skipped/exact path. W8A8 quantizes only exact
     # P@V blocks; skipped blocks intentionally retain the FP16 centroid
     # approximation. Their outputs therefore need not be bitwise close, but a

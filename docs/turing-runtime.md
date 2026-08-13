@@ -326,29 +326,28 @@ Tensor Core PV, and FP32 online state; skipped residual V centroids remain
 original-value FP16. K and, when enabled, V are quantized once per call and
 shared by sparse and dense Query blocks.
 
-The Query CTA loads its INT8 Q tile once, derives the route threshold directly
-from it, and expands it into resident FP16 shared storage for skipped-block
-correction. One Q-to-K-centroid Tensor Core traversal supplies both the routing
-score and the online-softmax correction, with conflict-free per-warp shared
-partials instead of shared atomics. The compact route is then copied into four
-32-bit registers per lane before the arena is reused for exact K/V tiles. The
-D128 FP16-PV compute_75 cubin reports 218 BF16 / 200 FP16 registers per main
-thread, with zero stack/local-memory spill and 32 KiB dynamic shared memory.
-The current resources permit two 128-thread CTAs per SM75; occupancy is reported
-for diagnosis but is not a production gate. Native
-D64 FP16-PV uses 152 BF16 / 159 FP16 registers, no stack or local spill, and
-16 KiB dynamic shared memory.
+The Query CTA derives the route threshold from its INT8 Q tile and expands that
+tile into resident FP16 shared storage for skipped-block correction. One
+Q-to-K-centroid Tensor Core traversal supplies both the routing score and the
+online-softmax correction, with conflict-free per-warp shared partials instead
+of shared atomics. The compact route is then copied into four 32-bit registers
+per lane before the arena is reused for exact K/V tiles. Keeping both the FP16
+correction operand and the INT8 exact operand live would raise D128 shared
+storage above 32 KiB, so the production kernel deliberately re-reads the small
+INT8 Q tile instead of reducing CTA residency. Exact-Q staging is only 8 KiB
+per CTA and is normally L2-hot after routing.
 
-The D128 W8A8 sparse specialization uses 254 BF16 / 255 FP16 registers per
-thread with zero stack/local-memory spill; 128 threads use at most 32640
-registers per CTA. This currently permits two CTAs on a 64 KiB/65536-register
-Turing SM, but larger single-CTA candidates remain valid when they reduce K/V
-traffic and total latency. The route-free dense D128
-W8A8 specialization uses 180 registers and no stack/local spill. Native D64
-W8A8 uses 176/175 registers for sparse BF16/FP16 and 134 registers for the
-route-free dense kernel, with no stack/local spill. These resource
-figures are static compute_75 reports; resident-CTA throughput still requires a
-real Turing profile.
+The official-style `1x64` and quality `2x32` residual paths, plus the 64- and
+128-token exact-K staging paths, are separate compile-time specializations.
+This removes runtime loop bounds and second-stage state from the default
+long-sequence kernel without changing the selected route or arithmetic order.
+A correctness gate requires bitwise-identical output between K64 and K128
+staging. The exact compute_75 image contains 24 variants for each native head
+dimension, all with zero stack/local-memory spill and unchanged 16 KiB D64 /
+32 KiB D128 dynamic shared memory. Register use ranges from 138--175 for D64
+and 180--255 for D128. Occupancy is reported for diagnosis but is not a
+production gate; final resident-CTA throughput still requires real Turing
+profiling.
 
 With the 0.23 causal/varlen specializations, compute_75 reports zero local and
 stack storage for all dense W8A8 variants. D128 uses 180 registers for fixed
@@ -362,12 +361,13 @@ from 1.146 ms in the discarded serial prototype. These are direction tests,
 not a substitute for exact-sm75 profiling.
 
 On an A40 JITing compute_75 PTX, four-head FP16 synthetic tests at threshold 1.0
-selected 20.0%, 17.6%, and 16.7% of blocks at 4096, 8192, and 16384 tokens.
-Official-style `1x64` measured 0.186, 0.483, and 1.553 ms versus dense Sage at
-0.388, 1.385, and 5.138 ms (2.09x, 2.87x, and 3.31x). `2x32` measured 0.209,
-0.566, and 1.888 ms. An H3-like BF16 shape with 56 heads and 52,860 tokens
-measured 279.8 ms at 15.9% route density versus 769.3 ms for dense Sage (2.75x
-attention speedup). These are directional A40 compute_75/PTX compatibility
+selected 19.4%, 17.8%, and 16.6% of blocks at 4096, 8192, and 16384 tokens.
+After residual and K-stage specialization, Sol-W8A8 `1x64` measured 0.235,
+0.519, and 1.526 ms versus dense Sage at 0.405, 1.431, and 5.352 ms (1.72x,
+2.76x, and 3.51x). `2x32` FP16-PV measured 0.232, 0.607, and 1.996 ms. An
+H3-like BF16 shape with 56 heads and 52,842 tokens measured 176.3 ms at 16.2%
+route density, down from about 186.8 ms before both compile-time
+specializations. These are directional A40 compute_75/PTX compatibility
 results, not Turing end-to-end or visual-quality measurements.
 
 Kernel 0.21 adds native D64 dense W8A8 and Sol kernels rather than padding D64
