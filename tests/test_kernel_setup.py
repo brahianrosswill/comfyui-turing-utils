@@ -203,6 +203,23 @@ class KernelSetupTest(unittest.TestCase):
             benchmark,
         )
 
+    def test_linear_tiles_are_autotuned_only_on_exact_sm75(self):
+        bindings = (PLUGIN_ROOT / "kernel" / "csrc" / "bindings.cpp").read_text(
+            encoding="utf-8"
+        )
+        source = (
+            PLUGIN_ROOT / "kernel" / "csrc" / "turing" / "w4a8.cu"
+        ).read_text(encoding="utf-8")
+        benchmark = (
+            PLUGIN_ROOT / "kernel" / "scripts" / "benchmark_backends.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn('pybind11::arg("tile_policy") = 0', bindings)
+        self.assertIn("run_auto_tuned_tile", source)
+        self.assertIn("properties->major != 7 || properties->minor != 5", source)
+        self.assertIn("cudaStreamIsCapturing", source)
+        self.assertIn("codebook_tile_cache", source)
+        self.assertIn("--tile-sweep", benchmark)
+
     def test_windows_conda_target_specific_cccl_path_is_added(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             prefix = Path(temp_dir)

@@ -168,7 +168,8 @@ at::Tensor turing_w4a8_linear(at::Tensor activation,
                               at::Tensor weight,
                               at::Tensor activation_scale,
                               at::Tensor weight_scale,
-                              std::optional<at::Tensor> bias) {
+                              std::optional<at::Tensor> bias,
+                              int64_t tile_policy) {
     activation = activation.contiguous();
     weight = weight.contiguous();
     activation_scale = activation_scale.to(at::kFloat).contiguous();
@@ -209,7 +210,8 @@ at::Tensor turing_w4a8_linear(at::Tensor activation,
                                           from_torch(activation_scale),
                                           from_torch(weight_scale),
                                           maybe_tensor(bias),
-                                          from_torch(output));
+                                          from_torch(output),
+                                          int_cast<int>(tile_policy));
     return output;
 }
 
@@ -221,7 +223,8 @@ at::Tensor turing_codebook_w4a8_linear(at::Tensor activation,
                                        at::Tensor codebook,
                                        std::optional<at::Tensor> bias,
                                        int64_t group_size,
-                                       int64_t chunk_rows) {
+                                       int64_t chunk_rows,
+                                       int64_t tile_policy) {
     activation = activation.contiguous();
     weight = weight.contiguous();
     activation_scale = activation_scale.reshape({-1}).to(at::kFloat).contiguous();
@@ -316,7 +319,8 @@ at::Tensor turing_codebook_w4a8_linear(at::Tensor activation,
         workspace.defined() ? from_torch(workspace) : Tensor{},
         from_torch(output),
         int_cast<int>(group_size),
-        inline_decode);
+        inline_decode,
+        int_cast<int>(tile_policy));
     return output;
 }
 
@@ -324,7 +328,8 @@ at::Tensor turing_int8_linear(at::Tensor activation,
                               at::Tensor weight,
                               at::Tensor activation_scale,
                               at::Tensor weight_scale,
-                              std::optional<at::Tensor> bias) {
+                              std::optional<at::Tensor> bias,
+                              int64_t tile_policy) {
     activation = activation.contiguous();
     weight = weight.contiguous();
     activation_scale = activation_scale.reshape({-1}).to(at::kFloat).contiguous();
@@ -366,7 +371,8 @@ at::Tensor turing_int8_linear(at::Tensor activation,
         from_torch(activation_scale),
         from_torch(weight_scale),
         maybe_tensor(bias),
-        from_torch(output));
+        from_torch(output),
+        int_cast<int>(tile_policy));
     return output;
 }
 
@@ -805,7 +811,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("weight"),
           pybind11::arg("activation_scale"),
           pybind11::arg("weight_scale"),
-          pybind11::arg("bias") = std::nullopt);
+          pybind11::arg("bias") = std::nullopt,
+          pybind11::arg("tile_policy") = 0);
     m.def("turing_codebook_w4a8_linear",
           &turing_codebook_w4a8_linear,
           pybind11::arg("activation"),
@@ -816,14 +823,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("codebook"),
           pybind11::arg("bias") = std::nullopt,
           pybind11::arg("group_size") = 16,
-          pybind11::arg("chunk_rows") = 0);
+          pybind11::arg("chunk_rows") = 0,
+          pybind11::arg("tile_policy") = 0);
     m.def("turing_int8_linear",
           &turing_int8_linear,
           pybind11::arg("activation"),
           pybind11::arg("weight"),
           pybind11::arg("activation_scale"),
           pybind11::arg("weight_scale"),
-          pybind11::arg("bias") = std::nullopt);
+          pybind11::arg("bias") = std::nullopt,
+          pybind11::arg("tile_policy") = 0);
     m.def("turing_dequantize_int8_bf16",
           &turing_dequantize_int8_bf16,
           pybind11::arg("accumulator"),

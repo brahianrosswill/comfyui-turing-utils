@@ -97,13 +97,27 @@ are direction and format tests, not final exact-sm75 or model-quality acceptance
 results. Final throughput acceptance still requires an exact-sm75 run.
 
 The inline and raw-W8 long-sequence kernels use the same 256-thread CTA and
-shared-memory tile. The SM75 cubin reports 244 versus 208 registers per thread,
-zero local-memory spill, and one resident CTA in both cases; inline decode does
-not lower CTA density. The staged fallback uses 4,096-output-channel chunks,
+shared-memory tile. Both 128x256 and 256x128 policies are compiled. The SM75
+cubin reports 244/248 registers for inline decode and 208/210 for raw W8,
+zero local-memory spill, and one resident CTA for each long policy; inline
+decode does not lower CTA density. The staged fallback uses 4,096-output-channel chunks,
 matching Kitchen's production chunk policy, and is bounded at 112 MiB for H3
 fc2 and 21 MiB for qkv/fc1. MiniMax and Wan planning remain conservative for
 short or non-g16 inputs and reserve only the largest mutually exclusive staged
 workspace.
+
+Exact-sm75 raw W8, signed W4, and long-sequence codebook W4 dispatch perform a
+one-time per-device/per-MNK tile microbenchmark and cache the result for the
+process. It measures both long policies instead of assuming that more resident
+CTAs or one fixed shared-memory budget predicts throughput. CUDA Graph capture
+and non-sm75 compatibility runs use the static heuristic and never synchronize
+for tuning. The tuning cost is paid once per distinct contraction shape and is
+small compared with model initialization. On A40 compute_75/PTX, the existing
+long-sequence 128x256 policy remained best for H3-like raw W8/W4, while
+codebook W4 at M=10,000, N=K=5,376 measured 4.38 ms for 256x128 versus 6.27 ms
+for 128x256. These numbers justify device measurement but do not select the
+Turing winner. `benchmark_backends.py --suite linear --tile-sweep` exposes all
+compiled policies for acceptance runs.
 
 The stable Sage main loop was also rebuilt from historical commit `4255f3c`
 in an isolated worktree and compared with the current compute-75 image on the

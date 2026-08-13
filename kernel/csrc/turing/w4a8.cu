@@ -5,8 +5,13 @@
 #include <cuda_runtime.h>
 
 #include <climits>
+#include <array>
 #include <cstdint>
+#include <limits>
+#include <map>
+#include <mutex>
 #include <stdexcept>
+#include <tuple>
 #include <type_traits>
 
 #include "cutlass/cutlass.h"
@@ -372,6 +377,105 @@ enum class WeightKind {
     kCodebookW4,
 };
 
+struct TileTuneKey {
+    int device;
+    int m;
+    int n;
+    int k;
+
+    bool operator<(TileTuneKey const &other) const {
+        return std::tie(device, m, n, k) <
+            std::tie(other.device, other.m, other.n, other.k);
+    }
+};
+
+struct TileTuneCache {
+    std::mutex mutex;
+    std::map<TileTuneKey, int> selected_policy;
+};
+
+TileTuneCache w4_tile_cache;
+TileTuneCache w8_tile_cache;
+TileTuneCache codebook_tile_cache;
+
+template <typename RunPolicy>
+bool run_auto_tuned_tile(TileTuneCache &cache,
+                         int m,
+                         int n,
+                         int k,
+                         int heuristic_policy,
+                         cudaStream_t stream,
+                         RunPolicy &&run_policy) {
+    int device = 0;
+    checkCUDA(cudaGetDevice(&device));
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    checkCUDA(cudaStreamIsCapturing(stream, &capture_status));
+    if (capture_status != cudaStreamCaptureStatusNone) {
+        return run_policy(heuristic_policy);
+    }
+
+    const TileTuneKey key{device, m, n, k};
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (auto found = cache.selected_policy.find(key);
+        found != cache.selected_policy.end()) {
+        return run_policy(found->second);
+    }
+
+    std::array<int, 4> candidates{};
+    int candidate_count = 0;
+    if (m <= 32) {
+        candidates[candidate_count++] = 1;
+    } else if (m <= 128) {
+        candidates[candidate_count++] = 1;
+        candidates[candidate_count++] = 2;
+        candidates[candidate_count++] = 3;
+        candidates[candidate_count++] = 5;
+    } else if (m <= 512) {
+        candidates[candidate_count++] = 3;
+        candidates[candidate_count++] = 4;
+        candidates[candidate_count++] = 5;
+    } else {
+        candidates[candidate_count++] = 4;
+        candidates[candidate_count++] = 5;
+    }
+
+    std::array<float, 6> best_ms;
+    best_ms.fill(std::numeric_limits<float>::infinity());
+    for (int round = 0; round < 2; ++round) {
+        for (int index = 0; index < candidate_count; ++index) {
+            const int candidate_index = round == 0
+                ? index
+                : candidate_count - index - 1;
+            const int policy = candidates[candidate_index];
+            cudaEvent_t start = nullptr;
+            cudaEvent_t stop = nullptr;
+            checkCUDA(cudaEventCreate(&start));
+            checkCUDA(cudaEventCreate(&stop));
+            checkCUDA(cudaEventRecord(start, stream));
+            const bool launched = run_policy(policy);
+            checkCUDA(cudaEventRecord(stop, stream));
+            checkCUDA(cudaEventSynchronize(stop));
+            float elapsed_ms = std::numeric_limits<float>::infinity();
+            if (launched) {
+                checkCUDA(cudaEventElapsedTime(&elapsed_ms, start, stop));
+                best_ms[policy] = std::min(best_ms[policy], elapsed_ms);
+            }
+            checkCUDA(cudaEventDestroy(stop));
+            checkCUDA(cudaEventDestroy(start));
+        }
+    }
+
+    int selected = heuristic_policy;
+    for (int index = 0; index < candidate_count; ++index) {
+        const int policy = candidates[index];
+        if (best_ms[policy] < best_ms[selected] * 0.98f) {
+            selected = policy;
+        }
+    }
+    cache.selected_policy.emplace(key, selected);
+    return run_policy(selected);
+}
+
 template <typename Output, WeightKind Kind, int TBM, int TBN, int WM, int WN>
 struct TuringW4A8Gemm {
     static constexpr bool PackedWeight = Kind != WeightKind::kInt8;
@@ -701,25 +805,50 @@ bool dispatch(const int8_t *activation,
               int m,
               int n,
               int k,
-              cudaStream_t stream) {
+              cudaStream_t stream,
+              int tile_policy) {
+    const auto run_policy = [&](int policy) {
+        switch (policy) {
+        case 1:
+            return run_tile<16, 64, 16, 32>(
+                activation, weight, activation_scale, weight_scale, bias, output, m, n, k, stream);
+        case 2:
+            return run_tile<32, 64, 32, 32>(
+                activation, weight, activation_scale, weight_scale, bias, output, m, n, k, stream);
+        case 3:
+            return run_tile<64, 128, 32, 64>(
+                activation, weight, activation_scale, weight_scale, bias, output, m, n, k, stream);
+        case 4:
+            return run_tile<256, 128, 64, 64>(
+                activation, weight, activation_scale, weight_scale, bias, output, m, n, k, stream);
+        case 5:
+            return run_tile<128, 256, 64, 64>(
+                activation, weight, activation_scale, weight_scale, bias, output, m, n, k, stream);
+        default:
+            throw std::runtime_error("invalid Turing W4A8 tile policy");
+        }
+    };
+    if (tile_policy != 0) {
+        return run_policy(tile_policy);
+    }
+    int heuristic_policy;
     if (m <= 32) {
-        return run_tile<16, 64, 16, 32>(
-            activation, weight, activation_scale, weight_scale, bias, output, m, n, k, stream);
+        heuristic_policy = 1;
+    } else if (m <= 128 && n < 8192) {
+        heuristic_policy = 2;
+    } else if (m <= 512) {
+        heuristic_policy = 3;
+    } else if (m <= 8192) {
+        heuristic_policy = 4;
+    } else {
+        heuristic_policy = 5;
     }
-    if (m <= 128 && n < 8192) {
-        return run_tile<32, 64, 32, 32>(
-            activation, weight, activation_scale, weight_scale, bias, output, m, n, k, stream);
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    if (properties->major != 7 || properties->minor != 5) {
+        return run_policy(heuristic_policy);
     }
-    if (m <= 512) {
-        return run_tile<64, 128, 32, 64>(
-            activation, weight, activation_scale, weight_scale, bias, output, m, n, k, stream);
-    }
-    if (m <= 8192) {
-        return run_tile<256, 128, 64, 64>(
-            activation, weight, activation_scale, weight_scale, bias, output, m, n, k, stream);
-    }
-    return run_tile<128, 256, 64, 64>(
-        activation, weight, activation_scale, weight_scale, bias, output, m, n, k, stream);
+    return run_auto_tuned_tile(
+        w4_tile_cache, m, n, k, heuristic_policy, stream, run_policy);
 }
 
 bool dispatch_int8(const int8_t *activation,
@@ -732,30 +861,55 @@ bool dispatch_int8(const int8_t *activation,
                    int n,
                    int k,
                    int output_stride,
-                   cudaStream_t stream) {
+                   cudaStream_t stream,
+                   int tile_policy = 0) {
+    const auto run_policy = [&](int policy) {
+        switch (policy) {
+        case 1:
+            return run_int8_tile<16, 64, 16, 32>(
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
+        case 2:
+            return run_int8_tile<32, 64, 32, 32>(
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
+        case 3:
+            return run_int8_tile<64, 128, 32, 64>(
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
+        case 4:
+            return run_int8_tile<256, 128, 64, 64>(
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
+        case 5:
+            return run_int8_tile<128, 256, 64, 64>(
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
+        default:
+            throw std::runtime_error("invalid Turing INT8 tile policy");
+        }
+    };
+    if (tile_policy != 0) {
+        return run_policy(tile_policy);
+    }
+    int heuristic_policy;
     if (m <= 32) {
-        return run_int8_tile<16, 64, 16, 32>(
-            activation, weight, activation_scale, weight_scale, bias,
-            output, m, n, k, output_stride, stream);
+        heuristic_policy = 1;
+    } else if (m <= 128 && n < 8192) {
+        heuristic_policy = 2;
+    } else if (m <= 512) {
+        heuristic_policy = 3;
+    } else if (m <= 8192) {
+        heuristic_policy = 4;
+    } else {
+        heuristic_policy = 5;
     }
-    if (m <= 128 && n < 8192) {
-        return run_int8_tile<32, 64, 32, 32>(
-            activation, weight, activation_scale, weight_scale, bias,
-            output, m, n, k, output_stride, stream);
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    if (properties->major != 7 || properties->minor != 5) {
+        return run_policy(heuristic_policy);
     }
-    if (m <= 512) {
-        return run_int8_tile<64, 128, 32, 64>(
-            activation, weight, activation_scale, weight_scale, bias,
-            output, m, n, k, output_stride, stream);
-    }
-    if (m <= 8192) {
-        return run_int8_tile<256, 128, 64, 64>(
-            activation, weight, activation_scale, weight_scale, bias,
-            output, m, n, k, output_stride, stream);
-    }
-    return run_int8_tile<128, 256, 64, 64>(
-        activation, weight, activation_scale, weight_scale, bias,
-        output, m, n, k, output_stride, stream);
+    return run_auto_tuned_tile(
+        w8_tile_cache, m, n, k, heuristic_policy, stream, run_policy);
 }
 
 bool dispatch_codebook(const int8_t *activation,
@@ -769,7 +923,8 @@ bool dispatch_codebook(const int8_t *activation,
                        int m,
                        int n,
                        int k,
-                       cudaStream_t stream) {
+                       cudaStream_t stream,
+                       int tile_policy) {
     // The long-sequence W8A8 policy is already register-limited to one CTA per
     // SM75 SM. Inline decoding cannot reduce its CTA residency, while using it
     // for smaller policies could cross a two-CTA register threshold. Keep the
@@ -777,19 +932,28 @@ bool dispatch_codebook(const int8_t *activation,
     if (m <= 8192) {
         return false;
     }
-    return run_codebook_tile<128, 256, 64, 64>(
-        activation,
-        weight,
-        activation_scale,
-        group_scale,
-        channel_scale,
-        codebook,
-        bias,
-        output,
-        m,
-        n,
-        k,
-        stream);
+    const auto run_policy = [&](int policy) {
+        if (policy == 4) {
+            return run_codebook_tile<256, 128, 64, 64>(
+                activation, weight, activation_scale, group_scale,
+                channel_scale, codebook, bias, output, m, n, k, stream);
+        }
+        if (policy == 5) {
+            return run_codebook_tile<128, 256, 64, 64>(
+                activation, weight, activation_scale, group_scale,
+                channel_scale, codebook, bias, output, m, n, k, stream);
+        }
+        throw std::runtime_error("invalid Turing codebook W4A8 tile policy");
+    };
+    if (tile_policy != 0) {
+        return run_policy(tile_policy);
+    }
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    if (properties->major != 7 || properties->minor != 5) {
+        return run_policy(5);
+    }
+    return run_auto_tuned_tile(
+        codebook_tile_cache, m, n, k, 5, stream, run_policy);
 }
 
 // Decode one 16-column vector per thread. This intentionally matches Kitchen's
@@ -891,7 +1055,8 @@ void turing_w4a8_linear(Tensor activation,
                         Tensor activation_scale,
                         Tensor weight_scale,
                         Tensor bias,
-                        Tensor output) {
+                        Tensor output,
+                        int tile_policy) {
     const int64_t m64 = activation.size(0);
     const int64_t k64 = activation.size(1);
     const int64_t n64 = weight.size(0);
@@ -942,7 +1107,8 @@ void turing_w4a8_linear(Tensor activation,
         m,
         n,
         k,
-        stream);
+        stream,
+        tile_policy);
     if (!launched) {
         throw std::runtime_error("CUTLASS SM75 W4A8 kernel rejected the problem shape");
     }
@@ -959,7 +1125,8 @@ void turing_codebook_w4a8_linear(Tensor activation,
                                  Tensor workspace,
                                  Tensor output,
                                  int group_size,
-                                 bool inline_decode) {
+                                 bool inline_decode,
+                                 int tile_policy) {
     const int m = activation.size(0);
     const int k = activation.size(1);
     const int n = weight.size(0);
@@ -1005,7 +1172,8 @@ void turing_codebook_w4a8_linear(Tensor activation,
                 m,
                 n,
                 k,
-                stream)) {
+                stream,
+                tile_policy)) {
             throw std::runtime_error(
                 "inline CUTLASS SM75 codebook W4A8 rejected the problem shape");
         }
@@ -1049,7 +1217,8 @@ void turing_int8_linear(Tensor activation,
                         Tensor activation_scale,
                         Tensor weight_scale,
                         Tensor bias,
-                        Tensor output) {
+                        Tensor output,
+                        int tile_policy) {
     const int m = activation.size(0);
     const int k = activation.size(1);
     const int n = weight.size(0);
@@ -1070,7 +1239,9 @@ void turing_int8_linear(Tensor activation,
         n,
         k,
         n,
-        getCurrentCUDAStream());
+        getCurrentCUDAStream(),
+        tile_policy);
+
     if (!launched) {
         throw std::runtime_error("CUTLASS SM75 INT8 kernel rejected the problem shape");
     }

@@ -177,34 +177,39 @@ def main() -> None:
     core_records = _function_records(
         _sm75_section(_resource_output(core), "TuringCodebookGemmKernel")
     )
+    long_shapes = (
+        "GemmShapeILi128ELi256ELi64",
+        "GemmShapeILi256ELi128ELi64",
+    )
     inline = [
         metrics
         for name, metrics in core_records
         if "TuringCodebookGemmKernel" in name
-        and "GemmShapeILi128ELi256ELi64" in name
+        and any(shape in name for shape in long_shapes)
     ]
     raw_w8 = [
         metrics
         for name, metrics in core_records
         if "TuringCodebookGemmKernel" not in name
         and "integer_subbyte" not in name
-        and "GemmShapeILi128ELi256ELi64" in name
+        and any(shape in name for shape in long_shapes)
     ]
-    if len(inline) != 1 or len(raw_w8) != 1:
+    if len(inline) != 2 or len(raw_w8) != 2:
         raise RuntimeError(
-            "expected one inline-codebook and one raw-W8 long-sequence SM75 kernel, "
+            "expected two inline-codebook and two raw-W8 long-sequence SM75 kernels, "
             f"found inline={len(inline)} raw_w8={len(raw_w8)}"
         )
-    inline_metrics, raw_metrics = inline[0], raw_w8[0]
-    for name, metrics in (("inline codebook W4A8", inline_metrics), ("raw W8A8", raw_metrics)):
-        _validate_no_spill(name, metrics)
+    for name, records in (("inline codebook W4A8", inline), ("raw W8A8", raw_w8)):
+        for metrics in records:
+            _validate_no_spill(name, metrics)
     threads = 256
     sm75_registers = 65536
-    inline_ctas = sm75_registers // (threads * inline_metrics["REG"])
-    raw_ctas = sm75_registers // (threads * raw_metrics["REG"])
+    inline_ctas = [sm75_registers // (threads * metrics["REG"]) for metrics in inline]
+    raw_ctas = [sm75_registers // (threads * metrics["REG"]) for metrics in raw_w8]
     print(
         "long-sequence W4A8 resource audit passed: "
-        f"registers=inline:{inline_metrics['REG']}/raw_w8:{raw_metrics['REG']} "
+        f"registers=inline:{[item['REG'] for item in inline]}/"
+        f"raw_w8:{[item['REG'] for item in raw_w8]} "
         f"register_limited_ctas=inline:{inline_ctas}/raw_w8:{raw_ctas} "
         "local=0 stack=0 shared_tile=identical; CTA density is reported, not gated"
     )

@@ -255,6 +255,7 @@ def benchmark_linear(
     rows: tuple[int, ...],
     warmup: int,
     repeats: int,
+    tile_sweep: bool = False,
 ) -> None:
     try:
         from comfy_kitchen.backends import cuda as kitchen_cuda
@@ -347,6 +348,70 @@ def benchmark_linear(
                     ),
                 ),
             ]
+            if tile_sweep:
+                from comfyui_turing_utils_kernel import _C as low_level
+
+                for tile_policy in range(1, 6):
+                    measurements.append(
+                        Measurement(
+                            f"bundled raw W8A8 tile-policy {tile_policy}",
+                            "tile-diagnostic",
+                            _elapsed_ms(
+                                lambda tile_policy=tile_policy: low_level.turing_int8_linear(
+                                    activation,
+                                    decoded,
+                                    activation_scale,
+                                    channel_scale,
+                                    None,
+                                    tile_policy,
+                                ),
+                                warmup,
+                                repeats,
+                            ),
+                        )
+                    )
+                    measurements.append(
+                        Measurement(
+                            f"bundled packed W4A8 tile-policy {tile_policy}",
+                            "tile-diagnostic",
+                            _elapsed_ms(
+                                lambda tile_policy=tile_policy: low_level.turing_w4a8_linear(
+                                    activation,
+                                    packed_signed,
+                                    activation_scale,
+                                    channel_scale,
+                                    None,
+                                    tile_policy,
+                                ),
+                                warmup,
+                                repeats,
+                            ),
+                        )
+                    )
+                if m > 8192:
+                    for tile_policy in (4, 5):
+                        measurements.append(
+                            Measurement(
+                                f"bundled codebook W4A8 tile-policy {tile_policy}",
+                                "tile-diagnostic",
+                                _elapsed_ms(
+                                    lambda tile_policy=tile_policy: low_level.turing_codebook_w4a8_linear(
+                                        activation,
+                                        packed_codebook,
+                                        activation_scale,
+                                        group_scale.view(torch.uint8),
+                                        channel_scale,
+                                        codebook,
+                                        None,
+                                        16,
+                                        -1,
+                                        tile_policy,
+                                    ),
+                                    warmup,
+                                    repeats,
+                                ),
+                            )
+                        )
             if m > 8192:
                 measurements.append(
                     Measurement(
@@ -1042,6 +1107,11 @@ def main() -> None:
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument(
+        "--tile-sweep",
+        action="store_true",
+        help="report every compiled linear tile; production exact-sm75 dispatch tunes and caches automatically",
+    )
     args = parser.parse_args()
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -1063,7 +1133,13 @@ def main() -> None:
         if args.suite == "quality":
             compare_w4_format_quality(device)
         if args.suite in ("linear", "all"):
-            benchmark_linear(device, args.rows, args.warmup, args.repeats)
+            benchmark_linear(
+                device,
+                args.rows,
+                args.warmup,
+                args.repeats,
+                tile_sweep=args.tile_sweep,
+            )
         if args.suite in ("preprocess", "all"):
             benchmark_preprocessing(device, args.rows, args.warmup, args.repeats)
         if args.suite in ("attention", "all"):
