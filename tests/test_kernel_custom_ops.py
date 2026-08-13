@@ -48,6 +48,37 @@ class KernelCustomOpContractTest(unittest.TestCase):
         self.assertEqual(linear.shape, (7, 64))
         self.assertEqual(linear.dtype, torch.bfloat16)
 
+        codebook_linear = kernel.turing_codebook_w4a8_linear(
+            activation,
+            weight,
+            row_scale,
+            torch.empty((64, 8), dtype=torch.uint8, device="meta"),
+            column_scale,
+            torch.empty((16,), dtype=torch.float32, device="meta"),
+        )
+        self.assertEqual(codebook_linear.shape, (7, 64))
+        self.assertEqual(codebook_linear.dtype, torch.bfloat16)
+
+        long_codebook_linear = kernel.turing_codebook_w4a8_linear(
+            torch.empty((9000, 128), dtype=torch.int8, device="meta"),
+            weight,
+            torch.empty((9000,), dtype=torch.float32, device="meta"),
+            torch.empty((64, 8), dtype=torch.uint8, device="meta"),
+            column_scale,
+            torch.empty((16,), dtype=torch.float32, device="meta"),
+            chunk_rows=-1,
+        )
+        self.assertEqual(long_codebook_linear.shape, (9000, 64))
+
+        int8_linear = kernel.turing_int8_linear(
+            activation,
+            torch.empty((64, 128), dtype=torch.int8, device="meta"),
+            row_scale,
+            column_scale,
+        )
+        self.assertEqual(int8_linear.shape, (7, 64))
+        self.assertEqual(int8_linear.dtype, torch.bfloat16)
+
         accumulator = torch.empty((7, 80), dtype=torch.int32, device="meta")
         epilogue = kernel.turing_dequantize_int8_bf16(
             accumulator, row_scale, column_scale, 64

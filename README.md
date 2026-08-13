@@ -14,6 +14,9 @@ attention, and focused Wan/Bernini utilities.
 - `comfy-kitchen>=0.2.26` for ConvRot model integration
 - the independently installed `comfyui-turing-utils-kernel>=0.23.0` on exact sm75
 
+Grouped-codebook `asym_w4a8_int8` checkpoints require kernel 0.24.0. Existing
+W8A8, W4A4, legacy W4A8, and attention paths keep their earlier minimum.
+
 ## Installation
 
 ```bash
@@ -185,6 +188,7 @@ python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-sparse
 python kernel/scripts/release_gate.py --build --device cuda:0
+python kernel/scripts/benchmark_backends.py --device cuda:0 --suite all
 ```
 
 Compatible A40 runs validate numerical behavior and allocation shapes but do

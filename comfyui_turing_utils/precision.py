@@ -14,6 +14,7 @@ from .quantization.dispatch import (
     backend_available,
     is_supported_turing_device,
     preflight_kitchen,
+    preflight_codebook_w4a8,
     preflight_w4a8,
     register_backend,
 )
@@ -22,7 +23,9 @@ from .quantization.dispatch import (
 LOG = logging.getLogger("comfyui-turing-utils")
 MIN_KITCHEN_VERSION = (0, 2, 26)
 MIN_KERNEL_VERSION = (0, 8, 0)
+MIN_CODEBOOK_W4A8_KERNEL_VERSION = (0, 24, 0)
 _CONVROT_W4_LAYOUT = "TensorCoreConvRotW4A4Layout"
+_CODEBOOK_W4_LAYOUT = "AsymW4A8Int8Layout"
 _TENSORWISE_INT8_LAYOUT = "TensorWiseINT8Layout"
 
 
@@ -79,7 +82,7 @@ def _check_kitchen_contract() -> None:
         )
 
 
-def _check_kernel_contract() -> None:
+def _check_kernel_contract(minimum_version=MIN_KERNEL_VERSION) -> None:
     try:
         kernel = load_kernel_package()
     except (ImportError, OSError) as exc:
@@ -87,8 +90,8 @@ def _check_kernel_contract() -> None:
             "The independently installed comfyui-turing-utils-kernel is unavailable; reinstall ./kernel"
         ) from exc
     kernel_version = getattr(kernel, "__version__", "0.0.0")
-    if _version_tuple(kernel_version) < MIN_KERNEL_VERSION:
-        required = ".".join(str(value) for value in MIN_KERNEL_VERSION)
+    if _version_tuple(kernel_version) < minimum_version:
+        required = ".".join(str(value) for value in minimum_version)
         raise RuntimeError(
             f"Turing Utils requires comfyui-turing-utils-kernel>={required}, "
             f"got {kernel_version}; reinstall the independent kernel package"
@@ -106,12 +109,17 @@ def prepare_turing_runtime(
 
     if attention_backend is not None:
         attention_backend = normalize_attention_backend(attention_backend)
+    codebook_w4a8 = bool(getattr(summary, "codebook_w4a8", 0))
     bundled_attention = attention_backend in {"w8a8", "sage"}
-    needs_kernel = bool(summary.w4a4 or summary.w4a8 or summary.w8a8) or bundled_attention
+    needs_kernel = bool(
+        summary.w4a4 or summary.w4a8 or codebook_w4a8 or summary.w8a8
+    ) or bundled_attention
     if needs_kernel:
         _check_kernel_contract()
+    if codebook_w4a8:
+        _check_kernel_contract(MIN_CODEBOOK_W4A8_KERNEL_VERSION)
 
-    if summary.w4a4 or summary.w4a8 or summary.w8a8:
+    if summary.w4a4 or summary.w4a8 or codebook_w4a8 or summary.w8a8:
         _check_kitchen_contract()
         import comfy_kitchen
 
@@ -122,6 +130,8 @@ def prepare_turing_runtime(
         capabilities = set(cuda_status.get("capabilities", ()))
         if (summary.w4a4 or summary.w4a8) and "convrot_w4a4_linear" not in capabilities:
             raise RuntimeError("Kitchen ConvRot W4 support is unavailable on Turing")
+        if codebook_w4a8 and "w4a8_int8_linear" not in capabilities:
+            raise RuntimeError("Kitchen grouped-codebook W4A8 support is unavailable on Turing")
         if summary.w8a8 and "int8_linear" not in capabilities:
             raise RuntimeError("Kitchen W8A8 support is unavailable on Turing")
         if not register_backend() or not backend_available():
@@ -129,6 +139,8 @@ def prepare_turing_runtime(
         preflight_kitchen(device, bool(summary.w4a4), bool(summary.w8a8))
         if summary.w4a8:
             preflight_w4a8(device)
+        if codebook_w4a8:
+            preflight_codebook_w4a8(device)
 
     if bundled_attention:
         if not bundled_available():
@@ -190,7 +202,7 @@ def normalize_turing_convrot_weight_dtypes(
 
         layout = getattr(weight, "_layout_cls", None)
         params = getattr(weight, "_params", None)
-        is_convrot = layout == _CONVROT_W4_LAYOUT or (
+        is_convrot = layout in {_CONVROT_W4_LAYOUT, _CODEBOOK_W4_LAYOUT} or (
             layout == _TENSORWISE_INT8_LAYOUT and bool(getattr(params, "convrot", False))
         )
         if not is_convrot:

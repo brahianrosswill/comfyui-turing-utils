@@ -13,6 +13,7 @@ from ..kernel_api import load_kernel_package
 
 _W8_LAYOUT = "TensorWiseINT8Layout"
 _W4_LAYOUT = "TensorCoreConvRotW4A4Layout"
+_CODEBOOK_W4_LAYOUT = "AsymW4A8Int8Layout"
 
 
 def convrot_weight_kind(weight: torch.Tensor) -> str | None:
@@ -27,6 +28,13 @@ def convrot_weight_kind(weight: torch.Tensor) -> str | None:
     if layout == _W4_LAYOUT and getattr(params, "quant_group_size", None) == 64:
         linear_dtype = getattr(params, "linear_dtype", None)
         return f"w4a{linear_dtype[-1]}" if linear_dtype in {"int4", "int8"} else None
+    if (
+        layout == _CODEBOOK_W4_LAYOUT
+        and getattr(params, "group_size", None) >= 4
+        and getattr(params, "codebook", None) is not None
+        and getattr(params, "correction", None) is None
+    ):
+        return "codebook_w4a8"
     return None
 
 
@@ -40,7 +48,12 @@ def turing_linear_input_act(linear: torch.nn.Module, x: torch.Tensor, input_act:
     import comfy.ops
     import comfy.quant_ops
 
-    from .dispatch import convrot_w4a4_linear, int8_linear, is_supported_turing_device
+    from .dispatch import (
+        codebook_w4a8_linear,
+        convrot_w4a4_linear,
+        int8_linear,
+        is_supported_turing_device,
+    )
 
     if (
         x.dtype != torch.bfloat16
@@ -72,6 +85,24 @@ def turing_linear_input_act(linear: torch.nn.Module, x: torch.Tensor, input_act:
                 out_dtype=x.dtype,
                 convrot=True,
                 convrot_groupsize=weight._params.convrot_groupsize,
+                input_act=input_act,
+            )
+        if kind == "codebook_w4a8":
+            qdata, s_rel, s_channel, correction, codebook = (
+                comfy.quant_ops.AsymW4A8Int8Layout.get_plain_tensors(weight)
+            )
+            params = weight._params
+            return codebook_w4a8_linear(
+                x,
+                qdata,
+                s_rel,
+                s_channel,
+                codebook=codebook,
+                correction=correction,
+                bias=bias,
+                group_size=params.group_size,
+                convrot_groupsize=params.convrot_groupsize,
+                out_dtype=x.dtype,
                 input_act=input_act,
             )
 

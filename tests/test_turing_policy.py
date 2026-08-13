@@ -160,6 +160,45 @@ class BF16PolicyTest(unittest.TestCase):
         register.assert_called_once_with()
         preflight.assert_called_once_with(torch.device("cuda", 0), False, True)
 
+    def test_codebook_w4a8_requires_new_kernel_and_uses_its_preflight(self):
+        summary = SimpleNamespace(
+            w4a4=0, w4a8=0, codebook_w4a8=1, w8a8=0
+        )
+        with (
+            mock.patch(
+                "comfy_kitchen.list_backends",
+                return_value={
+                    "cuda": {
+                        "available": True,
+                        "disabled": False,
+                        "capabilities": ("convrot_w4a4_linear", "int8_linear", "w4a8_int8_linear"),
+                    }
+                },
+            ),
+            mock.patch(
+                "comfyui_turing_utils.precision.is_supported_turing_device",
+                return_value=True,
+            ),
+            mock.patch("comfyui_turing_utils.precision._check_kernel_contract") as contract,
+            mock.patch("comfyui_turing_utils.precision._check_kitchen_contract"),
+            mock.patch("comfyui_turing_utils.precision.register_backend", return_value=True),
+            mock.patch("comfyui_turing_utils.precision.backend_available", return_value=True),
+            mock.patch("comfyui_turing_utils.precision.preflight_kitchen"),
+            mock.patch("comfyui_turing_utils.precision.preflight_codebook_w4a8") as preflight,
+        ):
+            bf16_policy.prepare_turing_runtime(
+                summary, torch.device("cuda", 0), "sdpa"
+            )
+
+        self.assertEqual(
+            contract.call_args_list,
+            [
+                mock.call(),
+                mock.call(bf16_policy.MIN_CODEBOOK_W4A8_KERNEL_VERSION),
+            ],
+        )
+        preflight.assert_called_once_with(torch.device("cuda", 0))
+
     def test_gtx16_keeps_comfyui_fallback(self):
         with (
             mock.patch("comfyui_turing_utils.precision._explicit_dtype_override", return_value=False),
@@ -265,6 +304,14 @@ class BF16PolicyTest(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "does not provide Turing W4A8"),
         ):
             turing_ops.preflight_w4a8(torch.device("cuda", 0))
+
+    def test_codebook_w4a8_preflight_reports_missing_independent_kernel(self):
+        with (
+            mock.patch.object(turing_ops, "is_supported_turing_device", return_value=True),
+            mock.patch.object(turing_ops, "_kernel_available", return_value=False),
+            self.assertRaisesRegex(RuntimeError, "codebook W4A8"),
+        ):
+            turing_ops.preflight_codebook_w4a8(torch.device("cuda", 0))
 
     def test_int8_activation_uses_staged_bf16_rotation_above_48k_shared_limit(self):
         x = torch.empty((3, 5376), dtype=torch.bfloat16)

@@ -417,7 +417,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
         )
         base = Base()
         base.memory_required = minimax_adapter._make_memory_required(
-            base, (2048, 4096)
+            base, (2048, 4096), (8192,)
         )
         target_area = 24 * 7 * 8 * 10 + 32 * 2 * 12
         with mock.patch(
@@ -431,7 +431,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
 
         explicit = plan.explicit_condition_bytes(2)
         expected = target_area + max(plan.equivalent_area, explicit)
-        expected += plan.full_rows + 4096
+        expected += max(plan.full_rows + 4096, 8192)
         self.assertEqual(required, expected)
 
     def test_outer_sample_wrapper_exposes_and_restores_latent_shapes(self):

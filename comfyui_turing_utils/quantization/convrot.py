@@ -35,6 +35,7 @@ DIFFUSION_FOLDER_NAME = "diffusion_models"
 CLIP_FOLDER_NAME = "text_encoders"
 MODEL_EXTENSIONS = {".safetensors", ".sft"}
 W4_FORMAT = "convrot_w4a4"
+CODEBOOK_W4_FORMAT = "asym_w4a8_int8"
 W8_FORMAT = "int8_tensorwise"
 LEGACY_W8_FORMAT = "int8_rowwise"
 MAX_SAFETENSORS_HEADER_SIZE = 128 * 1024 * 1024
@@ -45,6 +46,7 @@ MAX_QUANT_CONFIG_SIZE = 1024 * 1024
 class ConvRotSummary:
     w4a4: int = 0
     w4a8: int = 0
+    codebook_w4a8: int = 0
     w8a8: int = 0
 
 
@@ -101,6 +103,24 @@ def _classify_config(config: dict, layer_name: str, force_int8_gemm: bool) -> tu
                 "expected 'int4' or 'int8'"
             )
         return "w4", "int8" if force_int8_gemm else activation_dtype
+
+    if quant_format == CODEBOOK_W4_FORMAT:
+        convrot = _config_value(config, params, "convrot", True)
+        if convrot is not True:
+            raise ValueError(
+                f"Grouped-codebook W4A8 layer {layer_name} must declare convrot=true"
+            )
+        group_size = _config_value(config, params, "group_size", 16)
+        convrot_groupsize = _config_value(config, params, "convrot_groupsize", 256)
+        if not isinstance(group_size, int) or isinstance(group_size, bool) or group_size < 4:
+            raise ValueError(
+                f"Grouped-codebook W4A8 layer {layer_name} has invalid group_size={group_size!r}"
+            )
+        if convrot_groupsize != 256:
+            raise ValueError(
+                f"Grouped-codebook W4A8 layer {layer_name} requires convrot_groupsize=256"
+            )
+        return "w4_codebook", "int8"
 
     convrot = _config_value(config, params, "convrot", False)
     if not isinstance(convrot, bool):
@@ -329,8 +349,9 @@ def configure_convrot_activation(
         raise ValueError("The selected model does not contain supported ConvRot quantization metadata")
 
     if force_int8_gemm:
-        for _, config, _, _ in classified_records:
-            config["linear_dtype"] = "int8"
+        for _, config, weight_dtype, _ in classified_records:
+            if weight_dtype != "w4_codebook":
+                config["linear_dtype"] = "int8"
 
     if header_quantization is not None:
         metadata["_quantization_metadata"] = json.dumps(header_quantization)
@@ -340,6 +361,11 @@ def configure_convrot_activation(
     summary = ConvRotSummary(
         w4a4=sum(1 for weight_dtype, act_dtype in layer_types.values() if (weight_dtype, act_dtype) == ("w4", "int4")),
         w4a8=sum(1 for weight_dtype, act_dtype in layer_types.values() if (weight_dtype, act_dtype) == ("w4", "int8")),
+        codebook_w4a8=sum(
+            1
+            for weight_dtype, act_dtype in layer_types.values()
+            if (weight_dtype, act_dtype) == ("w4_codebook", "int8")
+        ),
         w8a8=sum(1 for weight_dtype, act_dtype in layer_types.values() if (weight_dtype, act_dtype) == ("w8", "int8")),
     )
     return metadata, summary
@@ -348,6 +374,7 @@ def configure_convrot_activation(
 def _summarize_convrot_modules(root: torch.nn.Module) -> ConvRotSummary:
     w4a4 = 0
     w4a8 = 0
+    codebook_w4a8 = 0
     w8a8 = 0
     for _, module in root.named_modules():
         quant_format = getattr(module, "quant_format", None)
@@ -364,9 +391,25 @@ def _summarize_convrot_modules(root: torch.nn.Module) -> ConvRotSummary:
                     f"Loaded ConvRot W4 layer has unsupported linear_dtype={activation_dtype!r}; "
                     "update ComfyUI and comfy-kitchen"
                 )
+        elif quant_format == CODEBOOK_W4_FORMAT:
+            if getattr(params, "codebook", None) is None:
+                raise RuntimeError(
+                    "Loaded grouped-codebook W4A8 layer is missing its 16-entry codebook"
+                )
+            if getattr(params, "correction", None) is not None:
+                raise RuntimeError(
+                    "Loaded grouped-codebook W4A8 layer uses asymmetric correction, "
+                    "which is not supported by the production Turing path"
+                )
+            codebook_w4a8 += 1
         elif quant_format == W8_FORMAT and getattr(params, "convrot", False):
             w8a8 += 1
-    return ConvRotSummary(w4a4=w4a4, w4a8=w4a8, w8a8=w8a8)
+    return ConvRotSummary(
+        w4a4=w4a4,
+        w4a8=w4a8,
+        codebook_w4a8=codebook_w4a8,
+        w8a8=w8a8,
+    )
 
 
 def _loaded_convrot_summary(model) -> ConvRotSummary:
@@ -378,7 +421,7 @@ def _loaded_convrot_clip_summary(clip) -> ConvRotSummary:
 
 
 def _validate_runtime_support(expected: ConvRotSummary, device: torch.device | None = None) -> None:
-    if expected.w4a8 == 0:
+    if expected.w4a8 == 0 and expected.codebook_w4a8 == 0:
         return
 
     try:
@@ -458,10 +501,12 @@ def load_convrot_model(
         )
 
     LOG.info(
-        "Loaded ConvRot model with force_int8_gemm=%s: W4A4=%d, W4A8=%d, W8A8=%d",
+        "Loaded ConvRot model with force_int8_gemm=%s: "
+        "W4A4=%d, legacy_W4A8=%d, codebook_W4A8=%d, W8A8=%d",
         force_int8_gemm,
         loaded.w4a4,
         loaded.w4a8,
+        loaded.codebook_w4a8,
         loaded.w8a8,
     )
     apply_model_adapters(model, load_device)
@@ -531,10 +576,12 @@ def load_convrot_clip(
         )
 
     LOG.info(
-        "Loaded ConvRot CLIP with force_int8_gemm=%s: W4A4=%d, W4A8=%d, W8A8=%d",
+        "Loaded ConvRot CLIP with force_int8_gemm=%s: "
+        "W4A4=%d, legacy_W4A8=%d, codebook_W4A8=%d, W8A8=%d",
         force_int8_gemm,
         loaded.w4a4,
         loaded.w4a8,
+        loaded.codebook_w4a8,
         loaded.w8a8,
     )
     clip.patcher.cached_patcher_init = (

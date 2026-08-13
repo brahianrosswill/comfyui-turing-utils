@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit static SM75 attention resources from the built extension."""
+"""Audit static SM75 attention and long-sequence W4A8 resources."""
 
 from __future__ import annotations
 
@@ -42,15 +42,40 @@ def _metrics(line: str) -> dict[str, int]:
     }
 
 
+def _sm75_section(output: str, marker: str | None = None) -> str:
+    for section in output.split("Fatbin elf code:"):
+        if re.search(r"\barch\s*=\s*sm_75\b", section) and (
+            marker is None or marker in section
+        ):
+            return section
+    suffix = f" containing {marker!r}" if marker else ""
+    raise RuntimeError(f"built extension does not contain an exact sm75 cubin{suffix}")
+
+
+def _function_records(section: str) -> list[tuple[str, dict[str, int]]]:
+    records = []
+    lines = section.splitlines()
+    for index, line in enumerate(lines[:-1]):
+        if not line.lstrip().startswith("Function "):
+            continue
+        metrics = _metrics(lines[index + 1])
+        if metrics:
+            records.append((line, metrics))
+    return records
+
+
 def main() -> None:
     package = KERNEL / "comfyui_turing_utils_kernel"
     suffix = sysconfig.get_config_var("EXT_SUFFIX")
     qattn = package / f"_sage_qattn_sm75{suffix}" if suffix else None
     fused = package / f"_sage_fused_sm75{suffix}" if suffix else None
+    core = package / f"_C{suffix}" if suffix else None
     if qattn is None or not qattn.is_file():
         raise RuntimeError(f"the current Python Sage extension is not built: suffix={suffix}")
     if fused is None or not fused.is_file():
         raise RuntimeError(f"the current Python Sage fused extension is not built: suffix={suffix}")
+    if core is None or not core.is_file():
+        raise RuntimeError(f"the current Python core extension is not built: suffix={suffix}")
     output = _resource_output(qattn)
     records: list[tuple[int, dict[str, int]]] = []
     lines = output.splitlines()
@@ -147,6 +172,49 @@ def main() -> None:
         f"registers<={max(item['REG'] for item in preprocessing_records)} "
         f"static_shared<={max(item['SHARED'] for item in preprocessing_records)} "
         "local=0 stack=0"
+    )
+
+    core_records = _function_records(
+        _sm75_section(_resource_output(core), "TuringCodebookGemmKernel")
+    )
+    inline = [
+        metrics
+        for name, metrics in core_records
+        if "TuringCodebookGemmKernel" in name
+        and "GemmShapeILi128ELi256ELi64" in name
+    ]
+    raw_w8 = [
+        metrics
+        for name, metrics in core_records
+        if "TuringCodebookGemmKernel" not in name
+        and "integer_subbyte" not in name
+        and "GemmShapeILi128ELi256ELi64" in name
+    ]
+    if len(inline) != 1 or len(raw_w8) != 1:
+        raise RuntimeError(
+            "expected one inline-codebook and one raw-W8 long-sequence SM75 kernel, "
+            f"found inline={len(inline)} raw_w8={len(raw_w8)}"
+        )
+    inline_metrics, raw_metrics = inline[0], raw_w8[0]
+    for name, metrics in (("inline codebook W4A8", inline_metrics), ("raw W8A8", raw_metrics)):
+        if metrics.get("REG", 256) > 255:
+            raise RuntimeError(f"{name} exceeds the SM75 register limit: {metrics}")
+        if metrics.get("LOCAL", 1) != 0 or metrics.get("STACK", 1) != 0:
+            raise RuntimeError(f"{name} spilled to local/stack memory: {metrics}")
+    threads = 256
+    sm75_registers = 65536
+    inline_ctas = sm75_registers // (threads * inline_metrics["REG"])
+    raw_ctas = sm75_registers // (threads * raw_metrics["REG"])
+    if inline_ctas < raw_ctas:
+        raise RuntimeError(
+            "inline codebook decode lowers register-limited CTA density: "
+            f"inline={inline_ctas} raw_w8={raw_ctas}"
+        )
+    print(
+        "long-sequence W4A8 resource audit passed: "
+        f"registers=inline:{inline_metrics['REG']}/raw_w8:{raw_metrics['REG']} "
+        f"register_limited_ctas=inline:{inline_ctas}/raw_w8:{raw_ctas} "
+        "local=0 stack=0 shared_tile=identical(source-gated<=48KiB)"
     )
 
 

@@ -248,7 +248,7 @@ class WanMemoryPlanningTest(unittest.TestCase):
             mock.patch("comfyui_turing_utils.adapters.wan.is_supported_turing_device", return_value=True),
             mock.patch(
                 "comfyui_turing_utils.adapters.wan._quantized_wan_summary",
-                return_value=(Counter({"w8a8": 2}), (4096,)),
+                return_value=(Counter({"w8a8": 2}), (4096,), ()),
             ),
             mock.patch("comfyui_turing_utils.adapters.wan.turing_int8_workspace_bytes", return_value=64.0),
         ):

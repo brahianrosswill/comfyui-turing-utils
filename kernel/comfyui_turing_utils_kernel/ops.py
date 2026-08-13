@@ -35,6 +35,97 @@ def _turing_w4a8_linear_fake(activation, weight, activation_scale, weight_scale,
     )
 
 
+@torch.library.custom_op("turing_utils::codebook_w4a8_linear", mutates_args=())
+def turing_codebook_w4a8_linear(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    group_scale: torch.Tensor,
+    channel_scale: torch.Tensor,
+    codebook: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    group_size: int = 16,
+    chunk_rows: int = 0,
+) -> torch.Tensor:
+    """SM75 grouped-codebook W4A8.
+
+    ``chunk_rows=0`` selects the production policy, ``-1`` forces inline
+    packed-W4 decode for supported long sequences, and a positive multiple of
+    eight forces the bounded staged path.
+    """
+    if activation.device.type != "cuda":
+        raise RuntimeError("Turing codebook W4A8 requires CUDA tensors")
+    if torch.cuda.get_device_capability(activation.device) < (7, 5):
+        raise RuntimeError("Turing codebook W4A8 requires sm75 or newer")
+    if group_scale.dtype == torch.float8_e4m3fn:
+        group_scale = group_scale.view(torch.uint8)
+    if group_scale.dtype != torch.uint8:
+        raise TypeError("group_scale must be float8_e4m3fn or its raw uint8 view")
+    return _C.turing_codebook_w4a8_linear(
+        activation.contiguous(),
+        weight.contiguous(),
+        activation_scale.contiguous(),
+        group_scale.contiguous(),
+        channel_scale.contiguous(),
+        codebook.contiguous(),
+        None if bias is None else bias.contiguous(),
+        group_size,
+        chunk_rows,
+    )
+
+
+@turing_codebook_w4a8_linear.register_fake
+def _turing_codebook_w4a8_linear_fake(
+    activation,
+    weight,
+    activation_scale,
+    group_scale,
+    channel_scale,
+    codebook,
+    bias=None,
+    group_size=16,
+    chunk_rows=0,
+):
+    return torch.empty(
+        (activation.size(0), weight.size(0)),
+        dtype=torch.bfloat16,
+        device=activation.device,
+    )
+
+
+@torch.library.custom_op("turing_utils::int8_linear", mutates_args=())
+def turing_int8_linear(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Raw SM75 W8A8 contraction used by package preflight and comparison."""
+    if activation.device.type != "cuda":
+        raise RuntimeError("Turing INT8 linear requires CUDA tensors")
+    if torch.cuda.get_device_capability(activation.device) < (7, 5):
+        raise RuntimeError("Turing INT8 linear requires sm75 or newer")
+    return _C.turing_int8_linear(
+        activation.contiguous(),
+        weight.contiguous(),
+        activation_scale.contiguous(),
+        weight_scale.contiguous(),
+        None if bias is None else bias.contiguous(),
+    )
+
+
+@turing_int8_linear.register_fake
+def _turing_int8_linear_fake(
+    activation, weight, activation_scale, weight_scale, bias=None
+):
+    return torch.empty(
+        (activation.size(0), weight.size(0)),
+        dtype=torch.bfloat16,
+        device=activation.device,
+    )
+
+
 @torch.library.custom_op("turing_utils::dequantize_int8_bf16", mutates_args=())
 def turing_dequantize_int8_bf16(
     accumulator: torch.Tensor,

@@ -119,6 +119,95 @@ def validate_w4a8(device: torch.device) -> None:
             atol=0.01,
         )
 
+    # Kijai's current MiniMax-H3 W4A8 files use Kitchen's symmetric grouped
+    # codebook layout: packed 4-bit indices, E4M3 relative group scales, and
+    # one FP32 channel scale.  Validate the exact decode contract separately
+    # from the legacy signed-nibble format above.
+    generator = torch.Generator(device=device).manual_seed(4388)
+    m, n, k, group_size = 7, 24, 256, 16
+    activation = torch.randint(
+        -128, 128, (m, k), generator=generator, device=device, dtype=torch.int8
+    )
+    codes = torch.randint(
+        0, 16, (n, k), generator=generator, device=device, dtype=torch.int32
+    )
+    packed_codes = (
+        (codes[:, 0::2] & 0x0F) | ((codes[:, 1::2] & 0x0F) << 4)
+    ).to(torch.int8)
+    codebook = torch.linspace(-1.0, 1.0, 16, device=device, dtype=torch.float32)
+    group_scale = (
+        torch.rand(
+            (n, k // group_size), generator=generator, device=device
+        )
+        * 64.0
+        + 4.0
+    ).to(torch.float8_e4m3fn)
+    activation_scale = torch.rand((m,), generator=generator, device=device) * 0.01
+    channel_scale = torch.rand((n,), generator=generator, device=device) * 0.02
+    bias = torch.randn((n,), generator=generator, device=device, dtype=torch.bfloat16)
+    output = comfyui_turing_utils_kernel.turing_codebook_w4a8_linear(
+        activation,
+        packed_codes,
+        activation_scale,
+        group_scale,
+        channel_scale,
+        codebook,
+        bias,
+        group_size,
+    )
+    decoded = (
+        codebook[codes]
+        * group_scale.float().repeat_interleave(group_size, dim=1)
+    ).round().clamp(-127, 127)
+    reference = (
+        activation.float() @ decoded.float().t()
+    ) * activation_scale[:, None] * channel_scale[None, :] + bias.float()
+    _assert_close(
+        "grouped-codebook W4A8",
+        output,
+        reference,
+        rtol=0.01,
+        atol=0.02,
+    )
+
+    # The long-sequence policy decodes packed W4 directly while filling the
+    # CUTLASS shared tile. It must stay bit exact with the staged decoder,
+    # including a predicated N edge.
+    long_activation = torch.randint(
+        -128,
+        128,
+        (8193, k),
+        generator=generator,
+        device=device,
+        dtype=torch.int8,
+    )
+    long_scale = torch.rand(
+        (8193,), generator=generator, device=device
+    ) * 0.01
+    inline = comfyui_turing_utils_kernel.turing_codebook_w4a8_linear(
+        long_activation,
+        packed_codes,
+        long_scale,
+        group_scale,
+        channel_scale,
+        codebook,
+        bias,
+        group_size,
+    )
+    staged = comfyui_turing_utils_kernel.turing_codebook_w4a8_linear(
+        long_activation,
+        packed_codes,
+        long_scale,
+        group_scale,
+        channel_scale,
+        codebook,
+        bias,
+        group_size,
+        chunk_rows=n,
+    )
+    if not torch.equal(inline, staged):
+        raise RuntimeError("inline grouped-codebook W4A8 must be bit exact with staged decode")
+
 
 def validate_segmented_norm(device: torch.device) -> None:
     rows, hidden = 19, 384

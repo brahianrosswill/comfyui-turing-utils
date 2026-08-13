@@ -160,6 +160,163 @@ at::Tensor turing_w4a8_linear(at::Tensor activation,
     return output;
 }
 
+at::Tensor turing_codebook_w4a8_linear(at::Tensor activation,
+                                       at::Tensor weight,
+                                       at::Tensor activation_scale,
+                                       at::Tensor group_scale,
+                                       at::Tensor channel_scale,
+                                       at::Tensor codebook,
+                                       std::optional<at::Tensor> bias,
+                                       int64_t group_size,
+                                       int64_t chunk_rows) {
+    activation = activation.contiguous();
+    weight = weight.contiguous();
+    activation_scale = activation_scale.reshape({-1}).to(at::kFloat).contiguous();
+    group_scale = group_scale.contiguous();
+    channel_scale = channel_scale.reshape({-1}).to(at::kFloat).contiguous();
+    codebook = codebook.reshape({-1}).to(at::kFloat).contiguous();
+    if (bias.has_value()) {
+        bias = bias.value().reshape({-1}).to(at::kFloat).contiguous();
+    }
+
+    check_cuda_2d(activation, "activation");
+    check_cuda_2d(weight, "weight");
+    check_cuda_2d(group_scale, "group_scale");
+    TORCH_CHECK(activation.scalar_type() == at::kChar, "activation must be int8");
+    TORCH_CHECK(weight.scalar_type() == at::kChar, "weight must use packed int8 storage");
+    TORCH_CHECK(group_scale.scalar_type() == at::kByte,
+                "group_scale must contain raw float8_e4m3fn bytes");
+    TORCH_CHECK(activation.device() == weight.device() &&
+                    activation.device() == group_scale.device() &&
+                    activation.device() == activation_scale.device() &&
+                    activation.device() == channel_scale.device() &&
+                    activation.device() == codebook.device(),
+                "all codebook W4A8 tensors must use the same CUDA device");
+
+    const int64_t m = activation.size(0);
+    const int64_t k = activation.size(1);
+    const int64_t n = weight.size(0);
+    TORCH_CHECK(m > 0 && n > 0 && k > 0, "codebook W4A8 dimensions must be positive");
+    TORCH_CHECK(m <= INT_MAX && n <= INT_MAX && k <= INT_MAX,
+                "codebook W4A8 dimensions exceed the CUDA kernel range");
+    TORCH_CHECK(k % 16 == 0 && n % 8 == 0,
+                "codebook W4A8 requires K divisible by 16 and N divisible by 8");
+    TORCH_CHECK(weight.size(1) * 2 == k, "packed weight K must match activation K");
+    TORCH_CHECK(group_size >= 4 && k % group_size == 0 &&
+                    (16 % group_size == 0 || group_size % 16 == 0),
+                "unsupported codebook W4A8 group_size");
+    TORCH_CHECK(group_scale.size(0) == n && group_scale.size(1) == k / group_size,
+                "group_scale must have shape [N, K/group_size]");
+    TORCH_CHECK(activation_scale.numel() == m,
+                "activation_scale must contain one value per activation row");
+    TORCH_CHECK(channel_scale.numel() == n,
+                "channel_scale must contain one value per output channel");
+    TORCH_CHECK(codebook.numel() == 16, "codebook must contain 16 float32 values");
+    if (bias.has_value()) {
+        TORCH_CHECK(bias.value().is_cuda() && bias.value().device() == activation.device(),
+                    "bias must use the activation CUDA device");
+        TORCH_CHECK(bias.value().numel() == n,
+                    "bias must contain one value per output channel");
+    }
+
+    const at::cuda::CUDAGuard device_guard(activation.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major > 7 ||
+                    (properties->major == 7 && properties->minor >= 5),
+                "turing_codebook_w4a8_linear requires sm75 or newer");
+
+    // chunk_rows == 0 selects the production policy, a positive value forces
+    // the bounded staged path, and -1 forces the inline path for diagnostics.
+    // Auto only selects inline decode for the long-sequence tile, whose W8A8
+    // contraction is already limited to one resident CTA on SM75.
+    const bool force_inline = chunk_rows == -1;
+    TORCH_CHECK(chunk_rows >= -1, "chunk_rows must be -1, 0, or a positive multiple of 8");
+    const bool inline_decode = group_size == 16 && m > 8192 && chunk_rows <= 0;
+    constexpr int64_t default_chunk_rows = 4096;
+    if (inline_decode) {
+        chunk_rows = 0;
+    } else if (chunk_rows == 0) {
+        chunk_rows = std::min<int64_t>(n, default_chunk_rows);
+    } else {
+        TORCH_CHECK(chunk_rows % 8 == 0, "chunk_rows must be divisible by 8");
+        chunk_rows = std::min<int64_t>(n, chunk_rows);
+    }
+    TORCH_CHECK(!force_inline || inline_decode,
+                "forced inline codebook W4A8 requires group_size=16 and M>8192");
+
+    at::Tensor workspace;
+    if (!inline_decode) {
+        TORCH_CHECK(chunk_rows > 0, "codebook W4A8 could not select a valid chunk size");
+        workspace = at::empty({chunk_rows, k}, activation.options().dtype(at::kChar));
+    }
+    at::Tensor output = at::empty(
+        {m, n}, activation.options().dtype(at::kBFloat16));
+    TorchOpContext ctx;
+    comfyui_turing_utils::kernels::turing_codebook_w4a8_linear(
+        from_torch(activation),
+        from_torch(weight),
+        from_torch(activation_scale),
+        from_torch(group_scale),
+        from_torch(channel_scale),
+        from_torch(codebook),
+        maybe_tensor(bias),
+        workspace.defined() ? from_torch(workspace) : Tensor{},
+        from_torch(output),
+        int_cast<int>(group_size),
+        inline_decode);
+    return output;
+}
+
+at::Tensor turing_int8_linear(at::Tensor activation,
+                              at::Tensor weight,
+                              at::Tensor activation_scale,
+                              at::Tensor weight_scale,
+                              std::optional<at::Tensor> bias) {
+    activation = activation.contiguous();
+    weight = weight.contiguous();
+    activation_scale = activation_scale.reshape({-1}).to(at::kFloat).contiguous();
+    weight_scale = weight_scale.reshape({-1}).to(at::kFloat).contiguous();
+    if (bias.has_value()) {
+        bias = bias.value().reshape({-1}).to(at::kFloat).contiguous();
+    }
+    check_cuda_2d(activation, "activation");
+    check_cuda_2d(weight, "weight");
+    TORCH_CHECK(activation.scalar_type() == at::kChar && weight.scalar_type() == at::kChar,
+                "Turing INT8 linear activation and weight must be int8");
+    TORCH_CHECK(activation.device() == weight.device() &&
+                    activation.device() == activation_scale.device() &&
+                    activation.device() == weight_scale.device(),
+                "Turing INT8 linear tensors must use the same CUDA device");
+    TORCH_CHECK(weight.size(1) == activation.size(1), "INT8 linear K dimensions must match");
+    TORCH_CHECK(activation.size(1) % 16 == 0 && weight.size(0) % 8 == 0,
+                "Turing INT8 linear requires K%16=0 and N%8=0");
+    TORCH_CHECK(activation_scale.numel() == activation.size(0),
+                "activation_scale must contain one value per row");
+    TORCH_CHECK(weight_scale.numel() == weight.size(0),
+                "weight_scale must contain one value per output channel");
+    if (bias.has_value()) {
+        TORCH_CHECK(bias.value().is_cuda() && bias.value().device() == activation.device() &&
+                        bias.value().numel() == weight.size(0),
+                    "bias must contain one value per output channel on the same CUDA device");
+    }
+    const at::cuda::CUDAGuard device_guard(activation.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major > 7 ||
+                    (properties->major == 7 && properties->minor >= 5),
+                "turing_int8_linear requires sm75 or newer");
+    at::Tensor output = at::empty(
+        {activation.size(0), weight.size(0)}, activation.options().dtype(at::kBFloat16));
+    TorchOpContext ctx;
+    comfyui_turing_utils::kernels::turing_int8_linear(
+        from_torch(activation),
+        from_torch(weight),
+        from_torch(activation_scale),
+        from_torch(weight_scale),
+        maybe_tensor(bias),
+        from_torch(output));
+    return output;
+}
+
 at::Tensor turing_dequantize_int8_bf16(at::Tensor accumulator,
                                         at::Tensor activation_scale,
                                         at::Tensor weight_scale,
@@ -643,6 +800,24 @@ at::Tensor turing_layer_norm_adaln(at::Tensor input,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("turing_w4a8_linear",
           &turing_w4a8_linear,
+          pybind11::arg("activation"),
+          pybind11::arg("weight"),
+          pybind11::arg("activation_scale"),
+          pybind11::arg("weight_scale"),
+          pybind11::arg("bias") = std::nullopt);
+    m.def("turing_codebook_w4a8_linear",
+          &turing_codebook_w4a8_linear,
+          pybind11::arg("activation"),
+          pybind11::arg("weight"),
+          pybind11::arg("activation_scale"),
+          pybind11::arg("group_scale"),
+          pybind11::arg("channel_scale"),
+          pybind11::arg("codebook"),
+          pybind11::arg("bias") = std::nullopt,
+          pybind11::arg("group_size") = 16,
+          pybind11::arg("chunk_rows") = 0);
+    m.def("turing_int8_linear",
+          &turing_int8_linear,
           pybind11::arg("activation"),
           pybind11::arg("weight"),
           pybind11::arg("activation_scale"),

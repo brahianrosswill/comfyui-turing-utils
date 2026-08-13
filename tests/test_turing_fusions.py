@@ -44,6 +44,21 @@ class SegmentValidationTest(unittest.TestCase):
             limit,
         )
 
+    def test_codebook_workspace_is_bounded_by_output_chunks(self):
+        chunk_rows = turing_ops.TURING_CODEBOOK_W4A8_CHUNK_ROWS
+        self.assertEqual(
+            turing_ops.turing_codebook_w4a8_workspace_bytes(28672, 5376),
+            28672 * chunk_rows,
+        )
+        self.assertEqual(
+            turing_ops.turing_codebook_w4a8_workspace_bytes(5376, 28672),
+            5376 * chunk_rows,
+        )
+        self.assertEqual(
+            turing_ops.turing_codebook_w4a8_workspace_bytes(0, 28672),
+            0,
+        )
+
 
 class FusionDispatchTest(unittest.TestCase):
     @staticmethod
@@ -74,6 +89,25 @@ class FusionDispatchTest(unittest.TestCase):
             linear_dtype=linear_dtype,
         )
         return QuantizedTensor(qdata, "TensorCoreConvRotW4A4Layout", params)
+
+    @staticmethod
+    def _codebook_w4_weight(out_features=8, in_features=256):
+        from comfy.quant_ops import AsymW4A8Int8Layout, QuantizedTensor
+
+        qdata = torch.zeros((out_features, in_features // 2), dtype=torch.int8)
+        params = AsymW4A8Int8Layout.Params(
+            scale=torch.ones(
+                (out_features, in_features // 16), dtype=torch.float8_e4m3fn
+            ),
+            s_channel=torch.ones(out_features, dtype=torch.float32),
+            codebook=torch.linspace(-1, 1, 16, dtype=torch.float32),
+            correction=None,
+            group_size=16,
+            convrot_groupsize=256,
+            orig_dtype=torch.bfloat16,
+            orig_shape=(out_features, in_features),
+        )
+        return QuantizedTensor(qdata, "AsymW4A8Int8Layout", params)
 
     def test_direct_turing_input_act_preserves_cast_lifecycle(self):
         weight = self._w8a8_weight()
@@ -149,6 +183,34 @@ class FusionDispatchTest(unittest.TestCase):
 
         self.assertIs(result, output)
         self.assertEqual(kernel.call_args.kwargs["input_act"], "gelu_tanh")
+
+    def test_direct_turing_input_act_supports_grouped_codebook_w4a8(self):
+        weight = self._codebook_w4_weight()
+        linear = SimpleNamespace(weight=weight)
+        x = torch.zeros((2, 512), dtype=torch.bfloat16)
+        output = torch.empty((2, 8), dtype=torch.bfloat16)
+        offload = (None, None, None)
+        with (
+            mock.patch(
+                "comfyui_turing_utils.quantization.dispatch.is_supported_turing_device",
+                return_value=True,
+            ),
+            mock.patch(
+                "comfy.ops.cast_bias_weight",
+                return_value=(weight, None, offload),
+            ),
+            mock.patch("comfy.ops.uncast_bias_weight") as uncast,
+            mock.patch(
+                "comfyui_turing_utils.quantization.dispatch.codebook_w4a8_linear",
+                return_value=output,
+            ) as kernel,
+        ):
+            result = turing_fusions.turing_linear_input_act(linear, x, "swiglu")
+
+        self.assertIs(result, output)
+        self.assertEqual(kernel.call_args.kwargs["group_size"], 16)
+        self.assertEqual(kernel.call_args.kwargs["input_act"], "swiglu")
+        uncast.assert_called_once_with(linear, weight, None, offload)
 
     def test_large_w8_gemm_attempts_fixed_workspace_even_when_latency_heuristic_declines(self):
         from comfy_kitchen.backends import cuda as kitchen_cuda

@@ -19,7 +19,11 @@ from ..attention.protocol import (
 )
 from ..attention.stable import fused_qk_preprocessing_available
 from ..profiling import CUDA_PHASE_PROFILER
-from ..quantization.dispatch import is_supported_turing_device, turing_int8_workspace_bytes
+from ..quantization.dispatch import (
+    is_supported_turing_device,
+    turing_codebook_w4a8_workspace_bytes,
+    turing_int8_workspace_bytes,
+)
 
 
 LOG = logging.getLogger("comfyui-turing-utils")
@@ -28,6 +32,7 @@ _MEMORY_CONTEXT_ATTR = "_turing_utils_wan_memory_context"
 _OUTER_SAMPLE_WRAPPER_KEY = "turing_utils_wan_memory_context"
 _W4_LAYOUT = "TensorCoreConvRotW4A4Layout"
 _W8_LAYOUT = "TensorWiseINT8Layout"
+_CODEBOOK_W4_LAYOUT = "AsymW4A8Int8Layout"
 _SELF_ATTENTION_FORWARD_PARAMETERS = (
     "x",
     "freqs",
@@ -321,21 +326,28 @@ def _make_extra_conds(base_model, patch_size):
     return weak_method(extra_conds, base_model)
 
 
-def _make_memory_required(base_model, patch_size, w8_output_channels: tuple[int, ...]):
+def _make_memory_required(
+    base_model,
+    patch_size,
+    w8_output_channels: tuple[int, ...],
+    fixed_workspaces: tuple[int, ...] = (),
+):
     original = OriginalMethod.capture(base_model.memory_required, base_model)
 
     def memory_required(self, input_shape, cond_shapes={}):
         required = original(self, input_shape, cond_shapes=cond_shapes)
-        if not w8_output_channels:
+        if not w8_output_channels and not fixed_workspaces:
             return required
 
         rows = _shape_token_rows(input_shape, patch_size)
         for shape in cond_shapes.get(_CONTEXT_SHAPE_KEY, ()):
             rows += _shape_token_rows(shape, patch_size)
-        workspace = max(
+        workspaces = [
             turing_int8_workspace_bytes(rows, output_channels)
             for output_channels in w8_output_channels
-        )
+        ]
+        workspaces.extend(fixed_workspaces)
+        workspace = max(workspaces)
         return required + workspace
 
     return weak_method(memory_required, base_model)
@@ -372,15 +384,24 @@ def _convrot_planning_kind(weight) -> str | None:
     layout = getattr(weight, "_layout_cls", None)
     if layout == _W8_LAYOUT and bool(getattr(params, "convrot", False)):
         return "w8a8"
+    if (
+        layout == _CODEBOOK_W4_LAYOUT
+        and getattr(params, "codebook", None) is not None
+        and getattr(params, "correction", None) is None
+    ):
+        return "codebook_w4a8"
     if layout != _W4_LAYOUT or getattr(params, "quant_group_size", None) != 64:
         return None
     linear_dtype = getattr(params, "linear_dtype", None)
     return {"int4": "w4a4", "int8": "w4a8"}.get(linear_dtype)
 
 
-def _quantized_wan_summary(diffusion_model) -> tuple[Counter, tuple[int, ...]]:
+def _quantized_wan_summary(
+    diffusion_model,
+) -> tuple[Counter, tuple[int, ...], tuple[int, ...]]:
     formats = Counter()
     w8_outputs = set()
+    fixed_workspaces = set()
     for module in diffusion_model.modules():
         weight = getattr(module, "weight", None)
         kind = _convrot_planning_kind(weight)
@@ -389,7 +410,14 @@ def _quantized_wan_summary(diffusion_model) -> tuple[Counter, tuple[int, ...]]:
         formats[kind] += 1
         if kind == "w8a8" and getattr(weight, "ndim", 0) == 2:
             w8_outputs.add(int(weight.shape[0]))
-    return formats, tuple(sorted(w8_outputs))
+        elif kind == "codebook_w4a8" and getattr(weight, "ndim", 0) == 2:
+            fixed_workspaces.add(
+                turing_codebook_w4a8_workspace_bytes(
+                    int(weight.shape[1]),
+                    int(weight.shape[0]),
+                )
+            )
+    return formats, tuple(sorted(w8_outputs)), tuple(sorted(fixed_workspaces))
 
 
 def apply_wan_adapter(model, device: torch.device) -> int:
@@ -409,7 +437,9 @@ def apply_wan_adapter(model, device: torch.device) -> int:
     if getattr(base_model, "_turing_utils_wan_adapter", False):
         return 0
 
-    formats, w8_output_channels = _quantized_wan_summary(diffusion_model)
+    formats, w8_output_channels, fixed_workspaces = _quantized_wan_summary(
+        diffusion_model
+    )
 
     patch_size = tuple(int(value) for value in diffusion_model.patch_size)
     base_model.extra_conds = _make_extra_conds(base_model, patch_size)
@@ -418,7 +448,7 @@ def apply_wan_adapter(model, device: torch.device) -> int:
     if _CONTEXT_SHAPE_KEY not in factors:
         base_model.memory_usage_factor_conds = (*factors, _CONTEXT_SHAPE_KEY)
     base_model.memory_required = _make_memory_required(
-        base_model, patch_size, w8_output_channels
+        base_model, patch_size, w8_output_channels, fixed_workspaces
     )
     base_model._turing_utils_wan_adapter = True
 
@@ -435,9 +465,10 @@ def apply_wan_adapter(model, device: torch.device) -> int:
 
     LOG.info(
         "Enabled Wan Turing adapter: formats=[%s], context-aware VRAM planning, "
-        "w8_outputs=[%s], fused_qk_attention=%d",
+        "w8_outputs=[%s], fixed_workspaces=[%s MiB], fused_qk_attention=%d",
         ",".join(f"{kind}:{count}" for kind, count in sorted(formats.items())),
         ",".join(map(str, w8_output_channels)) or "none",
+        ",".join(f"{value / 1024**2:.1f}" for value in fixed_workspaces) or "none",
         attention_fusions,
     )
     return max(sum(formats.values()), attention_fusions, 1)

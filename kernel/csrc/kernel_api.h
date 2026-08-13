@@ -11,6 +11,25 @@ void turing_w4a8_linear(Tensor activation,
                         Tensor bias,
                         Tensor output);
 
+void turing_codebook_w4a8_linear(Tensor activation,
+                                 Tensor weight,
+                                 Tensor activation_scale,
+                                 Tensor group_scale,
+                                 Tensor channel_scale,
+                                 Tensor codebook,
+                                 Tensor bias,
+                                 Tensor workspace,
+                                 Tensor output,
+                                 int group_size,
+                                 bool inline_decode);
+
+void turing_int8_linear(Tensor activation,
+                        Tensor weight,
+                        Tensor activation_scale,
+                        Tensor weight_scale,
+                        Tensor bias,
+                        Tensor output);
+
 void turing_dequantize_int8_bf16(Tensor accumulator,
                                  Tensor activation_scale,
                                  Tensor weight_scale,

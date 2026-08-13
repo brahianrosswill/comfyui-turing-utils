@@ -46,6 +46,33 @@ def quant_config(value: torch.Tensor) -> dict:
 
 
 class ConvRotActivationTest(unittest.TestCase):
+    def test_grouped_codebook_w4a8_metadata_is_preserved(self):
+        key = "blocks.0.mlp.fc1.comfy_quant"
+        state_dict = {
+            key: quant_tensor(
+                {
+                    "format": "asym_w4a8_int8",
+                    "group_size": 16,
+                    "convrot": True,
+                    "convrot_groupsize": 256,
+                }
+            )
+        }
+
+        _, summary = configure_convrot_activation(state_dict, None, True)
+
+        self.assertEqual(summary, ConvRotSummary(codebook_w4a8=1))
+        self.assertNotIn("linear_dtype", quant_config(state_dict[key]))
+
+    def test_grouped_codebook_w4a8_rejects_non_convrot_metadata(self):
+        state_dict = {
+            "blocks.0.mlp.fc1.comfy_quant": quant_tensor(
+                {"format": "asym_w4a8_int8", "convrot": False}
+            )
+        }
+        with self.assertRaisesRegex(ValueError, "must declare convrot=true"):
+            configure_convrot_activation(state_dict, None, False)
+
     def test_false_uses_w4_format_default(self):
         metadata = {
             "_quantization_metadata": json.dumps(

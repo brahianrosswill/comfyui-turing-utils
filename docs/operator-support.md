@@ -28,6 +28,8 @@ implementation.
 | Family | `turing_utils::` operator | Purpose |
 |---|---|---|
 | Linear | `w4a8_linear` | Packed INT4 weights with INT8 activations on SM75 Tensor Cores; BF16 output |
+| Linear | `codebook_w4a8_linear` | Grouped-codebook INT4 storage with E4M3 group scales, inline packed-to-shared decode for long sequences, bounded staged fallback, SM75 INT8 Tensor Core contraction, and BF16 output |
+| Linear | `int8_linear` | Raw prequantized SM75 W8A8 contraction used by the grouped-codebook path and backend regression gates |
 | Epilogue | `dequantize_int8_bf16` | INT32 GEMM workspace to packed BF16 output |
 | Activation quantization | `swiglu_int8_convrot_quantize`, `swiglu_int4_convrot_quantize` | Fused SwiGLU and ConvRot activation quantization |
 | Activation quantization | `gelu_int8_convrot_quantize`, `gelu_int4_convrot_quantize` | Fused tanh-GELU and ConvRot activation quantization |
@@ -83,7 +85,8 @@ real SM75 profile.
 |---|---|---|---|---|
 | W8A8 | INT8 | INT8 | Kitchen/cuBLAS | ConvRot quantization, fused SwiGLU/GELU, BF16 epilogue, workspace policy |
 | W4A4 | packed INT4 | INT4 | Kitchen | Turing BF16 input/output compatibility and fused activation quantization |
-| W4A8 | packed INT4 | INT8 | local exact-SM75 kernel | packed-weight load, INT8 Tensor Core MMA, BF16 output |
+| Legacy W4A8 | signed packed INT4 | INT8 | local exact-SM75 kernel | packed-weight shared-tile expansion, INT8 Tensor Core MMA, BF16 output |
+| Grouped-codebook W4A8 | 4-bit codebook indices + E4M3 g16 scales + FP32 channel scales | INT8 | local exact-SM75 kernel | register decode directly into the shared W8A8 tile for long sequences, bounded staged fallback, BF16 output; covers the symmetric `asym_w4a8_int8` MiniMax-H3 files |
 
 ConvRot group size 256 is the optimized H3 path. Unsupported layouts, group
 sizes, devices, or dtypes are rejected or delegated to Kitchen according to the
@@ -124,3 +127,14 @@ calibration tooling for head/layer/step Sol
 budgets, then real-Turing backend A/B. The first two target tensor traffic in
 the MLP/projection-heavy part of H3 and therefore have a higher whole-model
 ceiling than another dense attention variant.
+
+`kernel/scripts/benchmark_backends.py` is the repeatable backend regression
+gate. It reports prequantized and end-to-end scopes separately for H3 QKV/fc1/
+fc2 shapes, compares the two W4 formats with raw W8A8, Kitchen when its binary
+is compatible, bundled/external attention implementations, and SDPA. Its
+preprocess suite separately measures A8/A4 ConvRot quantization, fused
+SwiGLU/tanh-GELU input activation, RMSNorm/LayerNorm+AdaLN, and the BF16
+epilogue, so Python/eager regressions cannot be misreported as GEMM or attention
+regressions. On a newer GPU, build with
+`COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX"` before using its numbers as a Turing
+direction check.

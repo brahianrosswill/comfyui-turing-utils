@@ -39,7 +39,8 @@ not skip attention or quantized-kernel preflight.
 |---|---|---|---|
 | W8A8 | fused Kitchen rotation when it fits; BF16 row-buffer or staged fallback | SwiGLU and tanh-GELU are folded into the same rotation/quantization decision | requested dtype, BF16 fast epilogue where eligible |
 | W4A4 | fused A4 rotation when it fits; BF16 row-buffer or grouped staged fallback | bundled staged/row-buffer SwiGLU or tanh-GELU produces packed A4 directly | original BF16 boundary |
-| W4A8 | shares the W8 activation quantizer and consumes packed W4 directly | shares fused W8 SwiGLU/tanh-GELU quantization | BF16 |
+| Legacy W4A8 | shares the W8 activation quantizer and consumes signed packed W4 directly | shares fused W8 SwiGLU/tanh-GELU quantization | BF16 |
+| Grouped-codebook W4A8 | shares the W8 activation quantizer; long sequences decode packed g16 codebook values directly into the W8A8 shared tile, with a bounded staged fallback | shares fused W8 SwiGLU/tanh-GELU quantization | BF16 |
 
 The BF16 row-buffer stores one completed rotated row as BF16 and keeps only
 active FHT groups in FP32. Launch selection is constrained to less than 48 KiB
@@ -55,6 +56,48 @@ storage stay in the epilogue. It never creates a persistent W8 weight copy and
 keeps every production tile within the default 48 KiB shared-memory limit.
 Non-Tensor-Core-compatible edge dimensions retain a small DP4A compatibility
 kernel so the public API does not silently narrow its accepted shapes.
+
+Kernel 0.24 also accepts the symmetric `asym_w4a8_int8` layout used by the
+current MiniMax-H3 experimental W4A8 checkpoints. Unlike the legacy signed
+nibble format, each stored nibble is a codebook index and must be combined
+with an E4M3 per-group relative scale before INT8 MMA. The SM75 implementation
+loads one packed 16-value group per thread, combines it with the E4M3 scale and
+codebook in registers, and writes the decoded values directly into CUTLASS's
+normal crosswise S8 shared-memory tile. The long-sequence path therefore has no
+decoded-weight workspace; short sequences and non-g16 compatibility cases keep
+the bounded staged implementation. Neither path expands the checkpoint at load
+time or creates an MxN INT32 accumulator. Asymmetric correction files
+remain a Kitchen fallback and are not silently accepted by this path.
+
+On an A40 running the compute-75 schedule, H3's 52,842-row inline/staged/raw-W8
+prequantized timings were 66.64/66.28/64.88 ms for QKV,
+88.29/88.59/86.65 ms for fc1, and 84.54/84.81/83.12 ms for fc2. Including the
+local BF16 ConvRot quantizer gave 70.14/70.64/69.47 ms,
+91.27/91.87/91.23 ms, and 104.51/104.57/103.98 ms respectively. Inline decode
+is therefore slightly faster than staged end to end and removes 112 MiB of
+peak allocation for the H3 fc2 shape, while remaining near W8A8 parity. A
+synthetic checkpoint-format comparison measured
+relative L2 0.07314 and cosine 0.99732 for grouped-codebook g16, versus relative
+L2 0.16035 and cosine 0.98738 for the legacy row-scaled signed W4 format. These
+are direction and format tests, not final exact-sm75 or model-quality acceptance
+results. Final throughput acceptance still requires an exact-sm75 run.
+
+The inline and raw-W8 long-sequence kernels use the same 256-thread CTA and
+shared-memory tile. The SM75 cubin reports 244 versus 208 registers per thread,
+zero local-memory spill, and one resident CTA in both cases; inline decode does
+not lower CTA density. The staged fallback uses 4,096-output-channel chunks,
+matching Kitchen's production chunk policy, and is bounded at 112 MiB for H3
+fc2 and 21 MiB for qkv/fc1. MiniMax and Wan planning remain conservative for
+short or non-g16 inputs and reserve only the largest mutually exclusive staged
+workspace.
+
+The stable Sage main loop was also rebuilt from historical commit `4255f3c`
+in an isolated worktree and compared with the current compute-75 image on the
+same A40 tensors. Old/current timings were 0.7685/0.7677 ms at N=4096,
+2.8179/2.8197 ms at N=8192, and 10.9173/10.9179 ms at N=16384. The maximum
+difference is about 0.1%, so an observed whole-workflow regression should be
+profiled in projection, Q/K/V preparation, model patching, or VRAM movement;
+it is not explained by a slower bundled stable-Sage CUDA main loop.
 
 For W8A8 GEMM, Kitchen's fused Turing kernel remains first choice. The no-bias
 contraction fallback uses cuBLAS INT8 plus the bundled vectorized BF16

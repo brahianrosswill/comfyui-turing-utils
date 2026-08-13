@@ -18,7 +18,9 @@ TURING_SHARED_MEMORY_LIMIT = 48 * 1024
 # fixed-workspace fused Turing path. This is a dispatch threshold, never an
 # input-size limit.
 TURING_INT8_GLOBAL_WORKSPACE_LIMIT = 64 * 1024 * 1024
+TURING_CODEBOOK_W4A8_CHUNK_ROWS = 4096
 _PREFLIGHTED_DEVICES: set[int] = set()
+_PREFLIGHTED_CODEBOOK_DEVICES: set[int] = set()
 _PREFLIGHTED_KITCHEN: set[tuple[int, bool, bool]] = set()
 
 
@@ -36,12 +38,25 @@ def turing_int8_workspace_bytes(rows: int, output_channels: int) -> int:
     )
 
 
-def _kernel_available() -> bool:
+def turing_codebook_w4a8_workspace_bytes(
+    input_channels: int,
+    output_channels: int,
+) -> int:
+    """Return the bounded decoded-weight workspace used by grouped W4A8."""
+    if input_channels <= 0 or output_channels <= 0:
+        return 0
+    return (
+        min(int(output_channels), TURING_CODEBOOK_W4A8_CHUNK_ROWS)
+        * int(input_channels)
+    )
+
+
+def _kernel_available(name: str = "turing_w4a8_linear") -> bool:
     try:
         extension = load_kernel_extension("_C")
     except (ImportError, OSError):
         return False
-    return hasattr(extension, "turing_w4a8_linear")
+    return hasattr(extension, name)
 
 
 def _kernel_op(name: str):
@@ -123,6 +138,54 @@ def preflight_w4a8(device: torch.device) -> None:
         raise RuntimeError("SwiGLU W4A8 BF16 self-test failed")
     torch.cuda.synchronize(device)
     _PREFLIGHTED_DEVICES.add(index)
+
+
+def preflight_codebook_w4a8(device: torch.device) -> None:
+    """Validate the published grouped-codebook W4A8 contract once per device."""
+    if not is_supported_turing_device(device):
+        raise RuntimeError(f"unsupported device {device}")
+    if not _kernel_available("turing_codebook_w4a8_linear"):
+        raise RuntimeError(
+            "the installed comfyui-turing-utils-kernel does not provide Turing codebook W4A8"
+        )
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index in _PREFLIGHTED_CODEBOOK_DEVICES:
+        return
+
+    operation = _kernel_op("turing_codebook_w4a8_linear")
+    m, n, k, group_size = 3, 8, 64, 16
+    activation = ((torch.arange(m * k, device=device) % 23) - 11).to(torch.int8).reshape(m, k)
+    codes = (torch.arange(n * k, device=device) % 16).to(torch.int32).reshape(n, k)
+    packed = ((codes[:, 0::2] & 0x0f) | ((codes[:, 1::2] & 0x0f) << 4)).to(torch.int8)
+    codebook = torch.linspace(-0.95, 0.95, 16, dtype=torch.float32, device=device)
+    group_scale = torch.linspace(
+        8.0, 32.0, n * (k // group_size), dtype=torch.float32, device=device
+    ).reshape(n, k // group_size).to(torch.float8_e4m3fn)
+    channel_scale = torch.linspace(0.01, 0.03, n, dtype=torch.float32, device=device)
+    activation_scale = torch.linspace(0.02, 0.04, m, dtype=torch.float32, device=device)
+    bias = torch.linspace(-0.1, 0.1, n, dtype=torch.bfloat16, device=device)
+    output = operation(
+        activation,
+        packed,
+        activation_scale,
+        group_scale,
+        channel_scale,
+        codebook,
+        bias,
+        group_size,
+    )
+    decoded = (
+        codebook[codes]
+        * group_scale.float().repeat_interleave(group_size, dim=1)
+    ).round().clamp(-127, 127)
+    reference = (
+        activation.float() @ decoded.float().t()
+    ) * activation_scale[:, None] * channel_scale[None, :] + bias.float()
+    if output.dtype is not torch.bfloat16 or not torch.allclose(
+        output.float(), reference, rtol=0.01, atol=0.02
+    ):
+        raise RuntimeError("codebook W4A8 numerical self-test failed")
+    _PREFLIGHTED_CODEBOOK_DEVICES.add(index)
 
 
 def preflight_kitchen(device: torch.device, w4a4: bool, w8a8: bool) -> None:
@@ -606,6 +669,79 @@ def int8_linear(
     return output.reshape(*original_shape[:-1], output_channels)
 
 
+def codebook_w4a8_linear(
+    x: torch.Tensor,
+    qdata: torch.Tensor,
+    s_rel: torch.Tensor,
+    s_channel: torch.Tensor,
+    codebook: torch.Tensor | None = None,
+    correction: torch.Tensor | None = None,
+    bias: torch.Tensor | None = None,
+    group_size: int = 16,
+    convrot_groupsize: int = 256,
+    out_dtype: torch.dtype = torch.bfloat16,
+    input_act: str | None = None,
+) -> torch.Tensor:
+    """Run Kitchen's grouped-codebook format through the bounded SM75 path."""
+    from comfy_kitchen.backends import cuda as kitchen_cuda
+    from comfy_kitchen.backends._activations import apply_input_act
+
+    fast_path = (
+        x.dtype is torch.bfloat16
+        and out_dtype is torch.bfloat16
+        and is_supported_turing_device(x.device)
+        and convrot_groupsize == 256
+        and correction is None
+        and codebook is not None
+        and codebook.numel() == 16
+        and s_rel.dtype is torch.float8_e4m3fn
+        and qdata.ndim == 2
+        and qdata.shape[0] % 8 == 0
+        and qdata.shape[1] * 2 == x.shape[-1]
+    )
+    if not fast_path:
+        x = apply_input_act(x, input_act)
+        return kitchen_cuda.w4a8_int8_linear(
+            x,
+            qdata,
+            s_rel,
+            s_channel,
+            codebook=codebook,
+            correction=correction,
+            bias=bias,
+            group_size=group_size,
+            convrot_groupsize=convrot_groupsize,
+            out_dtype=out_dtype,
+        )
+
+    original_shape = x.shape
+    x2d = x.reshape(-1, original_shape[-1]).contiguous()
+    if input_act not in (None, "none", "swiglu", "gelu_tanh"):
+        x2d = apply_input_act(x2d, input_act)
+        input_act = None
+    qactivation, activation_scale = _quantize_turing_int8_activation(
+        x2d,
+        convrot_groupsize,
+        input_act=input_act,
+    )
+    operation = _kernel_op("turing_codebook_w4a8_linear")
+    output = operation(
+        qactivation,
+        qdata,
+        activation_scale,
+        s_rel,
+        s_channel,
+        codebook,
+        bias,
+        group_size,
+    )
+    return output.reshape(*original_shape[:-1], qdata.shape[0])
+
+
+# Kitchen resolves backend implementations by the public capability name.
+w4a8_int8_linear = codebook_w4a8_linear
+
+
 def convrot_w4a4_linear(
     x: torch.Tensor,
     qweight: torch.Tensor,
@@ -701,6 +837,7 @@ def register_backend() -> bool:
     cuda_devices = frozenset({"cuda"})
     standard_floats = frozenset({torch.float32, torch.float16, torch.bfloat16})
     has_w4a8_kernel = _kernel_available()
+    has_codebook_w4a8_kernel = _kernel_available("turing_codebook_w4a8_linear")
 
     def require_convrot_256(kwargs):
         if kwargs.get("convrot") is not True:
@@ -720,46 +857,92 @@ def register_backend() -> bool:
             return ValidationResult.fail("linear_dtype", "Turing W4A8 kernel is unavailable")
         return ValidationResult.ok()
 
-    registry.register(
-        BACKEND_NAME,
-        sys.modules[__name__],
-        {
-            "int8_linear": FunctionConstraints(
-                params={
-                    "x": ParamConstraint(
-                        dtypes=frozenset({torch.bfloat16}),
-                        shape_rules=(MinDims(2), SupportedTuringTensor()),
-                    ),
-                    "weight": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
-                    "weight_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
-                    "bias": ParamConstraint(dtypes=standard_floats),
-                    "out_dtype": ParamConstraint(dtypes=standard_floats),
-                    "convrot": ParamConstraint(dtypes=frozenset({bool})),
-                    "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
-                    "input_act": ParamConstraint(dtypes=frozenset({str, type(None)})),
-                },
-                default_devices=cuda_devices,
-                call_rules=(require_convrot_256,),
-            ),
-            "convrot_w4a4_linear": FunctionConstraints(
-                params={
-                    "x": ParamConstraint(
-                        dtypes=frozenset({torch.bfloat16}),
-                        shape_rules=(MinDims(2), SupportedTuringTensor()),
-                    ),
-                    "qweight": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)),
-                    "wscales": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(1),)),
-                    "bias": ParamConstraint(dtypes=standard_floats),
-                    "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
-                    "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
-                    "linear_dtype": ParamConstraint(dtypes=frozenset({str})),
-                    "input_act": ParamConstraint(dtypes=frozenset({str, type(None)})),
-                },
-                default_devices=cuda_devices,
-                call_rules=(require_w4_convrot_256,),
-            ),
-        },
-    )
+    def require_codebook_w4a8(kwargs):
+        if not has_codebook_w4a8_kernel:
+            return ValidationResult.fail("qdata", "Turing codebook W4A8 kernel is unavailable")
+        if kwargs.get("convrot_groupsize") != 256:
+            return ValidationResult.fail(
+                "convrot_groupsize", "Turing codebook W4A8 requires ConvRot group size 256"
+            )
+        if kwargs.get("correction") is not None:
+            return ValidationResult.fail(
+                "correction", "Turing codebook W4A8 fast path supports symmetric files only"
+            )
+        if kwargs.get("codebook") is None:
+            return ValidationResult.fail(
+                "codebook", "Turing codebook W4A8 requires a 16-entry codebook"
+            )
+        return ValidationResult.ok()
+
+    operations = {
+        "int8_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(MinDims(2), SupportedTuringTensor()),
+                ),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)
+                ),
+                "weight_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "bias": ParamConstraint(dtypes=standard_floats),
+                "out_dtype": ParamConstraint(dtypes=standard_floats),
+                "convrot": ParamConstraint(dtypes=frozenset({bool})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "input_act": ParamConstraint(dtypes=frozenset({str, type(None)})),
+            },
+            default_devices=cuda_devices,
+            call_rules=(require_convrot_256,),
+        ),
+        "convrot_w4a4_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(MinDims(2), SupportedTuringTensor()),
+                ),
+                "qweight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)
+                ),
+                "wscales": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(1),)
+                ),
+                "bias": ParamConstraint(dtypes=standard_floats),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "quant_group_size": ParamConstraint(dtypes=frozenset({int})),
+                "linear_dtype": ParamConstraint(dtypes=frozenset({str})),
+                "input_act": ParamConstraint(dtypes=frozenset({str, type(None)})),
+            },
+            default_devices=cuda_devices,
+            call_rules=(require_w4_convrot_256,),
+        ),
+    }
+    if "w4a8_int8_linear" in cuda_capabilities:
+        operations["w4a8_int8_linear"] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(MinDims(2), SupportedTuringTensor()),
+                ),
+                "qdata": ParamConstraint(
+                    dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(2),)
+                ),
+                "s_rel": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn}), shape_rules=(ExactDims(2),)
+                ),
+                "s_channel": ParamConstraint(
+                    dtypes=frozenset({torch.float32}), shape_rules=(ExactDims(1),)
+                ),
+                "codebook": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "correction": ParamConstraint(dtypes=standard_floats),
+                "bias": ParamConstraint(dtypes=standard_floats),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "out_dtype": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=cuda_devices,
+            call_rules=(require_codebook_w4a8,),
+        )
+    registry.register(BACKEND_NAME, sys.modules[__name__], operations)
     existing_priority = list(getattr(registry, "_priority", ("cuda", "triton", "eager")))
     registry.set_priority([BACKEND_NAME, *(name for name in existing_priority if name != BACKEND_NAME)])
     LOG.info("Registered Turing Utils ConvRot backend")

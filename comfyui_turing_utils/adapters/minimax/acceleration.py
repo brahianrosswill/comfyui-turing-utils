@@ -38,7 +38,11 @@ from ...quantization.fusions import (
     segmented_rms_adaln,
     turing_linear_input_act,
 )
-from ...quantization.dispatch import is_supported_turing_device, turing_int8_workspace_bytes
+from ...quantization.dispatch import (
+    is_supported_turing_device,
+    turing_codebook_w4a8_workspace_bytes,
+    turing_int8_workspace_bytes,
+)
 
 
 LOG = logging.getLogger("comfyui-turing-utils")
@@ -249,7 +253,11 @@ def _dtype_size(dtype) -> int:
         return 2
 
 
-def _make_memory_required(base_model, w8_output_channels: tuple[int, ...]):
+def _make_memory_required(
+    base_model,
+    w8_output_channels: tuple[int, ...],
+    fixed_workspaces: tuple[int, ...],
+):
     original = OriginalMethod.capture(base_model.memory_required, base_model)
 
     def memory_required(self, input_shape, cond_shapes={}):
@@ -272,12 +280,16 @@ def _make_memory_required(base_model, w8_output_channels: tuple[int, ...]):
         )
         required += max(explicit_extra - heuristic_extra, 0)
 
-        if w8_output_channels:
-            rows = max(plan.full_rows for plan in plans)
-            required += max(
-                turing_int8_workspace_bytes(rows, output_channels)
-                for output_channels in w8_output_channels
-            )
+        rows = max(plan.full_rows for plan in plans)
+        transient_workspaces = [
+            turing_int8_workspace_bytes(rows, output_channels)
+            for output_channels in w8_output_channels
+        ]
+        transient_workspaces.extend(fixed_workspaces)
+        if transient_workspaces:
+            # Linear layers execute serially, so only the largest transient
+            # workspace is live at once. Summing them would over-reserve VRAM.
+            required += max(transient_workspaces)
         return required
 
     return weak_method(memory_required, base_model)
@@ -286,13 +298,24 @@ def _make_memory_required(base_model, w8_output_channels: tuple[int, ...]):
 _make_outer_sample_wrapper = make_minimax_runtime_context_wrapper
 
 
-def _w8_output_channels(root: torch.nn.Module) -> tuple[int, ...]:
+def _linear_workspace_requirements(
+    root: torch.nn.Module,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
     outputs = set()
+    fixed_workspaces = set()
     for module in root.modules():
         weight = getattr(module, "weight", None)
-        if convrot_weight_kind(weight) == "w8a8" and getattr(weight, "ndim", 0) == 2:
+        kind = convrot_weight_kind(weight)
+        if kind == "w8a8" and getattr(weight, "ndim", 0) == 2:
             outputs.add(int(weight.shape[0]))
-    return tuple(sorted(outputs))
+        elif kind == "codebook_w4a8" and getattr(weight, "ndim", 0) == 2:
+            fixed_workspaces.add(
+                turing_codebook_w4a8_workspace_bytes(
+                    int(weight.shape[1]),
+                    int(weight.shape[0]),
+                )
+            )
+    return tuple(sorted(outputs)), tuple(sorted(fixed_workspaces))
 
 
 def _install_memory_planning(model, base_model, diffusion_model) -> bool:
@@ -316,13 +339,18 @@ def _install_memory_planning(model, base_model, diffusion_model) -> bool:
     factors = tuple(getattr(base_model, "memory_usage_factor_conds", ()))
     if _MEMORY_SHAPE_KEY not in factors:
         base_model.memory_usage_factor_conds = (*factors, _MEMORY_SHAPE_KEY)
-    outputs = _w8_output_channels(base_model)
-    base_model.memory_required = _make_memory_required(base_model, outputs)
+    outputs, fixed_workspaces = _linear_workspace_requirements(base_model)
+    base_model.memory_required = _make_memory_required(
+        base_model,
+        outputs,
+        fixed_workspaces,
+    )
 
     setattr(base_model, _MEMORY_ADAPTER_ATTR, True)
     LOG.info(
-        "Enabled MiniMax packed-sequence VRAM planning: W8 outputs=[%s]",
+        "Enabled MiniMax packed-sequence VRAM planning: W8 outputs=[%s] fixed_workspaces=[%s MiB]",
         ",".join(map(str, outputs)) or "none",
+        ",".join(f"{value / 1024**2:.1f}" for value in fixed_workspaces) or "none",
     )
     return True
 

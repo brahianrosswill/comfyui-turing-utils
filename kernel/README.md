@@ -1,7 +1,8 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's exact-sm75
-runtime. Version 0.23.0 contains packed W4A8 Tensor Core GEMM, W8/W4 ConvRot
+runtime. Version 0.24.0 contains legacy packed W4A8 and grouped-codebook W4A8
+Tensor Core GEMMs, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, bundled Sage attention, pure-INT8 W8A8 attention,
 and an explicitly selected experimental model-independent sparse attention
@@ -16,7 +17,8 @@ route map is materialized. The local neighborhood is fixed to the official
 It contains no model-weight format or model loader.
 
 Every stable public tensor operator is registered through
-`torch.library.custom_op` with a fake/meta implementation: W4A8 GEMM, BF16
+`torch.library.custom_op` with a fake/meta implementation: both W4A8 GEMMs, a
+raw W8A8 contraction used by the grouped-codebook path and regression tests, BF16
 epilogue, ConvRot activation fusions, normalization fusions, fixed and varlen
 Sage, dense W8A8, Sol, and fused Q/K RMSNorm+RoPE+INT8 preprocessing.
 Prequantized Python state objects deliberately stay
@@ -42,7 +44,7 @@ csrc/
   turing/
     convrot_quant.cu                      staged/row-buffer W8 and W4 ConvRot quantizers
     segmented_rms_adaln.cu                RMSNorm/LayerNorm + AdaLN kernels
-    w4a8.cu                               packed W4-to-S8 SM75 Tensor Core GEMM
+    w4a8.cu                               legacy packed W4 and grouped-codebook W4 SM75 GEMMs
     sage/                                 bundled dense/sparse attention and fused Q/K preprocessing
 comfyui_turing_utils_kernel/
   ops.py                                  stable Turing operator API
@@ -68,6 +70,9 @@ python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-sparse
 python kernel/scripts/validate_wan_fusions.py --device cuda:0
+python kernel/scripts/benchmark_backends.py --device cuda:0 --suite all
+python kernel/scripts/benchmark_backends.py --device cuda:0 --suite attention \
+  --sequences 4096 --heads 56 --kv-heads 56 --head-dim 128
 ```
 
 `--experimental-sparse` also runs the explicit correctness gate. A fully
@@ -89,6 +94,15 @@ dialect. Linux stays on PyTorch's portable C++17 baseline, including with CUDA
 standards can be overridden with
 `COMFYUI_TURING_UTILS_HOST_CXX_STANDARD` and
 `COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD` when diagnosing a toolchain issue.
+
+Version 0.24 adds the symmetric `asym_w4a8_int8` layout used by current
+MiniMax-H3 grouped-codebook checkpoints. The local SM75 path decodes packed
+indices and E4M3 g16 scales directly while filling the normal CUTLASS W8A8
+shared-memory tile for long sequences, then writes BF16 directly. Short
+sequences and non-g16 compatibility cases retain a bounded staged decoder. It
+does not materialize a full INT32 output workspace. Unsupported asymmetric
+correction layouts delegate to Kitchen rather than silently changing their
+math.
 
 Version 0.23 retains the split prequantize/execute attention ABI used by current
 ComfyUI attention tensor containers. It releases the original Q/K/V storage
@@ -131,6 +145,7 @@ print("Turing sparse:", comfyui_turing_utils_kernel.turing_sage.sparse_available
 print("Turing W8A8 attention:", comfyui_turing_utils_kernel.turing_sage.w8a8_available())
 print("Fused Q/K preprocessing:", comfyui_turing_utils_kernel.turing_sage.fused_qk_preprocessing_available())
 print("Turing W4A8:", callable(comfyui_turing_utils_kernel.turing_w4a8_linear))
+print("Turing codebook W4A8:", callable(comfyui_turing_utils_kernel.turing_codebook_w4a8_linear))
 print("Turing SwiGLU:", callable(comfyui_turing_utils_kernel.turing_swiglu_int8_convrot_quantize))
 print("Turing norm:", callable(comfyui_turing_utils_kernel.turing_segmented_rms_adaln))
 PY
