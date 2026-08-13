@@ -343,8 +343,8 @@ __device__ __forceinline__ float load_bf16_input(
     return __bfloat162float(input[row_offset + column]);
 }
 
-// Whole-row ConvRot under the default 48 KiB SM75 shared-memory limit.  The
-// inactive row is stored as BF16 while each active group retains FP32 scratch.
+// Whole-row ConvRot. The inactive row is stored as BF16 while each active
+// group retains FP32 scratch.
 // This preserves the staged path's BF16 rounding but removes its global-memory
 // intermediate and second kernel launch.
 template <int BlockThreads, bool SwiGLU, bool Int4, bool Gelu = false>
@@ -451,7 +451,13 @@ void launch_bf16_rowbuffer(Tensor input, Tensor output, Tensor scales) {
     const size_t shared_bytes =
         static_cast<size_t>(k) * sizeof(uint16_t) +
         kGroupsInFlight * 2 * kConvRotGroup * sizeof(float);
-    bf16_rowbuffer_convrot_quantize_kernel<BlockThreads, SwiGLU, Int4, Gelu>
+    auto kernel =
+        bf16_rowbuffer_convrot_quantize_kernel<BlockThreads, SwiGLU, Int4, Gelu>;
+    checkCUDA(cudaFuncSetAttribute(
+        kernel,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(shared_bytes)));
+    kernel
         <<<rows, BlockThreads, shared_bytes, getCurrentCUDAStream()>>>(
             static_cast<const nv_bfloat16 *>(input.ptr),
             static_cast<int8_t *>(output.ptr),

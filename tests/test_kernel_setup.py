@@ -164,6 +164,28 @@ class KernelSetupTest(unittest.TestCase):
         self.assertGreaterEqual(fused.count(current_stream), 10)
         self.assertNotIn("<<<grid, block>>>", fused)
 
+    def test_bf16_convrot_uses_device_optin_shared_memory_and_tunable_geometry(self):
+        bindings = (PLUGIN_ROOT / "kernel" / "csrc" / "bindings.cpp").read_text(
+            encoding="utf-8"
+        )
+        source = (
+            PLUGIN_ROOT / "kernel" / "csrc" / "turing" / "convrot_quant.cu"
+        ).read_text(encoding="utf-8")
+        benchmark = (
+            PLUGIN_ROOT / "kernel" / "scripts" / "benchmark_backends.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("sharedMemPerBlockOptin", bindings)
+        self.assertIn("{512, 768, 1024}", bindings)
+        self.assertIn("sharedMemPerMultiprocessor", bindings)
+        self.assertIn("maxThreadsPerMultiProcessor", bindings)
+        self.assertIn("forced_threads", bindings)
+        self.assertIn("cudaFuncAttributeMaxDynamicSharedMemorySize", source)
+        self.assertIn('(\"fc2\", 5376, 14336, \"swiglu\")', benchmark)
+        self.assertIn(
+            '(\"H3 fc2 fused SwiGLU+ConvRot A8\", 28672, \"swiglu\")',
+            benchmark,
+        )
+
     def test_windows_conda_target_specific_cccl_path_is_added(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             prefix = Path(temp_dir)

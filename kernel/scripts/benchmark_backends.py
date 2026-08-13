@@ -285,7 +285,7 @@ def benchmark_linear(
         # H3 fc2 consumes the activated half of fc1's [gate | up] output.
         # Benchmarking a plain BF16 [M, 28672] tensor both misses the SwiGLU
         # fusion and selects a row-buffer path that production never uses.
-        ("fc2", 5376, 28672, "swiglu"),
+        ("fc2", 5376, 14336, "swiglu"),
     )
     for m in rows:
         for shape_name, n, k, input_act in shapes:
@@ -742,7 +742,7 @@ def benchmark_preprocessing(
         generator = torch.Generator(device=device).manual_seed(7300 + m)
         for name, raw_k, input_act in (
             ("H3 qkv/fc1 ConvRot A8", 5376, None),
-            ("H3 fc2 fused SwiGLU+ConvRot A8", 57344, "swiglu"),
+            ("H3 fc2 fused SwiGLU+ConvRot A8", 28672, "swiglu"),
             ("Wan tanh-GELU+ConvRot A8", 5120, "gelu_tanh"),
         ):
             x = torch.randn(
@@ -752,12 +752,14 @@ def benchmark_preprocessing(
                 generator=generator,
             )
             if input_act == "swiglu":
-                bundled = lambda: turing.turing_swiglu_int8_convrot_quantize(
-                    x, 256
+                bundled = lambda: turing.turing_bf16_int8_convrot_quantize(
+                    x, 256, swiglu=True
                 )
-                bundled_int4 = lambda: turing.turing_swiglu_int4_convrot_quantize(
-                    x, 256
+                bundled_int4 = lambda: turing.turing_bf16_int4_convrot_quantize(
+                    x, 256, swiglu=True
                 )
+                staged = lambda: turing.turing_swiglu_int8_convrot_quantize(x, 256)
+                staged_int4 = lambda: turing.turing_swiglu_int4_convrot_quantize(x, 256)
             elif input_act == "gelu_tanh":
                 bundled = lambda: turing.turing_bf16_gelu_int8_convrot_quantize(
                     x, 256
@@ -798,6 +800,32 @@ def benchmark_preprocessing(
                     _elapsed_ms(bundled, warmup, repeats),
                 )
             ]
+            if input_act == "swiglu":
+                _append_optional(
+                    measurements,
+                    "bundled staged compatibility path",
+                    "end-to-end",
+                    staged,
+                    warmup,
+                    repeats,
+                )
+            if input_act == "swiglu" and raw_k == 28672:
+                # The low-level binding accepts a forced geometry only for
+                # reproducible tuning. The registered custom op remains on
+                # the production auto selector.
+                core = getattr(turing, "_C", None)
+                if core is not None:
+                    for threads in (512, 768, 1024):
+                        _append_optional(
+                            measurements,
+                            f"bundled SM75 forced {threads} threads",
+                            "geometry",
+                            lambda threads=threads: core.turing_bf16_int8_convrot_quantize(
+                                x, 256, True, threads
+                            ),
+                            warmup,
+                            repeats,
+                        )
             if kitchen_cuda is not None:
                 _append_optional(
                     measurements,
@@ -828,6 +856,15 @@ def benchmark_preprocessing(
                     _elapsed_ms(bundled_int4, warmup, repeats),
                 )
             ]
+            if input_act == "swiglu":
+                _append_optional(
+                    int4_measurements,
+                    "bundled staged compatibility path",
+                    "end-to-end",
+                    staged_int4,
+                    warmup,
+                    repeats,
+                )
             if kitchen_cuda is not None:
                 _append_optional(
                     int4_measurements,

@@ -340,7 +340,7 @@ class BF16PolicyTest(unittest.TestCase):
         fused.assert_called_once_with(x, 256)
         staged.assert_not_called()
 
-    def test_bf16_rowbuffer_convrot_replaces_staged_h3_shapes_under_48k(self):
+    def test_bf16_rowbuffer_convrot_replaces_staged_h3_shapes_with_optin_shared(self):
         rowbuffer = mock.Mock(return_value=("q", "s"))
         for hidden_size in (5376, 7168, 14336):
             x = torch.empty((3, hidden_size), dtype=torch.bfloat16)
@@ -513,7 +513,7 @@ class BF16PolicyTest(unittest.TestCase):
         self.assertIs(linear.call_args.args[2], activation_scale)
 
     def test_w4a4_uses_grouped_rotation_when_fused_shared_memory_is_full(self):
-        x = torch.empty((3, 16384), dtype=torch.bfloat16)
+        x = torch.empty((3, 28672), dtype=torch.bfloat16)
         rotated = torch.empty_like(x)
         with (
             mock.patch.object(kitchen_cuda, "quantize_int4_rowwise_convrot64") as fused,
@@ -525,6 +525,25 @@ class BF16PolicyTest(unittest.TestCase):
         fused.assert_not_called()
         rotate.assert_called_once_with(x, 256)
         quantize.assert_called_once_with(rotated)
+
+    def test_w4a4_uses_optin_rowbuffer_above_kitchen_default_limit(self):
+        x = torch.empty((3, 16384), dtype=torch.bfloat16)
+        rowbuffer = mock.Mock(return_value=("q", "s"))
+        with (
+            mock.patch.object(kitchen_cuda, "quantize_int4_rowwise_convrot64") as fused,
+            mock.patch.object(kitchen_cuda, "rotate_int8_convrot_weight") as rotate,
+            mock.patch.dict(
+                sys.modules,
+                {"comfyui_turing_utils_kernel": SimpleNamespace(
+                    turing_bf16_int4_convrot_quantize=rowbuffer
+                )},
+            ),
+        ):
+            result = turing_ops._quantize_turing_int4_activation(x, 256)
+        self.assertEqual(result, ("q", "s"))
+        rowbuffer.assert_called_once_with(x, 256, swiglu=False)
+        fused.assert_not_called()
+        rotate.assert_not_called()
 
     def test_w4a4_keeps_h3_bf16_rotation_fused_when_it_fits(self):
         x = torch.empty((3, 14336), dtype=torch.bfloat16)

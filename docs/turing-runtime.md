@@ -44,10 +44,23 @@ not skip attention or quantized-kernel preflight.
 
 The BF16 row-buffer stores one completed rotated row as BF16 and keeps only
 active FHT groups in FP32. Launch selection uses the device's opt-in dynamic
-shared-memory limit rather than a fixed 48 KiB policy. It does not allocate the full activated or rotated BF16
+shared-memory limit rather than a fixed 48 KiB policy. Among the 512/768/1024
+thread geometries that fit, dispatch estimates resident CTAs from the device's
+shared-memory and thread limits and selects the geometry with the most active
+warps for the actual row count. Resident CTA count is an input to that choice,
+not a fixed acceptance rule. It does not allocate the full activated or rotated BF16
 intermediate. A40 compatibility validation shows identical packed INT8/INT4
 values versus the staged operators across K=256, 5376, 7168, and 14336; INT4
 scale differences are at most normal FP32 reduction-order roundoff.
+
+For the real H3 fc2 boundary (`M=4096`, raw SwiGLU width 28672, contracted
+width 14336), an A40 JITing compute_75 PTX measured 0.589 ms for the row-buffer
+A8 path versus 0.967 ms for the former staged path, and 0.530 versus 0.888 ms
+for A4. Forced 512/768/1024 A8 geometries measured 0.599/0.775/0.767 ms and
+produced identical packed values and scales. A40 selects 512 because its
+100 KiB shared-memory pool can keep two such CTAs resident; exact Turing has a
+different 64 KiB residency calculation, so its final geometry and throughput
+still require an exact-sm75 measurement.
 
 W4A8 reads packed W4 tiles directly, expands each vector once while filling
 CUTLASS's SM75 crosswise INT8 shared-memory layout, and executes the contraction
@@ -70,12 +83,13 @@ time or creates an MxN INT32 accumulator. Asymmetric correction files
 remain a Kitchen fallback and are not silently accepted by this path.
 
 On an A40 running the compute-75 schedule, H3's 52,842-row inline/staged/raw-W8
-prequantized timings were 66.64/66.28/64.88 ms for QKV,
-88.29/88.59/86.65 ms for fc1, and 84.54/84.81/83.12 ms for fc2. Including the
-local BF16 ConvRot quantizer gave 70.14/70.64/69.47 ms,
-91.27/91.87/91.23 ms, and 104.51/104.57/103.98 ms respectively. Inline decode
+prequantized timings were 66.64/66.28/64.88 ms for QKV and
+88.29/88.59/86.65 ms for fc1. Including the local BF16 ConvRot quantizer gave
+70.14/70.64/69.47 ms and 91.27/91.87/91.23 ms respectively. Inline decode
 is therefore slightly faster than staged end to end and removes 112 MiB of
-peak allocation for the H3 fc2 shape, while remaining near W8A8 parity. A
+peak allocation on the former large-K proxy, while remaining near W8A8 parity. The benchmark now uses the actual H3 fc2
+contracted width 14336 rather than treating the full 28672-wide fc1 output as
+the fc2 contraction. A
 synthetic checkpoint-format comparison measured
 relative L2 0.07314 and cosine 0.99732 for grouped-codebook g16, versus relative
 L2 0.16035 and cosine 0.98738 for the legacy row-scaled signed W4 format. These

@@ -13,7 +13,8 @@ from ..kernel_api import load_kernel_extension, load_kernel_package
 
 LOG = logging.getLogger("comfyui-turing-utils")
 BACKEND_NAME = "turing_utils_sm75"
-TURING_SHARED_MEMORY_LIMIT = 48 * 1024
+KITCHEN_DEFAULT_SHARED_MEMORY_LIMIT = 48 * 1024
+TURING_OPTIN_SHARED_MEMORY_LIMIT = 64 * 1024
 # Above this point a full MxN INT32 accumulator is more expensive than the
 # fixed-workspace fused Turing path. This is a dispatch threshold, never an
 # input-size limit.
@@ -300,7 +301,7 @@ def _convrot_int8_bf16_rowbuffer_fits(hidden_size: int) -> bool:
         # ptxas reserves three additional aligned words around the static
         # warp-reduction arrays (80/112/144 bytes for 512/768/1024 threads).
         static_bytes = (block_threads // 32 + 4) * 4
-        if dynamic_bytes + static_bytes < TURING_SHARED_MEMORY_LIMIT:
+        if dynamic_bytes + static_bytes <= TURING_OPTIN_SHARED_MEMORY_LIMIT:
             return True
     return False
 
@@ -353,7 +354,7 @@ def _quantize_turing_int8_activation(
             ) from exc
         return turing_gelu_int8_convrot_quantize(x2d, group_size)
     requested_shared = _convrot_int8_shared_memory_bytes(x2d.shape[0], hidden_size)
-    if requested_shared < TURING_SHARED_MEMORY_LIMIT:
+    if requested_shared < KITCHEN_DEFAULT_SHARED_MEMORY_LIMIT:
         if input_act == "swiglu":
             return kitchen_cuda.quantize_int8_rowwise_convrot64(
                 x2d, group_size, input_act="swiglu"
@@ -387,7 +388,7 @@ def _quantize_turing_int8_activation(
     if staged is None:
         raise RuntimeError(
             "Turing INT8 activation requires Kitchen staged ConvRot quantization "
-            "when the 48 KiB shared-memory limit is exceeded"
+            "when Kitchen's default shared-memory launch does not fit"
         )
     return staged(x2d, group_size)
 
@@ -452,7 +453,7 @@ def _quantize_turing_int4_activation(
     requested_shared = _convrot_int4_shared_memory_bytes(
         x2d.shape[0], x2d.shape[1], x2d.element_size()
     )
-    if requested_shared < TURING_SHARED_MEMORY_LIMIT:
+    if requested_shared < KITCHEN_DEFAULT_SHARED_MEMORY_LIMIT:
         return kitchen_cuda.quantize_int4_rowwise_convrot64(x2d, group_size)
     if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(x2d.shape[1]):
         try:
@@ -471,7 +472,7 @@ def _quantize_turing_int4_activation(
     if rotate is None:
         raise RuntimeError(
             "Turing INT4 activation requires Kitchen grouped ConvRot rotation "
-            "when the 48 KiB shared-memory limit is exceeded"
+            "when Kitchen's default shared-memory launch does not fit"
         )
     rotated = rotate(x2d, group_size)
     return kitchen_cuda.quantize_int4_rowwise(rotated)

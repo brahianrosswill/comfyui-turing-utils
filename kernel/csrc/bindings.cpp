@@ -3,7 +3,9 @@
 #include <c10/cuda/CUDAStream.h>
 #include <torch/csrc/utils/pybind.h>
 
+#include <algorithm>
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <tuple>
 #include <utility>
@@ -102,6 +104,57 @@ void check_float_like(const at::Tensor &t, const char *name) {
                     t.scalar_type() == at::kFloat,
                 name,
                 " must be float16, bfloat16, or float32");
+}
+
+int select_bf16_convrot_threads(const cudaDeviceProp *properties,
+                                int64_t hidden,
+                                int64_t rows,
+                                int forced_threads = 0) {
+    const int64_t shared_limit = properties->sharedMemPerBlockOptin > 0
+        ? static_cast<int64_t>(properties->sharedMemPerBlockOptin)
+        : static_cast<int64_t>(properties->sharedMemPerBlock);
+    int best_threads = 0;
+    int64_t best_active_warps = -1;
+    for (const int threads : {512, 768, 1024}) {
+        if (forced_threads != 0 && threads != forced_threads) {
+            continue;
+        }
+        const int64_t groups_in_flight = threads / 64;
+        const int64_t dynamic_bytes =
+            hidden * static_cast<int64_t>(sizeof(uint16_t)) +
+            groups_in_flight * 2 * 256 * static_cast<int64_t>(sizeof(float));
+        const int64_t static_bytes =
+            (threads / 32 + 4) * static_cast<int64_t>(sizeof(float));
+        const int64_t shared_bytes = dynamic_bytes + static_bytes;
+        if (shared_bytes > shared_limit) {
+            continue;
+        }
+        if (forced_threads != 0) {
+            return threads;
+        }
+
+        const int64_t shared_per_sm = properties->sharedMemPerMultiprocessor;
+        const int64_t resident_by_shared = shared_per_sm / shared_bytes;
+        const int64_t resident_by_threads =
+            properties->maxThreadsPerMultiProcessor / threads;
+        const int64_t grid_ctas_per_sm =
+            (rows + properties->multiProcessorCount - 1) /
+            properties->multiProcessorCount;
+        const int64_t resident_ctas = std::max<int64_t>(
+            1, std::min({resident_by_shared, resident_by_threads, grid_ctas_per_sm}));
+        const int64_t active_warps = resident_ctas * (threads / 32);
+        if (active_warps > best_active_warps) {
+            best_active_warps = active_warps;
+            best_threads = threads;
+        }
+    }
+    if (best_threads != 0) {
+        return best_threads;
+    }
+    TORCH_CHECK(false,
+                "BF16 row-buffer ConvRot requires more shared memory than device ",
+                properties->name, " provides (opt-in limit ", shared_limit, " bytes)");
+    return 0;
 }
 
 Tensor maybe_tensor(const std::optional<at::Tensor> &value) {
@@ -498,13 +551,16 @@ std::tuple<at::Tensor, at::Tensor> turing_gelu_int4_convrot_quantize(
 }
 
 std::tuple<at::Tensor, at::Tensor> turing_bf16_int8_convrot_quantize(
-    at::Tensor input, int64_t group_size, bool swiglu) {
+    at::Tensor input, int64_t group_size, bool swiglu, int64_t forced_threads) {
     input = input.contiguous();
     check_cuda_2d(input, "input");
     TORCH_CHECK(input.scalar_type() == at::kBFloat16,
                 "BF16 row-buffer ConvRot input must be bfloat16");
     TORCH_CHECK(group_size == 256,
                 "BF16 row-buffer ConvRot only supports group_size=256");
+    TORCH_CHECK(forced_threads == 0 || forced_threads == 512 ||
+                    forced_threads == 768 || forced_threads == 1024,
+                "forced_threads must be 0, 512, 768, or 1024");
 
     const int64_t rows = input.size(0);
     const int64_t input_columns = input.size(1);
@@ -517,33 +573,13 @@ std::tuple<at::Tensor, at::Tensor> turing_bf16_int8_convrot_quantize(
                     hidden <= std::numeric_limits<int>::max(),
                 "BF16 row-buffer ConvRot dimensions exceed the CUDA kernel range");
 
-    constexpr int64_t shared_limit = 48 * 1024;
-    const auto shared_bytes = [hidden](int threads) {
-        const int64_t groups_in_flight = threads / 64;
-        const int64_t dynamic_bytes =
-            hidden * static_cast<int64_t>(sizeof(uint16_t)) +
-            groups_in_flight * 2 * 256 * static_cast<int64_t>(sizeof(float));
-        // ptxas reports three additional alignment words around the static
-        // warp-reduction arrays.
-        const int64_t static_bytes =
-            (threads / 32 + 4) * static_cast<int64_t>(sizeof(float));
-        return dynamic_bytes + static_bytes;
-    };
-    int block_threads = 0;
-    for (const int candidate : {1024, 768, 512}) {
-        if (shared_bytes(candidate) < shared_limit) {
-            block_threads = candidate;
-            break;
-        }
-    }
-    TORCH_CHECK(block_threads != 0,
-                "BF16 row-buffer ConvRot cannot fit under the 48 KiB shared-memory limit");
-
     const at::cuda::CUDAGuard device_guard(input.device());
     const cudaDeviceProp *properties = getCurrentDeviceProperties();
     TORCH_CHECK(properties->major > 7 ||
                     (properties->major == 7 && properties->minor >= 5),
                 "BF16 row-buffer ConvRot requires sm75 or newer");
+    const int block_threads = select_bf16_convrot_threads(
+        properties, hidden, rows, static_cast<int>(forced_threads));
 
     at::Tensor output = at::empty(
         {rows, hidden}, input.options().dtype(at::kChar));
@@ -579,30 +615,11 @@ std::tuple<at::Tensor, at::Tensor> turing_bf16_int4_convrot_quantize(
                     hidden <= std::numeric_limits<int>::max(),
                 "BF16 row-buffer INT4 ConvRot dimensions exceed the CUDA kernel range");
 
-    constexpr int64_t shared_limit = 48 * 1024;
-    const auto shared_bytes = [hidden](int threads) {
-        const int64_t groups_in_flight = threads / 64;
-        const int64_t dynamic_bytes =
-            hidden * static_cast<int64_t>(sizeof(uint16_t)) +
-            groups_in_flight * 2 * 256 * static_cast<int64_t>(sizeof(float));
-        const int64_t static_bytes =
-            (threads / 32 + 4) * static_cast<int64_t>(sizeof(float));
-        return dynamic_bytes + static_bytes;
-    };
-    int block_threads = 0;
-    for (const int candidate : {1024, 768, 512}) {
-        if (shared_bytes(candidate) < shared_limit) {
-            block_threads = candidate;
-            break;
-        }
-    }
-    TORCH_CHECK(block_threads != 0,
-                "BF16 row-buffer INT4 ConvRot cannot fit under the 48 KiB shared-memory limit");
-
     const at::cuda::CUDAGuard device_guard(input.device());
     const cudaDeviceProp *properties = getCurrentDeviceProperties();
     TORCH_CHECK(properties->major > 7 || (properties->major == 7 && properties->minor >= 5),
                 "BF16 row-buffer INT4 ConvRot requires sm75 or newer");
+    const int block_threads = select_bf16_convrot_threads(properties, hidden, rows);
 
     at::Tensor output = at::empty({rows, hidden / 2}, input.options().dtype(at::kChar));
     at::Tensor scales = at::empty({rows, 1}, input.options().dtype(at::kFloat));
@@ -633,28 +650,12 @@ std::tuple<at::Tensor, at::Tensor> turing_bf16_gelu_convrot_quantize(
                     hidden <= std::numeric_limits<int>::max(),
                 "BF16 GELU row-buffer dimensions exceed the CUDA kernel range");
 
-    constexpr int64_t shared_limit = 48 * 1024;
-    const auto shared_bytes = [hidden](int threads) {
-        const int64_t groups_in_flight = threads / 64;
-        return hidden * static_cast<int64_t>(sizeof(uint16_t)) +
-               groups_in_flight * 2 * 256 * static_cast<int64_t>(sizeof(float)) +
-               (threads / 32 + 4) * static_cast<int64_t>(sizeof(float));
-    };
-    int block_threads = 0;
-    for (const int candidate : {1024, 768, 512}) {
-        if (shared_bytes(candidate) < shared_limit) {
-            block_threads = candidate;
-            break;
-        }
-    }
-    TORCH_CHECK(block_threads != 0,
-                "BF16 GELU row-buffer ConvRot cannot fit under the 48 KiB shared-memory limit");
-
     const at::cuda::CUDAGuard device_guard(input.device());
     const cudaDeviceProp *properties = getCurrentDeviceProperties();
     TORCH_CHECK(properties->major > 7 ||
                     (properties->major == 7 && properties->minor >= 5),
                 "BF16 GELU row-buffer ConvRot requires sm75 or newer");
+    const int block_threads = select_bf16_convrot_threads(properties, hidden, rows);
 
     at::Tensor output = at::empty(
         {rows, int4 ? hidden / 2 : hidden}, input.options().dtype(at::kChar));
@@ -849,7 +850,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &turing_bf16_int8_convrot_quantize,
           pybind11::arg("input"),
           pybind11::arg("group_size") = 256,
-          pybind11::arg("swiglu") = false);
+          pybind11::arg("swiglu") = false,
+          pybind11::arg("forced_threads") = 0);
     m.def("turing_bf16_int4_convrot_quantize",
           &turing_bf16_int4_convrot_quantize,
           pybind11::arg("input"),
