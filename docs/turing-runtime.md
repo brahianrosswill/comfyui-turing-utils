@@ -379,6 +379,16 @@ W8A8 core measured 696.3 ms versus 774.1 ms for stable Sage (1.11x). Before
 the fix the dense core measured about 946 ms. This is still an A40 directional
 test; exact-sm75 end-to-end throughput remains the acceptance criterion.
 
+Stable Sage deliberately remains CTA-K64. A CTA-K128 experiment kept roughly
+the same theoretical active-warp count, but the upstream kernel has no
+cross-K-warp merge for its online-softmax state: its output cosine versus
+CTA-K64 was only about 0.50, and it was 10--20% slower in A40 compute_75/PTX
+tests. The kernel now rejects any future multi-K-warp instantiation at compile
+time. Route-free dense W8A8 also deliberately uses one compile-time K stage;
+its public 64/128 route tile setting applies to Sol routing and does not create
+a slower dense runtime staging loop. The common benchmark reports both Sage
+and W8A8 prequantized cores so preprocessing cannot hide this distinction.
+
 The Sage1 and Sage2 adaptations produced severe block artefacts and black
 flicker in local Turing tests. They are unstable experiments, not production
 fallbacks. The loader, public package, default bindings, and default template

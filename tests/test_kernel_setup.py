@@ -164,6 +164,23 @@ class KernelSetupTest(unittest.TestCase):
         self.assertGreaterEqual(fused.count(current_stream), 10)
         self.assertNotIn("<<<grid, block>>>", fused)
 
+    def test_stable_sage_locks_single_k_warp_and_benchmarks_core(self):
+        fixed = (
+            PLUGIN_ROOT
+            / "kernel"
+            / "csrc"
+            / "turing"
+            / "sage"
+            / "qk_int_sv_f16_cuda_sm75.cu"
+        ).read_text(encoding="utf-8")
+        benchmark = (
+            PLUGIN_ROOT / "kernel" / "scripts" / "benchmark_backends.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("num_warps_k == 1", fixed)
+        self.assertIn("cross-warp online-softmax reduction", fixed)
+        self.assertIn("prequantize_sageattn", benchmark)
+        self.assertIn('"bundled Sage",\n                "prequantized"', benchmark)
+
     def test_bf16_convrot_uses_device_optin_shared_memory_and_tunable_geometry(self):
         bindings = (PLUGIN_ROOT / "kernel" / "csrc" / "bindings.cpp").read_text(
             encoding="utf-8"

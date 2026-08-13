@@ -582,7 +582,12 @@ def benchmark_attention(
         import comfy_kitchen
     except ImportError:
         comfy_kitchen = None
-    from comfyui_turing_utils_kernel.turing_sage import sageattn, w8a8attn
+    from comfyui_turing_utils_kernel.turing_sage import (
+        prequantize_sageattn,
+        sageattn,
+        sageattn_from_prequantized,
+        w8a8attn,
+    )
 
     external_sage = None
     try:
@@ -661,10 +666,22 @@ def benchmark_attention(
         bundled_state = __import__(
             "comfyui_turing_utils_kernel.turing_sage", fromlist=["prequantize_sol_sageattn"]
         ).prequantize_sol_sageattn(q, k, v, use_w8a8=True, force_dense=True)
+        sage_state = prequantize_sageattn(q, k, v)
         from comfyui_turing_utils_kernel.turing_sage import (
             sol_sparse_sageattn_from_prequantized,
         )
 
+        measurements.append(
+            Measurement(
+                "bundled Sage",
+                "prequantized",
+                _elapsed_ms(
+                    lambda: sageattn_from_prequantized(sage_state),
+                    warmup,
+                    repeats,
+                ),
+            )
+        )
         measurements.append(
             Measurement(
                 "bundled W8A8",
@@ -718,7 +735,7 @@ def benchmark_attention(
             )
         )
         _print_table("backend timing", measurements)
-        del q, k, v, bundled_state, reference, bundled
+        del q, k, v, bundled_state, sage_state, reference, bundled
         if kitchen_state is not None:
             del kitchen_state
         if kitchen is not None:

@@ -88,6 +88,10 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
 
   constexpr uint32_t num_warps_q = CTA_Q / WARP_Q;
   constexpr uint32_t num_warps_k = CTA_K / WARP_K;
+  static_assert(
+      num_warps_k == 1,
+      "Stable Sage requires one K warp; wider K tiles need an explicit "
+      "cross-warp online-softmax reduction");
   constexpr uint32_t num_warps = num_warps_q * num_warps_k;
   constexpr uint32_t num_tiles_q = WARP_Q / MMA_QK_M;
   constexpr uint32_t num_tiles_k = WARP_K / MMA_QK_N;
@@ -691,8 +695,6 @@ __global__ void qk_int_sv_f16_attn_kernel(int8_t *__restrict__ Q, int8_t *__rest
     __syncthreads();
 
   }
-
-  // TODO: thread block sync mdo state for num_warps_k > 0
 
   normalize_d<num_tiles_q, num_tiles_v, DenominatorAccumUnit>(RO, m, d);
 
