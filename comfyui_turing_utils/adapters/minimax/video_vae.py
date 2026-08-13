@@ -42,7 +42,16 @@ _DECODE_SAFETY_FACTOR = 1.08
 _ENCODE_SAFETY_FACTOR = 1.05
 _MULTIBAND_DOWNSAMPLE = 8
 _MULTIBAND_HIGH_WEIGHT_POWER = 4
+_MULTIBAND_FRAME_CHUNK = 4
 _SHARED_CORE_FEATHER_TOKENS = 1
+_PIXEL_RESIZE_FRAME_BATCH = 8
+_RTX_VSR_QUALITIES = {
+    "medium": "MEDIUM",
+    "high": "HIGH",
+    "ultra": "ULTRA",
+    "high_bitrate_high": "HIGHBITRATE_HIGH",
+    "high_bitrate_ultra": "HIGHBITRATE_ULTRA",
+}
 
 
 def require_h3_video_vae(vae):
@@ -144,16 +153,16 @@ def _decode_memory_requirement(
         latent_shape[0] * model.decoder.out_channels * resident_frames * height * width
     )
     pixel_workspace = pixel_elements * (comfy.model_management.dtype_size(dtype) + 4)
-    # Multiband uses an FP32 accumulation canvas, one tile-local low-pass
-    # tensor, and two FP32 scalar normalization maps.
+    # Multiband uses two FP32 accumulation canvases.  Its full-frame low-pass
+    # temporaries are bounded to a few frames at a time.
     pixel_workspace += (
-        pixel_elements * (4 - comfy.model_management.dtype_size(dtype))
+        pixel_elements * (8 - comfy.model_management.dtype_size(dtype))
         + latent_shape[0]
         * model.decoder.out_channels
-        * resident_frames
-        * tile_height
-        * tile_width
-        * comfy.model_management.dtype_size(dtype)
+        * min(resident_frames, _MULTIBAND_FRAME_CHUNK)
+        * height
+        * width
+        * 8
         + 2 * height * width * 4
     )
     structural_estimate = int(
@@ -994,7 +1003,14 @@ def _shared_core_multiband_decoder_forward(
                     weighted = attended[:, local_index, :core_tokens].mul(
                         query_weights[local_index].view(1, -1, 1)
                     )
-                    image_attention.index_add_(1, global_indices, weighted)
+                    # Every index is unique inside one window, and windows are
+                    # consumed serially here.  Avoid CUDA index_add atomics:
+                    # apart from being unnecessary, their reduction order is
+                    # not guaranteed and W8A8 can amplify a one-ULP boundary
+                    # difference after several independent tail blocks.
+                    accumulated = image_attention.index_select(1, global_indices)
+                    accumulated.add_(weighted)
+                    image_attention.index_copy_(1, global_indices, accumulated)
 
                 suffix_attention = attended[:, :, core_tokens:].reshape(
                     batch * window_count, suffix_tokens, dim
@@ -1012,11 +1028,15 @@ def _shared_core_multiband_decoder_forward(
                     _feed_forward(block.ff, suffix_normed),
                     comfy.ops.cast_to_input(block.scale2, suffix_group),
                 )
-                suffix[:, window_tensor] = suffix_group.view(
-                    batch,
-                    window_count,
-                    suffix_tokens,
-                    dim,
+                suffix.index_copy_(
+                    1,
+                    window_tensor,
+                    suffix_group.view(
+                        batch,
+                        window_count,
+                        suffix_tokens,
+                        dim,
+                    ),
                 )
         del qkv_image
         for token_start in range(0, layout.image_tokens, linear_chunk):
@@ -1300,19 +1320,21 @@ class _MultibandPixelAssembler:
             torch.float32,
             device,
         )
-        self.canvas = None
+        self.low_canvas = None
+        self.high_canvas = None
 
     def add(self, window_index, tile):
         i, j = divmod(window_index, self.columns)
         y, x = self.y_starts[i], self.x_starts[j]
-        if self.canvas is None:
-            self.canvas = torch.zeros(
+        if self.low_canvas is None:
+            self.low_canvas = torch.zeros(
                 *tile.shape[:-2],
                 self.height,
                 self.width,
                 dtype=torch.float32,
                 device=tile.device,
             )
+            self.high_canvas = torch.zeros_like(self.low_canvas)
         low_weight, high_weight = _multiband_window_weights(
             i,
             j,
@@ -1331,16 +1353,33 @@ class _MultibandPixelAssembler:
             high_weight
             / self.high_sum[y : y + self.y_lengths[i], x : x + self.x_lengths[j]]
         )
-        low = _spatial_lowpass(tile)
-        high = tile.float() - low.float()
-        contribution = low.float().mul(low_weight)
-        contribution.addcmul_(high, high_weight)
-        self.canvas[..., y : y + tile.shape[-2], x : x + tile.shape[-1]].add_(
-            contribution
-        )
+        tile = tile.float()
+        self.low_canvas[
+            ..., y : y + tile.shape[-2], x : x + tile.shape[-1]
+        ].addcmul_(tile, low_weight)
+        self.high_canvas[
+            ..., y : y + tile.shape[-2], x : x + tile.shape[-1]
+        ].addcmul_(tile, high_weight)
 
     def finish(self):
-        return self.canvas
+        # Split frequencies only after both complete canvases exist.  The old
+        # tile-local split used different boundary conditions for every tile;
+        # because low and high bands also had different feather weights, even
+        # identical overlapping pixels did not reconstruct identically and
+        # produced a characteristic pair of seam lines.  A global split keeps
+        # one sampling phase and has the useful invariant
+        # low_canvas == high_canvas => output == either canvas.
+        for frame_start in range(0, self.high_canvas.shape[2], _MULTIBAND_FRAME_CHUNK):
+            frame_end = min(
+                frame_start + _MULTIBAND_FRAME_CHUNK,
+                self.high_canvas.shape[2],
+            )
+            frame_slice = slice(frame_start, frame_end)
+            low = _spatial_lowpass(self.low_canvas[:, :, frame_slice])
+            high = self.high_canvas[:, :, frame_slice]
+            high.sub_(_spatial_lowpass(high)).add_(low)
+        self.low_canvas = None
+        return self.high_canvas
 
 
 def _encode_moments(model, x, module_session):
@@ -1513,13 +1552,16 @@ def _decode_temporal(
     tiles_per_batch,
     progress,
     independent_tail_blocks,
+    output_device=None,
 ):
     chunk_dec = model.tokens_chunk_size * model.vae_ratio_t
     split_count = int(model.token_drop > 0) + 1
+    if output_device is None:
+        output_device = comfy.model_management.intermediate_device()
     output = torch.empty(
         model.decode_output_shape(z.shape),
         dtype=torch.float32,
-        device=comfy.model_management.intermediate_device(),
+        device=output_device,
     )
     writer = _PixelWriter(output, model, z.device)
 
@@ -1567,12 +1609,18 @@ def decode_video(
     latent,
     attention="sdpa",
     independent_tail_blocks=2,
+    *,
+    output_device=None,
+    unload=True,
 ):
     model = require_h3_video_vae(vae)
     # H3 advertises FP16/FP32 to ComfyUI and defaults to FP16 on supported
     # NVIDIA GPUs, including Turing.  Follow the dtype used to load this VAE so
     # an explicit global --fp32-vae override cannot create mixed-dtype modules.
     compute_dtype = vae.vae_dtype
+    if output_device is None:
+        output_device = vae.output_device
+    output_device = torch.device(output_device)
     block_count = len(model.decoder.transformer_blocks)
     independent_tail_blocks = int(independent_tail_blocks)
     if not 0 <= independent_tail_blocks <= block_count:
@@ -1641,7 +1689,7 @@ def decode_video(
                 independent_tail_blocks,
             )[:, :, -1:]
             dec = model._finalize_pixels(dec)
-            return dec.to(vae.output_device).movedim(1, -1)
+            return dec.to(output_device).movedim(1, -1)
         dec = _decode_temporal(
             model,
             z,
@@ -1650,6 +1698,7 @@ def decode_video(
             batch_tiles,
             progress,
             independent_tail_blocks,
+            output_device,
         )
         return dec.movedim(1, -1)
     finally:
@@ -1658,7 +1707,8 @@ def decode_video(
         if block_session is not None:
             block_session.finish()
         _clear_attention_caches(model.decoder)
-        vae.patcher.partially_unload(vae.patcher.offload_device, 1e30)
+        if unload:
+            vae.patcher.partially_unload(vae.patcher.offload_device, 1e30)
 
 
 def _encode_clip(
@@ -1715,6 +1765,54 @@ def _encode_temporal(
     return z[:, :, : -model.token_drop] if model.token_drop > 0 else z
 
 
+def _encode_temporal_device(
+    model,
+    pixels,
+    process_input,
+    device,
+    compute_dtype,
+    tile_size,
+    tile_overlap,
+    module_session,
+    tiles_per_batch,
+    progress,
+):
+    """Normalize and transfer one temporal clip at a time.
+
+    In particular, do not materialize a complete FP32 normalized copy of a
+    GPU-resident upscaled video.  The encoder consumes FP16 clips, so keeping
+    the persistent pixel buffer in FP16 is both exact for its input domain and
+    substantially lowers the fused decode/resize/encode peak.
+    """
+
+    z_list = []
+    for start in range(0, pixels.shape[2], model.clip_length):
+        clip = pixels[:, :, start : start + model.clip_length]
+        if clip.shape[2] < model.clip_length:
+            pad = clip[:, :, -1:].repeat(
+                1,
+                1,
+                model.clip_length - clip.shape[2],
+                1,
+                1,
+            )
+            clip = torch.cat((clip, pad), dim=2)
+        clip = process_input(clip.float()).to(device=device, dtype=compute_dtype)
+        z_list.append(
+            _encode_clip(
+                model,
+                clip,
+                tile_size,
+                tile_overlap,
+                module_session,
+                tiles_per_batch,
+                progress,
+            )
+        )
+    z = torch.cat(z_list, dim=2)
+    return z[:, :, : -model.token_drop] if model.token_drop > 0 else z
+
+
 def _encode_temporal_buffered(
     model,
     pixels,
@@ -1744,7 +1842,7 @@ def _encode_temporal_buffered(
         # Keep the transport path in FP32.  Casting pixels on the host costs a
         # full extra pass and changes the transfer representation; the VAE
         # activation cast happens on the GPU immediately before compute.
-        clip = process_input(clip).float()
+        clip = process_input(clip.float())
         if (
             staging[slot] is None
             or staging[slot].shape != clip.shape
@@ -1800,14 +1898,44 @@ class _PinnedBufferUnavailable(RuntimeError):
     pass
 
 
+def _prepare_encode_pixels(vae, pixels):
+    if pixels.ndim == 4:
+        pixels = vae.vae_encode_crop_pixels(pixels).movedim(-1, 1)
+        return pixels.movedim(1, 0).unsqueeze(0)
+    if pixels.ndim != 5:
+        raise ValueError(
+            "MiniMax H3 video pixels must be [T,H,W,C] or [B,T,H,W,C], "
+            f"got {tuple(pixels.shape)}"
+        )
+
+    # ComfyUI's generic crop helper treats every dimension between batch and
+    # channels as spatial.  For a batched video that includes the frame axis,
+    # so crop H/W explicitly and leave time untouched.
+    if vae.crop_input:
+        ratio = vae.spacial_compression_encode()
+        for dim in (-3, -2):
+            extent = int(pixels.shape[dim])
+            cropped = extent // ratio * ratio
+            if cropped != extent:
+                pixels = pixels.narrow(dim, (extent - cropped) // 2, cropped)
+    channels = int(pixels.shape[-1])
+    if channels > vae.output_channels:
+        pixels = pixels[..., : vae.output_channels]
+    elif channels < vae.output_channels:
+        raise ValueError(
+            f"MiniMax H3 video pixels require {vae.output_channels} channels, got {channels}"
+        )
+    return pixels.movedim(-1, 1)
+
+
 def encode_video(
     vae,
     pixels,
+    *,
+    unload=True,
 ):
     model = require_h3_video_vae(vae)
-    pixels = vae.vae_encode_crop_pixels(pixels).movedim(-1, 1)
-    if pixels.ndim < 5:
-        pixels = pixels.movedim(1, 0).unsqueeze(0)
+    pixels = _prepare_encode_pixels(vae, pixels)
     compute_dtype = vae.vae_dtype
     tile_size = TILE_SIZE
     tile_count = _spatial_tile_count(
@@ -1850,9 +1978,10 @@ def encode_video(
             "H3 VAE Encode",
         )
         if pixels.shape[2] == 1:
-            x = vae.process_input(pixels).float().to(vae.device)
-            if x.dtype != compute_dtype:
-                x = x.to(compute_dtype)
+            x = vae.process_input(pixels.float()).to(
+                device=vae.device,
+                dtype=compute_dtype,
+            )
             moments = _encode_clip(
                 model,
                 x,
@@ -1881,10 +2010,10 @@ def encode_video(
                 logging.warning(
                     "H3 VAE could not allocate pinned encoder buffers; using synchronous FP32 pixel copies"
                 )
-                x = vae.process_input(pixels).float()
-                moments = _encode_temporal(
+                moments = _encode_temporal_device(
                     model,
-                    x,
+                    pixels,
+                    vae.process_input,
                     vae.device,
                     compute_dtype,
                     tile_size,
@@ -1894,10 +2023,10 @@ def encode_video(
                     progress,
                 )
         else:
-            x = vae.process_input(pixels).float()
-            moments = _encode_temporal(
+            moments = _encode_temporal_device(
                 model,
-                x,
+                pixels,
+                vae.process_input,
                 vae.device,
                 compute_dtype,
                 tile_size,
@@ -1917,4 +2046,214 @@ def encode_video(
             progress.finish()
         if module_session is not None:
             module_session.finish()
-        vae.patcher.partially_unload(vae.patcher.offload_device, 1e30)
+        if unload:
+            vae.patcher.partially_unload(vae.patcher.offload_device, 1e30)
+
+
+def _pixel_stage_device(vae, source_shape, width, height):
+    batch, channels, frames, source_height, source_width = source_shape
+    source_bytes = batch * channels * frames * source_height * source_width * 4
+    target_bytes = batch * frames * height * width * channels * 2
+    budget = _tile_memory_budget(vae)
+    staging_budget = int(budget * 0.35)
+    # Decode activations are gone before the target allocation and the source
+    # is released before encode.  Still leave most of the budget to weights and
+    # one encoder tile, especially on 22 GiB Turing cards.
+    if source_bytes + target_bytes <= staging_budget:
+        return vae.device
+    logging.info(
+        "MiniMax H3 pixel upscale uses CPU FP16 staging: source+target %.0f MiB exceeds the %.0f MiB GPU staging budget",
+        (source_bytes + target_bytes) / 1024**2,
+        staging_budget / 1024**2,
+    )
+    return torch.device("cpu")
+
+
+class _RTXVideoSuperResolution:
+    def __init__(self, width, height, quality):
+        try:
+            from nvvfx import VideoSuperRes
+        except (ImportError, OSError) as error:
+            raise RuntimeError(
+                "RTX VSR requires NVIDIA's optional nvidia-vfx package and a "
+                "supported recent NVIDIA driver; install it in ComfyUI's Python environment"
+            ) from error
+
+        quality_name = _RTX_VSR_QUALITIES.get(quality)
+        if quality_name is None:
+            raise ValueError(f"Unknown RTX VSR quality: {quality}")
+        quality_value = getattr(VideoSuperRes.QualityLevel, quality_name, None)
+        if quality_value is None:
+            raise RuntimeError(
+                f"The installed nvidia-vfx package does not provide {quality_name}"
+            )
+        self.effect = VideoSuperRes(quality=quality_value)
+        self.effect.output_width = int(width)
+        self.effect.output_height = int(height)
+        self.effect.load()
+
+    def __call__(self, frame):
+        result = self.effect.run(frame.float().contiguous())
+        image = getattr(result, "image", result)
+        # The SDK owns and reuses this DLPack storage on its next invocation.
+        return torch.from_dlpack(image).clone()
+
+
+def _resize_video_pixels(
+    pixels,
+    width,
+    height,
+    method,
+    rtx_vsr_quality,
+    compute_device,
+    output_device,
+):
+    if pixels.ndim != 5 or pixels.shape[-1] != 3:
+        raise ValueError(
+            "MiniMax H3 decoded pixels must be [B,T,H,W,3], "
+            f"got {tuple(pixels.shape)}"
+        )
+    batch, frames, source_height, source_width, channels = pixels.shape
+    if width < source_width or height < source_height:
+        raise ValueError(
+            "MiniMax H3 Latent Pixel Upscale does not downscale pixels: "
+            f"source={source_width}x{source_height}, target={width}x{height}"
+        )
+    if method == "rtx_vsr" and (
+        width > source_width * 4 or height > source_height * 4
+    ):
+        raise ValueError("RTX VSR supports at most 4x spatial upscaling")
+    if method == "rtx_vsr" and torch.device(compute_device).type != "cuda":
+        raise RuntimeError("RTX VSR requires a CUDA compute device")
+
+    output = torch.empty(
+        batch,
+        frames,
+        height,
+        width,
+        channels,
+        dtype=torch.float16,
+        device=output_device,
+    )
+    progress = _TileProgress(
+        batch * frames,
+        compute_device,
+        "H3 Pixel Upscale Frames",
+    )
+    try:
+        if method == "rtx_vsr":
+            effect = _RTXVideoSuperResolution(width, height, rtx_vsr_quality)
+            for batch_index in range(batch):
+                for frame_index in range(frames):
+                    frame = pixels[batch_index, frame_index].permute(2, 0, 1)
+                    frame = frame.to(compute_device, dtype=torch.float32)
+                    resized = effect(frame).permute(1, 2, 0)
+                    output[batch_index, frame_index].copy_(
+                        resized.to(device=output_device, dtype=torch.float16)
+                    )
+                    progress.update(1)
+            return output
+
+        if method not in {"bicubic", "bilinear", "nearest-exact"}:
+            raise ValueError(f"Unknown H3 pixel upscale method: {method}")
+        for frame_start in range(0, frames, _PIXEL_RESIZE_FRAME_BATCH):
+            frame_end = min(frame_start + _PIXEL_RESIZE_FRAME_BATCH, frames)
+            frame_batch = pixels[:, frame_start:frame_end].permute(0, 1, 4, 2, 3)
+            frame_batch = frame_batch.reshape(-1, channels, source_height, source_width)
+            frame_batch = frame_batch.to(compute_device, dtype=torch.float32)
+            kwargs = {}
+            if method in {"bicubic", "bilinear"}:
+                kwargs["align_corners"] = False
+                kwargs["antialias"] = False
+            resized = F.interpolate(
+                frame_batch,
+                size=(height, width),
+                mode=method,
+                **kwargs,
+            )
+            resized = resized.view(
+                batch,
+                frame_end - frame_start,
+                channels,
+                height,
+                width,
+            ).permute(0, 1, 3, 4, 2)
+            output[:, frame_start:frame_end].copy_(
+                resized.to(device=output_device, dtype=torch.float16)
+            )
+            progress.update(batch * (frame_end - frame_start))
+        return output
+    finally:
+        progress.finish()
+
+
+def upscale_latent_via_pixels(
+    vae,
+    latent,
+    width,
+    height,
+    method="bicubic",
+    rtx_vsr_quality="high",
+    attention="sdpa",
+    independent_tail_blocks=2,
+):
+    model = require_h3_video_vae(vae)
+    if latent.ndim != 5 or latent.shape[1] != 24:
+        raise ValueError(
+            "MiniMax H3 video latent must be [B,24,T,H,W], "
+            f"got {tuple(latent.shape)}"
+        )
+    width = int(width)
+    height = int(height)
+    if width <= 0 or height <= 0 or width % 32 or height % 32:
+        raise ValueError(
+            f"Target width and height must be positive multiples of 32, got {width}x{height}"
+        )
+    if method not in {"bicubic", "bilinear", "nearest-exact", "rtx_vsr"}:
+        raise ValueError(f"Unknown H3 pixel upscale method: {method}")
+    if method == "rtx_vsr" and rtx_vsr_quality not in _RTX_VSR_QUALITIES:
+        raise ValueError(f"Unknown RTX VSR quality: {rtx_vsr_quality}")
+    source_shape = model.decode_output_shape(latent.shape)
+    source_height, source_width = source_shape[-2:]
+    if width < source_width or height < source_height:
+        raise ValueError(
+            "MiniMax H3 Latent Pixel Upscale does not downscale pixels: "
+            f"source={source_width}x{source_height}, target={width}x{height}"
+        )
+    if method == "rtx_vsr" and (
+        width > source_width * 4 or height > source_height * 4
+    ):
+        raise ValueError("RTX VSR supports at most 4x spatial upscaling")
+    if width == source_width and height == source_height:
+        logging.info(
+            "MiniMax H3 Latent Pixel Upscale target matches the decoded size; running a VAE pixel round trip without resizing"
+        )
+    stage_device = _pixel_stage_device(vae, source_shape, width, height)
+    completed = False
+    try:
+        decoded = decode_video(
+            vae,
+            latent,
+            attention,
+            independent_tail_blocks,
+            output_device=stage_device,
+            unload=False,
+        )
+        resized = _resize_video_pixels(
+            decoded,
+            width,
+            height,
+            method,
+            rtx_vsr_quality,
+            vae.device,
+            stage_device,
+        )
+        del decoded
+        output = encode_video(vae, resized, unload=True)
+        completed = True
+        return output
+    finally:
+        if not completed:
+            # encode_video performs the normal unload on success.  This path is
+            # essential when decode, resize, or encode raises.
+            vae.patcher.partially_unload(vae.patcher.offload_device, 1e30)

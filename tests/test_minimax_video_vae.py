@@ -252,6 +252,40 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         torch.testing.assert_close(normalized_low, torch.ones_like(normalized_low))
         torch.testing.assert_close(normalized_high, torch.ones_like(normalized_high))
 
+    def test_multiband_identical_overlaps_reconstruct_without_seam_pairs(self):
+        height = width = 48
+        starts_y, lengths_y, _ = video_vae.split_tiles(height, 24, 8, 2)
+        starts_x, lengths_x, _ = video_vae.split_tiles(width, 24, 8, 2)
+        assembler = video_vae._MultibandPixelAssembler(
+            starts_y,
+            lengths_y,
+            starts_x,
+            lengths_x,
+            height,
+            width,
+            torch.device("cpu"),
+        )
+        rows, columns = torch.meshgrid(
+            torch.linspace(-1, 1, height),
+            torch.linspace(-1, 1, width),
+            indexing="ij",
+        )
+        image = (
+            torch.sin(columns * 13) + torch.cos(rows * 9) + rows * columns
+        ).view(1, 1, 1, height, width)
+        for i, y in enumerate(starts_y):
+            for j, x in enumerate(starts_x):
+                assembler.add(
+                    i * len(starts_x) + j,
+                    image[..., y : y + lengths_y[i], x : x + lengths_x[j]],
+                )
+        torch.testing.assert_close(
+            assembler.finish(),
+            image,
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
     def test_decode_spatial_routes_fixed_boundary_policy(self):
         expected = object()
         model = SimpleNamespace(post_quant_conv=lambda value: value)
@@ -432,6 +466,194 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         )
         self.assertEqual(set(encoder), {"pixels", "vae"})
         self.assertEqual(decoder["independent_tail_blocks"][1]["default"], 2)
+        upscaler = nodes.MiniMaxH3LatentPixelUpscale.INPUT_TYPES()["required"]
+        self.assertEqual(
+            set(upscaler),
+            {
+                "samples",
+                "vae",
+                "width",
+                "height",
+                "upscale_method",
+                "rtx_vsr_quality",
+                "attention",
+                "independent_tail_blocks",
+            },
+        )
+
+    def test_prepare_batched_pixels_crops_only_spatial_axes(self):
+        vae = SimpleNamespace(
+            crop_input=True,
+            output_channels=3,
+            spacial_compression_encode=lambda: 16,
+        )
+        pixels = torch.zeros(2, 5, 34, 50, 3)
+        actual = video_vae._prepare_encode_pixels(vae, pixels)
+        self.assertEqual(actual.shape, (2, 3, 5, 32, 48))
+
+    def test_bicubic_pixel_resize_batches_frames_and_stores_fp16(self):
+        torch.manual_seed(4)
+        pixels = torch.rand(1, 5, 4, 6, 3)
+        progress = mock.Mock()
+        with mock.patch.object(video_vae, "_TileProgress", return_value=progress):
+            actual = video_vae._resize_video_pixels(
+                pixels,
+                12,
+                8,
+                "bicubic",
+                "high",
+                torch.device("cpu"),
+                torch.device("cpu"),
+            )
+        expected = torch.nn.functional.interpolate(
+            pixels.permute(0, 1, 4, 2, 3).reshape(5, 3, 4, 6),
+            size=(8, 12),
+            mode="bicubic",
+            align_corners=False,
+            antialias=False,
+        ).view(1, 5, 3, 8, 12).permute(0, 1, 3, 4, 2)
+        self.assertEqual(actual.dtype, torch.float16)
+        torch.testing.assert_close(actual, expected.half(), rtol=0, atol=0)
+        progress.update.assert_called_once_with(5)
+        progress.finish.assert_called_once_with()
+
+    def test_rtx_vsr_wrapper_uses_sdk_owned_dlpack_safely(self):
+        instances = []
+
+        class QualityLevel:
+            HIGH = 3
+
+        class VideoSuperRes:
+            def __init__(self, quality):
+                self.quality = quality
+                self.loaded = False
+                instances.append(self)
+
+            def load(self):
+                self.loaded = True
+
+            def run(self, frame):
+                return SimpleNamespace(image=frame.add(1))
+
+        VideoSuperRes.QualityLevel = QualityLevel
+
+        with mock.patch.dict(
+            sys.modules,
+            {"nvvfx": SimpleNamespace(VideoSuperRes=VideoSuperRes)},
+        ):
+            effect = video_vae._RTXVideoSuperResolution(12, 8, "high")
+            frame = torch.zeros(3, 4, 6)
+            actual = effect(frame)
+        self.assertTrue(instances[0].loaded)
+        self.assertEqual(instances[0].quality, QualityLevel.HIGH)
+        self.assertEqual((instances[0].output_width, instances[0].output_height), (12, 8))
+        torch.testing.assert_close(actual, torch.ones_like(frame))
+
+    def test_fused_pixel_roundtrip_retains_vae_until_encode(self):
+        latent = torch.zeros(1, 24, 2, 2, 3)
+        decoded = torch.zeros(1, 5, 32, 48, 3)
+        resized = torch.zeros(1, 5, 64, 96, 3, dtype=torch.float16)
+        encoded = torch.zeros(1, 24, 2, 4, 6)
+        patcher = SimpleNamespace(
+            offload_device=torch.device("cpu"),
+            partially_unload=mock.Mock(),
+        )
+        vae = SimpleNamespace(device=torch.device("cpu"), patcher=patcher)
+        model = SimpleNamespace(
+            decode_output_shape=lambda _shape: (1, 3, 5, 32, 48)
+        )
+        with (
+            mock.patch.object(video_vae, "require_h3_video_vae", return_value=model),
+            mock.patch.object(
+                video_vae, "_pixel_stage_device", return_value=torch.device("cpu")
+            ),
+            mock.patch.object(video_vae, "decode_video", return_value=decoded) as decode,
+            mock.patch.object(
+                video_vae, "_resize_video_pixels", return_value=resized
+            ) as resize,
+            mock.patch.object(video_vae, "encode_video", return_value=encoded) as encode,
+        ):
+            actual = video_vae.upscale_latent_via_pixels(
+                vae,
+                latent,
+                96,
+                64,
+                "bicubic",
+                "high",
+                "sdpa",
+                2,
+            )
+        self.assertIs(actual, encoded)
+        decode.assert_called_once_with(
+            vae,
+            latent,
+            "sdpa",
+            2,
+            output_device=torch.device("cpu"),
+            unload=False,
+        )
+        resize.assert_called_once_with(
+            decoded,
+            96,
+            64,
+            "bicubic",
+            "high",
+            vae.device,
+            torch.device("cpu"),
+        )
+        encode.assert_called_once_with(vae, resized, unload=True)
+        patcher.partially_unload.assert_not_called()
+
+    def test_pixel_upscale_node_preserves_h3_audio_and_resizes_video_mask(self):
+        video = torch.zeros(1, 24, 2, 2, 3)
+        audio = torch.ones(1, 32, 2, 7)
+        video_mask = torch.zeros(1, 1, 2, 2, 3)
+        audio_mask = torch.ones_like(audio)
+        nested = nodes.comfy.nested_tensor.NestedTensor((video, audio))
+        nested_mask = nodes.comfy.nested_tensor.NestedTensor(
+            (video_mask, audio_mask)
+        )
+        resized = torch.full((1, 24, 2, 4, 6), 3.0)
+        vae = SimpleNamespace(device=torch.device("cpu"))
+        with (
+            mock.patch.object(nodes, "require_h3_video_vae"),
+            mock.patch.object(
+                nodes,
+                "upscale_latent_via_pixels",
+                return_value=resized,
+            ) as run,
+            mock.patch.object(
+                nodes.comfy.model_management,
+                "cuda_device_context",
+                return_value=nullcontext(),
+            ),
+        ):
+            output = nodes.MiniMaxH3LatentPixelUpscale().upscale(
+                {"samples": nested, "noise_mask": nested_mask},
+                vae,
+                96,
+                64,
+                "bicubic",
+                "high",
+                "sdpa",
+                2,
+            )[0]
+        run.assert_called_once_with(
+            vae,
+            video,
+            96,
+            64,
+            "bicubic",
+            "high",
+            "sdpa",
+            2,
+        )
+        output_video, output_audio = output["samples"].unbind()
+        output_video_mask, output_audio_mask = output["noise_mask"].unbind()
+        self.assertIs(output_video, resized)
+        self.assertIs(output_audio, audio)
+        self.assertEqual(output_video_mask.shape[-2:], (4, 6))
+        self.assertIs(output_audio_mask, audio_mask)
 
     def test_auto_tile_batch_respects_memory_limit(self):
         vae = SimpleNamespace()

@@ -46,6 +46,12 @@ only after its CUDA sources or required version change.
 - `H3 Concat AV Latent` combines standalone H3 video and audio latents into the
   model's native nested AV latent. `H3 Separate AV Latent` splits the streams
   again; both nodes preserve matching video/audio noise masks.
+- `MiniMax H3 Video VAE Decode/Encode (Experimental)` provide fixed 256px H3
+  tiling, shared-core decode, deterministic global multiband stitching, and
+  retained asynchronous weights. `MiniMax H3 Latent Pixel Upscale
+  (Experimental)` combines decode, full-frame GPU resize, and re-encode for a
+  stable second-stage latent; an optional RTX VSR path is loaded only when
+  selected.
 - `Patch MiniMax H3 Block Cache (Experimental)` skips stable transformer-block
   spans by reusing trajectory residuals. It provides the recovered standard and
   short-step Turbo policies, keeps sampler branches isolated, and is a

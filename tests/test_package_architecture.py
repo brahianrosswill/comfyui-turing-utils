@@ -83,6 +83,7 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsVideoMotionContactSheet",
                 "TuringUtilsMiniMaxH3VideoVAEDecode",
                 "TuringUtilsMiniMaxH3VideoVAEEncode",
+                "TuringUtilsMiniMaxH3LatentPixelUpscale",
             ),
         )
 

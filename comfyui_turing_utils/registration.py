@@ -10,7 +10,11 @@ from .nodes.minimax import (
     MiniMaxH3BlockCachePatch,
     MiniMaxH3VideoFramesPadding,
 )
-from .nodes.minimax_vae import MiniMaxH3VideoVAEDecode, MiniMaxH3VideoVAEEncode
+from .nodes.minimax_vae import (
+    MiniMaxH3LatentPixelUpscale,
+    MiniMaxH3VideoVAEDecode,
+    MiniMaxH3VideoVAEEncode,
+)
 from .nodes.wan import WanVideoFramesPadding
 
 
@@ -29,6 +33,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsVideoMotionContactSheet": VideoMotionContactSheet,
     "TuringUtilsMiniMaxH3VideoVAEDecode": MiniMaxH3VideoVAEDecode,
     "TuringUtilsMiniMaxH3VideoVAEEncode": MiniMaxH3VideoVAEEncode,
+    "TuringUtilsMiniMaxH3LatentPixelUpscale": MiniMaxH3LatentPixelUpscale,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -46,4 +51,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsVideoMotionContactSheet": "Video Motion Contact Sheet (Experimental)",
     "TuringUtilsMiniMaxH3VideoVAEDecode": "MiniMax H3 Video VAE Decode (Experimental)",
     "TuringUtilsMiniMaxH3VideoVAEEncode": "MiniMax H3 Video VAE Encode (Experimental)",
+    "TuringUtilsMiniMaxH3LatentPixelUpscale": "MiniMax H3 Latent Pixel Upscale (Experimental)",
 }
