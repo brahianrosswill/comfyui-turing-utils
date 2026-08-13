@@ -27,11 +27,13 @@ class KernelSetupTest(unittest.TestCase):
         *,
         arch_list: str = "8.6",
         cuda_version: str = "12.8",
+        extra_environment: dict[str, str] | None = None,
     ):
         environment = {
             "CONDA_PREFIX": str(conda_prefix),
             "COMFYUI_TURING_UTILS_ARCH_LIST": arch_list,
         }
+        environment.update(extra_environment or {})
         with (
             mock.patch.object(platform, "system", return_value="Windows"),
             mock.patch.dict(os.environ, environment, clear=False),
@@ -276,6 +278,62 @@ class KernelSetupTest(unittest.TestCase):
         flags = extensions[0].kwargs["extra_compile_args"]
         self.assertIn("/std:c++17", flags["cxx"])
         self.assertIn("-std=c++17", flags["nvcc"])
+
+    def test_conda_toolkit_metadata_precedes_torch_cuda_label(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prefix = Path(temp_dir)
+            (prefix / "version.txt").write_text("CUDA Version 11.8.0", encoding="utf-8")
+            cccl = prefix / "Library" / "include" / "targets" / "x64"
+            (cccl / "nv").mkdir(parents=True)
+            (cccl / "nv" / "target").touch()
+            self._make_cutlass_headers(prefix / "Library" / "include")
+
+            extensions = self._run_windows_setup(prefix, cuda_version="12.8")
+
+        flags = extensions[0].kwargs["extra_compile_args"]
+        self.assertIn("/std:c++17", flags["cxx"])
+        self.assertIn("-std=c++17", flags["nvcc"])
+
+    def test_cxx_standard_overrides_are_normalized_and_validated(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prefix = Path(temp_dir)
+            cccl = prefix / "Library" / "include" / "targets" / "x64"
+            (cccl / "nv").mkdir(parents=True)
+            (cccl / "nv" / "target").touch()
+            self._make_cutlass_headers(prefix / "Library" / "include")
+            extensions = self._run_windows_setup(
+                prefix,
+                extra_environment={
+                    "COMFYUI_TURING_UTILS_HOST_CXX_STANDARD": "/std:c++20",
+                    "COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD": "20",
+                },
+            )
+            with self.assertRaisesRegex(RuntimeError, "must select c\\+\\+17 or c\\+\\+20"):
+                self._run_windows_setup(
+                    prefix,
+                    extra_environment={
+                        "COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD": "c++23",
+                    },
+                )
+
+        flags = extensions[0].kwargs["extra_compile_args"]
+        self.assertEqual(flags["cxx"].count("/std:c++20"), 1)
+        self.assertEqual(flags["nvcc"].count("-std=c++20"), 1)
+
+    def test_wheel_builder_finds_windows_conda_nvcc(self):
+        script = PLUGIN_ROOT / "kernel" / "scripts" / "build_wheel.py"
+        namespace = runpy.run_path(str(script), run_name="__turing_utils_build_wheel_test__")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            prefix = Path(temp_dir)
+            nvcc = prefix / "Library" / "bin" / "nvcc.exe"
+            nvcc.parent.mkdir(parents=True)
+            nvcc.touch()
+            environment = {"CONDA_PREFIX": str(prefix)}
+            with mock.patch.object(platform, "system", return_value="Windows"):
+                selected = namespace["configure_cuda_home"](environment)
+
+        self.assertEqual(selected, nvcc.resolve())
+        self.assertEqual(environment["CUDA_HOME"], str((prefix / "Library").resolve()))
 
     def test_nvidia_cutlass_python_package_is_auto_detected(self):
         with tempfile.TemporaryDirectory() as temp_dir:

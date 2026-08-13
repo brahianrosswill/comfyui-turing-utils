@@ -91,6 +91,27 @@ def _default_cxx_standard(cuda_version: tuple[int, int] | None) -> str:
     return "c++20" if cuda_version is None or cuda_version >= (12, 0) else "c++17"
 
 
+def _normalize_cxx_standard(value: str, variable: str) -> str:
+    """Accept concise overrides while rejecting malformed compiler flags."""
+    normalized = str(value).strip().lower()
+    for prefix in ("-std=", "/std:"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+            break
+    aliases = {
+        "17": "c++17",
+        "c++17": "c++17",
+        "20": "c++20",
+        "c++20": "c++20",
+    }
+    try:
+        return aliases[normalized]
+    except KeyError as error:
+        raise RuntimeError(
+            f"{variable} must select c++17 or c++20, got {value!r}"
+        ) from error
+
+
 def _is_cutlass_include_dir(candidate: Path) -> bool:
     required = (
         "cutlass/cutlass.h",
@@ -337,12 +358,16 @@ COMMON_DEFINES = [
 
 CUDA_TOOLKIT_VERSION = _cuda_toolkit_version()
 DEFAULT_CXX_STANDARD = _default_cxx_standard(CUDA_TOOLKIT_VERSION)
-HOST_CXX_STANDARD = os.environ.get(
+HOST_CXX_STANDARD = _normalize_cxx_standard(
+    os.environ.get(
+        "COMFYUI_TURING_UTILS_HOST_CXX_STANDARD",
+        os.environ.get("COMFYUI_TURING_UTILS_CXX_STANDARD", DEFAULT_CXX_STANDARD),
+    ),
     "COMFYUI_TURING_UTILS_HOST_CXX_STANDARD",
-    os.environ.get("COMFYUI_TURING_UTILS_CXX_STANDARD", DEFAULT_CXX_STANDARD),
 )
-NVCC_CXX_STANDARD = os.environ.get(
-    "COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD", DEFAULT_CXX_STANDARD
+NVCC_CXX_STANDARD = _normalize_cxx_standard(
+    os.environ.get("COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD", DEFAULT_CXX_STANDARD),
+    "COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD",
 )
 
 NVCC_FLAGS = [
@@ -388,10 +413,9 @@ if CUDAHOSTCXX:
     NVCC_FLAGS.extend(["-ccbin", CUDAHOSTCXX])
 
 if IS_WINDOWS:
-    std_flag = HOST_CXX_STANDARD if HOST_CXX_STANDARD.startswith("/std:") else f"/std:{HOST_CXX_STANDARD}"
     CXX_FLAGS = [
         "/DENABLE_BF16=1",
-        std_flag,
+        f"/std:{HOST_CXX_STANDARD}",
         "/O2",
         "/EHsc",
         "/MD",

@@ -18,6 +18,26 @@ def run(cmd: list[str], env: dict[str, str]) -> None:
     subprocess.check_call(cmd, cwd=ROOT, env=env)
 
 
+def configure_cuda_home(env: dict[str, str]) -> Path | None:
+    """Find NVCC in activated Conda CUDA layouts before importing PyTorch."""
+    executable = "nvcc.exe" if platform.system() == "Windows" else "nvcc"
+    roots: list[Path] = []
+    for variable in ("CUDA_HOME", "CUDA_PATH"):
+        if env.get(variable):
+            roots.append(Path(env[variable]))
+    conda_prefix = env.get("CONDA_PREFIX")
+    if conda_prefix:
+        prefix = Path(conda_prefix)
+        roots.append(prefix / "Library" if platform.system() == "Windows" else prefix)
+    for root in roots:
+        candidate = root / "bin" / executable
+        if candidate.is_file():
+            env.setdefault("CUDA_HOME", str(root.resolve()))
+            return candidate.resolve()
+    discovered = shutil.which("nvcc")
+    return Path(discovered).resolve() if discovered else None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build a comfyui-turing-utils-kernel wheel.")
     parser.add_argument("--arch-list", default=os.environ.get("COMFYUI_TURING_UTILS_ARCH_LIST", DEFAULT_ARCH_LIST))
@@ -27,6 +47,7 @@ def main() -> None:
 
     env = os.environ.copy()
     env["COMFYUI_TURING_UTILS_ARCH_LIST"] = args.arch_list
+    nvcc = configure_cuda_home(env)
 
     if platform.system() == "Windows":
         if shutil.which("cl") is None:
@@ -34,7 +55,7 @@ def main() -> None:
         env.setdefault("DISTUTILS_USE_SDK", "1")
         env.setdefault("MSSdk", "1")
 
-    if shutil.which("nvcc") is None:
+    if nvcc is None:
         print("warning: nvcc was not found on PATH; CUDA_HOME must point at a CUDA toolkit.", file=sys.stderr)
 
     if not args.skip_build_deps:

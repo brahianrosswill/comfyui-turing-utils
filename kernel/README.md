@@ -84,6 +84,10 @@ not imported or executed during normal inference.
 On Windows, use an x64 Visual Studio Developer shell. CUDA 12.8 Conda users
 must have the CCCL directory containing `nv/target`; the build discovers
 `%CONDA_PREFIX%\Library\include\targets\x64` automatically.
+`python kernel/scripts/build_wheel.py` also detects
+`%CONDA_PREFIX%\Library\bin\nvcc.exe` and exports the matching CUDA home for
+the isolated build, so activating the environment is sufficient even when
+NVCC itself is not on `PATH`.
 The build selects its Windows language dialect from the actual CUDA toolkit
 used by NVCC: CUDA 12 and newer use C++20, while older toolkits use C++17.
 NVCC 12.0 was the first CUDA release with C++20 support, and CUTLASS's
@@ -93,7 +97,11 @@ dialect. Linux stays on PyTorch's portable C++17 baseline, including with CUDA
 `nvcc --version` and toolkit metadata over PyTorch's compiled CUDA label. The
 standards can be overridden with
 `COMFYUI_TURING_UTILS_HOST_CXX_STANDARD` and
-`COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD` when diagnosing a toolchain issue.
+`COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD` when diagnosing a toolchain issue;
+accepted values are `17`/`c++17` and `20`/`c++20` (compiler flag prefixes are
+also normalized). PyTorch 2.8 may still print a harmless Windows NVCC warning
+that its internally prepended C++17 flag is replaced; the selected project
+standard is emitted later on the command line and is the value NVCC uses.
 
 Version 0.24 adds the symmetric `asym_w4a8_int8` layout used by current
 MiniMax-H3 grouped-codebook checkpoints. The local SM75 path decodes packed
