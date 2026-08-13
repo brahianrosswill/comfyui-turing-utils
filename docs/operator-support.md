@@ -93,6 +93,28 @@ sizes, devices, or dtypes are rejected or delegated to Kitchen according to the
 format contract; dense checkpoint weights are never silently quantized at
 runtime.
 
+## Production classification
+
+"Production" means that the public shape/dtype contract is checked before any
+input is consumed, fake/meta registration is available, Linux and Windows
+build paths are gated, numerical references pass, and the exact-sm75 cubin has
+no stack/local spill. It does not mean that one backend is fastest for every
+sequence length or that an A40 PTX result can choose a Turing launch policy.
+
+| Tier | Operator families | Runtime policy |
+|---|---|---|
+| Production default | Dense W8A8 attention; ConvRot W8A8/W4A8/W4A4 activation paths; BF16 epilogue; normalization fusions | Selected by the loader/adapter after preflight; exact-sm75 tile choices are cached per device and contraction shape |
+| Production alternative | Stable Sage; SDPA FP16 bridge; legacy and grouped-codebook W4A8 | Explicit backend/weight-format choice with deterministic fallback |
+| Explicit experiment | Sol FP16-PV and Sol W8A8 | Never selected merely by loading a model; quality and exact-Turing speed remain workflow acceptance gates |
+| Compatibility only | DP4A W4A8 edges and staged codebook decode | Preserves supported shapes when the fast Tensor Core/inline contract is unavailable |
+
+The resource release gate covers all compiled production and compatibility
+families, not only attention: 50 core kernels, 48 native D64/D128 attention
+variants, and 24 D64/D128 Q/K preprocessing variants in the current exact-sm75
+image. All report zero stack/local memory. Register count and shared-memory use
+are recorded rather than constrained to the obsolete "two CTAs per SM" rule;
+the final choice is based on measured latency on the target device.
+
 ## Model-specific integration
 
 - MiniMax H3 publishes packed text/image/video/audio token ranges, estimates
@@ -127,6 +149,14 @@ calibration tooling for head/layer/step Sol
 budgets, then real-Turing backend A/B. The first two target tensor traffic in
 the MLP/projection-heavy part of H3 and therefore have a higher whole-model
 ceiling than another dense attention variant.
+
+The current A40 environment could not load the installed Kitchen CUDA binary
+because that binary requires a newer CUDA driver. The repeatable benchmark
+reports this as an unavailable comparison instead of substituting a different
+kernel. Bundled Sage was compared against external Sage and the historical
+pre-refactor bundled image; the stable main loop stayed within about 0.1% of
+the historical image. Exact-sm75 Kitchen/bundled A/B therefore remains an
+explicit release-machine task, not an inferred result.
 
 `kernel/scripts/benchmark_backends.py` is the repeatable backend regression
 gate. It reports prequantized and end-to-end scopes separately for H3 QKV/fc1/

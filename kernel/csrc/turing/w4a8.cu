@@ -986,43 +986,45 @@ __global__ void decode_codebook_w4_to_s8(
     const int64_t scale_row = static_cast<int64_t>(row) * groups_per_row;
     const uint2 packed = *reinterpret_cast<const uint2 *>(
         packed_weight + static_cast<int64_t>(row) * packed_k + packed_column);
-    const unsigned words[2] = {packed.x, packed.y};
-
     const int base_group = output_column / group_size;
-    float scales[4];
-    scales[0] = load_group_scale<uint8_t>(group_scale[scale_row + base_group]);
-    scales[1] = scales[0];
-    scales[2] = scales[0];
-    scales[3] = scales[0];
-    if (group_size < 16) {
-        scales[1] = load_group_scale<uint8_t>(group_scale[scale_row + base_group + 1]);
-        if (group_size < 8) {
-            scales[2] = load_group_scale<uint8_t>(group_scale[scale_row + base_group + 2]);
-            scales[3] = load_group_scale<uint8_t>(group_scale[scale_row + base_group + 3]);
-        }
-    }
-
-    char4 decoded[4];
+    uint4 decoded;
 #pragma unroll
-    for (int word = 0; word < 2; ++word) {
-        const unsigned bytes = words[word];
+    for (int output_word = 0; output_word < 4; ++output_word) {
+        const unsigned bytes = output_word < 2 ? packed.x : packed.y;
+        const int input_shift = (output_word & 1) * 16;
+        const int local_group = group_size >= 16 ? 0 : (output_word * 4) / group_size;
+        const float scale = load_group_scale<uint8_t>(
+            group_scale[scale_row + base_group + local_group]);
+        unsigned decoded_word = 0;
 #pragma unroll
-        for (int byte_index = 0; byte_index < 4; ++byte_index) {
-            const int pair = word * 4 + byte_index;
-            const int local_group = group_size >= 16 ? 0 : (pair * 2) / group_size;
-            const float scale = scales[local_group];
-            const unsigned value = (bytes >> (byte_index * 8)) & 0xffu;
+        for (int byte_index = 0; byte_index < 2; ++byte_index) {
+            const unsigned value =
+                (bytes >> (input_shift + byte_index * 8)) & 0xffu;
             const unsigned low = value & 0x0fu;
             const unsigned high = value >> 4;
-            auto *target = reinterpret_cast<int8_t *>(&decoded[pair / 2]) + (pair % 2) * 2;
-            target[0] = static_cast<int8_t>(max(
-                -127, min(127, __float2int_rn(shared_codebook[low] * scale))));
-            target[1] = static_cast<int8_t>(max(
-                -127, min(127, __float2int_rn(shared_codebook[high] * scale))));
+            const int low_value = max(
+                -127, min(127, __float2int_rn(shared_codebook[low] * scale)));
+            const int high_value = max(
+                -127, min(127, __float2int_rn(shared_codebook[high] * scale)));
+            decoded_word |=
+                (static_cast<unsigned>(static_cast<uint8_t>(low_value))
+                 << (byte_index * 16));
+            decoded_word |=
+                (static_cast<unsigned>(static_cast<uint8_t>(high_value))
+                 << (byte_index * 16 + 8));
+        }
+        if (output_word == 0) {
+            decoded.x = decoded_word;
+        } else if (output_word == 1) {
+            decoded.y = decoded_word;
+        } else if (output_word == 2) {
+            decoded.z = decoded_word;
+        } else {
+            decoded.w = decoded_word;
         }
     }
     *reinterpret_cast<uint4 *>(output + static_cast<int64_t>(row) * k + output_column) =
-        *reinterpret_cast<uint4 *>(decoded);
+        decoded;
 }
 
 void launch_codebook_decode(const int8_t *packed_weight,

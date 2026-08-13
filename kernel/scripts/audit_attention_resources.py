@@ -54,6 +54,17 @@ def _sm75_section(output: str, marker: str | None = None) -> str:
     raise RuntimeError(f"built extension does not contain an exact sm75 cubin{suffix}")
 
 
+def _sm75_records(output: str) -> list[tuple[str, dict[str, int]]]:
+    sections = [
+        section
+        for section in output.split("Fatbin elf code:")
+        if re.search(r"\barch\s*=\s*sm_75\b", section)
+    ]
+    if not sections:
+        raise RuntimeError("built extension does not contain an exact sm75 cubin")
+    return [record for section in sections for record in _function_records(section)]
+
+
 def _function_records(section: str) -> list[tuple[str, dict[str, int]]]:
     records = []
     lines = section.splitlines()
@@ -174,8 +185,51 @@ def main() -> None:
         "local=0 stack=0"
     )
 
-    core_records = _function_records(
-        _sm75_section(_resource_output(core), "TuringCodebookGemmKernel")
+    core_output = _resource_output(core)
+    core_records = _sm75_records(core_output)
+    if len(core_records) < 50:
+        raise RuntimeError(
+            "expected the complete SM75 core operator family, "
+            f"found only {len(core_records)} kernels"
+        )
+    for name, metrics in core_records:
+        _validate_no_spill(name, metrics)
+        if metrics.get("SHARED", SM75_SHARED_MEMORY_LIMIT + 1) > SM75_SHARED_MEMORY_LIMIT:
+            raise RuntimeError(f"{name} exceeds the SM75 static shared limit: {metrics}")
+
+    expected_families = (
+        ("BF16 epilogue", "dequantize_int8_bf16", 4, 64),
+        ("ConvRot row-buffer", "bf16_rowbuffer_convrot_quantize_kernel", 18, 64),
+        ("ConvRot staged reduction", "swiglu_rotate_amax_kernel", 4, 64),
+        ("ConvRot staged INT8 output", "quantize_from_partials_kernel", 2, 64),
+        ("ConvRot staged INT4 output", "quantize_int4_from_partials_kernel", 2, 64),
+        ("segmented RMSNorm+AdaLN", "segmented_rms_adaln_kernel", 3, 96),
+        ("LayerNorm+AdaLN", "layer_norm_adaln_kernel", 3, 96),
+        ("codebook W4 decoder", "decode_codebook_w4_to_s8", 1, 64),
+        ("W4A8 compatibility", "w4a8_compatibility_kernel", 1, 96),
+    )
+    family_summary = []
+    for label, marker, expected, register_limit in expected_families:
+        family = [metrics for name, metrics in core_records if marker in name]
+        if len(family) != expected:
+            raise RuntimeError(
+                f"expected {expected} {label} SM75 kernels, found {len(family)}"
+            )
+        maximum = max(metrics["REG"] for metrics in family)
+        if maximum > register_limit:
+            raise RuntimeError(
+                f"{label} register regression: maximum={maximum}, limit={register_limit}"
+            )
+        family_summary.append(f"{label}:{len(family)}@r{maximum}")
+
+    print(
+        "core operator resource audit passed: "
+        + " ".join(family_summary)
+        + f" total={len(core_records)} local=0 stack=0"
+    )
+
+    w4_section_records = _function_records(
+        _sm75_section(core_output, "TuringCodebookGemmKernel")
     )
     long_shapes = (
         "GemmShapeILi128ELi256ELi64",
@@ -183,13 +237,13 @@ def main() -> None:
     )
     inline = [
         metrics
-        for name, metrics in core_records
+        for name, metrics in w4_section_records
         if "TuringCodebookGemmKernel" in name
         and any(shape in name for shape in long_shapes)
     ]
     raw_w8 = [
         metrics
-        for name, metrics in core_records
+        for name, metrics in w4_section_records
         if "TuringCodebookGemmKernel" not in name
         and "integer_subbyte" not in name
         and any(shape in name for shape in long_shapes)

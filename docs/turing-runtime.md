@@ -82,15 +82,16 @@ the bounded staged implementation. Neither path expands the checkpoint at load
 time or creates an MxN INT32 accumulator. Asymmetric correction files
 remain a Kitchen fallback and are not silently accepted by this path.
 
-On an A40 running the compute-75 schedule, H3's 52,842-row inline/staged/raw-W8
-prequantized timings were 66.64/66.28/64.88 ms for QKV and
-88.29/88.59/86.65 ms for fc1. Including the local BF16 ConvRot quantizer gave
-70.14/70.64/69.47 ms and 91.27/91.87/91.23 ms respectively. Inline decode
-is therefore slightly faster than staged end to end and removes 112 MiB of
-peak allocation on the former large-K proxy, while remaining near W8A8 parity. The benchmark now uses the actual H3 fc2
-contracted width 14336 rather than treating the full 28672-wide fc1 output as
-the fc2 contraction. A
-synthetic checkpoint-format comparison measured
+The benchmark uses H3's actual fc2 contracted width 14336 rather than treating
+the full 28672-wide fc1 output as the fc2 contraction. On an A40 running the
+compute-75/PTX schedule, the latest 4,096-row prequantized W8/legacy-W4/
+codebook-W4 timings were 4.38/4.78/5.54 ms for QKV, 6.21/6.40/7.33 ms for
+fc1, and 2.70/3.04/3.48 ms for fc2. At 8,192 rows they were
+9.95/9.85/10.54 ms, 13.32/13.22/14.05 ms, and 6.13/6.29/6.75 ms. Codebook W4
+is therefore a checkpoint-size and quantization-quality feature, not a claim
+of higher contraction throughput than W8A8. Inline decode still removes the
+112 MiB staged workspace at long H3 sequence lengths without creating a
+persistent expanded weight. A synthetic checkpoint-format comparison measured
 relative L2 0.07314 and cosine 0.99732 for grouped-codebook g16, versus relative
 L2 0.16035 and cosine 0.98738 for the legacy row-scaled signed W4 format. These
 are direction and format tests, not final exact-sm75 or model-quality acceptance
@@ -105,6 +106,12 @@ matching Kitchen's production chunk policy, and is bounded at 112 MiB for H3
 fc2 and 21 MiB for qkv/fc1. MiniMax and Wan planning remain conservative for
 short or non-g16 inputs and reserve only the largest mutually exclusive staged
 workspace.
+
+The staged codebook decoder packs all 16 output bytes in registers. Its exact
+SM75 image uses 28 registers, 64 bytes of static shared storage, and zero stack
+or local memory; the previous addressable temporary arrays required a 16-byte
+per-thread stack frame. The compatibility path remains bit exact with inline
+g16 decode, including predicated N edges.
 
 Exact-sm75 raw W8, signed W4, and long-sequence codebook W4 dispatch perform a
 one-time per-device/per-MNK tile microbenchmark and cache the result for the
@@ -430,11 +437,29 @@ and possible blocks, min/mean/max layer density, sampling step, layer range,
 protected Query count, and residual profile. Debug-off adds no counter atomic,
 event, synchronization, or allocation.
 
+The final A40 compute-75/PTX regression sweep keeps preprocessing and core
+attention separate. At N=4096/H56/D128, end-to-end Sage/W8A8/SDPA/external-
+Sage measured 4.67/5.47/4.39/4.63 ms, while the already-prequantized bundled
+cores measured 4.54/4.32 ms. At N=8192 they measured
+18.68/19.65/18.04/17.10 ms end to end and 18.39/16.51 ms prequantized. This
+confirms that W8A8's INT8 PV core is faster but its extra V quantization is not
+amortized at short sequences; the long H3 measurements above are the intended
+default workload. It also prevents a core win from being mislabeled as an
+end-to-end win.
+
+The same sweep measured fused H3-like fc2 SwiGLU ConvRot input preparation at
+0.65 versus 1.04 ms staged for 4,096 rows and 1.17 versus 1.92 ms for 8,192
+rows (about 1.6x). The packed BF16 epilogue measured about 5x faster than its
+eager reference. These are the retained optimizations. Grouped-codebook W4 is
+retained for checkpoint size/quality despite being 6--29% slower than raw W8
+in the tested contractions; no production documentation claims otherwise.
+
 ## Validation boundary
 
 Release builds target sm75 for bundled Sage. Static tests validate dispatch,
-fallbacks, loader independence, shapes, dtypes, spill-free SM75 resources, the public
-symbol boundary, and exclusion of the retired Sage1/Sage2 variants. For compatible A40
+fallbacks, loader independence, shapes, dtypes, spill-free SM75 resources for
+every compiled core/attention/preprocessing family, the public symbol boundary,
+and exclusion of the retired Sage1/Sage2 variants. For compatible A40
 validation, build with:
 
 ```bash
@@ -443,6 +468,7 @@ python -m pip install -v --no-build-isolation -e ./kernel
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --experimental-sparse
 python kernel/scripts/validate_wan_fusions.py --device cuda:0
+python kernel/scripts/audit_attention_resources.py
 ```
 
 An A40 run validates numerical behavior, allocation shapes, and the absence of
