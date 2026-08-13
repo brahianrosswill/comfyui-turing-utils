@@ -104,6 +104,96 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             )
         self.assertTrue(torch.equal(actual, expected))
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_shared_overlap_single_window_matches_decoder(self):
+        from comfy.ldm.minimax.vae import ViT3DDecoder
+
+        torch.manual_seed(5)
+        decoder = ViT3DDecoder(
+            patch_size=2,
+            patch_size_t=1,
+            in_channels=4,
+            out_channels=3,
+            num_layers=1,
+            heads=1,
+            dim_head=64,
+            rope_dim_ratio=0.75,
+            operations=torch.nn,
+        ).cuda().half().eval()
+        for parameter in decoder.parameters():
+            torch.nn.init.uniform_(parameter, -0.02, 0.02)
+        model = SimpleNamespace(decoder=decoder, vae_ratio=2, blend=blend)
+        x = torch.randn(1, 4, 2, 3, 5, device="cuda", dtype=torch.float16)
+        options = video_vae._attention_options("sdpa", x.device)
+        session = SimpleNamespace(before_stage=lambda _index: None)
+        with torch.inference_mode():
+            expected = video_vae._decoder_forward(
+                decoder,
+                x.clone(),
+                options,
+                session,
+            )
+            actual = video_vae._shared_overlap_decoder_forward(
+                model,
+                x.clone(),
+                options,
+                session,
+                2,
+                None,
+            )
+        torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_shared_overlap_window_batching_is_invariant(self):
+        from comfy.ldm.minimax.vae import ViT3DDecoder
+
+        torch.manual_seed(6)
+        decoder = ViT3DDecoder(
+            patch_size=2,
+            patch_size_t=1,
+            in_channels=4,
+            out_channels=3,
+            num_layers=2,
+            heads=1,
+            dim_head=64,
+            rope_dim_ratio=0.75,
+            operations=torch.nn,
+        ).cuda().half().eval()
+        for parameter in decoder.parameters():
+            torch.nn.init.uniform_(parameter, -0.01, 0.01)
+        model = SimpleNamespace(decoder=decoder, vae_ratio=2, blend=blend)
+        x = torch.randn(2, 4, 2, 4, 5, device="cuda", dtype=torch.float16)
+        options = video_vae._attention_options("sdpa", x.device)
+        session = SimpleNamespace(before_stage=lambda _index: None)
+        progress = mock.Mock()
+        with (
+            mock.patch.object(video_vae, "TILE_SIZE", 4),
+            mock.patch.object(video_vae, "TILE_OVERLAP", 2),
+            torch.inference_mode(),
+        ):
+            expected = video_vae._shared_overlap_decoder_forward(
+                model,
+                x.clone(),
+                options,
+                session,
+                1,
+                None,
+            )
+            actual = video_vae._shared_overlap_decoder_forward(
+                model,
+                x.clone(),
+                options,
+                session,
+                3,
+                progress,
+            )
+            layout = video_vae._SharedWindowLayout(model, 2, 4, 5, x.device)
+        torch.testing.assert_close(actual, expected, rtol=2e-3, atol=2e-3)
+        self.assertEqual(
+            sum(call.args[0] for call in progress.update.call_args_list),
+            layout.window_count * len(decoder.transformer_blocks),
+        )
+
     def test_split_tiles_covers_exact_extent(self):
         for length in (128, 256, 480, 720, 848, 1280):
             for tile in (256, 288, 320):
@@ -173,6 +263,36 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             expected_tiles,
         )
 
+    def test_shared_window_assembler_preserves_identical_overlap_values(self):
+        model = SimpleNamespace(vae_ratio=2, blend=blend)
+        value = torch.arange(2 * 4 * 5 * 3, dtype=torch.float32).view(
+            1, 2, 4, 5, 3
+        )
+        flattened = value.reshape(1, -1, 3)
+        with (
+            mock.patch.object(video_vae, "TILE_SIZE", 4),
+            mock.patch.object(video_vae, "TILE_OVERLAP", 2),
+        ):
+            layout = video_vae._SharedWindowLayout(
+                model,
+                2,
+                4,
+                5,
+                torch.device("cpu"),
+            )
+            assembler = video_vae._WindowFeatureAssembler(
+                model,
+                layout,
+                1,
+                3,
+                torch.float32,
+                torch.device("cpu"),
+            )
+            for index, indices in enumerate(layout.token_indices):
+                assembler.add(index, flattened[:, indices])
+            actual = assembler.finish()
+        self.assertTrue(torch.equal(actual, flattened))
+
     def test_decoder_node_uses_optimized_runtime(self):
         vae = mock.Mock()
         vae.device = torch.device("cpu")
@@ -193,8 +313,16 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 "2",
                 "256",
                 "sdpa",
+                "official",
             )[0]
-        run.assert_called_once_with(vae, latent, "2", "sdpa", "256")
+        run.assert_called_once_with(
+            vae,
+            latent,
+            "2",
+            "sdpa",
+            "256",
+            "official",
+        )
         self.assertEqual(output.shape, (2, 4, 4, 3))
 
     def test_encoder_node_uses_optimized_runtime(self):
@@ -303,6 +431,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         self.assertEqual(decoder["tiles_per_batch"][1]["default"], "auto")
         self.assertEqual(encoder["tiles_per_batch"][1]["default"], "auto")
         self.assertEqual(decoder["decoder_tile_size"][1]["default"], "256")
+        self.assertEqual(decoder["decoder_tiling"][1]["default"], "official")
         self.assertNotIn("tile_preset", decoder)
         self.assertNotIn("tile_preset", encoder)
         self.assertNotIn("tile_overlap", decoder)
@@ -345,24 +474,46 @@ class MiniMaxVideoVAETest(unittest.TestCase):
 
     def test_tile_progress_uses_comfy_progress_bar(self):
         bar = mock.Mock()
-        with mock.patch.object(
-            video_vae.comfy.utils, "ProgressBar", return_value=bar
-        ) as factory:
-            progress = video_vae._TileProgress(11)
+        terminal = mock.Mock()
+        with (
+            mock.patch.object(
+                video_vae.comfy.utils, "ProgressBar", return_value=bar
+            ) as factory,
+            mock.patch.object(video_vae, "tqdm", return_value=terminal) as tqdm_factory,
+        ):
+            progress = video_vae._TileProgress(11, description="H3 VAE Test")
             progress.update(4)
             progress.update(3)
+            progress.finish()
         factory.assert_called_once_with(11)
+        tqdm_factory.assert_called_once_with(
+            total=11,
+            desc="H3 VAE Test",
+            disable=not video_vae.comfy.utils.PROGRESS_BAR_ENABLED,
+        )
         self.assertEqual([call.args[0] for call in bar.update.call_args_list], [4, 3])
+        self.assertEqual(
+            [call.args[0] for call in terminal.update.call_args_list], [4, 3]
+        )
+        terminal.close.assert_called_once_with()
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_tile_progress_waits_for_cuda_events_off_thread(self):
         bar = mock.Mock()
-        with mock.patch.object(video_vae.comfy.utils, "ProgressBar", return_value=bar):
+        terminal = mock.Mock()
+        with (
+            mock.patch.object(video_vae.comfy.utils, "ProgressBar", return_value=bar),
+            mock.patch.object(video_vae, "tqdm", return_value=terminal),
+        ):
             progress = video_vae._TileProgress(5, torch.device("cuda"))
             progress.update(3)
             progress.update(2)
             progress.finish()
         self.assertEqual([call.args[0] for call in bar.update.call_args_list], [3, 2])
+        self.assertEqual(
+            [call.args[0] for call in terminal.update.call_args_list], [3, 2]
+        )
+        terminal.close.assert_called_once_with()
         self.assertIsNone(progress.worker)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import comfy.model_management
 
 from ..adapters.minimax.video_vae import (
+    DECODER_TILING_MODES,
     DECODER_TILE_SIZES,
     TILES_PER_BATCH,
     decode_video,
@@ -41,6 +42,13 @@ class MiniMaxH3VideoVAEDecode:
                         "tooltip": "Decoder attention only. On Turing, BF16 SDPA inputs are consumed through containers and computed as FP16 to avoid the slow math fallback. W8A8 refers to QK attention, not VAE weight quantization.",
                     },
                 ),
+                "decoder_tiling": (
+                    DECODER_TILING_MODES,
+                    {
+                        "default": "official",
+                        "tooltip": "official keeps independent 256px windows. shared_overlap is experimental: it shares image-token QKV/MLP work across overlapping windows while preserving each window's local 256px attention and RoPE.",
+                    },
+                ),
             }
         }
 
@@ -60,6 +68,7 @@ class MiniMaxH3VideoVAEDecode:
         tiles_per_batch,
         decoder_tile_size,
         attention,
+        decoder_tiling="official",
     ):
         require_h3_video_vae(vae)
         latent = samples["samples"]
@@ -72,6 +81,7 @@ class MiniMaxH3VideoVAEDecode:
                 tiles_per_batch,
                 attention,
                 decoder_tile_size,
+                decoder_tiling,
             )
         if images.ndim == 5:
             images = images.reshape(-1, *images.shape[-3:])

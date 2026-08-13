@@ -43,7 +43,16 @@ does not disable cross-tile weight retention.
   retained only as explicit experiments. They keep the spatial RoPE increment
   of a 256px tile instead of renormalizing every larger tile back to `[-1, 1]`,
   but they still change transformer context and are not quality-equivalent to
-  the official geometry. Encoder geometry is never changed.
+  the official geometry. In particular, an 18-token/288px tile must either
+  compress its coordinate step to stay inside `[-1, 1]` or preserve the
+  16-token step and extend its endpoints to `+/-1.0625`; neither matches the
+  trained 16-token/256px distribution. Encoder geometry is never changed.
+- Decoder `decoder_tiling=official` preserves ComfyUI's independent-window
+  equations. `shared_overlap` is an explicit experimental mode available only
+  with 256px tiles. It keeps every attention window and local RoPE exactly
+  256px while merging redundant image-token state between transformer blocks.
+  `tiles_per_batch` then controls how many local windows enter one attention
+  launch; it does not change the merged result.
 - decoder `attention` selects SDPA, Sage, or W8A8-QK for this VAE call only.
   SDPA is the default. On Turing, container-owned BF16 Q/K/V are converted to
   FP16 before SDPA so PyTorch does not select the BF16 math fallback.
@@ -72,12 +81,47 @@ The following behaviors are automatic rather than node switches:
 If Windows or the current RAM budget cannot provide the pinned buffers, the
 nodes preserve correctness and fall back to synchronous FP32 copies.
 
-Both nodes publish a ComfyUI progress bar whose total is the number of spatial
-tiles multiplied by the number of temporal clips/chunks. Every kernel batch
-advances it by the actual number of tiles in that batch, including a shorter
-final batch. CUDA events feed the bar from a small background consumer only
-after each batch really finishes; this keeps its ETA meaningful without
-synchronizing the main submission stream or disabling transfer/compute overlap.
+Both nodes publish matching ComfyUI and terminal `tqdm` progress bars. Their
+total is the number of spatial tiles multiplied by the number of temporal
+clips/chunks. Every kernel batch advances both bars by the actual number of
+tiles in that batch, including a shorter final batch. CUDA events feed the bars
+from a small background consumer only after each batch really finishes; this
+keeps the ETA meaningful without synchronizing the main submission stream or
+disabling transfer/compute overlap.
+
+In `shared_overlap` mode a window is revisited by every decoder transformer
+block, so the progress total additionally includes the decoder block count.
+This reports completed window-block work rather than holding at zero until the
+entire merged frame finishes.
+
+## Experimental shared-overlap decoder
+
+The official decoder evaluates every overlapping 256px tile as a completely
+independent sample and blends only final pixels. A physical overlap token can
+therefore have two different hidden states, local RoPE coordinates, and
+attention contexts. Removing one copy cannot be bitwise equivalent.
+
+The experimental path instead performs the following at each decoder block:
+
+1. keep one global image-token lattice for the temporal chunk;
+2. apply block RMSNorm and QKV projection once to each unique image token;
+3. gather projected Q/K/V into the original 256px windows;
+4. append independent per-window register and suffix states;
+5. apply each window's original local RoPE and execute packed window batches
+   without a dense or block-diagonal mask;
+6. blend overlap attention outputs back to the unique lattice in the official
+   order, using the mean per-pixel ramp of each 16px output patch as that
+   hidden token's blend weight;
+7. apply the attention output projection, residual, and SwiGLU MLP once to each
+   unique image token;
+8. retain register/suffix residual and MLP state independently per window.
+
+The approximation occurs at step 6: hidden states merge after every block
+instead of only after final pixel projection. This is intended to preserve the
+trained window size and local position scale while eliminating redundant
+token-wise work; it still requires real-checkpoint visual validation. A frame
+that fits in one tile automatically uses the exact official path because there
+is no overlap to share.
 
 ## Current validation status
 
@@ -101,6 +145,13 @@ and encoder double buffers only once. On the same A40 setup, decoder batch
 2.795/2.560/2.567 seconds with 2.37/4.36/8.33 GiB peaks. Every batched result
 was bitwise equal to batch 1. Real-checkpoint throughput and peak memory still
 need validation on the target Turing card.
+
+With a fully initialized 36-layer FP16 H3 decoder on an A40, SDPA, and seven
+latent temporal tokens, shared overlap changed 480x848 from 2.377 s to 1.461 s
+(1.63x) and 720x1280 from 4.109 s to 2.991 s (1.37x). Peaks changed from
+5.26/5.34 GiB to 5.37/5.72 GiB. Synthetic outputs were finite and invariant to
+window batch size; the expected approximation delta was small for the bounded
+random-weight test but is not a substitute for a real H3 checkpoint comparison.
 
 Dense SwiGLU routing was bitwise identical but slightly slower, so automatic
 fusion is restricted to compatible W8A8 weights. Sage and SDPA did not beat the
