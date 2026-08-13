@@ -5,9 +5,6 @@ from __future__ import annotations
 import comfy.model_management
 
 from ..adapters.minimax.video_vae import (
-    DECODER_TILING_MODES,
-    DECODER_TILE_SIZES,
-    TILES_PER_BATCH,
     decode_video,
     encode_video,
     require_h3_video_vae,
@@ -21,20 +18,6 @@ class MiniMaxH3VideoVAEDecode:
             "required": {
                 "samples": ("LATENT",),
                 "vae": ("VAE",),
-                "tiles_per_batch": (
-                    TILES_PER_BATCH,
-                    {
-                        "default": "auto",
-                        "tooltip": "Number of independent 256px tiles evaluated together on the batch dimension. auto chooses up to 4 tiles within ComfyUI's current memory budget.",
-                    },
-                ),
-                "decoder_tile_size": (
-                    DECODER_TILE_SIZES,
-                    {
-                        "default": "256",
-                        "tooltip": "256 is the quality-stable H3 tile geometry. Larger values are explicit experiments that preserve 256px spatial RoPE spacing but still change transformer context and can change the image.",
-                    },
-                ),
                 "attention": (
                     ["sdpa", "sage", "w8a8"],
                     {
@@ -42,11 +25,14 @@ class MiniMaxH3VideoVAEDecode:
                         "tooltip": "Decoder attention only. On Turing, BF16 SDPA inputs are consumed through containers and computed as FP16 to avoid the slow math fallback. W8A8 refers to QK attention, not VAE weight quantization.",
                     },
                 ),
-                "decoder_tiling": (
-                    DECODER_TILING_MODES,
+                "independent_tail_blocks": (
+                    "INT",
                     {
-                        "default": "official",
-                        "tooltip": "official matches ComfyUI. official_multiband keeps independent windows but replaces final linear seams with normalized low/high-frequency stitching. shared_core computes each image-token Q/output/MLP once with a full 256px K/V halo. shared_core_multiband adds a one-token dual-context feather, restores independent windows for the last two blocks, then uses multiband stitching. shared_overlap is the older per-layer averaging experiment and may blur detail.",
+                        "default": 2,
+                        "min": 0,
+                        "max": 36,
+                        "step": 1,
+                        "tooltip": "Number of final decoder transformer blocks evaluated as independent 256px windows before multiband stitching. Higher values strengthen tile-local reconstruction and cost more compute; 0 keeps shared-core through every block.",
                     },
                 ),
             }
@@ -65,10 +51,8 @@ class MiniMaxH3VideoVAEDecode:
         self,
         samples,
         vae,
-        tiles_per_batch,
-        decoder_tile_size,
         attention,
-        decoder_tiling="official",
+        independent_tail_blocks,
     ):
         require_h3_video_vae(vae)
         latent = samples["samples"]
@@ -78,10 +62,8 @@ class MiniMaxH3VideoVAEDecode:
             images = decode_video(
                 vae,
                 latent,
-                tiles_per_batch,
                 attention,
-                decoder_tile_size,
-                decoder_tiling,
+                independent_tail_blocks,
             )
         if images.ndim == 5:
             images = images.reshape(-1, *images.shape[-3:])
@@ -95,13 +77,6 @@ class MiniMaxH3VideoVAEEncode:
             "required": {
                 "pixels": ("IMAGE",),
                 "vae": ("VAE",),
-                "tiles_per_batch": (
-                    TILES_PER_BATCH,
-                    {
-                        "default": "auto",
-                        "tooltip": "Number of independent official 256px tiles evaluated together on the batch dimension. auto chooses up to 2 tiles within ComfyUI's current memory budget.",
-                    },
-                ),
             }
         }
 
@@ -118,13 +93,11 @@ class MiniMaxH3VideoVAEEncode:
         self,
         pixels,
         vae,
-        tiles_per_batch,
     ):
         require_h3_video_vae(vae)
         with comfy.model_management.cuda_device_context(vae.device):
             latent = encode_video(
                 vae,
                 pixels,
-                tiles_per_batch,
             )
         return ({"samples": latent},)
