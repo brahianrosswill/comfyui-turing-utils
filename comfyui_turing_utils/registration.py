@@ -7,6 +7,7 @@ from .nodes.media import VideoMotionContactSheet
 from .nodes.minimax import (
     H3ConcatAVLatent,
     H3SeparateAVLatent,
+    MiniMaxH3BlockCachePatch,
     MiniMaxH3VideoFramesPadding,
 )
 from .nodes.wan import WanVideoFramesPadding
@@ -21,6 +22,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsBerniniInpaintCondition": BerniniInpaintCondition,
     "TuringUtilsH3ConcatAVLatent": H3ConcatAVLatent,
     "TuringUtilsH3SeparateAVLatent": H3SeparateAVLatent,
+    "TuringUtilsMiniMaxH3BlockCachePatch": MiniMaxH3BlockCachePatch,
     "TuringUtilsSolSparseAttentionPatch": SolSparseAttentionPatch,
     "TuringUtilsAttentionKernelTuningPatch": AttentionKernelTuningPatch,
     "TuringUtilsVideoMotionContactSheet": VideoMotionContactSheet,
@@ -35,6 +37,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsBerniniInpaintCondition": "Bernini Inpaint Condition",
     "TuringUtilsH3ConcatAVLatent": "H3 Concat AV Latent",
     "TuringUtilsH3SeparateAVLatent": "H3 Separate AV Latent",
+    "TuringUtilsMiniMaxH3BlockCachePatch": "Patch MiniMax H3 Block Cache (Experimental)",
     "TuringUtilsSolSparseAttentionPatch": "Patch Sol Sparse Attention (Experimental)",
     "TuringUtilsAttentionKernelTuningPatch": "Patch Turing Attention Kernel Tuning (Experimental)",
     "TuringUtilsVideoMotionContactSheet": "Video Motion Contact Sheet (Experimental)",

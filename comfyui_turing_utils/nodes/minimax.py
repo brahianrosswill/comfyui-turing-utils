@@ -7,6 +7,7 @@ import torch
 import comfy.nested_tensor
 import comfy.utils
 from comfy_api.latest import io
+from ..adapters.minimax.block_cache import install_minimax_block_cache
 from .wan import WanVideoFramesPadding, repeat_last_frame
 
 
@@ -18,6 +19,64 @@ def _ceil_h3_frame_count(frame_count: int) -> int:
     frame_count = max(int(frame_count), 5)
     remainder = (frame_count - 5) % 17
     return frame_count if remainder == 0 else frame_count + 17 - remainder
+
+
+class MiniMaxH3BlockCachePatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "processing_control_value": (
+                    "FLOAT",
+                    {"default": 0.08, "min": 0.0, "max": 1.0, "step": 0.005},
+                ),
+                "processing_percent_1": (
+                    "FLOAT",
+                    {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "processing_percent_2": (
+                    "FLOAT",
+                    {"default": 0.90, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
+                "mcs": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1}),
+                "device": (["auto", "gpu", "cpu"], {"default": "auto"}),
+                "mode": (
+                    ["standard", "4-step LoRA"],
+                    {"default": "standard"},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "patch"
+    CATEGORY = "Turing Utils/optimization"
+    EXPERIMENTAL = True
+    DESCRIPTION = "Trajectory-aware transformer-block caching for MiniMax H3."
+
+    def patch(
+        self,
+        model,
+        processing_control_value,
+        processing_percent_1,
+        processing_percent_2,
+        mcs,
+        device,
+        mode,
+    ):
+        if processing_percent_1 > processing_percent_2:
+            raise ValueError("processing_percent_1 must not exceed processing_percent_2")
+        return (
+            install_minimax_block_cache(
+                model,
+                processing_control_value,
+                processing_percent_1,
+                processing_percent_2,
+                mcs,
+                device,
+                mode == "4-step LoRA",
+            ),
+        )
 
 
 class MiniMaxH3VideoFramesPadding:
