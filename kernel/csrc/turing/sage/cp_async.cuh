@@ -46,8 +46,6 @@ enum class PrefetchMode {
 __device__ __forceinline__ void commit_group() {
 #ifdef CP_ASYNC_ENABLED
   asm volatile("cp.async.commit_group;\n" ::);
-#else
-  __threadfence_block();
 #endif
 }
 
@@ -59,8 +57,6 @@ template <size_t n>
 __device__ __forceinline__ void wait_group() {
 #ifdef CP_ASYNC_ENABLED
   asm volatile("cp.async.wait_group %0;\n" ::"n"(n));
-#else
-  __syncthreads();
 #endif
 }
 

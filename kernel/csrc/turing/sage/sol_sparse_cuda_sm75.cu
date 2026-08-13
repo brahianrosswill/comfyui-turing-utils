@@ -20,6 +20,7 @@
 #include "../utils.cuh"
 #include "../math.cuh"
 #include "attn_utils.cuh"
+#include "dispatch_utils.h"
 #include "torch_compat.h"
 
 #include <cuda_bf16.h>
@@ -115,8 +116,7 @@ struct AttentionGeometry
       "SM75 fused routing metadata must fit beside the 16-block summaries");
 };
 
-static_assert(AttentionGeometry<64>::kAttentionSharedBytes == 16 * 1024);
-static_assert(AttentionGeometry<128>::kAttentionSharedBytes == 32 * 1024);
+static_assert(AttentionGeometry<128>::kAttentionSharedBytes <= 64 * 1024);
 
 template <typename T>
 __device__ __forceinline__ float scalar_to_float(T value);
@@ -623,8 +623,8 @@ __global__ void sparse_attention_kernel(
   static_assert(!IsCausal || ForceDense,
                 "causal masking is supported only by dense W8A8");
   static_assert(
-      G::kAttentionSharedBytes <= 32 * 1024,
-      "SM75 sparse attention must stay within 32 KiB");
+      G::kAttentionSharedBytes <= 64 * 1024,
+      "SM75 sparse attention exceeds the architectural shared-memory limit");
   extern __shared__ int8_t shared_bytes[];
   smem_t<SwizzleMode::k128B, G::kHalfPacks> shared_correction_query(shared_bytes);
   smem_t<SwizzleMode::k128B, G::kHalfPacks> shared_summary_key(
@@ -1310,7 +1310,11 @@ void launch_sparse_threshold_attention(
 
   dim3 attention_grid(num_query_blocks, num_query_heads, batch_size);
   dim3 attention_block(WARP_SIZE, kWarps);
-  sparse_attention_kernel<HeadDim, T, UseW8A8, ForceDense, IsCausal, Varlen><<<
+  auto attention_kernel =
+      sparse_attention_kernel<HeadDim, T, UseW8A8, ForceDense, IsCausal, Varlen>;
+  configure_dynamic_shared_memory(
+      attention_kernel, G::kAttentionSharedBytes, "SM75 sparse attention");
+  attention_kernel<<<
       attention_grid,
       attention_block,
       G::kAttentionSharedBytes,

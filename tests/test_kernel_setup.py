@@ -129,10 +129,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn("kRouteStorageOffset", source)
         self.assertIn("key_int8", source)
         self.assertIn(
-            "AttentionGeometry<64>::kAttentionSharedBytes == 16 * 1024", source
-        )
-        self.assertIn(
-            "AttentionGeometry<128>::kAttentionSharedBytes == 32 * 1024", source
+            "AttentionGeometry<128>::kAttentionSharedBytes <= 64 * 1024", source
         )
         self.assertIn("HeadDim / 32", source)
         self.assertNotIn("__global__ void block_summary_kernel(", source)

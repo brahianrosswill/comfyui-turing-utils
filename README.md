@@ -75,8 +75,10 @@ internal arithmetic remain FP32. Explicit ComfyUI dtype flags still win.
 
 The ConvRot path reuses comfy-kitchen W8A8 and W4A4 operators and supplies a
 packed W4A8 SM75 Tensor Core kernel. Its row-buffer quantizers retain completed
-rows in BF16, use FP32 only for active rotation/reduction scratch, and stay under
-the default 48 KiB shared-memory limit. MiniMax-specific integration is isolated
+rows in BF16 and use FP32 only for active rotation/reduction scratch. Launches
+select the largest useful tile that fits the device's opt-in shared-memory
+limit; shared-memory size or resident CTA count is not an acceptance target.
+MiniMax-specific integration is isolated
 under `comfyui_turing_utils/adapters/minimax/`, including packed-sequence VRAM
 planning for text, keyframes, and multimodal references. Wan/Bernini integration
 is isolated under `comfyui_turing_utils/adapters/`; it adds batch-aware,
@@ -150,7 +152,7 @@ PV throughput rather than the routing policy. Both variants keep a 64-query
 tile. Native D64 uses 16 KiB dynamic shared memory, while D128 uses 32 KiB. The
 automatic logical K schedule uses 64 tokens for short K and two sequential
 64-token stages for K above 1024.
-The latter does not hold 128 K/V tokens in shared memory, preserving CTA density.
+These are the current production geometries, not global resource limits.
 
 Sol keeps the first denoising step and the first two transformer layers dense
 by default. If `dense_prefix_layers + dense_suffix_layers` reaches or exceeds
@@ -169,8 +171,9 @@ materialized. MiniMax H3 publishes complete text, reference-image, reference-
 video-anchor, reference-video-interior, reference-audio, target-audio, and
 target-video spans. Reference-video first/last latent frames follow the image
 sparsity switch; its interior follows the video switch. Defaults remain
-image=false, video=true, audio=false. D64/D128 CTAs remain at 16/32 KiB shared
-memory respectively. A40 compute_75 direction
+image=false, video=true, audio=false. The current D64/D128 variants use 16/32
+KiB respectively; larger candidates are accepted only when they improve real
+SM75 latency without spilling. A40 compute_75 direction
 tests validate numerical behavior and speed; final quality, occupancy, and
 throughput still require an actual Turing GPU.
 

@@ -16,6 +16,7 @@
 
 #pragma once
 #include "torch_compat.h"
+#include <cuda_runtime.h>
 #include <cstdint>
 #include <sstream>
 #include <stdexcept>
@@ -25,6 +26,32 @@
 #else
 #define SAGE_FUNC_NAME __PRETTY_FUNCTION__
 #endif
+
+template <typename Kernel>
+inline void configure_dynamic_shared_memory(
+    Kernel kernel, size_t requested_bytes, const char *kernel_name) {
+  int device = 0;
+  cudaError_t error = cudaGetDevice(&device);
+  TORCH_CHECK(error == cudaSuccess,
+              kernel_name, " could not query the CUDA device: ",
+              cudaGetErrorString(error));
+  int optin_limit = 0;
+  error = cudaDeviceGetAttribute(
+      &optin_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+  TORCH_CHECK(error == cudaSuccess,
+              kernel_name, " could not query dynamic shared memory: ",
+              cudaGetErrorString(error));
+  TORCH_CHECK(requested_bytes <= static_cast<size_t>(optin_limit),
+              kernel_name, " requests ", requested_bytes,
+              " bytes of dynamic shared memory, but device ", device,
+              " supports ", optin_limit);
+  error = cudaFuncSetAttribute(
+      kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+      static_cast<int>(requested_bytes));
+  TORCH_CHECK(error == cudaSuccess,
+              kernel_name, " could not opt in to ", requested_bytes,
+              " bytes of dynamic shared memory: ", cudaGetErrorString(error));
+}
 
 #define DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, ...)              \
   if (head_dim == 64) {                                         \

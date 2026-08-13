@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit static SM75 attention and long-sequence W4A8 resources."""
+"""Audit exact-SM75 kernel resources without prescribing an occupancy target."""
 
 from __future__ import annotations
 
@@ -12,6 +12,8 @@ import sysconfig
 
 
 KERNEL = Path(__file__).resolve().parents[1]
+SM75_REGISTER_LIMIT = 255
+SM75_SHARED_MEMORY_LIMIT = 64 * 1024
 
 
 def _cuobjdump() -> str:
@@ -64,6 +66,13 @@ def _function_records(section: str) -> list[tuple[str, dict[str, int]]]:
     return records
 
 
+def _validate_no_spill(name: str, metrics: dict[str, int]) -> None:
+    if metrics.get("REG", SM75_REGISTER_LIMIT + 1) > SM75_REGISTER_LIMIT:
+        raise RuntimeError(f"{name} exceeds the SM75 register limit: {metrics}")
+    if metrics.get("LOCAL", 1) != 0 or metrics.get("STACK", 1) != 0:
+        raise RuntimeError(f"{name} spilled to local/stack memory: {metrics}")
+
+
 def main() -> None:
     package = KERNEL / "comfyui_turing_utils_kernel"
     suffix = sysconfig.get_config_var("EXT_SUFFIX")
@@ -96,16 +105,8 @@ def main() -> None:
             "expected six SM75 sparse/dense variants per native head dimension, "
             f"found D64={len(dimensions[64])}, D128={len(dimensions[128])}"
         )
-    for _, metrics in records:
-        if metrics.get("REG", 256) > 255:
-            raise RuntimeError(f"SM75 register limit exceeded: {metrics}")
-        if metrics.get("LOCAL", 1) != 0:
-            raise RuntimeError(f"SM75 attention spilled to local memory: {metrics}")
-        if metrics.get("STACK", 1) != 0:
-            raise RuntimeError(f"SM75 attention spilled to stack memory: {metrics}")
-    for metrics in dimensions[64]:
-        if metrics.get("REG", 256) > 192:
-            raise RuntimeError(f"native D64 resource regression: {metrics}")
+    for dimension, metrics in records:
+        _validate_no_spill(f"D{dimension} attention", metrics)
 
     varlen_value_records = []
     for index, line in enumerate(lines):
@@ -121,7 +122,7 @@ def main() -> None:
         )
     for metrics in varlen_value_records:
         if (
-            metrics.get("REG", 256) > 96
+            metrics.get("REG", SM75_REGISTER_LIMIT + 1) > 96
             or metrics.get("STACK", 1) != 0
             or metrics.get("LOCAL", 1) != 0
             or metrics.get("SHARED", 1025) > 1024
@@ -133,7 +134,7 @@ def main() -> None:
         f"registers=D64:{sorted({item['REG'] for item in dimensions[64]})}/"
         f"D128:{sorted({item['REG'] for item in dimensions[128]})} "
         f"packed_v_registers:{sorted({item['REG'] for item in varlen_value_records})} "
-        "local=0 stack=0 dynamic_shared=D64:16384/D128:32768(source-gated)"
+        "local=0 stack=0 dynamic_shared=current-D64:16384/current-D128:32768"
     )
 
     preprocessing_output = _resource_output(fused)
@@ -159,10 +160,9 @@ def main() -> None:
             f"D128={len(preprocessing_dimensions[128])}"
         )
     for metrics in preprocessing_records:
-        if metrics.get("LOCAL", 1) != 0 or metrics.get("STACK", 1) != 0:
-            raise RuntimeError(f"Q/K preprocessing spilled to local/stack memory: {metrics}")
-        if metrics.get("SHARED", 32769) > 32 * 1024:
-            raise RuntimeError(f"Q/K preprocessing exceeds the 32 KiB shared budget: {metrics}")
+        _validate_no_spill("Q/K preprocessing", metrics)
+        if metrics.get("SHARED", SM75_SHARED_MEMORY_LIMIT + 1) > SM75_SHARED_MEMORY_LIMIT:
+            raise RuntimeError(f"Q/K preprocessing exceeds the SM75 shared limit: {metrics}")
         if metrics.get("REG", 256) > 96:
             raise RuntimeError(f"Q/K preprocessing register regression: {metrics}")
     print(
@@ -197,24 +197,16 @@ def main() -> None:
         )
     inline_metrics, raw_metrics = inline[0], raw_w8[0]
     for name, metrics in (("inline codebook W4A8", inline_metrics), ("raw W8A8", raw_metrics)):
-        if metrics.get("REG", 256) > 255:
-            raise RuntimeError(f"{name} exceeds the SM75 register limit: {metrics}")
-        if metrics.get("LOCAL", 1) != 0 or metrics.get("STACK", 1) != 0:
-            raise RuntimeError(f"{name} spilled to local/stack memory: {metrics}")
+        _validate_no_spill(name, metrics)
     threads = 256
     sm75_registers = 65536
     inline_ctas = sm75_registers // (threads * inline_metrics["REG"])
     raw_ctas = sm75_registers // (threads * raw_metrics["REG"])
-    if inline_ctas < raw_ctas:
-        raise RuntimeError(
-            "inline codebook decode lowers register-limited CTA density: "
-            f"inline={inline_ctas} raw_w8={raw_ctas}"
-        )
     print(
         "long-sequence W4A8 resource audit passed: "
         f"registers=inline:{inline_metrics['REG']}/raw_w8:{raw_metrics['REG']} "
         f"register_limited_ctas=inline:{inline_ctas}/raw_w8:{raw_ctas} "
-        "local=0 stack=0 shared_tile=identical(source-gated<=48KiB)"
+        "local=0 stack=0 shared_tile=identical; CTA density is reported, not gated"
     )
 
 

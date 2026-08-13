@@ -507,10 +507,11 @@ static void launch_qk_int_sv_f16_varlen_attn(
                                            CTA_K * HEAD_DIM * sizeof(int8_t) +
                                            CTA_K * HEAD_DIM * sizeof(half),
                                        CTA_Q * HEAD_DIM * sizeof(half));
-  static_assert(smem_max <= 48 * 1024, "SM75 attention must stay within 48 KiB shared memory");
+  static_assert(smem_max <= 64 * 1024,
+                "SM75 attention exceeds the architectural shared-memory limit");
 
   auto kernel_func = qk_int_sv_f16_varlen_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, IndexT, DTypeV, DTypeOut, mask_mode>;
-  cudaFuncSetAttribute(kernel_func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max);
+  configure_dynamic_shared_memory(kernel_func, smem_max, "SM75 varlen Sage attention");
 
   dim3 grid(div_ceil(max_seqlen_q, CTA_Q), num_qo_heads, batch_size);
   dim3 block(32, (CTA_Q / WARP_Q) * (CTA_K / WARP_K));

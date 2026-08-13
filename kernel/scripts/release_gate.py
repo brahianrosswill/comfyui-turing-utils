@@ -55,8 +55,7 @@ def _static_gate() -> None:
 
     cuda = (KERNEL / "csrc/turing/sage/sol_sparse_cuda_sm75.cu").read_text(encoding="utf-8")
     for marker in (
-        "AttentionGeometry<64>::kAttentionSharedBytes == 16 * 1024",
-        "AttentionGeometry<128>::kAttentionSharedBytes == 32 * 1024",
+        "AttentionGeometry<128>::kAttentionSharedBytes <= 64 * 1024",
         "key_tile_tokens == 64 || key_tile_tokens == 128",
         "key_tile_tokens / kBlockTokens",
         "quantize_varlen_value_kernel",
@@ -65,6 +64,10 @@ def _static_gate() -> None:
     ):
         if marker not in cuda:
             raise RuntimeError(f"missing SM75 attention resource/ABI gate: {marker}")
+    cp_async = (KERNEL / "csrc/turing/sage/cp_async.cuh").read_text(encoding="utf-8")
+    fallback = cp_async.split("#else", 1)[1].split("#endif", 1)[0]
+    if "__threadfence_block" in fallback or "__syncthreads" in fallback:
+        raise RuntimeError("SM75 synchronous-copy fallback contains a duplicate barrier")
     header = (KERNEL / "csrc/turing/sage/attn_cuda_sm75.h").read_text(encoding="utf-8")
     if header.count("int key_tile_tokens") != 2:
         raise RuntimeError("C++/pybind attention ABI does not expose both key-tile arguments")

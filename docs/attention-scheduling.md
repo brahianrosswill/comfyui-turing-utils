@@ -7,8 +7,8 @@ helps when the entire Query grid is smaller than the resident CTA capacity and
 individual tasks have extreme cost variance.
 
 MiniMax H3 does not meet that condition. A 52,842-token, 56-head call launches
-46,256 Query CTAs. Even with two resident 32 KiB CTAs on each of 72 SMs, this is
-over 321 scheduling waves. The observed Sol route-density spread (roughly
+46,256 Query CTAs. Even at two resident CTAs on each of 72 SMs, this is over
+321 scheduling waves. The observed Sol route-density spread (roughly
 0.24--0.32) is not large enough to overcome the atomic queue overhead. The
 runtime therefore keeps the ordinary Query grid.
 

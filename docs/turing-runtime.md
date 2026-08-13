@@ -43,8 +43,8 @@ not skip attention or quantized-kernel preflight.
 | Grouped-codebook W4A8 | shares the W8 activation quantizer; long sequences decode packed g16 codebook values directly into the W8A8 shared tile, with a bounded staged fallback | shares fused W8 SwiGLU/tanh-GELU quantization | BF16 |
 
 The BF16 row-buffer stores one completed rotated row as BF16 and keeps only
-active FHT groups in FP32. Launch selection is constrained to less than 48 KiB
-total shared memory. It does not allocate the full activated or rotated BF16
+active FHT groups in FP32. Launch selection uses the device's opt-in dynamic
+shared-memory limit rather than a fixed 48 KiB policy. It does not allocate the full activated or rotated BF16
 intermediate. A40 compatibility validation shows identical packed INT8/INT4
 values versus the staged operators across K=256, 5376, 7168, and 14336; INT4
 scale differences are at most normal FP32 reduction-order roundoff.
@@ -53,7 +53,7 @@ W4A8 reads packed W4 tiles directly, expands each vector once while filling
 CUTLASS's SM75 crosswise INT8 shared-memory layout, and executes the contraction
 with `m8n8k16` INT8 Tensor Core instructions. Scaling, optional bias, and BF16
 storage stay in the epilogue. It never creates a persistent W8 weight copy and
-keeps every production tile within the default 48 KiB shared-memory limit.
+rejects only tiles that exceed the actual per-device launch limit.
 Non-Tensor-Core-compatible edge dimensions retain a small DP4A compatibility
 kernel so the public API does not silently narrow its accepted shapes.
 
@@ -306,15 +306,16 @@ partials instead of shared atomics. The compact route is then copied into four
 32-bit registers per lane before the arena is reused for exact K/V tiles. The
 D128 FP16-PV compute_75 cubin reports 218 BF16 / 200 FP16 registers per main
 thread, with zero stack/local-memory spill and 32 KiB dynamic shared memory.
-Register and shared-memory limits permit two 128-thread CTAs per SM75; actual
-occupancy and bank behavior still need Nsight confirmation on Turing. Native
+The current resources permit two 128-thread CTAs per SM75; occupancy is reported
+for diagnosis but is not a production gate. Native
 D64 FP16-PV uses 152 BF16 / 159 FP16 registers, no stack or local spill, and
 16 KiB dynamic shared memory.
 
 The D128 W8A8 sparse specialization uses 254 BF16 / 255 FP16 registers per
 thread with zero stack/local-memory spill; 128 threads use at most 32640
-registers per CTA, so the 32 KiB shared-memory and register budgets still
-permit two CTAs on a 64 KiB/65536-register Turing SM. The route-free dense D128
+registers per CTA. This currently permits two CTAs on a 64 KiB/65536-register
+Turing SM, but larger single-CTA candidates remain valid when they reduce K/V
+traffic and total latency. The route-free dense D128
 W8A8 specialization uses 180 registers and no stack/local spill. Native D64
 W8A8 uses 176/175 registers for sparse BF16/FP16 and 134 registers for the
 route-free dense kernel, with no stack/local spill. These resource
@@ -394,7 +395,7 @@ event, synchronization, or allocation.
 ## Validation boundary
 
 Release builds target sm75 for bundled Sage. Static tests validate dispatch,
-fallbacks, loader independence, shapes, dtypes, the 16/32 KiB D64/D128 sparse policy, the public
+fallbacks, loader independence, shapes, dtypes, spill-free SM75 resources, the public
 symbol boundary, and exclusion of the retired Sage1/Sage2 variants. For compatible A40
 validation, build with:
 
