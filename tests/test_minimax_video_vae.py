@@ -118,8 +118,11 @@ class MiniMaxVideoVAETest(unittest.TestCase):
     def test_tiled_decode_matches_full_pointwise_decode(self):
         model = SimpleNamespace(vae_ratio=2, blend=blend, post_quant_conv=lambda x: x)
         z = torch.arange(20, dtype=torch.float32).view(1, 1, 1, 4, 5)
+        progress = mock.Mock()
+        batch_sizes = []
 
         def fake_decode(_model, value, *_args):
+            batch_sizes.append(value.shape[0])
             return value.repeat_interleave(2, -2).repeat_interleave(2, -1)
 
         with mock.patch.object(video_vae, "_decode_pixels", side_effect=fake_decode):
@@ -130,9 +133,19 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 2,
                 {},
                 SimpleNamespace(before_stage=lambda _index: None),
+                3,
+                progress,
             )
         expected = fake_decode(model, z)
         torch.testing.assert_close(actual, expected)
+        self.assertTrue(all(value <= 3 for value in batch_sizes[:-1]))
+        expected_tiles = len(video_vae.split_tiles(8, 4, 2, 2)[0]) * len(
+            video_vae.split_tiles(10, 4, 2, 2)[0]
+        )
+        self.assertEqual(
+            sum(call.args[0] for call in progress.update.call_args_list),
+            expected_tiles,
+        )
 
     def test_tiled_encode_matches_full_pointwise_encode(self):
         model = SimpleNamespace(
@@ -141,9 +154,24 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             _encode_moments=lambda value: value[..., ::2, ::2],
         )
         pixels = torch.arange(80, dtype=torch.float32).view(1, 1, 1, 8, 10)
-        actual = video_vae._tiled_encode(model, pixels, 4, 2)
+        progress = mock.Mock()
+        actual = video_vae._tiled_encode(
+            model,
+            pixels,
+            4,
+            2,
+            tiles_per_batch=3,
+            progress=progress,
+        )
         expected = model._encode_moments(pixels)
         torch.testing.assert_close(actual, expected)
+        expected_tiles = len(video_vae.split_tiles(8, 4, 2, 2)[0]) * len(
+            video_vae.split_tiles(10, 4, 2, 2)[0]
+        )
+        self.assertEqual(
+            sum(call.args[0] for call in progress.update.call_args_list),
+            expected_tiles,
+        )
 
     def test_decoder_node_uses_optimized_runtime(self):
         vae = mock.Mock()
@@ -162,10 +190,11 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             output = nodes.MiniMaxH3VideoVAEDecode().decode(
                 {"samples": latent},
                 vae,
-                "288",
+                "2",
+                "256",
                 "sdpa",
             )[0]
-        run.assert_called_once_with(vae, latent, "288", "sdpa")
+        run.assert_called_once_with(vae, latent, "2", "sdpa", "256")
         self.assertEqual(output.shape, (2, 4, 4, 3))
 
     def test_encoder_node_uses_optimized_runtime(self):
@@ -266,45 +295,75 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         self.assertEqual(writer.staging[1].dtype, torch.float32)
         self.assertTrue(torch.equal(actual, expected))
 
-    def test_tile_presets_are_numeric_and_auto_is_default(self):
-        self.assertEqual(video_vae.TILE_PRESETS[0], "auto")
-        for node in (
-            nodes.MiniMaxH3VideoVAEDecode,
-            nodes.MiniMaxH3VideoVAEEncode,
-        ):
-            required = node.INPUT_TYPES()["required"]
-            self.assertEqual(required["tile_preset"][1]["default"], "auto")
-            self.assertNotIn("tile_size", required)
-            self.assertNotIn("tile_overlap", required)
-            self.assertNotIn("activation_dtype", required)
-        self.assertEqual(video_vae.resolve_tile_preset("256", 720, 1280), 256)
-        self.assertEqual(video_vae.resolve_tile_preset("288", 720, 1280), 288)
-        auto = video_vae.resolve_tile_preset("auto", 720, 1280)
-        self.assertGreaterEqual(auto, 256)
-        self.assertLessEqual(auto, 480)
-        self.assertEqual(auto % 16, 0)
-        with self.assertRaisesRegex(ValueError, "Unknown"):
-            video_vae.resolve_tile_preset("balanced", 720, 1280)
+    def test_stable_tile_geometry_and_batch_controls(self):
+        self.assertEqual(video_vae.TILE_SIZE, 256)
+        self.assertEqual(video_vae.TILES_PER_BATCH[0], "auto")
+        decoder = nodes.MiniMaxH3VideoVAEDecode.INPUT_TYPES()["required"]
+        encoder = nodes.MiniMaxH3VideoVAEEncode.INPUT_TYPES()["required"]
+        self.assertEqual(decoder["tiles_per_batch"][1]["default"], "auto")
+        self.assertEqual(encoder["tiles_per_batch"][1]["default"], "auto")
+        self.assertEqual(decoder["decoder_tile_size"][1]["default"], "256")
+        self.assertNotIn("tile_preset", decoder)
+        self.assertNotIn("tile_preset", encoder)
+        self.assertNotIn("tile_overlap", decoder)
+        self.assertNotIn("activation_dtype", decoder)
 
-    def test_auto_tile_respects_memory_limit(self):
-        estimator = lambda edge: edge**4
-        constrained = video_vae.resolve_tile_preset(
-            "auto",
-            480,
-            848,
-            memory_limit=256**4,
-            memory_estimator=estimator,
-        )
-        unconstrained = video_vae.resolve_tile_preset("auto", 480, 848)
-        self.assertEqual(constrained, 256)
-        self.assertEqual(unconstrained, 480)
-        with self.assertRaisesRegex(ValueError, "supplied together"):
-            video_vae.resolve_tile_preset(
+    def test_auto_tile_batch_respects_memory_limit(self):
+        vae = SimpleNamespace()
+        with mock.patch.object(video_vae, "_tile_memory_budget", return_value=35):
+            selected, estimate = video_vae._select_tiles_per_batch(
+                vae,
                 "auto",
-                480,
-                848,
-                memory_limit=256**4,
+                8,
+                lambda count: count * 10,
+                4,
             )
+        self.assertEqual((selected, estimate), (3, 30))
+        selected, estimate = video_vae._select_tiles_per_batch(
+            vae,
+            "16",
+            5,
+            lambda count: count * 10,
+            2,
+        )
+        self.assertEqual((selected, estimate), (5, 50))
+
+    def test_experimental_decoder_ids_preserve_canonical_spatial_step(self):
+        official = video_vae.h3_vae.create_token_ids(
+            (2, 16, 16), torch.device("cpu"), torch.float32
+        )
+        stable = video_vae._decoder_token_ids(
+            (2, 16, 16), torch.device("cpu"), torch.float32, True
+        )
+        self.assertTrue(torch.equal(stable, official))
+        larger = video_vae._decoder_token_ids(
+            (1, 18, 18), torch.device("cpu"), torch.float32, True
+        ).view(1, 18, 18, 3)
+        self.assertAlmostEqual(float(larger[0, 0, 0, 1]), -1.0625)
+        self.assertAlmostEqual(float(larger[0, 1, 0, 1]), -0.9375)
+        self.assertAlmostEqual(float(larger[0, 0, 0, 2]), -1.0625)
+
+    def test_tile_progress_uses_comfy_progress_bar(self):
+        bar = mock.Mock()
+        with mock.patch.object(
+            video_vae.comfy.utils, "ProgressBar", return_value=bar
+        ) as factory:
+            progress = video_vae._TileProgress(11)
+            progress.update(4)
+            progress.update(3)
+        factory.assert_called_once_with(11)
+        self.assertEqual([call.args[0] for call in bar.update.call_args_list], [4, 3])
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_tile_progress_waits_for_cuda_events_off_thread(self):
+        bar = mock.Mock()
+        with mock.patch.object(video_vae.comfy.utils, "ProgressBar", return_value=bar):
+            progress = video_vae._TileProgress(5, torch.device("cuda"))
+            progress.update(3)
+            progress.update(2)
+            progress.finish()
+        self.assertEqual([call.args[0] for call in bar.update.call_args_list], [3, 2])
+        self.assertIsNone(progress.worker)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_encoder_double_buffer_converts_into_fp16_destination(self):
@@ -333,6 +392,8 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 torch.device("cuda"),
                 256,
                 64,
+                None,
+                1,
                 None,
             )
         self.assertEqual([value.dtype for value in seen], [torch.float16] * 2)
@@ -550,6 +611,8 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 64,
                 {},
                 SimpleNamespace(before_stage=lambda _index: None),
+                1,
+                None,
             )
         self.assertTrue(torch.equal(actual, expected))
 

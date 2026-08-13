@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import math
+import queue
+import threading
 
 import torch
 
@@ -12,6 +14,7 @@ import comfy.model_management
 import comfy.ops
 import comfy.quant_ops
 import comfy.rmsnorm
+import comfy.utils
 import comfy_aimdo.model_vbar
 from comfy.ldm.minimax import vae as h3_vae
 from comfy.ldm.modules.attention import AttentionTensorContainer
@@ -26,10 +29,12 @@ from ...attention.protocol import (
 )
 
 
-TILE_PRESETS = ("auto", "256", "288", "320", "384", "480")
-_FIXED_TILE_EDGES = {str(edge): edge for edge in (256, 288, 320, 384, 480)}
-_AUTO_TILE_EDGES = tuple(range(256, 481, 16))
+TILE_SIZE = 256
 TILE_OVERLAP = 64
+TILES_PER_BATCH = ("auto", "1", "2", "4", "8", "16")
+DECODER_TILE_SIZES = ("256", "288", "320", "384", "480")
+_AUTO_DECODE_TILE_BATCH_LIMIT = 4
+_AUTO_ENCODE_TILE_BATCH_LIMIT = 2
 _DECODER_BYTES_PER_FP16_TOKEN = 64 * 1024
 _ENCODER_BYTES_PER_FP16_PIXEL_FRAME = 1800
 _ENCODER_FIXED_WORKSPACE = 256 * 1024**2
@@ -66,45 +71,19 @@ def split_tiles(input_len: int, tile_size: int, overlap_min: int, ratio: int):
     return starts, [tile_size] * count, overlaps
 
 
-def resolve_tile_preset(
-    preset: str,
-    height: int,
-    width: int,
-    *,
-    memory_limit: int | None = None,
-    memory_estimator=None,
-) -> int:
-    if preset in _FIXED_TILE_EDGES:
-        return _FIXED_TILE_EDGES[preset]
-    if preset != "auto":
-        raise ValueError(f"Unknown H3 VAE tile preset: {preset}")
-    if (memory_limit is None) != (memory_estimator is None):
-        raise ValueError("memory_limit and memory_estimator must be supplied together")
-
-    # Search aligned sizes and minimize repeated tile area. The upper bound
-    # avoids admitting arbitrarily large per-tile activations.
-    best = None
-    for edge in _AUTO_TILE_EDGES:
-        if (
-            memory_estimator is not None
-            and memory_estimator(edge) > memory_limit
-            and edge != 256
-        ):
-            continue
-        _y_starts, y_lengths, _y_overlaps = split_tiles(
-            height, edge, TILE_OVERLAP, 16
-        )
-        _x_starts, x_lengths, _x_overlaps = split_tiles(
-            width, edge, TILE_OVERLAP, 16
-        )
-        processed_area = sum(y_lengths) * sum(x_lengths)
-        candidate = (processed_area, edge)
-        if best is None or candidate < best:
-            best = candidate
-    return best[1]
+def _spatial_tile_count(height, width, tile_size=TILE_SIZE):
+    return len(split_tiles(height, tile_size, TILE_OVERLAP, 16)[0]) * len(
+        split_tiles(width, tile_size, TILE_OVERLAP, 16)[0]
+    )
 
 
-def _decode_memory_requirement(vae, latent_shape, tile_size, dtype):
+def _decode_memory_requirement(
+    vae,
+    latent_shape,
+    tile_size,
+    tiles_per_batch,
+    dtype,
+):
     model = vae.first_stage_model
     height = latent_shape[-2] * model.vae_ratio
     width = latent_shape[-1] * model.vae_ratio
@@ -137,7 +116,11 @@ def _decode_memory_requirement(vae, latent_shape, tile_size, dtype):
     # the gated MLP workspace overlap. The complete decoded chunk also exists
     # as a compute-dtype canvas while FP32 finalized pixels are copied out.
     transformer_workspace = (
-        sequence * _DECODER_BYTES_PER_FP16_TOKEN * dtype_scale
+        latent_shape[0]
+        * sequence
+        * _DECODER_BYTES_PER_FP16_TOKEN
+        * dtype_scale
+        * tiles_per_batch
     )
     pixel_elements = (
         latent_shape[0]
@@ -152,10 +135,18 @@ def _decode_memory_requirement(vae, latent_shape, tile_size, dtype):
     structural_estimate = int(
         (transformer_workspace + pixel_workspace) * _DECODE_SAFETY_FACTOR
     )
+    # ComfyUI's estimate describes one internally tiled sample. Preserve its
+    # fixed allowance and scale only the structural per-tile workspace here.
     return max(official_estimate, structural_estimate)
 
 
-def _encode_memory_requirement(vae, pixel_shape, tile_size, dtype):
+def _encode_memory_requirement(
+    vae,
+    pixel_shape,
+    tile_size,
+    tiles_per_batch,
+    dtype,
+):
     model = vae.first_stage_model
     batch, channels, frames, height, width = pixel_shape
     clip_frames = min(frames, model.clip_length)
@@ -181,6 +172,7 @@ def _encode_memory_requirement(vae, pixel_shape, tile_size, dtype):
         * tile_width
         * _ENCODER_BYTES_PER_FP16_PIXEL_FRAME
         * dtype_scale
+        * tiles_per_batch
     )
     buffer_count = 2 if frames > model.clip_length else 1
     input_buffers = (
@@ -210,28 +202,85 @@ def _tile_memory_budget(vae):
     )
 
 
-def _select_tile(vae, preset, height, width, memory_estimator):
-    if preset == "auto":
-        budget = _tile_memory_budget(vae)
-        tile_size = resolve_tile_preset(
-            preset,
-            height,
-            width,
-            memory_limit=budget,
-            memory_estimator=memory_estimator,
-        )
-        estimate = memory_estimator(tile_size)
-        log = logging.warning if estimate > budget else logging.info
-        log(
-            "MiniMax H3 VAE auto tile selected %dpx: estimated %.0f MiB, available %.0f MiB%s",
-            tile_size,
-            estimate / 1024**2,
-            budget / 1024**2,
-            " (minimum tile exceeds the current budget)" if estimate > budget else "",
-        )
-        return tile_size, estimate
-    tile_size = resolve_tile_preset(preset, height, width)
-    return tile_size, memory_estimator(tile_size)
+def _select_tiles_per_batch(
+    vae,
+    preset,
+    tile_count,
+    memory_estimator,
+    auto_limit,
+):
+    if preset != "auto":
+        try:
+            selected = int(preset)
+        except (TypeError, ValueError) as error:
+            raise ValueError(f"Unknown H3 VAE tiles_per_batch value: {preset}") from error
+        if selected < 1:
+            raise ValueError("H3 VAE tiles_per_batch must be at least one")
+        selected = min(selected, tile_count)
+        return selected, memory_estimator(selected)
+
+    budget = _tile_memory_budget(vae)
+    selected = 1
+    for candidate in range(2, min(tile_count, auto_limit) + 1):
+        if memory_estimator(candidate) > budget:
+            break
+        selected = candidate
+    estimate = memory_estimator(selected)
+    log = logging.warning if estimate > budget else logging.info
+    log(
+        "MiniMax H3 VAE auto tile batch selected %d/%d: estimated %.0f MiB, available %.0f MiB%s",
+        selected,
+        tile_count,
+        estimate / 1024**2,
+        budget / 1024**2,
+        " (one tile exceeds the current budget)" if estimate > budget else "",
+    )
+    return selected, estimate
+
+
+class _TileProgress:
+    def __init__(self, total, device=None):
+        self.total = int(total)
+        self.bar = comfy.utils.ProgressBar(self.total)
+        self.device = torch.device(device) if device is not None else torch.device("cpu")
+        self.pending = None
+        self.worker = None
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            self.pending = queue.Queue()
+            self.worker = threading.Thread(
+                target=self._consume,
+                name="h3-vae-tile-progress",
+                daemon=True,
+            )
+            self.worker.start()
+
+    def _consume(self):
+        while True:
+            item = self.pending.get()
+            if item is None:
+                return
+            event, count = item
+            try:
+                event.synchronize()
+                self.bar.update(count)
+            except RuntimeError:
+                logging.exception("H3 VAE tile progress event failed")
+
+    def update(self, count):
+        count = int(count)
+        if self.worker is None:
+            self.bar.update(count)
+            return
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(self.device))
+        self.pending.put((event, count))
+
+    def finish(self):
+        if self.worker is None:
+            return
+        self.pending.put(None)
+        self.worker.join()
+        self.worker = None
 
 
 def _norm_weight(module, name, reference):
@@ -461,7 +510,28 @@ def _fused_swiglu_eligible(linear):
     )
 
 
-def _decoder_forward(decoder, x, transformer_options, block_session):
+def _decoder_token_ids(patch_dims, device, dtype, canonical_spatial=False):
+    coords_list = []
+    for axis, dim_size in enumerate(patch_dims):
+        coords = torch.arange(0.5, dim_size, dtype=dtype, device=device)
+        if canonical_spatial and axis > 0 and dim_size > TILE_SIZE // 16:
+            # Preserve the spatial phase increment of a 256px/16-token tile.
+            # Centering keeps a larger experimental tile symmetric around zero.
+            coords = (coords - dim_size / 2) / (TILE_SIZE // 32)
+        else:
+            coords = 2.0 * (coords / dim_size) - 1.0
+        coords_list.append(coords)
+    coords = torch.stack(torch.meshgrid(*coords_list, indexing="ij"), dim=-1)
+    return coords.flatten(0, len(patch_dims) - 1).unsqueeze(0)
+
+
+def _decoder_forward(
+    decoder,
+    x,
+    transformer_options,
+    block_session,
+    canonical_spatial=False,
+):
     batch, _, latent_t, latent_h, latent_w = x.shape
     h = decoder.x_embedder(x.flatten(2).transpose(1, 2))
     num_patches = h.shape[1]
@@ -475,8 +545,11 @@ def _decoder_forward(decoder, x, transformer_options, block_session):
         dim=1,
     )
 
-    img_ids = h3_vae.create_token_ids(
-        (latent_t, latent_h, latent_w), x.device, x.dtype
+    img_ids = _decoder_token_ids(
+        (latent_t, latent_h, latent_w),
+        x.device,
+        x.dtype,
+        canonical_spatial,
     ).expand(batch, -1, -1)
     suffix_ids = torch.zeros(
         (batch, num_suffix, 3), device=x.device, dtype=img_ids.dtype
@@ -519,10 +592,22 @@ def _decoder_forward(decoder, x, transformer_options, block_session):
     )
 
 
-def _decode_pixels(model, z, transformer_options, block_session):
+def _decode_pixels(
+    model,
+    z,
+    transformer_options,
+    block_session,
+    canonical_spatial=False,
+):
     block_session.before_stage(0)
     z = model.post_quant_conv(z)
-    return _decoder_forward(model.decoder, z, transformer_options, block_session)
+    return _decoder_forward(
+        model.decoder,
+        z,
+        transformer_options,
+        block_session,
+        canonical_spatial,
+    )
 
 
 def _tiled_decode(
@@ -532,6 +617,8 @@ def _tiled_decode(
     tile_overlap,
     transformer_options,
     block_session,
+    tiles_per_batch=1,
+    progress=None,
 ):
     height = z.shape[-2] * model.vae_ratio
     width = z.shape[-1] * model.vae_ratio
@@ -542,22 +629,47 @@ def _tiled_decode(
         width, tile_size, tile_overlap, model.vae_ratio
     )
 
-    canvas = None
-    row_tails = []
-    out_y = 0
+    descriptors = []
     for i, (i_pos, i_len) in enumerate(zip(y_idx, y_len)):
         zi, zl = i_pos // model.vae_ratio, i_len // model.vae_ratio
-        new_tails = []
-        left_tail = None
-        out_x = 0
         for j, (j_pos, j_len) in enumerate(zip(x_idx, x_len)):
             zj, zw = j_pos // model.vae_ratio, j_len // model.vae_ratio
-            tile = _decode_pixels(
-                model,
-                z[..., zi : zi + zl, zj : zj + zw],
-                transformer_options,
-                block_session,
-            )
+            descriptors.append((i, j, zi, zl, zj, zw))
+
+    canvas = None
+    row_tails = []
+    new_tails = []
+    left_tail = None
+    current_row = 0
+    out_y = 0
+    out_x = 0
+    last_height = 0
+    source_batch = z.shape[0]
+    canonical_spatial = tile_size != TILE_SIZE
+    for start in range(0, len(descriptors), tiles_per_batch):
+        group = descriptors[start : start + tiles_per_batch]
+        inputs = [
+            z[..., zi : zi + zl, zj : zj + zw]
+            for _i, _j, zi, zl, zj, zw in group
+        ]
+        batched = inputs[0] if len(inputs) == 1 else torch.cat(inputs, dim=0)
+        decoded = _decode_pixels(
+            model,
+            batched,
+            transformer_options,
+            block_session,
+            canonical_spatial,
+        )
+        decoded_tiles = decoded.split(source_batch, dim=0)
+
+        for (i, j, _zi, _zl, _zj, _zw), tile in zip(group, decoded_tiles):
+            if i != current_row:
+                row_tails = new_tails
+                new_tails = []
+                left_tail = None
+                out_y += last_height
+                out_x = 0
+                current_row = i
             if i < len(y_idx) - 1:
                 new_tails.append(tile[..., -y_overlap[i] :, :].clone())
             next_left_tail = (
@@ -584,8 +696,9 @@ def _tiled_decode(
                 ..., out_y : out_y + tile.shape[-2], out_x : out_x + tile.shape[-1]
             ].copy_(tile)
             out_x += tile.shape[-1]
-        row_tails = new_tails
-        out_y += tile.shape[-2]
+            last_height = tile.shape[-2]
+        if progress is not None:
+            progress.update(len(group))
     return canvas
 
 
@@ -611,7 +724,15 @@ def _encode_moments(model, x, module_session):
     return model.quant_conv(model.encoder.conv_out(h))
 
 
-def _tiled_encode(model, x, tile_size, tile_overlap, module_session=None):
+def _tiled_encode(
+    model,
+    x,
+    tile_size,
+    tile_overlap,
+    module_session=None,
+    tiles_per_batch=1,
+    progress=None,
+):
     height, width = x.shape[-2:]
     y_idx, y_len, y_overlap = split_tiles(
         height, tile_size, tile_overlap, model.vae_ratio
@@ -620,13 +741,27 @@ def _tiled_encode(model, x, tile_size, tile_overlap, module_session=None):
         width, tile_size, tile_overlap, model.vae_ratio
     )
 
-    rows = []
-    for i_pos, i_len in zip(y_idx, y_len):
-        row = []
-        for j_pos, j_len in zip(x_idx, x_len):
-            tile = x[..., i_pos : i_pos + i_len, j_pos : j_pos + j_len]
-            row.append(_encode_moments(model, tile, module_session))
-        rows.append(row)
+    descriptors = [
+        (i, j, i_pos, i_len, j_pos, j_len)
+        for i, (i_pos, i_len) in enumerate(zip(y_idx, y_len))
+        for j, (j_pos, j_len) in enumerate(zip(x_idx, x_len))
+    ]
+    rows = [[None] * len(x_idx) for _ in y_idx]
+    source_batch = x.shape[0]
+    for start in range(0, len(descriptors), tiles_per_batch):
+        group = descriptors[start : start + tiles_per_batch]
+        inputs = [
+            x[..., i_pos : i_pos + i_len, j_pos : j_pos + j_len]
+            for _i, _j, i_pos, i_len, j_pos, j_len in group
+        ]
+        batched = inputs[0] if len(inputs) == 1 else torch.cat(inputs, dim=0)
+        encoded = _encode_moments(model, batched, module_session)
+        for (i, j, *_bounds), tile in zip(
+            group, encoded.split(source_batch, dim=0)
+        ):
+            rows[i][j] = tile
+        if progress is not None:
+            progress.update(len(group))
 
     latent_y_overlap = [value // model.vae_ratio for value in y_overlap]
     latent_x_overlap = [value // model.vae_ratio for value in x_overlap]
@@ -738,6 +873,8 @@ def _decode_temporal(
     tile_overlap,
     transformer_options,
     block_session,
+    tiles_per_batch,
+    progress,
 ):
     chunk_dec = model.tokens_chunk_size * model.vae_ratio_t
     split_count = int(model.token_drop > 0) + 1
@@ -765,6 +902,8 @@ def _decode_temporal(
             tile_overlap,
             transformer_options,
             block_session,
+            tiles_per_batch,
+            progress,
         )
 
         for j in range(split_count):
@@ -789,22 +928,45 @@ def _decode_temporal(
 def decode_video(
     vae,
     latent,
-    tile_preset="auto",
+    tiles_per_batch="auto",
     attention="sdpa",
+    decoder_tile_size="256",
 ):
     model = require_h3_video_vae(vae)
     # H3 advertises FP16/FP32 to ComfyUI and defaults to FP16 on supported
     # NVIDIA GPUs, including Turing.  Follow the dtype used to load this VAE so
     # an explicit global --fp32-vae override cannot create mixed-dtype modules.
     compute_dtype = vae.vae_dtype
-    tile_size, memory = _select_tile(
-        vae,
-        tile_preset,
+    try:
+        tile_size = int(decoder_tile_size)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            f"Unknown H3 VAE decoder tile size: {decoder_tile_size}"
+        ) from error
+    if str(tile_size) not in DECODER_TILE_SIZES:
+        raise ValueError(f"Unknown H3 VAE decoder tile size: {decoder_tile_size}")
+    if tile_size != TILE_SIZE:
+        logging.warning(
+            "MiniMax H3 VAE decoder tile %d is experimental; using canonical 256px spatial RoPE spacing",
+            tile_size,
+        )
+    tile_count = _spatial_tile_count(
         latent.shape[-2] * model.vae_ratio,
         latent.shape[-1] * model.vae_ratio,
-        lambda edge: _decode_memory_requirement(
-            vae, latent.shape, edge, compute_dtype
+        tile_size,
+    )
+    batch_tiles, memory = _select_tiles_per_batch(
+        vae,
+        tiles_per_batch,
+        tile_count,
+        lambda count: _decode_memory_requirement(
+            vae,
+            latent.shape,
+            tile_size,
+            count,
+            compute_dtype,
         ),
+        _AUTO_DECODE_TILE_BATCH_LIMIT,
     )
     tile_overlap = TILE_OVERLAP
     comfy.model_management.load_models_gpu(
@@ -812,12 +974,17 @@ def decode_video(
     )
 
     block_session = None
+    progress = None
     try:
         transformer_options = _attention_options(attention, vae.device)
         z = latent.to(device=vae.device, dtype=compute_dtype)
         mean = model.latents_mean.view(1, -1, 1, 1, 1).to(z)
         std = model.latents_std.view(1, -1, 1, 1, 1).to(z)
         z = z * std + mean
+        temporal_chunks = (
+            1 if z.shape[2] == 1 else model._decode_temporal_chunks(z.shape[2])[1]
+        )
+        progress = _TileProgress(tile_count * temporal_chunks, z.device)
         block_session = _RetainedWeights(_decoder_weight_stages(model), z.device, True)
         block_session.start()
         if z.shape[2] == 1:
@@ -828,6 +995,8 @@ def decode_video(
                 tile_overlap,
                 transformer_options,
                 block_session,
+                batch_tiles,
+                progress,
             )[:, :, -1:]
             dec = model._finalize_pixels(dec)
             return dec.to(vae.output_device).movedim(1, -1)
@@ -838,22 +1007,36 @@ def decode_video(
             tile_overlap,
             transformer_options,
             block_session,
+            batch_tiles,
+            progress,
         )
         return dec.movedim(1, -1)
     finally:
+        if progress is not None:
+            progress.finish()
         if block_session is not None:
             block_session.finish()
         _clear_attention_caches(model.decoder)
         vae.patcher.partially_unload(vae.patcher.offload_device, 1e30)
 
 
-def _encode_clip(model, clip, tile_size, tile_overlap, module_session=None):
+def _encode_clip(
+    model,
+    clip,
+    tile_size,
+    tile_overlap,
+    module_session=None,
+    tiles_per_batch=1,
+    progress=None,
+):
     return _tiled_encode(
         model,
         model._normalize_pixels(clip),
         tile_size,
         tile_overlap,
         module_session,
+        tiles_per_batch,
+        progress,
     )
 
 
@@ -865,6 +1048,8 @@ def _encode_temporal(
     tile_size,
     tile_overlap,
     module_session,
+    tiles_per_batch,
+    progress,
 ):
     z_list = []
     for start in range(0, x.shape[2], model.clip_length):
@@ -875,7 +1060,15 @@ def _encode_temporal(
             pad = clip[:, :, -1:].repeat(1, 1, model.clip_length - clip.shape[2], 1, 1)
             clip = torch.cat((clip, pad), dim=2)
         z_list.append(
-            _encode_clip(model, clip, tile_size, tile_overlap, module_session)
+            _encode_clip(
+                model,
+                clip,
+                tile_size,
+                tile_overlap,
+                module_session,
+                tiles_per_batch,
+                progress,
+            )
         )
     z = torch.cat(z_list, dim=2)
     return z[:, :, : -model.token_drop] if model.token_drop > 0 else z
@@ -890,6 +1083,8 @@ def _encode_temporal_buffered(
     tile_size,
     tile_overlap,
     module_session,
+    tiles_per_batch,
+    progress,
 ):
     copy_stream = torch.cuda.Stream(device=device)
     staging = [None, None]
@@ -947,6 +1142,8 @@ def _encode_temporal_buffered(
                 tile_size,
                 tile_overlap,
                 module_session,
+                tiles_per_batch,
+                progress,
             )
         )
         done = torch.cuda.Event()
@@ -965,21 +1162,31 @@ class _PinnedBufferUnavailable(RuntimeError):
 def encode_video(
     vae,
     pixels,
-    tile_preset="auto",
+    tiles_per_batch="auto",
 ):
     model = require_h3_video_vae(vae)
     pixels = vae.vae_encode_crop_pixels(pixels).movedim(-1, 1)
     if pixels.ndim < 5:
         pixels = pixels.movedim(1, 0).unsqueeze(0)
     compute_dtype = vae.vae_dtype
-    tile_size, memory = _select_tile(
-        vae,
-        tile_preset,
+    tile_size = TILE_SIZE
+    tile_count = _spatial_tile_count(
         pixels.shape[-2],
         pixels.shape[-1],
-        lambda edge: _encode_memory_requirement(
-            vae, pixels.shape, edge, compute_dtype
+        tile_size,
+    )
+    batch_tiles, memory = _select_tiles_per_batch(
+        vae,
+        tiles_per_batch,
+        tile_count,
+        lambda count: _encode_memory_requirement(
+            vae,
+            pixels.shape,
+            tile_size,
+            count,
+            compute_dtype,
         ),
+        _AUTO_ENCODE_TILE_BATCH_LIMIT,
     )
     tile_overlap = TILE_OVERLAP
     comfy.model_management.load_models_gpu(
@@ -987,11 +1194,18 @@ def encode_video(
     )
 
     module_session = None
+    progress = None
     try:
         module_session = _RetainedWeights(
             _encoder_weight_stages(model), vae.device, True
         )
         module_session.start()
+        temporal_clips = (
+            1
+            if pixels.shape[2] == 1
+            else math.ceil(pixels.shape[2] / model.clip_length)
+        )
+        progress = _TileProgress(tile_count * temporal_clips, vae.device)
         if pixels.shape[2] == 1:
             x = vae.process_input(pixels).float().to(vae.device)
             if x.dtype != compute_dtype:
@@ -1002,6 +1216,8 @@ def encode_video(
                 tile_size,
                 tile_overlap,
                 module_session,
+                batch_tiles,
+                progress,
             )[:, :, -1:]
         elif pixels.device.type == "cpu" and torch.cuda.is_available():
             try:
@@ -1014,6 +1230,8 @@ def encode_video(
                     tile_size,
                     tile_overlap,
                     module_session,
+                    batch_tiles,
+                    progress,
                 )
             except _PinnedBufferUnavailable:
                 comfy.model_management.synchronize()
@@ -1029,6 +1247,8 @@ def encode_video(
                     tile_size,
                     tile_overlap,
                     module_session,
+                    batch_tiles,
+                    progress,
                 )
         else:
             x = vae.process_input(pixels).float()
@@ -1040,6 +1260,8 @@ def encode_video(
                 tile_size,
                 tile_overlap,
                 module_session,
+                batch_tiles,
+                progress,
             )
         mean = torch.chunk(moments.float(), 2, dim=1)[0]
         latent_mean = model.latents_mean.view(1, -1, 1, 1, 1).to(mean)
@@ -1048,6 +1270,8 @@ def encode_video(
             device=vae.output_device, dtype=torch.float32
         )
     finally:
+        if progress is not None:
+            progress.finish()
         if module_session is not None:
             module_session.finish()
         vae.patcher.partially_unload(vae.patcher.offload_device, 1e30)

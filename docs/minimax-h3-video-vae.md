@@ -33,13 +33,17 @@ does not disable cross-tile weight retention.
 
 ## Independent options
 
-- `tile_preset` is `auto` by default. Numeric choices (`256`, `288`, `320`,
-  `384`, and `480`) are the internal tile edge in pixels. `auto` searches
-  16-pixel-aligned edges from 256 through 480, rejects candidates whose
-  predicted peak exceeds ComfyUI's current available/reclaimable memory, and
-  minimizes repeated tile area among the remaining candidates. Spatial overlap
-  remains fixed at the H3 default of 64 pixels. Numeric presets are strict and
-  intentionally ignore the adaptive budget.
+- Spatial tiling is fixed to H3's quality-stable 256px edge and 64px overlap.
+  `tiles_per_batch` controls how many independent tiles execute together.
+  `auto` chooses the largest useful batch predicted to fit ComfyUI's current
+  available/reclaimable memory, capped at 2 for the encoder and 4 for the
+  decoder based on static A40 throughput. Numeric values are strict requests
+  capped only by the number of tiles in the frame.
+- Decoder `decoder_tile_size` is 256 by default. Larger numeric values are
+  retained only as explicit experiments. They keep the spatial RoPE increment
+  of a 256px tile instead of renormalizing every larger tile back to `[-1, 1]`,
+  but they still change transformer context and are not quality-equivalent to
+  the official geometry. Encoder geometry is never changed.
 - decoder `attention` selects SDPA, Sage, or W8A8-QK for this VAE call only.
   SDPA is the default. On Turing, container-owned BF16 Q/K/V are converted to
   FP16 before SDPA so PyTorch does not select the BF16 math fallback.
@@ -53,6 +57,9 @@ The following behaviors are automatic rather than node switches:
 - a compatible TensorWise W8A8 `w2` quantizer consumes SwiGLU directly; dense
   weights retain the eager path;
 - two reusable pinned FP32 pixel buffers overlap transfers with compute;
+- independent spatial tiles are concatenated on the batch dimension, never on
+  the sequence dimension. Attention therefore cannot cross tile boundaries and
+  no block-diagonal mask or masked recomputation is required;
 - encoder copies convert directly from pinned FP32 source storage into GPU
   buffers of the selected activation dtype, avoiding two persistent FP32 GPU
   clips and a separate activation cast in the default FP16 path;
@@ -65,6 +72,13 @@ The following behaviors are automatic rather than node switches:
 If Windows or the current RAM budget cannot provide the pinned buffers, the
 nodes preserve correctness and fall back to synchronous FP32 copies.
 
+Both nodes publish a ComfyUI progress bar whose total is the number of spatial
+tiles multiplied by the number of temporal clips/chunks. Every kernel batch
+advances it by the actual number of tiles in that batch, including a shorter
+final batch. CUDA events feed the bar from a small background consumer only
+after each batch really finishes; this keeps its ETA meaningful without
+synchronizing the main submission stream or disabling transfer/compute overlap.
+
 ## Current validation status
 
 The custom decoder and encoder equations are tested against ComfyUI's reference
@@ -73,26 +87,20 @@ The retained-weight lifecycle is tested for both success and allocation-failure
 cleanup.
 
 On an A40 with the complete 2.6B-parameter H3 VAE architecture and identical
-zeroed FP16 weights, the custom 256 path matched the official runtime and output
-exactly. Adaptive tiles reduced one-chunk decoder time from 2.22 s to 1.12 s at
-480x848 and from 4.19 s to 2.94 s at 720x1280. A two-clip encoder improved from
-5.21 s to 2.42 s and from 9.74 s to 6.73 s respectively. The speed comes from
-eliminating repeated tile work rather than a faster fixed-256 implementation.
-The zero-weight auto outputs were also identical, but that does not establish
-real-checkpoint quality: changing tile boundaries changes the context seen by
-the decoder transformer and must be visually validated with real weights.
+zeroed FP16 weights, the custom single-tile-batch 256 path matched the official
+runtime and output exactly. Direct real-checkpoint testing later showed visible
+grids for non-256 tiles, even though the custom arbitrary-size assembly was
+bitwise equal to ComfyUI's reference implementation with the same overridden
+tile size. This isolates the problem to H3's tile-conditioned decoder behavior,
+not the overlap copier, and is why automatic geometry selection was removed.
 
-Larger tiles exchange memory for speed. The measured encoder peaks were 7058
-MiB at 480x848/480px and 5094 MiB at 720x1280/400px. The tile-aware estimates
-were 7412 MiB and 5360 MiB, while the 256 estimates retain additional safety
-margin. The estimator includes H3 CNN/transformer workspaces, full decoded
-chunk residency, finalized pixel copies, and encoder double buffers rather than
-reusing ComfyUI's 256-oriented bounded-tile estimate unchanged.
-
-With a 3 GiB activation budget, auto selected 272px at 480x848 (2355 MiB
-measured, 2619 MiB estimated, 3.18 s) and 288px at 720x1280 (2777 MiB measured,
-2999 MiB estimated, 7.94 s). These remained about 1.64x and 1.23x faster than
-the corresponding official 256 runs while respecting the constrained budget.
+The batch-aware estimator scales the H3 CNN/transformer workspace with
+`tiles_per_batch` while counting the full decoded canvas, finalized pixel copy,
+and encoder double buffers only once. On the same A40 setup, decoder batch
+1/2/4 took 0.673/0.325/0.313 seconds, while encoder batch 1/2/4 took
+2.795/2.560/2.567 seconds with 2.37/4.36/8.33 GiB peaks. Every batched result
+was bitwise equal to batch 1. Real-checkpoint throughput and peak memory still
+need validation on the target Turing card.
 
 Dense SwiGLU routing was bitwise identical but slightly slower, so automatic
 fusion is restricted to compatible W8A8 weights. Sage and SDPA did not beat the

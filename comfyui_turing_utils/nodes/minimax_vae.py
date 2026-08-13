@@ -5,7 +5,8 @@ from __future__ import annotations
 import comfy.model_management
 
 from ..adapters.minimax.video_vae import (
-    TILE_PRESETS,
+    DECODER_TILE_SIZES,
+    TILES_PER_BATCH,
     decode_video,
     encode_video,
     require_h3_video_vae,
@@ -19,11 +20,18 @@ class MiniMaxH3VideoVAEDecode:
             "required": {
                 "samples": ("LATENT",),
                 "vae": ("VAE",),
-                "tile_preset": (
-                    TILE_PRESETS,
+                "tiles_per_batch": (
+                    TILES_PER_BATCH,
                     {
                         "default": "auto",
-                        "tooltip": "Internal spatial tile edge in output pixels. auto chooses an aligned 256-480 tile for the current frame size and ComfyUI's current memory budget; overlap is fixed at 64 pixels.",
+                        "tooltip": "Number of independent 256px tiles evaluated together on the batch dimension. auto chooses up to 4 tiles within ComfyUI's current memory budget.",
+                    },
+                ),
+                "decoder_tile_size": (
+                    DECODER_TILE_SIZES,
+                    {
+                        "default": "256",
+                        "tooltip": "256 is the quality-stable H3 tile geometry. Larger values are explicit experiments that preserve 256px spatial RoPE spacing but still change transformer context and can change the image.",
                     },
                 ),
                 "attention": (
@@ -49,7 +57,8 @@ class MiniMaxH3VideoVAEDecode:
         self,
         samples,
         vae,
-        tile_preset,
+        tiles_per_batch,
+        decoder_tile_size,
         attention,
     ):
         require_h3_video_vae(vae)
@@ -60,8 +69,9 @@ class MiniMaxH3VideoVAEDecode:
             images = decode_video(
                 vae,
                 latent,
-                tile_preset,
+                tiles_per_batch,
                 attention,
+                decoder_tile_size,
             )
         if images.ndim == 5:
             images = images.reshape(-1, *images.shape[-3:])
@@ -75,11 +85,11 @@ class MiniMaxH3VideoVAEEncode:
             "required": {
                 "pixels": ("IMAGE",),
                 "vae": ("VAE",),
-                "tile_preset": (
-                    TILE_PRESETS,
+                "tiles_per_batch": (
+                    TILES_PER_BATCH,
                     {
                         "default": "auto",
-                        "tooltip": "Internal spatial tile edge in input pixels. auto chooses an aligned 256-480 tile for the current frame size and ComfyUI's current memory budget; overlap is fixed at 64 pixels.",
+                        "tooltip": "Number of independent official 256px tiles evaluated together on the batch dimension. auto chooses up to 2 tiles within ComfyUI's current memory budget.",
                     },
                 ),
             }
@@ -98,13 +108,13 @@ class MiniMaxH3VideoVAEEncode:
         self,
         pixels,
         vae,
-        tile_preset,
+        tiles_per_batch,
     ):
         require_h3_video_vae(vae)
         with comfy.model_management.cuda_device_context(vae.device):
             latent = encode_video(
                 vae,
                 pixels,
-                tile_preset,
+                tiles_per_batch,
             )
         return ({"samples": latent},)
