@@ -10,7 +10,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_ARCH_LIST = "7.5;8.0;8.6;8.9"
+DEFAULT_ARCH_LIST = "7.5"
 
 
 def run(cmd: list[str], env: dict[str, str]) -> None:

@@ -1025,9 +1025,10 @@ void turing_w4a8_linear(Tensor activation,
     const int k = static_cast<int>(k64);
     const cudaStream_t stream = getCurrentCUDAStream();
 
-    // The public binding pads K to the m8n8k16 instruction boundary. Keep this
-    // guard at the CUDA ABI boundary so direct callers cannot silently enter a
-    // scalar full-matrix fallback.
+    // Keep the K-tail guard at the CUDA ABI boundary so direct callers cannot
+    // silently enter a scalar full-matrix fallback. The normal dispatcher pads
+    // contractions when profitable, while this path remains correct for direct
+    // or deliberately unpadded calls.
     if (k % 16 != 0) {
         const bool launched = m <= 2048
             ? run_k_tail_tile<64, 128, 32, 64>(

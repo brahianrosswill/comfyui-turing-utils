@@ -112,28 +112,6 @@ void quant_per_warp_int8_varlen_cuda(
                 bool rotate);
 
 
-void transpose_pad_permute_cuda(
-                at::Tensor input,
-                at::Tensor output,
-                int tensor_layout);
-
-void scale_fuse_quant_cuda(
-                at::Tensor input,
-                at::Tensor output,
-                at::Tensor scale,
-                int num_tokens,
-                float scale_max,
-                int tensor_layout);
-
-void mean_scale_fuse_quant_cuda(
-                at::Tensor input,
-                at::Tensor output,
-                at::Tensor mean,
-                at::Tensor scale,
-                int num_tokens,
-                float scale_max,
-                int tensor_layout);
-
 void varlen_attention_fwd_cuda(
                 at::Tensor query,
                 at::Tensor key,

@@ -335,13 +335,16 @@ def _windows_cccl_include_dirs() -> list[str]:
 
 
 def _arch_list() -> str:
-    value = os.environ.get("COMFYUI_TURING_UTILS_ARCH_LIST", "7.5;8.0;8.6;8.9")
+    # Production installs target exact Turing by default.  Developers and wheel
+    # builders can still request Ampere, Ada, Hopper, or PTX explicitly without
+    # making every local Turing install compile unused architectures.
+    value = os.environ.get("COMFYUI_TURING_UTILS_ARCH_LIST", "7.5")
     arches = []
     for raw in value.replace(",", ";").split(";"):
         arch = raw.strip()
         if not arch:
             continue
-        if arch in {"75", "80", "86", "89"}:
+        if arch in {"75", "80", "86", "89", "90"}:
             arch = f"{arch[0]}.{arch[1]}"
         arches.append(arch)
     return ";".join(arches)
@@ -514,7 +517,7 @@ if _includes_sm75():
 
 setup(
     name="comfyui-turing-utils-kernel",
-    version="0.25.0",
+    version="0.25.1",
     packages=find_packages(where=str(ROOT)),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

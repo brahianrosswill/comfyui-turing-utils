@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = ROOT / "kernel"
 COMFYUI_ROOT = ROOT.parents[1]
-EXPECTED_VERSION = "0.25.0"
+EXPECTED_VERSION = "0.25.1"
 
 
 def _run(command: list[str], *, cwd: Path = ROOT, env=None) -> None:
@@ -78,6 +78,7 @@ def _static_gate() -> None:
     for marker in (
         "CUDA_TOOLKIT_VERSION = _cuda_toolkit_version()",
         "def _normalize_cxx_standard(",
+        'os.environ.get("COMFYUI_TURING_UTILS_ARCH_LIST", "7.5")',
         'return "c++20" if cuda_version is None or cuda_version >= (12, 0) else "c++17"',
         '"COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD", DEFAULT_CXX_STANDARD',
     ):
@@ -87,6 +88,7 @@ def _static_gate() -> None:
             )
     wheel_builder = (KERNEL / "scripts/build_wheel.py").read_text(encoding="utf-8")
     for marker in (
+        'DEFAULT_ARCH_LIST = "7.5"',
         "def configure_cuda_home(",
         'prefix / "Library" if platform.system() == "Windows" else prefix',
         'env.setdefault("CUDA_HOME", str(root.resolve()))',
@@ -95,7 +97,23 @@ def _static_gate() -> None:
             raise RuntimeError(
                 "the standalone wheel builder cannot discover Conda NVCC"
             )
-    fused_header = (KERNEL / "csrc/turing/sage/fused.h").read_text(encoding="utf-8")
+    fused_source = (KERNEL / "csrc/turing/sage/fused.cu").read_text(
+        encoding="utf-8"
+    )
+    fused_header = (KERNEL / "csrc/turing/sage/fused.h").read_text(
+        encoding="utf-8"
+    )
+    for retired_fp8_helper in (
+        "TransposePadPermuteKernel",
+        "MeanScaleKernel",
+        "transpose_pad_permute_cuda",
+        "scale_fuse_quant_cuda",
+        "mean_scale_fuse_quant_cuda",
+    ):
+        if retired_fp8_helper in fused_source or retired_fp8_helper in fused_header:
+            raise RuntimeError(
+                f"retired Sage2/FP8 helper remains in the production build: {retired_fp8_helper}"
+            )
     fused_binding = (KERNEL / "csrc/turing/sage/pybind_fused.cpp").read_text(
         encoding="utf-8"
     )

@@ -92,11 +92,61 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(
             "csrc/turing/sage/qk_preprocess.cu", extensions[2].kwargs["sources"]
         )
-        self.assertEqual(setup.call_args.kwargs["version"], "0.25.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.25.1")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
         })
+
+    def test_default_arch_is_turing_and_explicit_hopper_remains_supported(self):
+        setup_source = SETUP_PATH.read_text(encoding="utf-8")
+        wheel_source = (
+            PLUGIN_ROOT / "kernel" / "scripts" / "build_wheel.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            'os.environ.get("COMFYUI_TURING_UTILS_ARCH_LIST", "7.5")',
+            setup_source,
+        )
+        self.assertIn('{"75", "80", "86", "89", "90"}', setup_source)
+        self.assertIn('DEFAULT_ARCH_LIST = "7.5"', wheel_source)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            include_dir = Path(temp_dir) / "cutlass" / "include"
+            self._make_cutlass_headers(include_dir)
+            environment = {
+                "COMFYUI_TURING_UTILS_ARCH_LIST": "8.0;8.6;8.9;90",
+                "COMFYUI_TURING_UTILS_CUTLASS_INCLUDE_DIR": str(include_dir),
+            }
+            with (
+                mock.patch.dict(os.environ, environment, clear=True),
+                mock.patch.object(platform, "system", return_value="Linux"),
+                mock.patch("torch.utils.cpp_extension.CUDAExtension", side_effect=self._extension),
+                mock.patch("torch.utils.cpp_extension.BuildExtension", object()),
+                mock.patch("setuptools.setup") as setup,
+            ):
+                namespace = runpy.run_path(
+                    str(SETUP_PATH), run_name="__turing_utils_multiarch_setup_test__"
+                )
+
+        self.assertEqual(namespace["ARCH_LIST"], "8.0;8.6;8.9;9.0")
+        self.assertEqual(
+            [extension.name for extension in setup.call_args.kwargs["ext_modules"]],
+            ["comfyui_turing_utils_kernel._C"],
+        )
+
+    def test_retired_sage2_fp8_helpers_are_not_compiled(self):
+        sage_dir = PLUGIN_ROOT / "kernel" / "csrc" / "turing" / "sage"
+        production_source = (sage_dir / "fused.cu").read_text(encoding="utf-8")
+        production_header = (sage_dir / "fused.h").read_text(encoding="utf-8")
+        for marker in (
+            "TransposePadPermuteKernel",
+            "MeanScaleKernel",
+            "transpose_pad_permute_cuda",
+            "scale_fuse_quant_cuda",
+            "mean_scale_fuse_quant_cuda",
+        ):
+            self.assertNotIn(marker, production_source)
+            self.assertNotIn(marker, production_header)
 
     def test_retired_sage_variants_are_absent_from_production_sources(self):
         csrc = PLUGIN_ROOT / "kernel" / "csrc" / "turing" / "sage"
@@ -114,7 +164,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.25.0")
+        self.assertEqual(metadata["project"]["version"], "0.25.1")
 
     def test_sparse_source_does_not_require_optional_cuda_library_headers(self):
         source = (
@@ -163,7 +213,7 @@ class KernelSetupTest(unittest.TestCase):
         # Retired Sage1/Sage2 launch sites are not part of the production
         # source count; every remaining fused family still names the current
         # PyTorch stream explicitly.
-        self.assertGreaterEqual(fused.count(current_stream), 10)
+        self.assertEqual(fused.count(current_stream), 8)
         self.assertNotIn("<<<grid, block>>>", fused)
 
     def test_stable_sage_locks_single_k_warp_and_benchmarks_core(self):
