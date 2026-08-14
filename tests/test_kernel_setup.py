@@ -92,7 +92,10 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(
             "csrc/turing/sage/qk_preprocess.cu", extensions[2].kwargs["sources"]
         )
-        self.assertEqual(setup.call_args.kwargs["version"], "0.25.1")
+        self.assertIn(
+            "csrc/turing/sage/overlap_blend.cu", extensions[2].kwargs["sources"]
+        )
+        self.assertEqual(setup.call_args.kwargs["version"], "0.26.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -164,7 +167,22 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.25.1")
+        self.assertEqual(metadata["project"]["version"], "0.26.0")
+
+    def test_overlap_epilogue_is_self_contained_and_deterministic_by_design(self):
+        source = (
+            PLUGIN_ROOT
+            / "kernel"
+            / "csrc"
+            / "turing"
+            / "sage"
+            / "overlap_blend.cu"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("ATen/cuda/CUDAContext", source)
+        self.assertNotIn("cusparse", source.lower())
+        self.assertNotIn("atomic", source.lower())
+        self.assertIn("float accumulated", source)
+        self.assertIn("getCurrentCUDAStream", source)
 
     def test_sparse_source_does_not_require_optional_cuda_library_headers(self):
         source = (

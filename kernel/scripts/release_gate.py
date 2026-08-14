@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = ROOT / "kernel"
 COMFYUI_ROOT = ROOT.parents[1]
-EXPECTED_VERSION = "0.25.1"
+EXPECTED_VERSION = "0.26.0"
 
 
 def _run(command: list[str], *, cwd: Path = ROOT, env=None) -> None:
@@ -119,6 +119,7 @@ def _static_gate() -> None:
     )
     for path, source, marker in (
         (KERNEL / "setup.py", setup_source, '"csrc/turing/sage/qk_preprocess.cu"'),
+        (KERNEL / "setup.py", setup_source, '"csrc/turing/sage/overlap_blend.cu"'),
         (
             KERNEL / "csrc/turing/sage/fused.h",
             fused_header,
@@ -129,9 +130,21 @@ def _static_gate() -> None:
             fused_binding,
             "quant_qk_rms_rope_int8_cuda",
         ),
+        (
+            KERNEL / "csrc/turing/sage/fused.h",
+            fused_header,
+            "overlap_blend_cuda",
+        ),
+        (
+            KERNEL / "csrc/turing/sage/pybind_fused.cpp",
+            fused_binding,
+            "overlap_blend_cuda",
+        ),
     ):
         if marker not in source:
-            raise RuntimeError(f"missing fused Q/K preprocessing ABI marker in {path}")
+            raise RuntimeError(
+                f"missing fused preprocessing/overlap ABI marker in {path}"
+            )
     sparse_policy = (ROOT / "comfyui_turing_utils/attention/sparse.py").read_text(
         encoding="utf-8"
     )

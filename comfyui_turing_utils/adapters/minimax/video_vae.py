@@ -30,11 +30,12 @@ from ...attention.protocol import (
     RMSNormSpec,
     RotaryEmbeddingSpec,
 )
+from ...kernel_api import load_turing_sage
 
 
 TILE_SIZE = 256
 TILE_OVERLAP = 64
-_AUTO_DECODE_TILE_BATCH_LIMIT = 4
+_AUTO_DECODE_TILE_BATCH_LIMIT = 16
 _AUTO_ENCODE_TILE_BATCH_LIMIT = 2
 _DECODER_BYTES_PER_FP16_TOKEN = 64 * 1024
 _ENCODER_BYTES_PER_FP16_PIXEL_FRAME = 1800
@@ -144,7 +145,7 @@ class _VAEDiagnostics:
             f"prefetch=({prefetch_state})"
         )
 
-    def begin(self, latent, attention, independent_tail_blocks, decoder):
+    def begin(self, latent, attention, decoder):
         if not self.enabled:
             return
         device_name = str(self.device)
@@ -157,7 +158,6 @@ class _VAEDiagnostics:
             device_name,
             capability,
             attention,
-            independent_tail_blocks,
             tuple(latent.shape),
         )
         if self.trace_tensors:
@@ -168,7 +168,7 @@ class _VAEDiagnostics:
             self.snapshot_weights(
                 "decode.begin",
                 decoder,
-                max(2, independent_tail_blocks),
+                2,
             )
         elif latent.device.type == "cpu":
             # Resolve this only after decode so observe/sync/isolation modes do
@@ -178,15 +178,14 @@ class _VAEDiagnostics:
     def _log_context(self, state):
         if self.context is None:
             return
-        mode, device_name, capability, attention, tail_blocks, latent_shape = self.context
+        mode, device_name, capability, attention, latent_shape = self.context
         logging.warning(
-            "[H3 VAE diagnostic] %s mode=%s device=%s sm=%s attention=%s tail_blocks=%d latent=%s",
+            "[H3 VAE diagnostic] %s mode=%s device=%s sm=%s attention=%s latent=%s",
             state,
             mode,
             device_name,
             capability,
             attention,
-            tail_blocks,
             latent_shape,
         )
 
@@ -304,7 +303,7 @@ class _VAEDiagnostics:
         for block_index in range(first, len(blocks)):
             self.snapshot_block(phase, block_index, blocks[block_index])
 
-    def finish(self, decoder, independent_tail_blocks):
+    def finish(self, decoder):
         if not self.enabled:
             return
         if not self.trace_tensors:
@@ -318,7 +317,7 @@ class _VAEDiagnostics:
             self.snapshot_weights(
                 "decode.end",
                 decoder,
-                max(2, independent_tail_blocks),
+                2,
             )
         for label, entries in self.records.items():
             minimum = min(float(entry["minimum"].float().cpu()) for entry in entries)
@@ -461,18 +460,21 @@ def _decode_memory_requirement(
         latent_shape[0] * resident_tokens * latent_shape[-2] * latent_shape[-1]
     )
     # The fixed decoder keeps one global image state plus global QKV and
-    # attention workspaces during the shared prefix.
+    # attention workspaces throughout all Transformer blocks.
     compute_bytes = comfy.model_management.dtype_size(dtype)
     transformer_workspace += unique_tokens * decoder_dim * (
         compute_bytes * 6 + 4
     )
-    # The final projection is always evaluated as independent 256px windows,
-    # even when no transformer blocks are assigned to the independent tail.
-    window_count = _spatial_tile_count(height, width)
-    window_state_tokens = latent_shape[0] * window_count * sequence
-    transformer_workspace += (
-        window_state_tokens * decoder_dim * comfy.model_management.dtype_size(dtype)
+    # Final pixel projection gathers only the active batch of 256px windows;
+    # no duplicated all-window Transformer state is retained.
+    projection_tokens = (
+        latent_shape[0]
+        * tiles_per_batch
+        * resident_tokens
+        * (tile_height // model.vae_ratio)
+        * (tile_width // model.vae_ratio)
     )
+    transformer_workspace += projection_tokens * decoder_dim * compute_bytes * 2
     pixel_elements = (
         latent_shape[0] * model.decoder.out_channels * resident_frames * height * width
     )
@@ -762,6 +764,7 @@ def _asymmetric_projected_attention(
     transformer_options,
     diagnostics=None,
     phase=None,
+    qk_normalized=False,
 ):
     """Execute core-query/full-halo attention without padding either side.
 
@@ -771,8 +774,9 @@ def _asymmetric_projected_attention(
     the selected SDPA/Sage/W8A8 backend.
     """
 
-    query = comfy.rmsnorm.rms_norm(query, module.norm_q.weight, module.norm_q.eps)
-    key = comfy.rmsnorm.rms_norm(key, module.norm_k.weight, module.norm_k.eps)
+    if not qk_normalized:
+        query = comfy.rmsnorm.rms_norm(query, module.norm_q.weight, module.norm_q.eps)
+        key = comfy.rmsnorm.rms_norm(key, module.norm_k.weight, module.norm_k.eps)
     query = _apply_split_half_rope(query, query_rotary)
     key = _apply_split_half_rope(key, key_rotary)
     out = h3_vae.optimized_attention(
@@ -1045,7 +1049,7 @@ class _SharedWindowLayout:
             weights[index, start : start + extent] = window_weight
         return weights / weights.sum(dim=0, keepdim=True).clamp_min_(1e-12)
 
-    def query_groups(self):
+    def query_groups(self, minimum_weight=0.0):
         device = self.token_indices.device
         y_weights = self._axis_overlap_weights(
             self.latent_h,
@@ -1059,6 +1063,27 @@ class _SharedWindowLayout:
             self.x_len,
             device,
         )
+        spatial_weights_by_window = torch.stack(
+            [
+                y_weights[i, :, None] * x_weights[j, None, :]
+                for i, j, *_unused in self.descriptors
+            ]
+        )
+        minimum_weight = max(0.0, float(minimum_weight))
+        if minimum_weight > 0.0:
+            retained = spatial_weights_by_window >= minimum_weight
+            # Always retain the strongest owner so aggressive experimental
+            # thresholds cannot leave a token uncovered.
+            strongest = spatial_weights_by_window.argmax(dim=0, keepdim=True)
+            retained.scatter_(0, strongest, True)
+            spatial_weights_by_window = spatial_weights_by_window.masked_fill(
+                ~retained,
+                0.0,
+            )
+            spatial_weights_by_window.div_(
+                spatial_weights_by_window.sum(dim=0, keepdim=True).clamp_min_(1e-12)
+            )
+
         global_indices_by_window = []
         local_indices_by_window = []
         weights_by_window = []
@@ -1068,8 +1093,8 @@ class _SharedWindowLayout:
             dtype=torch.float32,
             device=device,
         )
-        for i, j, yi, _yl, xi, _xl in self.descriptors:
-            spatial_weights = y_weights[i, :, None] * x_weights[j, None, :]
+        for window_index, (i, j, yi, _yl, xi, _xl) in enumerate(self.descriptors):
+            spatial_weights = spatial_weights_by_window[window_index]
             coordinates = torch.nonzero(spatial_weights > 0.0, as_tuple=False)
             rows, columns = coordinates[:, 0], coordinates[:, 1]
             token_weights = spatial_weights[rows, columns]
@@ -1119,6 +1144,112 @@ class _SharedWindowLayout:
         return len(self.descriptors)
 
 
+class _SharedSpatialPlan:
+    """Decode-session cache for immutable window and RoPE metadata."""
+
+    def __init__(self, model, latent_t, latent_h, latent_w, device, dtype):
+        decoder = model.decoder
+        self.layout = _SharedWindowLayout(
+            model,
+            latent_t,
+            latent_h,
+            latent_w,
+            device,
+        )
+        suffix_tokens = 1 + decoder.num_register_tokens
+        image_ids = h3_vae.create_token_ids(
+            (latent_t, self.layout.window_h, self.layout.window_w),
+            device,
+            dtype,
+        )
+        suffix_ids = torch.zeros(
+            (1, suffix_tokens, 3),
+            dtype=image_ids.dtype,
+            device=device,
+        )
+        self.rotary = decoder.pos_embed(torch.cat((image_ids, suffix_ids), dim=1))
+        self.suffix_rotary_indices = torch.arange(
+            self.layout.window_tokens,
+            self.layout.window_tokens + suffix_tokens,
+            device=device,
+        )
+        self._query_groups = {}
+        self._overlap_maps = None
+        self._overlap_backend_logged = False
+        try:
+            turing_sage = load_turing_sage()
+            self.overlap_blend = (
+                turing_sage.overlap_blend_compiled
+                if turing_sage.overlap_blend_available()
+                else None
+            )
+        except (AttributeError, ImportError, OSError):
+            self.overlap_blend = None
+
+    def query_groups(self, minimum_weight):
+        key = float(minimum_weight)
+        groups = self._query_groups.get(key)
+        if groups is None:
+            groups = self.layout.query_groups(key)
+            self._query_groups[key] = groups
+        return groups
+
+    def overlap_maps(self):
+        if self._overlap_maps is not None:
+            return self._overlap_maps
+        layout = self.layout
+        local_map = torch.full(
+            (layout.image_tokens, layout.window_count),
+            -1,
+            dtype=torch.int32,
+            device=layout.token_indices.device,
+        )
+        weight_map = torch.zeros(
+            (layout.image_tokens, layout.window_count),
+            dtype=torch.float32,
+            device=layout.token_indices.device,
+        )
+        for (
+            windows,
+            global_indices,
+            _local_indices,
+            weights,
+        ) in self.query_groups(0.0).values():
+            window_grid = windows[:, None].expand_as(global_indices)
+            flat_global = global_indices.reshape(-1)
+            flat_window = window_grid.reshape(-1)
+            # The epilogue consumes compact query outputs, so map global
+            # tokens to their position in that output rather than implicitly
+            # assuming it always equals the original K/V window position.
+            query_positions = torch.arange(
+                global_indices.shape[1],
+                dtype=torch.int32,
+                device=global_indices.device,
+            ).expand_as(global_indices)
+            local_map[flat_global, flat_window] = query_positions.reshape(-1)
+            weight_map[flat_global, flat_window] = weights.reshape(-1)
+        self._overlap_maps = (local_map.contiguous(), weight_map.contiguous())
+        return self._overlap_maps
+
+
+def _shared_spatial_plan(model, x, cache):
+    key = (
+        int(x.shape[2]),
+        int(x.shape[3]),
+        int(x.shape[4]),
+        x.device.type,
+        x.device.index,
+        x.dtype,
+    )
+    if cache is None:
+        return _SharedSpatialPlan(model, *key[:3], x.device, x.dtype)
+    plan = cache.get(key)
+    if plan is None:
+        plan = _SharedSpatialPlan(model, *key[:3], x.device, x.dtype)
+        cache[key] = plan
+    return plan
+
+
 def _feed_forward(module, value):
     if _fused_swiglu_eligible(module.w2):
         return comfy.ops.linear_input_act(module.w2, module.w1(value), "swiglu")
@@ -1160,18 +1291,15 @@ def _shared_core_multiband_decoder_forward(
     block_session,
     tiles_per_batch,
     progress,
-    independent_tail_blocks,
     diagnostics=None,
+    spatial_cache=None,
+    overlap_query_threshold=0.0,
+    final_full_overlap_blocks=36,
 ):
     decoder = model.decoder
     batch, _, latent_t, latent_h, latent_w = x.shape
-    layout = _SharedWindowLayout(
-        model,
-        latent_t,
-        latent_h,
-        latent_w,
-        x.device,
-    )
+    plan = _shared_spatial_plan(model, x, spatial_cache)
+    layout = plan.layout
     h = decoder.x_embedder(x.flatten(2).transpose(1, 2))
     dim = h.shape[-1]
     suffix_tokens = 1 + decoder.num_register_tokens
@@ -1191,42 +1319,17 @@ def _shared_core_multiband_decoder_forward(
         ),
         dim=2,
     ).contiguous()
-    image_ids = h3_vae.create_token_ids(
-        (latent_t, layout.window_h, layout.window_w),
-        x.device,
-        x.dtype,
-    )
-    suffix_ids = torch.zeros(
-        (1, suffix_tokens, 3),
-        dtype=image_ids.dtype,
-        device=image_ids.device,
-    )
-    rotary = decoder.pos_embed(torch.cat((image_ids, suffix_ids), dim=1))
-    suffix_rotary_indices = torch.arange(
-        layout.window_tokens,
-        layout.window_tokens + suffix_tokens,
-        device=x.device,
-    )
+    rotary = plan.rotary
+    suffix_rotary_indices = plan.suffix_rotary_indices
     linear_chunk = max(layout.window_tokens, tiles_per_batch * layout.window_tokens)
     blocks = list(decoder.transformer_blocks)
-    independent_tail_blocks = min(max(0, int(independent_tail_blocks)), len(blocks))
-    shared_block_count = len(blocks) - independent_tail_blocks
-    query_groups = {
-        query_tokens: (
-            windows,
-            global_indices,
-            local_indices,
-            weights,
-        )
-        for query_tokens, (
-            windows,
-            global_indices,
-            local_indices,
-            weights,
-        ) in layout.query_groups().items()
-    }
+    overlap_query_threshold = max(0.0, float(overlap_query_threshold))
+    final_full_overlap_blocks = min(
+        max(0, int(final_full_overlap_blocks)), len(blocks)
+    )
+    final_full_overlap_start = len(blocks) - final_full_overlap_blocks
 
-    for block_index, block in enumerate(blocks[:shared_block_count]):
+    for block_index, block in enumerate(blocks):
         if block_index > 0:
             block_session.before_stage(block_index)
         attention = block.attn
@@ -1234,7 +1337,7 @@ def _shared_core_multiband_decoder_forward(
             diagnostics
             if diagnostics is not None
             and diagnostics.active
-            and block_index == shared_block_count - 1
+            and block_index == len(blocks) - 1
             else None
         )
         attention_diagnostics = (
@@ -1245,14 +1348,16 @@ def _shared_core_multiband_decoder_forward(
         phase = f"shared.block{block_index:02d}"
         if trace_block is not None:
             trace_block.snapshot_block("before", block_index, block)
-        qkv_image = torch.empty(
+        query_image = torch.empty(
             batch,
             layout.image_tokens,
             attention.heads,
-            3 * attention.dim_head,
+            attention.dim_head,
             dtype=h.dtype,
             device=h.device,
         )
+        key_image = torch.empty_like(query_image)
+        value_image = torch.empty_like(query_image)
         for token_start in range(0, layout.image_tokens, linear_chunk):
             token_end = min(token_start + linear_chunk, layout.image_tokens)
             normed = comfy.rmsnorm.rms_norm(
@@ -1266,19 +1371,62 @@ def _shared_core_multiband_decoder_forward(
                 attention.heads,
                 3 * attention.dim_head,
             )
-            qkv_image[:, token_start:token_end].copy_(projected)
+            projected_q, projected_k, projected_v = torch.chunk(projected, 3, dim=-1)
+            query_image[:, token_start:token_end].copy_(
+                comfy.rmsnorm.rms_norm(
+                    projected_q,
+                    attention.norm_q.weight,
+                    attention.norm_q.eps,
+                )
+            )
+            key_image[:, token_start:token_end].copy_(
+                comfy.rmsnorm.rms_norm(
+                    projected_k,
+                    attention.norm_k.weight,
+                    attention.norm_k.eps,
+                )
+            )
+            value_image[:, token_start:token_end].copy_(projected_v)
         if trace_block is not None:
-            trace_block.record(f"{phase}.qkv_image", qkv_image)
+            trace_block.record(
+                f"{phase}.qkv_image",
+                torch.cat((query_image, key_image, value_image), dim=-1),
+            )
 
-        # Attention results from overlapping windows represent different local
-        # contexts.  Accumulate their partition-of-unity blend in FP32 so the
-        # repeated residual blocks do not amplify a periodic FP16 gain error at
-        # overlap crossings.
-        image_attention = torch.zeros(
-            h.shape,
-            dtype=torch.float32,
-            device=h.device,
+        block_threshold = (
+            0.0
+            if block_index >= final_full_overlap_start
+            else overlap_query_threshold
         )
+        query_groups = plan.query_groups(block_threshold)
+        full_group = query_groups.get(layout.window_tokens)
+        fused_overlap = bool(
+            block_threshold == 0.0
+            and plan.overlap_blend is not None
+            and tiles_per_batch >= layout.window_count
+            and len(query_groups) == 1
+            and full_group is not None
+            and int(full_group[0].numel()) == layout.window_count
+        )
+        if fused_overlap and not plan._overlap_backend_logged:
+            logging.info(
+                "MiniMax H3 VAE deterministic overlap epilogue active: windows=%d tokens=%d",
+                layout.window_count,
+                layout.image_tokens,
+            )
+            plan._overlap_backend_logged = True
+        # Attention results from overlapping windows represent different local
+        # contexts. The bundled epilogue performs the complete deterministic
+        # FP32 partition-of-unity reduction in one launch when every window
+        # fits in one attention batch. Smaller batches and pruned schedules
+        # retain the exact sequential FP32 fallback.
+        image_attention = None
+        if not fused_overlap:
+            image_attention = torch.zeros(
+                h.shape,
+                dtype=torch.float32,
+                device=h.device,
+            )
         for core_tokens in sorted(query_groups):
             (
                 grouped_windows,
@@ -1297,13 +1445,19 @@ def _shared_core_multiband_decoder_forward(
                 query_local_indices = grouped_local_indices[group_slice]
                 query_weights = grouped_weights[group_slice]
 
-                window_qkv = qkv_image[:, key_indices].reshape(
+                window_key = key_image[:, key_indices].reshape(
                     batch * window_count,
                     layout.window_tokens,
                     attention.heads,
-                    3 * attention.dim_head,
+                    attention.dim_head,
                 )
-                query_q = qkv_image[:, query_global_indices][..., : attention.dim_head]
+                window_value = value_image[:, key_indices].reshape(
+                    batch * window_count,
+                    layout.window_tokens,
+                    attention.heads,
+                    attention.dim_head,
+                )
+                query_q = query_image[:, query_global_indices]
                 query_q = query_q.reshape(
                     batch * window_count,
                     core_tokens,
@@ -1331,16 +1485,26 @@ def _shared_core_multiband_decoder_forward(
                     3 * attention.dim_head,
                 )
                 suffix_q, suffix_k, suffix_v = torch.chunk(suffix_qkv, 3, dim=-1)
+                suffix_q = comfy.rmsnorm.rms_norm(
+                    suffix_q,
+                    attention.norm_q.weight,
+                    attention.norm_q.eps,
+                )
+                suffix_k = comfy.rmsnorm.rms_norm(
+                    suffix_k,
+                    attention.norm_k.weight,
+                    attention.norm_k.eps,
+                )
                 query = torch.cat((query_q, suffix_q), dim=1)
                 key = torch.cat(
                     (
-                        window_qkv[..., attention.dim_head : 2 * attention.dim_head],
+                        window_key,
                         suffix_k,
                     ),
                     dim=1,
                 )
                 value = torch.cat(
-                    (window_qkv[..., 2 * attention.dim_head :], suffix_v),
+                    (window_value, suffix_v),
                     dim=1,
                 )
 
@@ -1372,6 +1536,7 @@ def _shared_core_multiband_decoder_forward(
                     transformer_options,
                     attention_diagnostics,
                     phase,
+                    qk_normalized=True,
                 ).view(
                     batch,
                     window_count,
@@ -1379,18 +1544,24 @@ def _shared_core_multiband_decoder_forward(
                     dim,
                 )
 
-                for local_index, global_indices in enumerate(query_global_indices):
-                    weighted = attended[:, local_index, :core_tokens].mul(
-                        query_weights[local_index].view(1, -1, 1)
+                if fused_overlap:
+                    local_map, overlap_weights = plan.overlap_maps()
+                    image_attention = plan.overlap_blend(
+                        attended[:, :, :core_tokens],
+                        local_map,
+                        overlap_weights,
                     )
-                    # Every index is unique inside one window, and windows are
-                    # consumed serially here.  Avoid CUDA index_add atomics:
-                    # apart from being unnecessary, their reduction order is
-                    # not guaranteed and W8A8 can amplify a one-ULP boundary
-                    # difference after several independent tail blocks.
-                    accumulated = image_attention.index_select(1, global_indices)
-                    accumulated.add_(weighted)
-                    image_attention.index_copy_(1, global_indices, accumulated)
+                else:
+                    for local_index, global_indices in enumerate(query_global_indices):
+                        weighted = attended[:, local_index, :core_tokens].mul(
+                            query_weights[local_index].view(1, -1, 1)
+                        )
+                        # Every index is unique inside one window, and windows
+                        # are consumed serially here. Avoid CUDA index_add
+                        # atomics: their reduction order is not guaranteed.
+                        accumulated = image_attention.index_select(1, global_indices)
+                        accumulated.add_(weighted)
+                        image_attention.index_copy_(1, global_indices, accumulated)
 
                 suffix_attention = attended[:, :, core_tokens:].reshape(
                     batch * window_count, suffix_tokens, dim
@@ -1418,7 +1589,9 @@ def _shared_core_multiband_decoder_forward(
                         dim,
                     ),
                 )
-        del qkv_image
+        if image_attention is None:
+            raise RuntimeError("shared-core overlap produced no image attention")
+        del query_image, key_image, value_image
         for token_start in range(0, layout.image_tokens, linear_chunk):
             token_end = min(token_start + linear_chunk, layout.image_tokens)
             h_slice = h[:, token_start:token_end]
@@ -1442,98 +1615,26 @@ def _shared_core_multiband_decoder_forward(
             trace_block.record(f"{phase}.residual2", h)
             trace_block.snapshot_block("after", block_index, block)
 
-    return _independent_window_tail(
+    return _project_shared_state_windows(
         decoder,
         h,
-        suffix,
-        rotary,
         layout,
-        blocks,
-        shared_block_count,
-        transformer_options,
-        block_session,
         tiles_per_batch,
         progress,
         diagnostics,
     )
 
 
-def _independent_window_tail(
+def _project_shared_state_windows(
     decoder,
     h,
-    suffix,
-    rotary,
     layout,
-    blocks,
-    first_block,
-    transformer_options,
-    block_session,
     tiles_per_batch,
     progress,
     diagnostics=None,
 ):
     batch = h.shape[0]
     dim = h.shape[-1]
-    suffix_tokens = suffix.shape[2]
-    window_states = torch.cat(
-        (
-            h[:, layout.token_indices],
-            suffix,
-        ),
-        dim=2,
-    ).contiguous()
-    sequence = layout.window_tokens + suffix_tokens
-
-    for block_index in range(first_block, len(blocks)):
-        if block_index > 0:
-            block_session.before_stage(block_index)
-        block = blocks[block_index]
-        phase = f"tail.block{block_index:02d}"
-        if diagnostics is not None:
-            diagnostics.snapshot_block("before", block_index, block)
-        for window_start in range(0, layout.window_count, tiles_per_batch):
-            window_end = min(window_start + tiles_per_batch, layout.window_count)
-            window_count = window_end - window_start
-            state = window_states[:, window_start:window_end].reshape(
-                batch * window_count, sequence, dim
-            )
-            normed = comfy.rmsnorm.rms_norm(
-                state,
-                block.norm1.weight,
-                block.norm1.eps,
-            )
-            attention_output = _attention_forward(
-                block.attn,
-                normed,
-                rotary.expand(batch * window_count, *rotary.shape[1:]),
-                transformer_options,
-                diagnostics,
-                phase,
-            )
-            state.addcmul_(
-                attention_output,
-                comfy.ops.cast_to_input(block.scale1, state),
-            )
-            del attention_output
-            if diagnostics is not None:
-                diagnostics.record(f"{phase}.residual1", state)
-            normed = comfy.rmsnorm.rms_norm(
-                state,
-                block.norm2.weight,
-                block.norm2.eps,
-            )
-            mlp_output = _feed_forward(block.ff, normed)
-            if diagnostics is not None:
-                diagnostics.record(f"{phase}.mlp", mlp_output)
-            state.addcmul_(
-                mlp_output,
-                comfy.ops.cast_to_input(block.scale2, state),
-            )
-            del mlp_output
-            if diagnostics is not None:
-                diagnostics.record(f"{phase}.residual2", state)
-        if diagnostics is not None:
-            diagnostics.snapshot_block("after", block_index, block)
     pixel_y_idx = [value * decoder.patch_size for value in layout.y_idx]
     pixel_y_len = [value * decoder.patch_size for value in layout.y_len]
     pixel_x_idx = [value * decoder.patch_size for value in layout.x_idx]
@@ -1551,9 +1652,10 @@ def _independent_window_tail(
     for window_start in range(0, layout.window_count, tiles_per_batch):
         window_end = min(window_start + tiles_per_batch, layout.window_count)
         window_count = window_end - window_start
-        image_states = window_states[
-            :, window_start:window_end, : layout.window_tokens
-        ].reshape(batch * window_count, layout.window_tokens, dim)
+        window_indices = layout.token_indices[window_start:window_end]
+        image_states = h[:, window_indices].reshape(
+            batch * window_count, layout.window_tokens, dim
+        )
         projected = decoder.proj_out(decoder.norm_out(image_states))
         decoded = _reshape_decoder_patches(
             decoder,
@@ -1571,7 +1673,7 @@ def _independent_window_tail(
             layout.window_w * decoder.patch_size,
         )
         if diagnostics is not None:
-            diagnostics.record("tail.projection", decoded)
+            diagnostics.record("window_projection", decoded)
         for local_index, window_index in enumerate(range(window_start, window_end)):
             assembler.add(window_index, decoded[:, local_index])
         if progress is not None:
@@ -1586,8 +1688,10 @@ def _decode_spatial(
     block_session,
     tiles_per_batch,
     progress,
-    independent_tail_blocks,
     diagnostics=None,
+    spatial_cache=None,
+    overlap_query_threshold=0.0,
+    final_full_overlap_blocks=36,
 ):
     if diagnostics is not None:
         diagnostics.begin_spatial()
@@ -1603,8 +1707,10 @@ def _decode_spatial(
         block_session,
         tiles_per_batch,
         progress,
-        independent_tail_blocks,
         diagnostics,
+        spatial_cache,
+        overlap_query_threshold,
+        final_full_overlap_blocks,
     )
 
 
@@ -1983,9 +2089,10 @@ def _decode_temporal(
     block_session,
     tiles_per_batch,
     progress,
-    independent_tail_blocks,
     output_device=None,
     diagnostics=None,
+    overlap_query_threshold=0.0,
+    final_full_overlap_blocks=36,
 ):
     chunk_dec = model.tokens_chunk_size * model.vae_ratio_t
     split_count = int(model.token_drop > 0) + 1
@@ -1997,6 +2104,7 @@ def _decode_temporal(
         device=output_device,
     )
     writer = _PixelWriter(output, model, z.device)
+    spatial_cache = {}
 
     pad_tokens, num_chunks = model._decode_temporal_chunks(z.shape[2])
     if pad_tokens > 0:
@@ -2015,8 +2123,10 @@ def _decode_temporal(
             block_session,
             tiles_per_batch,
             progress,
-            independent_tail_blocks,
             diagnostics,
+            spatial_cache,
+            overlap_query_threshold,
+            final_full_overlap_blocks,
         )
 
         for j in range(split_count):
@@ -2042,11 +2152,12 @@ def decode_video(
     vae,
     latent,
     attention="sdpa",
-    independent_tail_blocks=2,
     *,
     diagnostics="off",
     output_device=None,
     unload=True,
+    overlap_query_threshold=0.0,
+    final_full_overlap_blocks=36,
 ):
     model = require_h3_video_vae(vae)
     # H3 advertises FP16/FP32 to ComfyUI and defaults to FP16 on supported
@@ -2057,11 +2168,17 @@ def decode_video(
         output_device = vae.output_device
     output_device = torch.device(output_device)
     block_count = len(model.decoder.transformer_blocks)
-    independent_tail_blocks = int(independent_tail_blocks)
-    if not 0 <= independent_tail_blocks <= block_count:
+    overlap_query_threshold = float(overlap_query_threshold)
+    if not 0.0 <= overlap_query_threshold < 1.0:
         raise ValueError(
-            "H3 VAE independent_tail_blocks must be between 0 and "
-            f"{block_count}, got {independent_tail_blocks}"
+            "H3 VAE overlap_query_threshold must be in [0, 1), got "
+            f"{overlap_query_threshold}"
+        )
+    final_full_overlap_blocks = int(final_full_overlap_blocks)
+    if not 0 <= final_full_overlap_blocks <= block_count:
+        raise ValueError(
+            "H3 VAE final_full_overlap_blocks must be between 0 and "
+            f"{block_count}, got {final_full_overlap_blocks}"
         )
     diagnostic = _VAEDiagnostics(diagnostics, vae.device)
     runtime_diagnostics = (
@@ -2078,10 +2195,11 @@ def decode_video(
         latent.shape[-2] * latent.shape[-1]
     )
     logging.info(
-        "Experimental H3 VAE shared-core multiband decoder active: windows=%d duplicate_spatial_ratio=%.2fx independent_tail_blocks=%d",
+        "Experimental H3 VAE shared-core multiband decoder active: windows=%d duplicate_spatial_ratio=%.2fx overlap_threshold=%.4f final_full_overlap_blocks=%d",
         tile_count,
         duplicate_ratio,
-        independent_tail_blocks,
+        overlap_query_threshold,
+        final_full_overlap_blocks,
     )
     batch_tiles, memory = _select_tiles_per_batch(
         vae,
@@ -2100,7 +2218,6 @@ def decode_video(
     diagnostic.begin(
         latent,
         attention,
-        independent_tail_blocks,
         model.decoder,
     )
 
@@ -2128,6 +2245,7 @@ def decode_video(
             diagnostic.retain_weights,
         )
         block_session.start()
+        spatial_cache = {}
         if z.shape[2] == 1:
             dec = _decode_spatial(
                 model,
@@ -2136,8 +2254,10 @@ def decode_video(
                 block_session,
                 batch_tiles,
                 progress,
-                independent_tail_blocks,
                 runtime_diagnostics,
+                spatial_cache,
+                overlap_query_threshold,
+                final_full_overlap_blocks,
             )[:, :, -1:]
             dec = model._finalize_pixels(dec)
             diagnostic.record_final("decode.output", dec)
@@ -2149,9 +2269,10 @@ def decode_video(
             block_session,
             batch_tiles,
             progress,
-            independent_tail_blocks,
             output_device,
             runtime_diagnostics,
+            overlap_query_threshold,
+            final_full_overlap_blocks,
         )
         diagnostic.record_final("decode.output", dec)
         return dec.movedim(1, -1)
@@ -2160,7 +2281,7 @@ def decode_video(
             progress.finish()
         if block_session is not None:
             block_session.finish()
-        diagnostic.finish(model.decoder, independent_tail_blocks)
+        diagnostic.finish(model.decoder)
         _clear_attention_caches(model.decoder)
         if unload:
             vae.patcher.partially_unload(vae.patcher.offload_device, 1e30)
@@ -2650,7 +2771,8 @@ def upscale_latent_via_pixels(
     method="bicubic",
     rtx_vsr_quality="high",
     attention="sdpa",
-    independent_tail_blocks=2,
+    overlap_query_threshold=0.0,
+    final_full_overlap_blocks=36,
 ):
     model = require_h3_video_vae(vae)
     if latent.ndim != 5 or latent.shape[1] != 24:
@@ -2690,9 +2812,10 @@ def upscale_latent_via_pixels(
             vae,
             latent,
             attention,
-            independent_tail_blocks,
             output_device=stage_device,
             unload=False,
+            overlap_query_threshold=overlap_query_threshold,
+            final_full_overlap_blocks=final_full_overlap_blocks,
         )
         resized = _resize_video_pixels(
             decoded,

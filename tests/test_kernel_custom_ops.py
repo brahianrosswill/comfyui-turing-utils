@@ -12,6 +12,76 @@ import comfyui_turing_utils_kernel as kernel  # noqa: E402
 
 
 class KernelCustomOpContractTest(unittest.TestCase):
+    def test_overlap_blend_fake_contract_is_a_fullgraph_leaf(self):
+        values = torch.empty((2, 5, 17, 64), dtype=torch.float16, device="meta")
+        local_indices = torch.empty((31, 5), dtype=torch.int32, device="meta")
+        weights = torch.empty((31, 5), dtype=torch.float32, device="meta")
+        compiled = torch.compile(
+            lambda value, local, weight: kernel.turing_sage.overlap_blend_compiled(
+                value, local, weight
+            ),
+            backend="eager",
+            fullgraph=True,
+        )
+        output = compiled(values, local_indices, weights)
+        self.assertEqual(output.shape, (2, 31, 64))
+        self.assertEqual(output.dtype, torch.float16)
+        self.assertEqual(output.device.type, "meta")
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and kernel.turing_sage.overlap_blend_available(),
+        "the rebuilt CUDA overlap epilogue is required",
+    )
+    def test_overlap_blend_matches_ordered_fp32_reference(self):
+        torch.manual_seed(47)
+        batch, windows, tokens, channels, global_tokens = 2, 5, 17, 96, 31
+        local_indices = torch.full(
+            (global_tokens, windows), -1, dtype=torch.int32, device="cuda"
+        )
+        weights = torch.zeros(
+            (global_tokens, windows), dtype=torch.float32, device="cuda"
+        )
+        for global_index in range(global_tokens):
+            owners = [global_index % windows, (global_index + 2) % windows]
+            local_indices[global_index, owners[0]] = global_index % tokens
+            local_indices[global_index, owners[1]] = (global_index * 3) % tokens
+            weights[global_index, owners[0]] = 0.35
+            weights[global_index, owners[1]] = 0.65
+
+        for dtype, tolerance in (
+            (torch.float16, 2**-10),
+            (torch.bfloat16, 2**-7),
+        ):
+            base = torch.randn(
+                batch,
+                windows,
+                tokens + 3,
+                channels,
+                dtype=dtype,
+                device="cuda",
+            )
+            values = base[:, :, :tokens]
+            expected = torch.zeros(
+                batch, global_tokens, channels, dtype=torch.float32, device="cuda"
+            )
+            for global_index in range(global_tokens):
+                for window in range(windows):
+                    local = int(local_indices[global_index, window])
+                    if local >= 0:
+                        expected[:, global_index].add_(
+                            values[:, window, local].float()
+                            * weights[global_index, window]
+                        )
+            expected = expected.to(dtype)
+            first = kernel.turing_sage.overlap_blend_compiled(
+                values, local_indices, weights
+            )
+            second = kernel.turing_sage.overlap_blend_compiled(
+                values, local_indices, weights
+            )
+            torch.testing.assert_close(first, expected, rtol=0.0, atol=tolerance)
+            self.assertTrue(torch.equal(first, second))
+
     def test_convrot_fake_contracts(self):
         x = torch.empty((3, 512), dtype=torch.bfloat16, device="meta")
         expectations = {

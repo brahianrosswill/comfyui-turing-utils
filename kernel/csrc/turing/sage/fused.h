@@ -122,3 +122,8 @@ void varlen_attention_fwd_cuda(
                 int max_seqlen_q,
                 float sm_scale,
                 int is_causal);
+
+at::Tensor overlap_blend_cuda(
+                at::Tensor window_values,
+                at::Tensor local_indices,
+                at::Tensor weights);

@@ -30,18 +30,28 @@ class MiniMaxH3VideoVAEDecode:
                         "tooltip": "Decoder attention only. On Turing, BF16 SDPA inputs are consumed through containers and computed as FP16 to avoid the slow math fallback. W8A8 refers to QK attention, not VAE weight quantization.",
                     },
                 ),
-                "independent_tail_blocks": (
+            },
+            "optional": {
+                "overlap_query_threshold": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 0.5,
+                        "step": 0.01,
+                        "tooltip": "Experimental speed/quality control. Window-query memberships below this normalized cosine weight are skipped and the survivors are renormalized. Zero preserves the stable full-overlap path.",
+                    },
+                ),
+                "final_full_overlap_blocks": (
                     "INT",
                     {
-                        "default": 2,
+                        "default": 36,
                         "min": 0,
                         "max": 36,
                         "step": 1,
-                        "tooltip": "Number of final decoder transformer blocks evaluated as independent 256px windows before multiband stitching. Higher values strengthen tile-local reconstruction and cost more compute; 0 keeps shared-core through every block.",
+                        "tooltip": "Number of final decoder Transformer blocks that always keep every overlapping window contribution. Earlier blocks may prune low-weight overlap queries using overlap_query_threshold.",
                     },
                 ),
-            },
-            "optional": {
                 "diagnostics": (
                     [
                         "off",
@@ -72,8 +82,9 @@ class MiniMaxH3VideoVAEDecode:
         samples,
         vae,
         attention,
-        independent_tail_blocks,
         diagnostics="off",
+        overlap_query_threshold=0.0,
+        final_full_overlap_blocks=36,
     ):
         require_h3_video_vae(vae)
         latent = samples["samples"]
@@ -84,8 +95,9 @@ class MiniMaxH3VideoVAEDecode:
                 vae,
                 latent,
                 attention,
-                independent_tail_blocks,
                 diagnostics=diagnostics,
+                overlap_query_threshold=overlap_query_threshold,
+                final_full_overlap_blocks=final_full_overlap_blocks,
             )
         if images.ndim == 5:
             images = images.reshape(-1, *images.shape[-3:])
@@ -182,17 +194,28 @@ class MiniMaxH3LatentPixelUpscale:
                         "tooltip": "Attention backend for the decode half of the pixel round trip.",
                     },
                 ),
-                "independent_tail_blocks": (
+            },
+            "optional": {
+                "overlap_query_threshold": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 0.5,
+                        "step": 0.01,
+                    },
+                ),
+                "final_full_overlap_blocks": (
                     "INT",
                     {
-                        "default": 2,
+                        "default": 36,
                         "min": 0,
                         "max": 36,
                         "step": 1,
-                        "tooltip": "Final decoder blocks evaluated independently per 256px window. Two is the quality/performance default; larger values amplify tile-local and quantization differences.",
+                        "tooltip": "Final decoder Transformer blocks that retain all overlapping window contributions.",
                     },
                 ),
-            }
+            },
         }
 
     RETURN_TYPES = ("LATENT",)
@@ -214,7 +237,8 @@ class MiniMaxH3LatentPixelUpscale:
         upscale_method,
         rtx_vsr_quality,
         attention,
-        independent_tail_blocks,
+        overlap_query_threshold=0.0,
+        final_full_overlap_blocks=36,
     ):
         require_h3_video_vae(vae)
         if not isinstance(samples, dict) or "samples" not in samples:
@@ -243,7 +267,8 @@ class MiniMaxH3LatentPixelUpscale:
                 upscale_method,
                 rtx_vsr_quality,
                 attention,
-                independent_tail_blocks,
+                overlap_query_threshold,
+                final_full_overlap_blocks,
             )
 
         output = samples.copy()

@@ -238,6 +238,26 @@ def _validate_fixed_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, tenso
         raise ValueError("empty Q/K sequences are not supported")
 
 
+@_on_input_device
+def overlap_blend(
+    window_values: torch.Tensor,
+    local_indices: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    """Deterministically blend complete window outputs into global tokens."""
+    if window_values.ndim != 4:
+        raise ValueError("window_values must be [batch, windows, tokens, channels]")
+    if local_indices.ndim != 2 or weights.shape != local_indices.shape:
+        raise ValueError("overlap maps must be matching two-dimensional tensors")
+    if int(window_values.shape[1]) != int(local_indices.shape[1]):
+        raise ValueError("overlap map window count does not match window_values")
+    return _fused.overlap_blend_cuda(
+        window_values,
+        local_indices.to(device=window_values.device, dtype=torch.int32).contiguous(),
+        weights.to(device=window_values.device, dtype=torch.float32).contiguous(),
+    )
+
+
 def _short_sequence_attention(
     q: torch.Tensor,
     k: torch.Tensor,

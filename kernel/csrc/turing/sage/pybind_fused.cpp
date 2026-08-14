@@ -29,4 +29,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("quant_per_warp_int8_varlen_cuda", &quant_per_warp_int8_varlen_cuda, "quant_per_warp_int8_varlen_cuda");
 
   m.def("varlen_attention_fwd_cuda", &varlen_attention_fwd_cuda, "varlen_attention_fwd_cuda");
+  m.def("overlap_blend_cuda", &overlap_blend_cuda, "Deterministic FP32 multi-window overlap epilogue");
 }

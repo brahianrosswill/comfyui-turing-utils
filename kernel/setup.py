@@ -507,6 +507,7 @@ if _includes_sm75():
                     "csrc/turing/sage/pybind_fused.cpp",
                     "csrc/turing/sage/fused.cu",
                     "csrc/turing/sage/qk_preprocess.cu",
+                    "csrc/turing/sage/overlap_blend.cu",
                 ],
                 include_dirs=sage_include_dirs,
                 extra_compile_args={"cxx": CXX_FLAGS, "nvcc": sm75_nvcc_flags},
@@ -517,7 +518,7 @@ if _includes_sm75():
 
 setup(
     name="comfyui-turing-utils-kernel",
-    version="0.25.1",
+    version="0.26.0",
     packages=find_packages(where=str(ROOT)),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

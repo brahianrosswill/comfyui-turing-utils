@@ -1,7 +1,7 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's exact-sm75
-runtime. Version 0.25.1 contains legacy packed W4A8 and grouped-codebook W4A8
+runtime. Version 0.26.0 contains legacy packed W4A8 and grouped-codebook W4A8
 Tensor Core GEMMs, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, bundled Sage attention, pure-INT8 W8A8 attention,
@@ -23,6 +23,9 @@ Every stable public tensor operator is registered through
 raw W8A8 contraction used by the grouped-codebook path and regression tests, BF16
 epilogue, ConvRot activation fusions, normalization fusions, fixed and varlen
 Sage, dense W8A8, Sol, and fused Q/K RMSNorm+RoPE+INT8 preprocessing.
+The same extension also provides the deterministic FP32 overlap epilogue used
+by the MiniMax H3 shared-core VAE decoder when every spatial window fits in one
+attention batch.
 Prequantized Python state objects deliberately stay
 outside this boundary because they are ComfyUI tensor-lifetime coordination,
 not graph-level tensor operators.

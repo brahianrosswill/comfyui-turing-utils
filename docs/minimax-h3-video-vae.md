@@ -9,27 +9,26 @@ path for the official H3 video VAE. They accept the normal ComfyUI `VAE`,
 `MiniMax H3 Video VAE Decode` uses one fixed spatial policy:
 
 - 256px windows with 64px overlap, matching the geometry expected by H3;
-- one latent-token feather at shared attention boundaries, with deterministic
-  accumulation instead of atomic overlap reductions;
-- shared image-token state for the early decoder transformer blocks;
-- independent 256px windows for the configurable transformer tail and final
-  pixel projection;
+- full cosine partition-of-unity queries throughout every overlap by default,
+  with a deterministic FP32 epilogue instead of atomic overlap reductions;
+- one globally reconciled image-token state for decoder transformer blocks;
+- independent 256px windows only for the final pixel projection;
 - normalized multiband stitching whose frequency split is evaluated on two
   complete canvases rather than independently at every tile edge.
 
-`independent_tail_blocks` controls how many final decoder transformer blocks
-run independently per window. The default is 2. A larger value gives late
-blocks more tile-local freedom but repeats more work. Zero keeps every
-transformer block on the shared-token path; final projection and multiband
-stitching remain independent so boundaries are still reconstructed correctly.
+Two optional controls provide a shared-state speed/quality experiment:
 
-The tail is a deliberate approximation control, not a monotonic quality
-slider. At the shared/tiled fork, overlapping windows initially contain the
-same hidden tokens but use different local RoPE coordinates and context. Every
-additional independent block lets those copies diverge further. Quantized
-attention can amplify that divergence, so `2` is the tested default and `8`
-may expose grids even though it is closer to doing more of the decoder in the
-official per-tile form. Large values are mainly useful for diagnosis.
+- `overlap_query_threshold=0` retains every cosine membership and is the
+  quality-preserving default. A positive value drops only very small window
+  memberships, always retains at least one owner, and renormalizes survivors.
+- `final_full_overlap_blocks=36` keeps the complete overlap in every decoder
+  Transformer block. Lower values allow the threshold only in earlier blocks
+  and restore complete overlap for the requested final block count. Hidden
+  states remain globally reconciled after every block.
+
+For the common 864x480 decode geometry, threshold `0.03` retains about 80% of
+overlap queries in early blocks and forms only three query-size groups. Treat
+it as an experimental starting point, not a universal recommendation.
 
 The multiband implementation first constructs a low-frequency-priority canvas
 and a high-frequency-priority canvas, then separates their bands globally. It
@@ -37,7 +36,7 @@ therefore exactly reconstructs identical overlapping content (within FP32
 rounding) and avoids the paired seam lines caused by tile-local low-pass
 boundary conditions.
 
-The attention selector applies to both the shared prefix and independent tail:
+The attention selector applies to every shared decoder Transformer block:
 
 - `sdpa`: PyTorch SDPA, with FP16 computation for Turing BF16 inputs to avoid
   its slow math fallback;
@@ -53,8 +52,8 @@ input continue to use `off`. The available isolation modes are:
 - `observe_once` defers input/output fingerprints and memory reporting until
   decode has completed; it does not consume intermediate CUDA tensors;
 - `trace_once` traces the first temporal chunk, including the final shared
-  block, independent tail blocks, projection, multiband output, seam ratios,
-  CUDA memory, and VBAR-backed linear state;
+  block, window projection, multiband output, seam ratios, CUDA memory, and
+  VBAR-backed linear state;
 - `sync_only` synchronizes after every decoder attention call without tracing
   intermediate tensors;
 - `no_weight_retention_only` disables cross-block retained-weight prefetch for
@@ -102,8 +101,13 @@ a separate sampler so denoise strength and scheduling remain explicit.
 
 Both nodes choose the number of simultaneously evaluated windows internally.
 The choice is bounded by current free/reclaimable device memory and conservative
-activation estimates (up to four windows for decode and two for encode). This
+activation estimates (up to sixteen windows for decode and two for encode). This
 control is intentionally not exposed in the node UI.
+
+When all decode windows fit in one attention batch, kernel package 0.26.0 uses
+a single deterministic SM75 overlap epilogue. It accumulates window outputs in
+FP32 in fixed window order and writes the model dtype once. Smaller batches and
+pruned schedules fall back to the equivalent ordered FP32 Python path.
 
 Both paths retain prefetched weights across spatial windows and temporal chunks
 when memory allows. Decode uses asynchronous FP32 pixel double buffering;

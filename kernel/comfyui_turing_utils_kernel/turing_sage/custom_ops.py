@@ -3,6 +3,30 @@ from __future__ import annotations
 import torch
 
 
+@torch.library.custom_op("turing_utils::overlap_blend", mutates_args=())
+def overlap_blend_op(
+    window_values: torch.Tensor,
+    local_indices: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    from .core import overlap_blend
+
+    return overlap_blend(window_values, local_indices, weights)
+
+
+@overlap_blend_op.register_fake
+def _overlap_blend_fake(window_values, local_indices, weights):
+    return torch.empty(
+        (
+            window_values.shape[0],
+            local_indices.shape[0],
+            window_values.shape[-1],
+        ),
+        dtype=window_values.dtype,
+        device=window_values.device,
+    )
+
+
 @torch.library.custom_op("turing_utils::qk_rms_rope_int8", mutates_args=())
 def qk_rms_rope_int8(
     query: torch.Tensor,

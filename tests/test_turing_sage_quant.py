@@ -191,6 +191,8 @@ class TuringSageQuantContractTest(unittest.TestCase):
             [
                 "available",
                 "fused_qk_preprocessing_available",
+                "overlap_blend_available",
+                "overlap_blend_compiled",
                 "prequantize_sageattn",
                 "prequantize_sol_sageattn",
                 "preflight",

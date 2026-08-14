@@ -82,6 +82,24 @@ def fused_qk_preprocessing_available() -> bool:
     return hasattr(module, "quant_qk_rms_rope_int8_cuda")
 
 
+def overlap_blend_available() -> bool:
+    if not available():
+        return False
+    try:
+        module = importlib.import_module(
+            "comfyui_turing_utils_kernel._sage_fused_sm75"
+        )
+    except (ImportError, OSError):
+        return False
+    return hasattr(module, "overlap_blend_cuda")
+
+
+def overlap_blend_compiled(window_values, local_indices, weights):
+    from .custom_ops import overlap_blend_op
+
+    return overlap_blend_op(window_values, local_indices, weights)
+
+
 def sageattn(*args, **kwargs):
     """Run the stable bundled SM75 Sage attention implementation."""
     from .core import sageattn as implementation
@@ -442,6 +460,8 @@ def run_attention_correctness_gate(*args, **kwargs):
 __all__ = [
     "available",
     "fused_qk_preprocessing_available",
+    "overlap_blend_available",
+    "overlap_blend_compiled",
     "prequantize_sageattn",
     "prequantize_sol_sageattn",
     "preflight",
