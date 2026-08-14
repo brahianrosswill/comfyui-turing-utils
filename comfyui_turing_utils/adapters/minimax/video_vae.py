@@ -44,7 +44,6 @@ _ENCODE_SAFETY_FACTOR = 1.05
 _MULTIBAND_DOWNSAMPLE = 8
 _MULTIBAND_HIGH_WEIGHT_POWER = 4
 _MULTIBAND_FRAME_CHUNK = 4
-_SHARED_CORE_FEATHER_TOKENS = 1
 _PIXEL_RESIZE_FRAME_BATCH = 8
 _RTX_VSR_QUALITIES = {
     "medium": "MEDIUM",
@@ -463,8 +462,9 @@ def _decode_memory_requirement(
     )
     # The fixed decoder keeps one global image state plus global QKV and
     # attention workspaces during the shared prefix.
-    transformer_workspace += (
-        unique_tokens * decoder_dim * comfy.model_management.dtype_size(dtype) * 7
+    compute_bytes = comfy.model_management.dtype_size(dtype)
+    transformer_workspace += unique_tokens * decoder_dim * (
+        compute_bytes * 6 + 4
     )
     # The final projection is always evaluated as independent 256px windows,
     # even when no transformer blocks are assigned to the independent tail.
@@ -1014,46 +1014,46 @@ class _SharedWindowLayout:
         self.token_indices = torch.stack(token_indices)
 
     @staticmethod
-    def _axis_feather_weights(length, starts, lengths, device):
-        centers = torch.tensor(
-            [start + extent / 2 for start, extent in zip(starts, lengths)],
-            dtype=torch.float32,
-            device=device,
-        )
-        positions = torch.arange(length, dtype=torch.float32, device=device).add_(0.5)
-        owners = (positions[:, None] - centers[None, :]).abs().argmin(dim=1)
-        weights = torch.zeros(len(starts), length, dtype=torch.float32, device=device)
-        weights[owners, torch.arange(length, device=device)] = 1.0
-        feather_tokens = _SHARED_CORE_FEATHER_TOKENS
-        for index in range(len(starts) - 1):
-            boundary = (centers[index] + centers[index + 1]) / 2
-            phase = (
-                (positions - (boundary - feather_tokens)) / (2 * feather_tokens)
-            ).clamp(0.0, 1.0)
-            transition = (phase > 0.0) & (phase < 1.0)
-            if not bool(transition.any()):
-                continue
-            left = torch.cos(phase[transition] * (math.pi / 2)).square()
-            right = 1.0 - left
-            weights[:, transition] = 0.0
-            weights[index, transition] = left
-            weights[index + 1, transition] = right
+    def _axis_overlap_weights(length, starts, lengths, device):
+        """Build a full-overlap, normalized cosine partition of unity.
 
-        coordinates = torch.arange(length, device=device)
+        Every covered token remains a query in every covering window.  This is
+        deliberately more expensive than assigning almost the whole overlap
+        to one owner, but avoids changing the attention context abruptly over
+        a one-token ownership boundary.  Normalization also handles the
+        three-way overlaps produced when fixed 256px windows cover a short
+        image dimension.
+        """
+        weights = torch.zeros(len(starts), length, dtype=torch.float32, device=device)
         for index, (start, extent) in enumerate(zip(starts, lengths)):
-            covered = (coordinates >= start) & (coordinates < start + extent)
-            weights[index].mul_(covered)
+            positions = torch.arange(
+                extent,
+                dtype=torch.float32,
+                device=device,
+            ).add_(0.5)
+            window_weight = torch.ones_like(positions)
+            if index > 0:
+                overlap = starts[index - 1] + lengths[index - 1] - start
+                if overlap > 0:
+                    phase = (positions / overlap).clamp_(0.0, 1.0)
+                    window_weight.mul_(0.5 - 0.5 * torch.cos(math.pi * phase))
+            if index + 1 < len(starts):
+                overlap = start + extent - starts[index + 1]
+                if overlap > 0:
+                    phase = ((extent - positions) / overlap).clamp_(0.0, 1.0)
+                    window_weight.mul_(0.5 - 0.5 * torch.cos(math.pi * phase))
+            weights[index, start : start + extent] = window_weight
         return weights / weights.sum(dim=0, keepdim=True).clamp_min_(1e-12)
 
     def query_groups(self):
         device = self.token_indices.device
-        y_weights = self._axis_feather_weights(
+        y_weights = self._axis_overlap_weights(
             self.latent_h,
             self.y_idx,
             self.y_len,
             device,
         )
-        x_weights = self._axis_feather_weights(
+        x_weights = self._axis_overlap_weights(
             self.latent_w,
             self.x_idx,
             self.x_len,
@@ -1097,7 +1097,7 @@ class _SharedWindowLayout:
             rtol=1e-5,
             atol=1e-6,
         ):
-            raise RuntimeError("shared-core feather weights do not sum to one")
+            raise RuntimeError("shared-core overlap weights do not sum to one")
 
         windows_by_count = {}
         for window_index, global_indices in enumerate(global_indices_by_window):
@@ -1216,7 +1216,7 @@ def _shared_core_multiband_decoder_forward(
             windows,
             global_indices,
             local_indices,
-            weights.to(h.dtype),
+            weights,
         )
         for query_tokens, (
             windows,
@@ -1270,7 +1270,15 @@ def _shared_core_multiband_decoder_forward(
         if trace_block is not None:
             trace_block.record(f"{phase}.qkv_image", qkv_image)
 
-        image_attention = torch.zeros_like(h)
+        # Attention results from overlapping windows represent different local
+        # contexts.  Accumulate their partition-of-unity blend in FP32 so the
+        # repeated residual blocks do not amplify a periodic FP16 gain error at
+        # overlap crossings.
+        image_attention = torch.zeros(
+            h.shape,
+            dtype=torch.float32,
+            device=h.device,
+        )
         for core_tokens in sorted(query_groups):
             (
                 grouped_windows,
@@ -1415,7 +1423,9 @@ def _shared_core_multiband_decoder_forward(
             token_end = min(token_start + linear_chunk, layout.image_tokens)
             h_slice = h[:, token_start:token_end]
             h_slice.addcmul_(
-                attention.to_out(image_attention[:, token_start:token_end]),
+                attention.to_out(
+                    image_attention[:, token_start:token_end].to(h.dtype)
+                ),
                 comfy.ops.cast_to_input(block.scale1, h_slice),
             )
             normed = comfy.rmsnorm.rms_norm(

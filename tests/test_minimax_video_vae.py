@@ -108,7 +108,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             expected_tiles,
         )
 
-    def test_shared_core_feather_weights_cover_every_token_once(self):
+    def test_shared_core_overlap_weights_cover_every_window_extent(self):
         model = SimpleNamespace(vae_ratio=2)
         with (
             mock.patch.object(video_vae, "TILE_SIZE", 12),
@@ -132,8 +132,26 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 weight_sum.index_add_(0, global_indices[row], weights[row])
                 query_count += global_indices.shape[1]
         torch.testing.assert_close(weight_sum, torch.ones_like(weight_sum))
-        self.assertGreater(query_count, layout.image_tokens)
-        self.assertLess(query_count, layout.window_count * layout.window_tokens)
+        self.assertEqual(query_count, layout.window_count * layout.window_tokens)
+
+        y_weights = layout._axis_overlap_weights(
+            layout.latent_h,
+            layout.y_idx,
+            layout.y_len,
+            torch.device("cpu"),
+        )
+        x_weights = layout._axis_overlap_weights(
+            layout.latent_w,
+            layout.x_idx,
+            layout.x_len,
+            torch.device("cpu"),
+        )
+        torch.testing.assert_close(y_weights.sum(dim=0), torch.ones(layout.latent_h))
+        torch.testing.assert_close(x_weights.sum(dim=0), torch.ones(layout.latent_w))
+        for index, (start, extent) in enumerate(zip(layout.y_idx, layout.y_len)):
+            self.assertTrue(torch.all(y_weights[index, start : start + extent] > 0))
+        for index, (start, extent) in enumerate(zip(layout.x_idx, layout.x_len)):
+            self.assertTrue(torch.all(x_weights[index, start : start + extent] > 0))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_shared_core_multiband_window_batching_is_invariant(self):
