@@ -379,14 +379,35 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         )
 
     def test_vae_diagnostic_modes_control_runtime_isolation(self):
-        sync = video_vae._VAEDiagnostics("trace_once_sync", torch.device("cpu"))
+        observe = video_vae._VAEDiagnostics("observe_once", torch.device("cpu"))
+        sync = video_vae._VAEDiagnostics("sync_only", torch.device("cpu"))
         isolated = video_vae._VAEDiagnostics(
-            "trace_once_no_weight_retention", torch.device("cpu")
+            "no_weight_retention_only", torch.device("cpu")
         )
+        self.assertFalse(observe.trace_tensors)
+        self.assertFalse(observe.force_sync)
         self.assertTrue(sync.force_sync)
+        self.assertFalse(sync.trace_tensors)
         self.assertTrue(sync.retain_weights)
         self.assertFalse(isolated.force_sync)
         self.assertFalse(isolated.retain_weights)
+
+    def test_observe_diagnostics_defer_input_read_until_finish(self):
+        decoder = SimpleNamespace(transformer_blocks=[])
+        latent = torch.arange(8.0).view(1, 1, 2, 2, 2)
+        diagnostics = video_vae._VAEDiagnostics("observe_once", torch.device("cpu"))
+        diagnostics.begin(latent, "sdpa", 0, decoder)
+        self.assertEqual(diagnostics.records, {})
+        diagnostics.record("ignored.intermediate", latent)
+        self.assertEqual(diagnostics.records, {})
+        diagnostics.record_final("decode.output", latent)
+        self.assertEqual(set(diagnostics.records), {"decode.output"})
+        with self.assertLogs(level="WARNING"):
+            diagnostics.finish(decoder, 0)
+        self.assertEqual(
+            set(diagnostics.records),
+            {"decode.latent_input", "decode.output"},
+        )
 
     def test_encoder_node_uses_optimized_runtime(self):
         vae = mock.Mock()
@@ -488,6 +509,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         self.assertEqual(video_vae.TILE_SIZE, 256)
         self.assertEqual(video_vae.TILE_OVERLAP, 64)
         decoder = nodes.MiniMaxH3VideoVAEDecode.INPUT_TYPES()["required"]
+        decoder_optional = nodes.MiniMaxH3VideoVAEDecode.INPUT_TYPES()["optional"]
         encoder = nodes.MiniMaxH3VideoVAEEncode.INPUT_TYPES()["required"]
         self.assertEqual(
             set(decoder),
@@ -496,12 +518,12 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 "vae",
                 "attention",
                 "independent_tail_blocks",
-                "diagnostics",
             },
         )
+        self.assertEqual(set(decoder_optional), {"diagnostics"})
         self.assertEqual(set(encoder), {"pixels", "vae"})
         self.assertEqual(decoder["independent_tail_blocks"][1]["default"], 2)
-        self.assertEqual(decoder["diagnostics"][1]["default"], "off")
+        self.assertEqual(decoder_optional["diagnostics"][1]["default"], "off")
         upscaler = nodes.MiniMaxH3LatentPixelUpscale.INPUT_TYPES()["required"]
         self.assertEqual(
             set(upscaler),

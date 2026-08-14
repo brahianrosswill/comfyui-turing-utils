@@ -40,19 +40,22 @@ class MiniMaxH3VideoVAEDecode:
                         "tooltip": "Number of final decoder transformer blocks evaluated as independent 256px windows before multiband stitching. Higher values strengthen tile-local reconstruction and cost more compute; 0 keeps shared-core through every block.",
                     },
                 ),
+            },
+            "optional": {
                 "diagnostics": (
                     [
                         "off",
+                        "observe_once",
                         "trace_once",
-                        "trace_once_sync",
-                        "trace_once_no_weight_retention",
+                        "sync_only",
+                        "no_weight_retention_only",
                     ],
                     {
                         "default": "off",
-                        "tooltip": "Capture the first temporal decode chunk once. Sync isolates CUDA stream lifetime failures; no-weight-retention isolates VBAR/prefetch state. Diagnostic modes are intentionally slow and log locally to the terminal.",
+                        "tooltip": "Observe records only after decode and minimally perturbs execution. Trace inspects the first temporal chunk and is slow. Sync-only isolates stream lifetime; no-weight-retention-only isolates VBAR/prefetch. Logs stay local to the terminal.",
                     },
                 ),
-            }
+            },
         }
 
     RETURN_TYPES = ("IMAGE",)

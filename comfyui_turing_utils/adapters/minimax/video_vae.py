@@ -55,9 +55,10 @@ _RTX_VSR_QUALITIES = {
 }
 _VAE_DIAGNOSTIC_MODES = {
     "off",
+    "observe_once",
     "trace_once",
-    "trace_once_sync",
-    "trace_once_no_weight_retention",
+    "sync_only",
+    "no_weight_retention_only",
 }
 
 
@@ -68,10 +69,14 @@ class _VAEDiagnostics:
         self.mode = mode
         self.device = torch.device(device)
         self.enabled = mode != "off"
-        self.force_sync = mode == "trace_once_sync"
-        self.retain_weights = mode != "trace_once_no_weight_retention"
+        self.trace_tensors = mode == "trace_once"
+        self.force_sync = mode == "sync_only"
+        self.retain_weights = mode != "no_weight_retention_only"
         self.active = False
         self.spatial_calls = 0
+        self.sync_count = 0
+        self.context = None
+        self.deferred_inputs = []
         self.records = {}
         self.scalar_records = {}
         self.memory_records = []
@@ -143,14 +148,12 @@ class _VAEDiagnostics:
     def begin(self, latent, attention, independent_tail_blocks, decoder):
         if not self.enabled:
             return
-        self.active = True
         device_name = str(self.device)
         capability = "n/a"
         if self.device.type == "cuda" and torch.cuda.is_available():
             device_name = torch.cuda.get_device_name(self.device)
             capability = ".".join(map(str, torch.cuda.get_device_capability(self.device)))
-        logging.warning(
-            "[H3 VAE diagnostic] capture begin mode=%s device=%s sm=%s attention=%s tail_blocks=%d latent=%s",
+        self.context = (
             self.mode,
             device_name,
             capability,
@@ -158,16 +161,38 @@ class _VAEDiagnostics:
             independent_tail_blocks,
             tuple(latent.shape),
         )
-        self.record("decode.latent_input", latent, force=True)
-        self.memory("decode.begin")
-        self.snapshot_weights(
-            "decode.begin",
-            decoder,
-            max(2, independent_tail_blocks),
+        if self.trace_tensors:
+            self.active = True
+            self._log_context("capture begin")
+            self.record("decode.latent_input", latent, force=True)
+            self.memory("decode.begin")
+            self.snapshot_weights(
+                "decode.begin",
+                decoder,
+                max(2, independent_tail_blocks),
+            )
+        elif latent.device.type == "cpu":
+            # Resolve this only after decode so observe/sync/isolation modes do
+            # not insert tensor work or console I/O into the execution path.
+            self.deferred_inputs.append(("decode.latent_input", latent))
+
+    def _log_context(self, state):
+        if self.context is None:
+            return
+        mode, device_name, capability, attention, tail_blocks, latent_shape = self.context
+        logging.warning(
+            "[H3 VAE diagnostic] %s mode=%s device=%s sm=%s attention=%s tail_blocks=%d latent=%s",
+            state,
+            mode,
+            device_name,
+            capability,
+            attention,
+            tail_blocks,
+            latent_shape,
         )
 
     def begin_spatial(self):
-        if not self.enabled:
+        if not self.trace_tensors:
             return
         self.spatial_calls += 1
         self.active = self.spatial_calls == 1
@@ -178,7 +203,17 @@ class _VAEDiagnostics:
             self.memory("spatial.begin")
 
     def record(self, label, value, *, force=False):
-        if not self.enabled or (not force and not self.active) or not torch.is_tensor(value):
+        if not self.trace_tensors or (not force and not self.active):
+            return
+        self._record_tensor(label, value)
+
+    def record_final(self, label, value):
+        if not self.enabled:
+            return
+        self._record_tensor(label, value)
+
+    def _record_tensor(self, label, value):
+        if not torch.is_tensor(value):
             return
         if value.numel() == 0:
             return
@@ -196,12 +231,12 @@ class _VAEDiagnostics:
         )
 
     def record_scalar(self, label, value):
-        if not self.enabled or not self.active:
+        if not self.trace_tensors or not self.active:
             return
         self.scalar_records.setdefault(label, []).append(value.detach().float())
 
     def record_seams(self, label, value, y_boundaries, x_boundaries):
-        if not self.enabled or not self.active:
+        if not self.trace_tensors or not self.active:
             return
         for boundary in sorted(set(y_boundaries)):
             if boundary < 2 or boundary + 1 >= value.shape[-2]:
@@ -223,11 +258,11 @@ class _VAEDiagnostics:
             self.record_scalar(f"{label}.x_seam_ratio", seam / nearby.clamp_min(1e-12))
 
     def synchronize(self, label):
-        if not self.enabled or not self.active or not self.force_sync:
+        if not self.force_sync:
             return
         if self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.synchronize(self.device)
-            logging.warning("[H3 VAE diagnostic] synchronized after %s", label)
+            self.sync_count += 1
 
     def memory(self, label):
         if not self.enabled or self.device.type != "cuda" or not torch.cuda.is_available():
@@ -244,7 +279,7 @@ class _VAEDiagnostics:
         )
 
     def snapshot_block(self, phase, block_index, block):
-        if not self.enabled or not self.active:
+        if not self.trace_tensors or not self.active:
             return
         linears = {
             "qkv": block.attn.to_qkv,
@@ -263,7 +298,7 @@ class _VAEDiagnostics:
         )
 
     def snapshot_weights(self, phase, decoder, count):
-        if not self.enabled:
+        if not self.trace_tensors:
             return
         blocks = decoder.transformer_blocks
         first = max(0, len(blocks) - min(int(count), len(blocks)))
@@ -273,13 +308,19 @@ class _VAEDiagnostics:
     def finish(self, decoder, independent_tail_blocks):
         if not self.enabled:
             return
-        self.active = True
+        if not self.trace_tensors:
+            self._log_context("capture begin")
+        for label, value in self.deferred_inputs:
+            self._record_tensor(label, value)
+        self.deferred_inputs.clear()
+        self.active = self.trace_tensors
         self.memory("decode.end")
-        self.snapshot_weights(
-            "decode.end",
-            decoder,
-            max(2, independent_tail_blocks),
-        )
+        if self.trace_tensors:
+            self.snapshot_weights(
+                "decode.end",
+                decoder,
+                max(2, independent_tail_blocks),
+            )
         for label, entries in self.records.items():
             minimum = min(float(entry["minimum"].float().cpu()) for entry in entries)
             maximum = max(float(entry["maximum"].float().cpu()) for entry in entries)
@@ -322,6 +363,15 @@ class _VAEDiagnostics:
                 reserved / 1024**2,
                 free / 1024**2,
                 total / 1024**2,
+            )
+        if self.force_sync:
+            logging.warning(
+                "[H3 VAE diagnostic] sync_only completed attention_syncs=%d",
+                self.sync_count,
+            )
+        if not self.retain_weights:
+            logging.warning(
+                "[H3 VAE diagnostic] no_weight_retention_only completed with retained VBAR prefetch disabled"
             )
         logging.warning(
             "[H3 VAE diagnostic] capture complete; diagnostics are disabled outside this decode invocation"
@@ -1187,6 +1237,11 @@ def _shared_core_multiband_decoder_forward(
             and block_index == shared_block_count - 1
             else None
         )
+        attention_diagnostics = (
+            diagnostics
+            if diagnostics is not None and diagnostics.force_sync
+            else trace_block
+        )
         phase = f"shared.block{block_index:02d}"
         if trace_block is not None:
             trace_block.snapshot_block("before", block_index, block)
@@ -1307,7 +1362,7 @@ def _shared_core_multiband_decoder_forward(
                     query_rotary,
                     key_rotary,
                     transformer_options,
-                    trace_block,
+                    attention_diagnostics,
                     phase,
                 ).view(
                     batch,
@@ -1999,7 +2054,9 @@ def decode_video(
             f"{block_count}, got {independent_tail_blocks}"
         )
     diagnostic = _VAEDiagnostics(diagnostics, vae.device)
-    runtime_diagnostics = diagnostic if diagnostic.enabled else None
+    runtime_diagnostics = (
+        diagnostic if diagnostic.trace_tensors or diagnostic.force_sync else None
+    )
     tile_count = _spatial_tile_count(
         latent.shape[-2] * model.vae_ratio,
         latent.shape[-1] * model.vae_ratio,
@@ -2073,7 +2130,7 @@ def decode_video(
                 runtime_diagnostics,
             )[:, :, -1:]
             dec = model._finalize_pixels(dec)
-            diagnostic.record("decode.output", dec, force=True)
+            diagnostic.record_final("decode.output", dec)
             return dec.to(output_device).movedim(1, -1)
         dec = _decode_temporal(
             model,
@@ -2086,7 +2143,7 @@ def decode_video(
             output_device,
             runtime_diagnostics,
         )
-        diagnostic.record("decode.output", dec, force=True)
+        diagnostic.record_final("decode.output", dec)
         return dec.movedim(1, -1)
     finally:
         if progress is not None:

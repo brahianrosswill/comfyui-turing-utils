@@ -46,23 +46,29 @@ The attention selector applies to both the shared prefix and independent tail:
 
 ### One-shot diagnostics
 
-The decoder's `diagnostics` input is normally `off` and adds no tensor
-statistics or synchronization. The other modes trace only the first temporal
-decode chunk and print local terminal diagnostics for the latent, final shared
-block, independent tail blocks, projection, multiband output, seam ratios,
-CUDA memory, and VBAR-backed linear state:
+The decoder's optional `diagnostics` input is normally `off` and adds no tensor
+statistics or synchronization. Existing workflows that do not contain this
+input continue to use `off`. The available isolation modes are:
 
-- `trace_once` records the normal asynchronous path;
-- `trace_once_sync` synchronizes immediately after each traced attention call;
-- `trace_once_no_weight_retention` disables cross-block retained-weight
-  prefetch for that decode invocation.
+- `observe_once` defers input/output fingerprints and memory reporting until
+  decode has completed; it does not consume intermediate CUDA tensors;
+- `trace_once` traces the first temporal chunk, including the final shared
+  block, independent tail blocks, projection, multiband output, seam ratios,
+  CUDA memory, and VBAR-backed linear state;
+- `sync_only` synchronizes after every decoder attention call without tracing
+  intermediate tensors;
+- `no_weight_retention_only` disables cross-block retained-weight prefetch for
+  that invocation without tracing intermediate tensors.
 
 Use the same cached latent when comparing modes. A matching
 `decode.latent_input` fingerprint confirms that the VAE received the same
-sample. If only the sync mode is clean, inspect stream lifetime; if only the
-no-retention mode is clean, inspect VBAR/prefetch state. `finite=False` or an
-FP16 absolute maximum near 65504 identifies numerical overflow. Diagnostics
-are intentionally slow and automatically stop after that invocation.
+sample. Compare repeated fresh-process failure rates rather than relying on one
+run because allocator/stream bugs can be intermittent. If only `sync_only` is
+clean, inspect stream lifetime; if only `no_weight_retention_only` is clean,
+inspect VBAR/prefetch state. In a full trace, `finite=False` or an FP16 absolute
+maximum near 65504 identifies numerical overflow. Diagnostics automatically
+stop after that invocation; `trace_once` and `sync_only` are intentionally
+slow.
 
 ## Encode
 
