@@ -141,7 +141,7 @@ the final choice is based on measured latency on the target device.
 | Head/layer/step-specific Sol policy | not implemented | useful only behind calibration and visual/audio gates; do not replace the stable global policy without H3 data |
 | Route reuse and hysteresis | not implemented | potentially useful, but must justify route-state memory and avoid cross-prompt state leakage |
 | Kitchen versus bundled SM75 A/B | directionally tested on A40 | final backend policy still requires exact-SM75 profiling |
-| First-block or trajectory cache | not integrated | not a default fit for 6--8-step H3; leave to dedicated high-step nodes |
+| H3 trajectory block cache | experimental node | profile-driven standard, 4-step, and 8-step policies reuse one exact residual; sampler branches are isolated, skipped weights are omitted from Dynamic VRAM prefetch, and storage honors ComfyUI's GPU reserve/pinned-memory lifecycle; it remains opt-in because block skipping is inherently approximate |
 | Spectrum-style transformer skipping | not integrated | replay memory and audio workflow cost conflict with the Turing/dynamic-VRAM target |
 
 The next production-oriented order is: gated fc2/out-projection epilogues,

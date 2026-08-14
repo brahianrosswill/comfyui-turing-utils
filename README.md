@@ -54,9 +54,11 @@ only after its CUDA sources or required version change.
   stable second-stage latent; an optional RTX VSR path is loaded only when
   selected.
 - `Patch MiniMax H3 Block Cache (Experimental)` skips stable transformer-block
-  spans by reusing trajectory residuals. It provides the recovered standard and
-  short-step Turbo policies, keeps sampler branches isolated, and is a
-  Python-only patch that does not require rebuilding the CUDA package.
+  spans by reusing one exact trajectory residual. It provides conservative
+  standard, 4-step, and 8-step profiles, isolates sampler branches, prefetches
+  only blocks that actually execute, and follows ComfyUI's Dynamic VRAM and
+  pinned-memory lifecycle. It is a Python-only patch and does not require
+  rebuilding the CUDA package.
 - `Video Motion Contact Sheet (Experimental)` samples an `N x N` chronological
   storyboard from a loaded `VIDEO` or decoded `IMAGE` frame batch. It can use
   uniform or motion-weighted sampling and optionally wraps each panel in

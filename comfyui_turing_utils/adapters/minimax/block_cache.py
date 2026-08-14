@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import logging
 import math
+from dataclasses import dataclass
 
 import torch
 
@@ -21,21 +22,12 @@ LOG = logging.getLogger("comfyui-turing-utils")
 CACHE_KEY = "turing_utils_minimax_h3_block_cache"
 PATCH_KEY = "turing_utils_minimax_h3_block_cache"
 FORWARD_PATCH_KEY = "diffusion_model._forward"
+_CACHE_FORWARD_ATTR = "_turing_utils_minimax_block_cache_forward"
 
 _MIB = 1 << 20
-_RESIDUAL_FORECAST_BLEND = 0.35
-_RESIDUAL_FORECAST_LIMIT = 0.18
-_RESIDUAL_FORECAST_MAX_BETA = 1.0
-_RMS_DRIFT_LIMIT = 0.10
-_RMS_GAIN_LIMIT = 0.18
-_TURBO_DELTA_FLOOR = 0.30
-_TURBO_END_MARGIN = 6
-_TURBO_RMS_DRIFT_LIMIT = 0.16
-_TURBO_RMS_GAIN_LIMIT = 0.30
-_TURBO_SCALE_MAX = 1.15
-_TURBO_SCALE_MIN = 0.85
-_TURBO_SHORT_STEP_MAX = 10
-_TURBO_START = 6
+_CPU_TRANSFER_CHUNK_BYTES = 64 * _MIB
+_SHORT_PROFILE_MAX_STEPS = 10
+_SHORT_PROFILE_EDGE_BLOCKS = 6
 
 _FORWARD_PARAMETERS = (
     "x",
@@ -47,22 +39,23 @@ _FORWARD_PARAMETERS = (
 )
 
 
-def _sample_rms(hidden: torch.Tensor, span: tuple[int, int]) -> float:
-    start, end = span
-    if end <= start:
-        return 0.0
-    token_stride = max((end - start) // 1024, 1)
-    sample = hidden[start:end:token_stride, ::16].float()
-    return float(torch.sqrt(sample.square().mean() + 1e-12).item())
+@dataclass(frozen=True, slots=True)
+class CacheProfile:
+    name: str
+    threshold: float
+    start_percent: float
+    end_percent: float
+    max_consecutive_hits: int
+    max_hits: int | None
+    edge_blocks: int
 
 
-def _segment_stats(hidden: torch.Tensor, ranges) -> dict[str, float]:
-    return {kind: _sample_rms(hidden, span) for kind, span in ranges}
-
-
-def _relative_change(current: float, reference: float) -> float:
-    reference = max(float(reference), 1e-8)
-    return abs(float(current) - reference) / reference
+_PROFILES = {
+    "standard": CacheProfile("standard", 0.08, 0.10, 0.90, 2, None, 0),
+    "4-step LoRA": CacheProfile("4-step LoRA", 0.30, 0.20, 0.80, 1, 1, 6),
+    "8-step LoRA": CacheProfile("8-step LoRA", 0.20, 0.25, 0.75, 1, 2, 6),
+}
+_PROFILE_NAMES = ("auto", *_PROFILES)
 
 
 def _denoise_step_count(transformer_options) -> int | None:
@@ -75,52 +68,200 @@ def _denoise_step_count(transformer_options) -> int | None:
         return None
 
 
-def _turbo_ranges(block_count: int) -> tuple[int, int]:
-    if block_count <= 1:
-        return 0, max(block_count, 0)
-    start = min(_TURBO_START, block_count - 1)
-    return start, max(start, block_count - _TURBO_END_MARGIN)
+def _profile_block_range(
+    profile: CacheProfile,
+    block_count: int,
+) -> tuple[int, int]:
+    block_count = max(int(block_count), 0)
+    edge = min(max(int(profile.edge_blocks), 0), block_count // 2)
+    start, end = edge, block_count - edge
+    # A profile must never create an empty span: there would be no block after
+    # which the exact residual could be captured. Small synthetic models use
+    # the full span; production H3 keeps the requested six edge blocks exact.
+    return (0, block_count) if start >= end else (start, end)
+
+
+class ResidualStore:
+    """Own one exact cache tensor with bounded CPU/GPU staging."""
+
+    def __init__(self, cache_device: str):
+        if cache_device not in {"auto", "gpu", "cpu"}:
+            raise ValueError(f"Unsupported block-cache device: {cache_device}")
+        self.cache_device = cache_device
+        self.tensor = None
+        self.ready_event = None
+        self.comfy_pinned = False
+        self.storage_device = "none"
+        self.last_storage_device = "none"
+
+    def clear(self):
+        if self.ready_event is not None:
+            self.ready_event.synchronize()
+        if self.comfy_pinned and self.tensor is not None:
+            unpin_memory = getattr(
+                comfy.model_management,
+                "unpin_memory",
+                None,
+            )
+            if callable(unpin_memory):
+                unpin_memory(self.tensor)
+        self.tensor = None
+        self.ready_event = None
+        self.comfy_pinned = False
+        self.storage_device = "none"
+
+    def compatible(self, hidden: torch.Tensor) -> bool:
+        cached = self.tensor
+        return (
+            cached is not None
+            and tuple(cached.shape) == tuple(hidden.shape)
+            and cached.dtype == hidden.dtype
+        )
+
+    @staticmethod
+    def _byte_size(tensor: torch.Tensor) -> int:
+        return int(tensor.numel()) * int(tensor.element_size())
+
+    def _keep_on_gpu(self, source: torch.Tensor, transformer_options) -> bool:
+        if source.device.type != "cuda":
+            return True
+        if self.cache_device == "gpu":
+            return True
+        if self.cache_device == "cpu":
+            return False
+        byte_size = self._byte_size(source)
+        free_memory = int(comfy.model_management.get_free_memory(source.device))
+        reserve = int(comfy.model_management.minimum_inference_memory())
+        # The GPU snapshot is an additional allocation. Honor ComfyUI's full
+        # inference reserve before cloning; skipped blocks are not prefetched on
+        # a hit, and the snapshot is released before a full middle-span pass.
+        return free_memory > byte_size + reserve
+
+    @staticmethod
+    def _rows_per_chunk(tensor: torch.Tensor) -> int:
+        if tensor.ndim == 0 or int(tensor.shape[0]) <= 1:
+            return 1
+        row_elements = max(int(tensor.numel()) // int(tensor.shape[0]), 1)
+        row_bytes = row_elements * int(tensor.element_size())
+        return max(_CPU_TRANSFER_CHUNK_BYTES // max(row_bytes, 1), 1)
+
+    def capture(self, source: torch.Tensor, transformer_options):
+        """Capture an immutable pre-span snapshot on the selected device."""
+
+        self.clear()
+        if self._keep_on_gpu(source, transformer_options):
+            self.tensor = source.detach().clone()
+            self.storage_device = self.tensor.device.type
+            self.last_storage_device = self.storage_device
+            return
+
+        cached = torch.empty_like(source, device="cpu")
+        pin_memory = getattr(comfy.model_management, "pin_memory", None)
+        self.comfy_pinned = (
+            bool(pin_memory(cached)) if callable(pin_memory) else False
+        )
+        rows = self._rows_per_chunk(source)
+        for start in range(0, int(source.shape[0]), rows):
+            end = min(start + rows, int(source.shape[0]))
+            cached[start:end].copy_(
+                source[start:end],
+                non_blocking=self.comfy_pinned,
+            )
+        self.tensor = cached
+        self.storage_device = "cpu"
+        self.last_storage_device = self.storage_device
+        if source.device.type == "cuda":
+            self.ready_event = torch.cuda.Event()
+            self.ready_event.record(torch.cuda.current_stream(source.device))
+
+    def finish_residual(self, after: torch.Tensor):
+        """Replace the captured snapshot with the exact ``after - before``."""
+
+        cached = self.tensor
+        if cached is None:
+            raise RuntimeError("Block-cache snapshot is unavailable")
+        if not self.compatible(after):
+            raise RuntimeError("Block-cache snapshot changed shape or dtype")
+        if cached.device == after.device:
+            cached.neg_().add_(after)
+            return
+        if cached.device.type == "cpu" and after.device.type == "cuda":
+            stream = torch.cuda.current_stream(after.device)
+            if self.ready_event is not None:
+                stream.wait_event(self.ready_event)
+            rows = self._rows_per_chunk(cached)
+            staging_shape = (min(rows, int(cached.shape[0])), *cached.shape[1:])
+            staging = torch.empty(
+                staging_shape,
+                dtype=after.dtype,
+                device=after.device,
+            )
+            for start in range(0, int(cached.shape[0]), rows):
+                end = min(start + rows, int(cached.shape[0]))
+                count = end - start
+                chunk = staging[:count]
+                chunk.copy_(cached[start:end], non_blocking=self.comfy_pinned)
+                chunk.neg_().add_(after[start:end])
+                cached[start:end].copy_(
+                    chunk,
+                    non_blocking=self.comfy_pinned,
+                )
+            self.ready_event = torch.cuda.Event()
+            self.ready_event.record(stream)
+            return
+        cached.neg_().add_(
+            after.detach().to(device=cached.device, dtype=cached.dtype)
+        )
+
+    def apply(self, hidden: torch.Tensor):
+        cached = self.tensor
+        if cached is None:
+            raise RuntimeError("Block-cache residual is unavailable")
+        if cached.device == hidden.device and cached.dtype == hidden.dtype:
+            hidden.add_(cached)
+            return
+        if cached.device.type == "cpu" and hidden.device.type == "cuda":
+            stream = torch.cuda.current_stream(hidden.device)
+            if self.ready_event is not None:
+                stream.wait_event(self.ready_event)
+            rows = self._rows_per_chunk(cached)
+            staging_shape = (min(rows, int(cached.shape[0])), *cached.shape[1:])
+            staging = torch.empty(
+                staging_shape,
+                dtype=hidden.dtype,
+                device=hidden.device,
+            )
+            for start in range(0, int(cached.shape[0]), rows):
+                end = min(start + rows, int(cached.shape[0]))
+                count = end - start
+                chunk = staging[:count]
+                chunk.copy_(cached[start:end], non_blocking=self.comfy_pinned)
+                hidden[start:end].add_(chunk)
+            self.ready_event = torch.cuda.Event()
+            self.ready_event.record(stream)
+            return
+        hidden.add_(cached.to(device=hidden.device, dtype=hidden.dtype))
 
 
 class MiniMaxH3BlockCache:
     def __init__(
         self,
-        threshold: float,
-        start_percent: float,
-        end_percent: float,
-        max_consecutive_skips: int,
+        profile: CacheProfile,
         cache_device: str,
         block_count: int,
-        turbo_mode: bool = False,
     ):
-        self.threshold = float(threshold)
-        self.turbo_mode = bool(turbo_mode)
-        self.start_percent = float(start_percent)
-        self.end_percent = float(end_percent)
-        self.max_consecutive_skips = int(max_consecutive_skips)
-        self.skip_start, self.skip_end = (
-            _turbo_ranges(block_count) if turbo_mode else (0, block_count)
-        )
-        self.cache_device = cache_device
+        self.profile = profile
         self.block_count = int(block_count)
-        self.rms_gain_limit = (
-            _TURBO_RMS_GAIN_LIMIT if turbo_mode else _RMS_GAIN_LIMIT
+        self.skip_start, self.skip_end = _profile_block_range(
+            profile,
+            self.block_count,
         )
-        self.rms_drift_limit = (
-            _TURBO_RMS_DRIFT_LIMIT if turbo_mode else _RMS_DRIFT_LIMIT
-        )
+        self.residual = ResidualStore(cache_device)
         self.reset()
 
     def reset(self):
-        self.residual = None
-        self.previous_residual = None
-        self.residual_before_stats = {}
-        self.residual_after_stats = {}
-        self.previous_residual_before_stats = {}
-        self.previous_residual_after_stats = {}
-        self.residual_percent = None
-        self.previous_residual_percent = None
-        self.residual_delta_score = 0.0
+        self.residual.clear()
+        self.residual.last_storage_device = "none"
         self.current_percent = -1.0
         self.current_step_index = -1
         self.step_count = 0
@@ -129,21 +270,25 @@ class MiniMaxH3BlockCache:
         self.schedule = None
         self.last_sigma = None
         self.accumulated_delta = 0.0
-        self.consecutive_skips = 0
+        self.consecutive_hits = 0
         self.full_steps = 0
         self.cache_hits = 0
         self.skipped_blocks = 0
         self.cache_ranges = ()
         self.full_run = False
-        self.base = None
         self.reject_counts = {}
 
     def finish(self):
         total = (self.full_steps + self.cache_hits) * self.block_count
         if total:
             LOG.info(
-                "MiniMax H3 block cache: acceleration %.1f%%",
+                "MiniMax H3 block cache: profile=%s device=%s acceleration=%.1f%% "
+                "hits=%d full=%d",
+                self.profile.name,
+                self.residual.last_storage_device,
                 100.0 * self.skipped_blocks / total,
+                self.cache_hits,
+                self.full_steps,
             )
         if self.reject_counts:
             details = ", ".join(
@@ -161,7 +306,7 @@ class MiniMaxH3BlockCache:
         self.cache_ranges = tuple(
             (kind, (int(start), int(end)))
             for start, end, kind in segments
-            if kind in ("audio", "video")
+            if int(end) > int(start)
         )
 
     def _step_info(self, transformer_options):
@@ -204,29 +349,22 @@ class MiniMaxH3BlockCache:
     def _signature(hidden: torch.Tensor, cache_ranges):
         ranges = cache_ranges or (("all", (0, int(hidden.shape[0]))),)
         feature_count = int(hidden.shape[1])
-        feature_stride = max(feature_count // 64, 1)
+        sampled_features = min(feature_count, 64)
+        feature_stride = max(feature_count // sampled_features, 1)
+        row_budget = max(4096 // max(len(ranges) * sampled_features, 1), 1)
         parts = []
         for _, (start, end) in ranges:
-            row_step = max(math.ceil((end - start) / 512), 1)
+            row_step = max(math.ceil((end - start) / row_budget), 1)
             part = hidden[start:end:row_step, ::feature_stride]
-            parts.append(part[:, :64].reshape(-1))
+            parts.append(part[:row_budget, :sampled_features].reshape(-1))
         return torch.cat(parts).detach().float()
 
     def _clear_tensors(self):
-        self.residual = None
-        self.previous_residual = None
-        self.residual_before_stats = {}
-        self.residual_after_stats = {}
-        self.previous_residual_before_stats = {}
-        self.previous_residual_after_stats = {}
-        self.residual_percent = None
-        self.previous_residual_percent = None
-        self.residual_delta_score = 0.0
+        self.residual.clear()
         self.previous_signature = None
         self.accumulated_delta = 0.0
-        self.consecutive_skips = 0
+        self.consecutive_hits = 0
         self.full_run = False
-        self.base = None
 
     @staticmethod
     def _relative_tensor_change(current, reference) -> float:
@@ -240,126 +378,31 @@ class MiniMaxH3BlockCache:
         denominator = reference_sample.abs().mean().clamp_min(1e-6)
         return float(((current_sample - reference_sample).abs().mean() / denominator).item())
 
-    def _cache_on_gpu(self, source: torch.Tensor) -> bool:
-        if source.device.type != "cuda":
-            return True
-        if self.cache_device == "gpu":
-            return True
-        if self.cache_device == "cpu":
-            return False
-        required = _MIB * 1024 + source.numel() * source.element_size() * 4
-        return comfy.model_management.get_free_memory(source.device) > required
-
-    def _store_residual(self, residual, before_stats, after_stats, percent):
-        source = residual.detach()
-        if self._cache_on_gpu(source):
-            self.residual = source
-        else:
-            cached = torch.empty_like(source, device="cpu", pin_memory=True)
-            cached.copy_(source, non_blocking=cached.is_pinned())
-            self.residual = cached
-        self.residual_before_stats = dict(before_stats)
-        self.residual_after_stats = dict(after_stats)
-        self.residual_percent = percent
-
-    def store_middle(self, after):
-        if not self.full_run or self.base is None:
+    def complete_middle(self, after, _transformer_options):
+        if not self.full_run:
             return
-        old_residual = self.residual
-        old_before_stats = self.residual_before_stats
-        old_after_stats = self.residual_after_stats
-        old_percent = self.residual_percent
-
-        before_stats = _segment_stats(self.base, self.cache_ranges)
-        after_stats = _segment_stats(after, self.cache_ranges)
-        self._store_residual(
-            after - self.base,
-            before_stats,
-            after_stats,
-            self.current_percent,
-        )
-        if (
-            old_residual is not None
-            and old_residual.shape == self.residual.shape
-            and old_residual.device == self.residual.device
-            and old_residual.dtype == self.residual.dtype
-        ):
-            self.previous_residual = old_residual
-            self.previous_residual_before_stats = old_before_stats
-            self.previous_residual_after_stats = old_after_stats
-            self.previous_residual_percent = old_percent
-            self.residual_delta_score = self._relative_tensor_change(
-                self.residual, old_residual
-            )
-        else:
-            self.previous_residual = None
-            self.previous_residual_before_stats = {}
-            self.previous_residual_after_stats = {}
-            self.previous_residual_percent = None
-            self.residual_delta_score = math.inf
-
-        self.base = None
+        if self.residual.tensor is not None:
+            self.residual.finish_residual(after)
         self.full_run = False
         self.accumulated_delta = 0.0
-        self.consecutive_skips = 0
+        self.consecutive_hits = 0
         self.full_steps += 1
 
-    def _turbo_segment_scales(self, before_stats):
-        scales = {}
-        for kind, _ in self.cache_ranges:
-            current = before_stats.get(kind)
-            reference = self.residual_before_stats.get(kind)
-            if current is None or reference is None or reference <= 0.0:
-                continue
-            scales[kind] = min(
-                max(current / reference, _TURBO_SCALE_MIN), _TURBO_SCALE_MAX
-            )
-        return scales
-
-    def _apply_cached(self, hidden, cached, segment_scales, alpha=1.0):
-        if cached.device != hidden.device or cached.dtype != hidden.dtype:
-            non_blocking = cached.device.type == "cpu" and cached.is_pinned()
-            cached = cached.to(
-                device=hidden.device,
-                dtype=hidden.dtype,
-                non_blocking=non_blocking,
-            )
-        hidden.add_(cached, alpha=alpha)
-        for kind, span in self.cache_ranges:
-            scale = segment_scales.get(kind, 1.0)
-            if scale != 1.0:
-                start, end = span
-                hidden[start:end].add_(cached[start:end], alpha=alpha * (scale - 1.0))
-
-    def _forecast_residual(self):
-        if (
-            self.previous_residual is None
-            or self.previous_residual_percent is None
-            or self.residual_percent is None
-            or not math.isfinite(self.residual_delta_score)
-            or self.residual_delta_score > _RESIDUAL_FORECAST_LIMIT
-        ):
-            return self.residual
-        denominator = self.residual_percent - self.previous_residual_percent
-        if denominator <= 0.0:
-            self._reject("forecast_fallback")
-            return self.residual
-        beta = min(
-            max(
-                (self.current_percent - self.residual_percent) / denominator,
-                0.0,
-            ),
-            _RESIDUAL_FORECAST_MAX_BETA,
-        )
-        forecast_factor = _RESIDUAL_FORECAST_BLEND * beta
-        return self.residual + (self.residual - self.previous_residual) * forecast_factor
+    def _start_full(self, hidden, transformer_options, *, store_residual: bool):
+        self.residual.clear()
+        self.full_run = True
+        if store_residual:
+            self.residual.capture(hidden, transformer_options)
 
     def prepare_middle(self, hidden, transformer_options, force_full=False) -> bool:
         step_info = self._step_info(transformer_options)
         if step_info is None:
             self._reject("missing_step_info")
-            self.full_run = True
-            self.base = hidden.clone()
+            self._start_full(
+                hidden,
+                transformer_options,
+                store_residual=False,
+            )
             return False
         current_sigma, percent = step_info
 
@@ -380,70 +423,53 @@ class MiniMaxH3BlockCache:
         if math.isfinite(delta):
             self.accumulated_delta += delta
 
-        before_stats = _segment_stats(hidden, self.cache_ranges)
         eligible = True
+        store_residual = True
         if force_full:
             self._reject("patch_overlap")
             eligible = False
-        if not self.start_percent <= percent <= self.end_percent:
+            store_residual = False
+        if not self.profile.start_percent <= percent <= self.profile.end_percent:
             self._reject("outside_percent")
             eligible = False
-        if self.residual is None or self.residual.shape != hidden.shape:
+            if percent > self.profile.end_percent:
+                store_residual = False
+        if not self.residual.compatible(hidden):
             self._reject(
-                "missing_residual" if self.residual is None else "residual_shape"
+                "missing_residual"
+                if self.residual.tensor is None
+                else "residual_shape"
             )
             eligible = False
         if not math.isfinite(delta):
             self._reject("missing_delta")
             eligible = False
 
-        delta_threshold = (
-            max(self.threshold, _TURBO_DELTA_FLOOR)
-            if self.turbo_mode
-            else self.threshold
-        )
-        if self.accumulated_delta > delta_threshold:
+        if self.accumulated_delta > self.profile.threshold:
             self._reject("delta_threshold")
             eligible = False
-        if self.consecutive_skips >= self.max_consecutive_skips:
+        if self.consecutive_hits >= self.profile.max_consecutive_hits:
             self._reject("mcs")
             eligible = False
-
-        if self.residual is not None and self.residual_before_stats:
-            gain_changes = [
-                _relative_change(value, self.residual_before_stats[kind])
-                for kind, value in before_stats.items()
-                if kind in self.residual_before_stats
-            ]
-            drift_changes = [
-                _relative_change(value, self.residual_after_stats[kind])
-                for kind, value in before_stats.items()
-                if kind in self.residual_after_stats
-            ]
-            if (
-                not self.turbo_mode
-                and gain_changes
-                and max(gain_changes) > self.rms_gain_limit
-            ):
-                self._reject("rms_gain")
-                eligible = False
-            if drift_changes and max(drift_changes) > self.rms_drift_limit:
-                self._reject("rms_drift")
-                eligible = False
+        if (
+            self.profile.max_hits is not None
+            and self.cache_hits >= self.profile.max_hits
+        ):
+            self._reject("hit_budget")
+            eligible = False
+            store_residual = False
 
         if not eligible:
-            self.full_run = True
-            self.base = hidden.clone()
+            self._start_full(
+                hidden,
+                transformer_options,
+                store_residual=store_residual,
+            )
             return False
 
-        cached = self._forecast_residual()
-        segment_scales = (
-            self._turbo_segment_scales(before_stats) if self.turbo_mode else {}
-        )
-        self._apply_cached(hidden, cached, segment_scales)
+        self.residual.apply(hidden)
         self.full_run = False
-        self.base = None
-        self.consecutive_skips += 1
+        self.consecutive_hits += 1
         self.cache_hits += 1
         self.skipped_blocks += self.skip_end - self.skip_start
         return True
@@ -452,30 +478,32 @@ class MiniMaxH3BlockCache:
 class MiniMaxH3BlockCacheGroup:
     def __init__(
         self,
-        threshold: float,
-        start_percent: float,
-        end_percent: float,
-        max_consecutive_skips: int,
+        requested_profile: str,
         cache_device: str,
         block_count: int,
-        turbo_mode: bool = False,
     ):
-        self.threshold = float(threshold)
-        self.start_percent = float(start_percent)
-        self.end_percent = float(end_percent)
-        self.max_consecutive_skips = int(max_consecutive_skips)
+        if requested_profile not in _PROFILE_NAMES:
+            raise ValueError(f"Unsupported block-cache profile: {requested_profile}")
+        self.requested_profile = requested_profile
         self.cache_device = cache_device
         self.block_count = int(block_count)
-        self.turbo_mode = bool(turbo_mode)
         self.states = {}
 
     def _strategy(self, transformer_options):
-        if not self.turbo_mode:
-            return "standard"
         step_count = _denoise_step_count(transformer_options)
-        if step_count is not None and step_count <= _TURBO_SHORT_STEP_MAX:
-            return "turbo_four"
-        return "standard"
+        if self.requested_profile == "auto":
+            if step_count == 4:
+                return "4-step LoRA"
+            if step_count == 8:
+                return "8-step LoRA"
+            return "standard"
+        if (
+            self.requested_profile in {"4-step LoRA", "8-step LoRA"}
+            and step_count is not None
+            and step_count > _SHORT_PROFILE_MAX_STEPS
+        ):
+            return "standard"
+        return self.requested_profile
 
     @staticmethod
     def _branch_key(transformer_options):
@@ -493,27 +521,18 @@ class MiniMaxH3BlockCacheGroup:
         state = self.states.get(key)
         if state is not None:
             return state
-        if strategy == "turbo_four":
-            state = MiniMaxH3BlockCache(
-                _TURBO_DELTA_FLOOR,
-                0.20,
-                0.80,
-                1,
-                self.cache_device,
-                self.block_count,
-                True,
-            )
-        else:
-            state = MiniMaxH3BlockCache(
-                self.threshold,
-                self.start_percent,
-                self.end_percent,
-                self.max_consecutive_skips,
-                self.cache_device,
-                self.block_count,
-                False,
-            )
+        state = MiniMaxH3BlockCache(
+            _PROFILES[strategy],
+            self.cache_device,
+            self.block_count,
+        )
         self.states[key] = state
+        LOG.info(
+            "MiniMax H3 block cache selected profile=%s steps=%s requested=%s",
+            strategy,
+            _denoise_step_count(transformer_options),
+            self.requested_profile,
+        )
         return state
 
     def reset(self):
@@ -537,6 +556,14 @@ class _SamplingScope:
             return executor(*args, **kwargs)
         finally:
             self.cache.finish()
+
+
+class _CleanupCache:
+    def __init__(self, cache: MiniMaxH3BlockCacheGroup):
+        self.cache = cache
+
+    def __call__(self, *_args, **_kwargs):
+        self.cache.reset()
 
 
 def _run_block(
@@ -583,23 +610,28 @@ def _run_block(
     )["img"]
 
 
-def _run_span(
+def _run_blocks(
     model,
     hidden,
-    start,
-    end,
+    indices,
     t_emb,
     mod_segments,
     rope_freqs,
     transformer_options,
     blocks_replace,
     device,
+    *,
+    complete_after: int | None = None,
+    complete_callback=None,
 ):
-    blocks = list(model.blocks[start:end])
+    indices = tuple(int(index) for index in indices)
+    if not indices:
+        return hidden
+    blocks = [model.blocks[index] for index in indices]
     prefetch_queue = comfy.model_prefetch.make_prefetch_queue(
         blocks, device, transformer_options
     )
-    for index, block in zip(range(start, end), blocks):
+    for index, block in zip(indices, blocks):
         comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, block)
         hidden = _run_block(
             model,
@@ -611,6 +643,8 @@ def _run_span(
             transformer_options,
             blocks_replace,
         )
+        if index == complete_after and complete_callback is not None:
+            complete_callback(hidden, transformer_options)
     if prefetch_queue is not None:
         comfy.model_prefetch.prefetch_queue_pop(prefetch_queue, device, None)
     return hidden
@@ -792,11 +826,10 @@ def _cached_forward(
     cache.set_cache_ranges(layout)
     patches_replace = transformer_options.get("patches_replace", {})
     blocks_replace = patches_replace.get("dit", {})
-    hidden = _run_span(
+    hidden = _run_blocks(
         self,
         hidden,
-        0,
-        cache.skip_start,
+        range(0, cache.skip_start),
         t_emb,
         mod_segments,
         rope_freqs,
@@ -808,11 +841,24 @@ def _cached_forward(
         blocks_replace, cache.skip_start, cache.skip_end
     )
     if not cache.prepare_middle(hidden, transformer_options, force_full=force_full):
-        hidden = _run_span(
+        hidden = _run_blocks(
             self,
             hidden,
-            cache.skip_start,
-            cache.skip_end,
+            range(cache.skip_start, len(self.blocks)),
+            t_emb,
+            mod_segments,
+            rope_freqs,
+            transformer_options,
+            blocks_replace,
+            device,
+            complete_after=cache.skip_end - 1,
+            complete_callback=cache.complete_middle,
+        )
+    else:
+        hidden = _run_blocks(
+            self,
+            hidden,
+            range(cache.skip_end, len(self.blocks)),
             t_emb,
             mod_segments,
             rope_freqs,
@@ -820,19 +866,6 @@ def _cached_forward(
             blocks_replace,
             device,
         )
-        cache.store_middle(hidden)
-    hidden = _run_span(
-        self,
-        hidden,
-        cache.skip_end,
-        len(self.blocks),
-        t_emb,
-        mod_segments,
-        rope_freqs,
-        transformer_options,
-        blocks_replace,
-        device,
-    )
 
     video_seg = next(
         (start, end, t_row[seg_t["video"]])
@@ -904,17 +937,14 @@ def _make_cached_forward(diffusion_model):
             **kwargs,
         )
 
+    setattr(forward, _CACHE_FORWARD_ATTR, True)
     return weak_method(forward, diffusion_model)
 
 
 def install_minimax_block_cache(
     model,
-    threshold: float,
-    start_percent: float,
-    end_percent: float,
-    max_consecutive_skips: int,
+    profile: str,
     cache_device: str,
-    turbo_mode: bool,
 ):
     diffusion_model = model.get_model_object("diffusion_model")
     if not isinstance(diffusion_model, minimax_model.MiniMaxH3Model):
@@ -928,18 +958,22 @@ def install_minimax_block_cache(
 
     patched = model.clone()
     cache = MiniMaxH3BlockCacheGroup(
-        threshold,
-        start_percent,
-        end_percent,
-        max_consecutive_skips,
+        profile,
         cache_device,
         len(diffusion_model.blocks),
-        turbo_mode,
     )
     transformer_options = patched.model_options.setdefault(
         "transformer_options", {}
     )
     transformer_options[CACHE_KEY] = cache
+    existing_forward = getattr(patched, "object_patches", {}).get(FORWARD_PATCH_KEY)
+    if existing_forward is not None:
+        function = getattr(existing_forward, "__func__", existing_forward)
+        if not getattr(function, _CACHE_FORWARD_ATTR, False):
+            raise RuntimeError(
+                "MiniMax H3 block cache cannot compose with another "
+                "diffusion_model._forward object patch"
+            )
     patched.add_object_patch(
         FORWARD_PATCH_KEY, _make_cached_forward(diffusion_model)
     )
@@ -947,17 +981,28 @@ def install_minimax_block_cache(
         patched.remove_wrappers_with_key(
             comfy.patcher_extension.WrappersMP.OUTER_SAMPLE, PATCH_KEY
         )
+    if hasattr(patched, "remove_callbacks_with_key"):
+        patched.remove_callbacks_with_key(
+            comfy.patcher_extension.CallbacksMP.ON_CLEANUP, PATCH_KEY
+        )
     patched.add_wrapper_with_key(
         comfy.patcher_extension.WrappersMP.OUTER_SAMPLE,
         PATCH_KEY,
         _SamplingScope(cache),
+    )
+    patched.add_callback_with_key(
+        comfy.patcher_extension.CallbacksMP.ON_CLEANUP,
+        PATCH_KEY,
+        _CleanupCache(cache),
     )
     return patched
 
 
 __all__ = [
     "CACHE_KEY",
+    "CacheProfile",
     "MiniMaxH3BlockCache",
     "MiniMaxH3BlockCacheGroup",
+    "ResidualStore",
     "install_minimax_block_cache",
 ]

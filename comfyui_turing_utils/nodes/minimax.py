@@ -27,23 +27,26 @@ class MiniMaxH3BlockCachePatch:
         return {
             "required": {
                 "model": ("MODEL",),
-                "processing_control_value": (
-                    "FLOAT",
-                    {"default": 0.08, "min": 0.0, "max": 1.0, "step": 0.005},
+                "profile": (
+                    ["auto", "standard", "4-step LoRA", "8-step LoRA"],
+                    {
+                        "default": "auto",
+                        "tooltip": (
+                            "Auto selects a conservative preset only for an exact "
+                            "4- or 8-step trajectory; all other schedules use standard."
+                        ),
+                    },
                 ),
-                "processing_percent_1": (
-                    "FLOAT",
-                    {"default": 0.10, "min": 0.0, "max": 1.0, "step": 0.01},
-                ),
-                "processing_percent_2": (
-                    "FLOAT",
-                    {"default": 0.90, "min": 0.0, "max": 1.0, "step": 0.01},
-                ),
-                "mcs": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1}),
-                "device": (["auto", "gpu", "cpu"], {"default": "auto"}),
-                "mode": (
-                    ["standard", "4-step LoRA"],
-                    {"default": "standard"},
+                "cache_device": (
+                    ["auto", "gpu", "cpu"],
+                    {
+                        "default": "auto",
+                        "tooltip": (
+                            "Auto honors ComfyUI's free-VRAM reserve; skipped blocks "
+                            "also stay out of its Dynamic VRAM prefetch queue. CPU uses "
+                            "ComfyUI-managed pinned memory when available."
+                        ),
+                    },
                 ),
             }
         }
@@ -52,29 +55,18 @@ class MiniMaxH3BlockCachePatch:
     FUNCTION = "patch"
     CATEGORY = "Turing Utils/optimization"
     EXPERIMENTAL = True
-    DESCRIPTION = "Trajectory-aware transformer-block caching for MiniMax H3."
+    DESCRIPTION = (
+        "Profile-driven MiniMax H3 transformer-block caching. Auto selects the "
+        "dedicated 4-step or 8-step policy only for exact matching trajectories; "
+        "cache storage participates in ComfyUI's VRAM and pinned-memory lifecycle."
+    )
 
-    def patch(
-        self,
-        model,
-        processing_control_value,
-        processing_percent_1,
-        processing_percent_2,
-        mcs,
-        device,
-        mode,
-    ):
-        if processing_percent_1 > processing_percent_2:
-            raise ValueError("processing_percent_1 must not exceed processing_percent_2")
+    def patch(self, model, profile, cache_device):
         return (
             install_minimax_block_cache(
                 model,
-                processing_control_value,
-                processing_percent_1,
-                processing_percent_2,
-                mcs,
-                device,
-                mode == "4-step LoRA",
+                profile,
+                cache_device,
             ),
         )
 
