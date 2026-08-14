@@ -40,6 +40,18 @@ class MiniMaxH3VideoVAEDecode:
                         "tooltip": "Number of final decoder transformer blocks evaluated as independent 256px windows before multiband stitching. Higher values strengthen tile-local reconstruction and cost more compute; 0 keeps shared-core through every block.",
                     },
                 ),
+                "diagnostics": (
+                    [
+                        "off",
+                        "trace_once",
+                        "trace_once_sync",
+                        "trace_once_no_weight_retention",
+                    ],
+                    {
+                        "default": "off",
+                        "tooltip": "Capture the first temporal decode chunk once. Sync isolates CUDA stream lifetime failures; no-weight-retention isolates VBAR/prefetch state. Diagnostic modes are intentionally slow and log locally to the terminal.",
+                    },
+                ),
             }
         }
 
@@ -58,6 +70,7 @@ class MiniMaxH3VideoVAEDecode:
         vae,
         attention,
         independent_tail_blocks,
+        diagnostics="off",
     ):
         require_h3_video_vae(vae)
         latent = samples["samples"]
@@ -69,6 +82,7 @@ class MiniMaxH3VideoVAEDecode:
                 latent,
                 attention,
                 independent_tail_blocks,
+                diagnostics=diagnostics,
             )
         if images.ndim == 5:
             images = images.reshape(-1, *images.shape[-3:])

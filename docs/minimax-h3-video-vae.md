@@ -44,6 +44,26 @@ The attention selector applies to both the shared prefix and independent tail:
 - `sage`: bundled Turing Sage attention;
 - `w8a8`: quantized QK attention when the installed kernel supports it.
 
+### One-shot diagnostics
+
+The decoder's `diagnostics` input is normally `off` and adds no tensor
+statistics or synchronization. The other modes trace only the first temporal
+decode chunk and print local terminal diagnostics for the latent, final shared
+block, independent tail blocks, projection, multiband output, seam ratios,
+CUDA memory, and VBAR-backed linear state:
+
+- `trace_once` records the normal asynchronous path;
+- `trace_once_sync` synchronizes immediately after each traced attention call;
+- `trace_once_no_weight_retention` disables cross-block retained-weight
+  prefetch for that decode invocation.
+
+Use the same cached latent when comparing modes. A matching
+`decode.latent_input` fingerprint confirms that the VAE received the same
+sample. If only the sync mode is clean, inspect stream lifetime; if only the
+no-retention mode is clean, inspect VBAR/prefetch state. `finite=False` or an
+FP16 absolute maximum near 65504 identifies numerical overflow. Diagnostics
+are intentionally slow and automatically stop after that invocation.
+
 ## Encode
 
 `MiniMax H3 Video VAE Encode` retains the official 256px/64px tiled encoder

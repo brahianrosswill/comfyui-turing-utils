@@ -304,7 +304,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             )
         self.assertIs(actual, expected)
         session.before_stage.assert_called_once_with(0)
-        run.assert_called_once_with(model, "latent", {}, session, 4, None, 3)
+        run.assert_called_once_with(model, "latent", {}, session, 4, None, 3, None)
 
     def test_zero_tail_still_uses_independent_multiband_projection(self):
         decoder = SimpleNamespace(
@@ -355,9 +355,38 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 vae,
                 "sdpa",
                 2,
+                "off",
             )[0]
-        run.assert_called_once_with(vae, latent, "sdpa", 2)
+        run.assert_called_once_with(vae, latent, "sdpa", 2, diagnostics="off")
         self.assertEqual(output.shape, (2, 4, 4, 3))
+
+    def test_vae_diagnostics_capture_only_first_spatial_chunk(self):
+        decoder = SimpleNamespace(transformer_blocks=[])
+        diagnostics = video_vae._VAEDiagnostics("trace_once", torch.device("cpu"))
+        with self.assertLogs(level="WARNING") as captured:
+            diagnostics.begin(torch.arange(8.0).view(1, 1, 2, 2, 2), "sdpa", 0, decoder)
+            diagnostics.begin_spatial()
+            diagnostics.record("spatial.value", torch.tensor([1.0, 2.0]))
+            diagnostics.begin_spatial()
+            diagnostics.record("spatial.value", torch.tensor([3.0, 4.0]))
+            diagnostics.finish(decoder, 0)
+        self.assertEqual(len(diagnostics.records["spatial.value"]), 1)
+        self.assertTrue(
+            any(
+                "tensor=spatial.value calls=1" in message
+                for message in captured.output
+            )
+        )
+
+    def test_vae_diagnostic_modes_control_runtime_isolation(self):
+        sync = video_vae._VAEDiagnostics("trace_once_sync", torch.device("cpu"))
+        isolated = video_vae._VAEDiagnostics(
+            "trace_once_no_weight_retention", torch.device("cpu")
+        )
+        self.assertTrue(sync.force_sync)
+        self.assertTrue(sync.retain_weights)
+        self.assertFalse(isolated.force_sync)
+        self.assertFalse(isolated.retain_weights)
 
     def test_encoder_node_uses_optimized_runtime(self):
         vae = mock.Mock()
@@ -462,10 +491,17 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         encoder = nodes.MiniMaxH3VideoVAEEncode.INPUT_TYPES()["required"]
         self.assertEqual(
             set(decoder),
-            {"samples", "vae", "attention", "independent_tail_blocks"},
+            {
+                "samples",
+                "vae",
+                "attention",
+                "independent_tail_blocks",
+                "diagnostics",
+            },
         )
         self.assertEqual(set(encoder), {"pixels", "vae"})
         self.assertEqual(decoder["independent_tail_blocks"][1]["default"], 2)
+        self.assertEqual(decoder["diagnostics"][1]["default"], "off")
         upscaler = nodes.MiniMaxH3LatentPixelUpscale.INPUT_TYPES()["required"]
         self.assertEqual(
             set(upscaler),

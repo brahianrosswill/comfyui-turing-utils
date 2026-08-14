@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import queue
@@ -52,6 +53,279 @@ _RTX_VSR_QUALITIES = {
     "high_bitrate_high": "HIGHBITRATE_HIGH",
     "high_bitrate_ultra": "HIGHBITRATE_ULTRA",
 }
+_VAE_DIAGNOSTIC_MODES = {
+    "off",
+    "trace_once",
+    "trace_once_sync",
+    "trace_once_no_weight_retention",
+}
+
+
+class _VAEDiagnostics:
+    def __init__(self, mode, device):
+        if mode not in _VAE_DIAGNOSTIC_MODES:
+            raise ValueError(f"Unknown H3 VAE diagnostic mode: {mode}")
+        self.mode = mode
+        self.device = torch.device(device)
+        self.enabled = mode != "off"
+        self.force_sync = mode == "trace_once_sync"
+        self.retain_weights = mode != "trace_once_no_weight_retention"
+        self.active = False
+        self.spatial_calls = 0
+        self.records = {}
+        self.scalar_records = {}
+        self.memory_records = []
+
+    @staticmethod
+    def _sample(value, limit=256):
+        sample = value.detach()
+        while sample.numel() > limit:
+            dimension = max(range(sample.ndim), key=lambda index: sample.shape[index])
+            slices = [slice(None)] * sample.ndim
+            slices[dimension] = slice(None, None, 2)
+            sample = sample[tuple(slices)]
+        return sample.contiguous().reshape(-1).float()
+
+    @staticmethod
+    def _digest(sample):
+        payload = sample.cpu().numpy().tobytes()
+        return hashlib.blake2s(payload, digest_size=8).hexdigest()
+
+    @staticmethod
+    def _tensor_pointer(value):
+        try:
+            return int(value.data_ptr())
+        except RuntimeError:
+            return 0
+
+    @staticmethod
+    def _signature_token(value):
+        if value is None:
+            return "none"
+        if isinstance(value, (bool, int, float, str)):
+            return repr(value)
+        return f"{type(value).__name__}@{id(value):x}"
+
+    @staticmethod
+    def _linear_state(module):
+        weight = module.weight
+        qdata = getattr(weight, "_qdata", weight)
+        if isinstance(qdata, (tuple, list)):
+            qdata = qdata[0]
+        params = getattr(weight, "_params", None)
+        layout = getattr(weight, "_layout_cls", type(weight).__name__)
+        orig_dtype = getattr(params, "orig_dtype", None)
+        qdata_ptr = _VAEDiagnostics._tensor_pointer(qdata) if torch.is_tensor(qdata) else 0
+        resident = getattr(module, "_v_weight", None)
+        resident_qdata = getattr(resident, "_qdata", resident)
+        if isinstance(resident_qdata, (tuple, list)):
+            resident_qdata = resident_qdata[0]
+        resident_ptr = (
+            _VAEDiagnostics._tensor_pointer(resident_qdata)
+            if torch.is_tensor(resident_qdata)
+            else 0
+        )
+        prefetch = getattr(module, "_prefetch", None)
+        if prefetch is None:
+            prefetch_state = "none"
+        else:
+            prefetch_state = "resident=%s,signature=%s" % (
+                bool(prefetch.get("resident", False)),
+                _VAEDiagnostics._signature_token(prefetch.get("signature")),
+            )
+        return (
+            f"layout={layout},orig={orig_dtype},weight=0x{qdata_ptr:x},"
+            f"resident=0x{resident_ptr:x},vbar={_VAEDiagnostics._signature_token(getattr(module, '_v', None))},"
+            f"module_signature={_VAEDiagnostics._signature_token(getattr(module, '_v_signature', None))},"
+            f"prefetch=({prefetch_state})"
+        )
+
+    def begin(self, latent, attention, independent_tail_blocks, decoder):
+        if not self.enabled:
+            return
+        self.active = True
+        device_name = str(self.device)
+        capability = "n/a"
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            device_name = torch.cuda.get_device_name(self.device)
+            capability = ".".join(map(str, torch.cuda.get_device_capability(self.device)))
+        logging.warning(
+            "[H3 VAE diagnostic] capture begin mode=%s device=%s sm=%s attention=%s tail_blocks=%d latent=%s",
+            self.mode,
+            device_name,
+            capability,
+            attention,
+            independent_tail_blocks,
+            tuple(latent.shape),
+        )
+        self.record("decode.latent_input", latent, force=True)
+        self.memory("decode.begin")
+        self.snapshot_weights(
+            "decode.begin",
+            decoder,
+            max(2, independent_tail_blocks),
+        )
+
+    def begin_spatial(self):
+        if not self.enabled:
+            return
+        self.spatial_calls += 1
+        self.active = self.spatial_calls == 1
+        if self.active:
+            logging.warning(
+                "[H3 VAE diagnostic] tracing the first temporal decode chunk only"
+            )
+            self.memory("spatial.begin")
+
+    def record(self, label, value, *, force=False):
+        if not self.enabled or (not force and not self.active) or not torch.is_tensor(value):
+            return
+        if value.numel() == 0:
+            return
+        minimum, maximum = torch.aminmax(value.detach())
+        self.records.setdefault(label, []).append(
+            {
+                "minimum": minimum,
+                "maximum": maximum,
+                "sample": self._sample(value),
+                "shape": tuple(value.shape),
+                "dtype": value.dtype,
+                "device": value.device,
+                "pointer": self._tensor_pointer(value),
+            }
+        )
+
+    def record_scalar(self, label, value):
+        if not self.enabled or not self.active:
+            return
+        self.scalar_records.setdefault(label, []).append(value.detach().float())
+
+    def record_seams(self, label, value, y_boundaries, x_boundaries):
+        if not self.enabled or not self.active:
+            return
+        for boundary in sorted(set(y_boundaries)):
+            if boundary < 2 or boundary + 1 >= value.shape[-2]:
+                continue
+            seam = (value[..., boundary, :] - value[..., boundary - 1, :]).float().abs().mean()
+            nearby = (
+                (value[..., boundary - 1, :] - value[..., boundary - 2, :]).float().abs().mean()
+                + (value[..., boundary + 1, :] - value[..., boundary, :]).float().abs().mean()
+            ).mul_(0.5)
+            self.record_scalar(f"{label}.y_seam_ratio", seam / nearby.clamp_min(1e-12))
+        for boundary in sorted(set(x_boundaries)):
+            if boundary < 2 or boundary + 1 >= value.shape[-1]:
+                continue
+            seam = (value[..., boundary] - value[..., boundary - 1]).float().abs().mean()
+            nearby = (
+                (value[..., boundary - 1] - value[..., boundary - 2]).float().abs().mean()
+                + (value[..., boundary + 1] - value[..., boundary]).float().abs().mean()
+            ).mul_(0.5)
+            self.record_scalar(f"{label}.x_seam_ratio", seam / nearby.clamp_min(1e-12))
+
+    def synchronize(self, label):
+        if not self.enabled or not self.active or not self.force_sync:
+            return
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(self.device)
+            logging.warning("[H3 VAE diagnostic] synchronized after %s", label)
+
+    def memory(self, label):
+        if not self.enabled or self.device.type != "cuda" or not torch.cuda.is_available():
+            return
+        free, total = torch.cuda.mem_get_info(self.device)
+        self.memory_records.append(
+            (
+                label,
+                torch.cuda.memory_allocated(self.device),
+                torch.cuda.memory_reserved(self.device),
+                free,
+                total,
+            )
+        )
+
+    def snapshot_block(self, phase, block_index, block):
+        if not self.enabled or not self.active:
+            return
+        linears = {
+            "qkv": block.attn.to_qkv,
+            "out": block.attn.to_out,
+            "w1": block.ff.w1,
+            "w2": block.ff.w2,
+        }
+        states = " ; ".join(
+            f"{name}({self._linear_state(module)})" for name, module in linears.items()
+        )
+        logging.warning(
+            "[H3 VAE diagnostic] weights %s block=%d %s",
+            phase,
+            block_index,
+            states,
+        )
+
+    def snapshot_weights(self, phase, decoder, count):
+        if not self.enabled:
+            return
+        blocks = decoder.transformer_blocks
+        first = max(0, len(blocks) - min(int(count), len(blocks)))
+        for block_index in range(first, len(blocks)):
+            self.snapshot_block(phase, block_index, blocks[block_index])
+
+    def finish(self, decoder, independent_tail_blocks):
+        if not self.enabled:
+            return
+        self.active = True
+        self.memory("decode.end")
+        self.snapshot_weights(
+            "decode.end",
+            decoder,
+            max(2, independent_tail_blocks),
+        )
+        for label, entries in self.records.items():
+            minimum = min(float(entry["minimum"].float().cpu()) for entry in entries)
+            maximum = max(float(entry["maximum"].float().cpu()) for entry in entries)
+            finite = math.isfinite(minimum) and math.isfinite(maximum)
+            first_digest = self._digest(entries[0]["sample"])
+            last_digest = self._digest(entries[-1]["sample"])
+            pointers = {entry["pointer"] for entry in entries}
+            logging.warning(
+                "[H3 VAE diagnostic] tensor=%s calls=%d shape=%s dtype=%s device=%s finite=%s min=%.7g max=%.7g absmax=%.7g first=%s last=%s first_ptr=0x%x last_ptr=0x%x pointers=%d",
+                label,
+                len(entries),
+                entries[0]["shape"],
+                entries[0]["dtype"],
+                entries[0]["device"],
+                finite,
+                minimum,
+                maximum,
+                max(abs(minimum), abs(maximum)),
+                first_digest,
+                last_digest,
+                entries[0]["pointer"],
+                entries[-1]["pointer"],
+                len(pointers),
+            )
+        for label, values in self.scalar_records.items():
+            resolved = [float(value.cpu()) for value in values]
+            logging.warning(
+                "[H3 VAE diagnostic] metric=%s calls=%d min=%.5f max=%.5f mean=%.5f",
+                label,
+                len(resolved),
+                min(resolved),
+                max(resolved),
+                sum(resolved) / len(resolved),
+            )
+        for label, allocated, reserved, free, total in self.memory_records:
+            logging.warning(
+                "[H3 VAE diagnostic] memory=%s allocated=%.0fMiB reserved=%.0fMiB free=%.0fMiB total=%.0fMiB",
+                label,
+                allocated / 1024**2,
+                reserved / 1024**2,
+                free / 1024**2,
+                total / 1024**2,
+            )
+        logging.warning(
+            "[H3 VAE diagnostic] capture complete; diagnostics are disabled outside this decode invocation"
+        )
 
 
 def require_h3_video_vae(vae):
@@ -343,6 +617,8 @@ def _projected_attention(
     value,
     rotary_pos_emb,
     transformer_options,
+    diagnostics=None,
+    phase=None,
 ):
     executor = transformer_options.get(ATTENTION_EXECUTOR_KEY)
     if callable(executor):
@@ -368,7 +644,11 @@ def _projected_attention(
             container_factory=AttentionTensorContainer,
         )
         if outcome.supported:
-            return outcome.output.nan_to_num_(0.0)
+            output = outcome.output
+            if diagnostics is not None:
+                diagnostics.synchronize(f"{phase}.attention")
+                diagnostics.record(f"{phase}.attention_raw", output)
+            return output.nan_to_num_(0.0)
 
     query = comfy.rmsnorm.rms_norm(query, module.norm_q.weight, module.norm_q.eps)
     key = comfy.rmsnorm.rms_norm(key, module.norm_k.weight, module.norm_k.eps)
@@ -390,6 +670,9 @@ def _projected_attention(
         skip_reshape=True,
         transformer_options=transformer_options,
     )
+    if diagnostics is not None:
+        diagnostics.synchronize(f"{phase}.attention")
+        diagnostics.record(f"{phase}.attention_raw", out)
     return out.nan_to_num_(0.0)
 
 
@@ -427,6 +710,8 @@ def _asymmetric_projected_attention(
     query_rotary,
     key_rotary,
     transformer_options,
+    diagnostics=None,
+    phase=None,
 ):
     """Execute core-query/full-halo attention without padding either side.
 
@@ -448,12 +733,24 @@ def _asymmetric_projected_attention(
         skip_reshape=True,
         transformer_options=transformer_options,
     )
+    if diagnostics is not None:
+        diagnostics.synchronize(f"{phase}.attention")
+        diagnostics.record(f"{phase}.attention_raw", out)
     return out.nan_to_num_(0.0)
 
 
-def _attention_forward(module, x, rotary_pos_emb, transformer_options):
+def _attention_forward(
+    module,
+    x,
+    rotary_pos_emb,
+    transformer_options,
+    diagnostics=None,
+    phase=None,
+):
     batch_size, seq_len, _ = x.shape
     qkv = module.to_qkv(x).view(batch_size, seq_len, -1, 3 * module.dim_head)
+    if diagnostics is not None:
+        diagnostics.record(f"{phase}.qkv", qkv)
     query, key, value = torch.chunk(qkv, 3, dim=-1)
     out = _projected_attention(
         module,
@@ -462,8 +759,13 @@ def _attention_forward(module, x, rotary_pos_emb, transformer_options):
         value,
         rotary_pos_emb,
         transformer_options,
+        diagnostics,
+        phase,
     )
-    return module.to_out(out)
+    out = module.to_out(out)
+    if diagnostics is not None:
+        diagnostics.record(f"{phase}.to_out", out)
+    return out
 
 
 def _attention_options(attention, device):
@@ -809,6 +1111,7 @@ def _shared_core_multiband_decoder_forward(
     tiles_per_batch,
     progress,
     independent_tail_blocks,
+    diagnostics=None,
 ):
     decoder = model.decoder
     batch, _, latent_t, latent_h, latent_w = x.shape
@@ -877,6 +1180,16 @@ def _shared_core_multiband_decoder_forward(
         if block_index > 0:
             block_session.before_stage(block_index)
         attention = block.attn
+        trace_block = (
+            diagnostics
+            if diagnostics is not None
+            and diagnostics.active
+            and block_index == shared_block_count - 1
+            else None
+        )
+        phase = f"shared.block{block_index:02d}"
+        if trace_block is not None:
+            trace_block.snapshot_block("before", block_index, block)
         qkv_image = torch.empty(
             batch,
             layout.image_tokens,
@@ -899,6 +1212,8 @@ def _shared_core_multiband_decoder_forward(
                 3 * attention.dim_head,
             )
             qkv_image[:, token_start:token_end].copy_(projected)
+        if trace_block is not None:
+            trace_block.record(f"{phase}.qkv_image", qkv_image)
 
         image_attention = torch.zeros_like(h)
         for core_tokens in sorted(query_groups):
@@ -992,6 +1307,8 @@ def _shared_core_multiband_decoder_forward(
                     query_rotary,
                     key_rotary,
                     transformer_options,
+                    trace_block,
+                    phase,
                 ).view(
                     batch,
                     window_count,
@@ -1056,6 +1373,9 @@ def _shared_core_multiband_decoder_forward(
                 comfy.ops.cast_to_input(block.scale2, h_slice),
             )
         del image_attention
+        if trace_block is not None:
+            trace_block.record(f"{phase}.residual2", h)
+            trace_block.snapshot_block("after", block_index, block)
 
     return _independent_window_tail(
         decoder,
@@ -1069,6 +1389,7 @@ def _shared_core_multiband_decoder_forward(
         block_session,
         tiles_per_batch,
         progress,
+        diagnostics,
     )
 
 
@@ -1084,6 +1405,7 @@ def _independent_window_tail(
     block_session,
     tiles_per_batch,
     progress,
+    diagnostics=None,
 ):
     batch = h.shape[0]
     dim = h.shape[-1]
@@ -1101,6 +1423,9 @@ def _independent_window_tail(
         if block_index > 0:
             block_session.before_stage(block_index)
         block = blocks[block_index]
+        phase = f"tail.block{block_index:02d}"
+        if diagnostics is not None:
+            diagnostics.snapshot_block("before", block_index, block)
         for window_start in range(0, layout.window_count, tiles_per_batch):
             window_end = min(window_start + tiles_per_batch, layout.window_count)
             window_count = window_end - window_start
@@ -1112,24 +1437,38 @@ def _independent_window_tail(
                 block.norm1.weight,
                 block.norm1.eps,
             )
+            attention_output = _attention_forward(
+                block.attn,
+                normed,
+                rotary.expand(batch * window_count, *rotary.shape[1:]),
+                transformer_options,
+                diagnostics,
+                phase,
+            )
             state.addcmul_(
-                _attention_forward(
-                    block.attn,
-                    normed,
-                    rotary.expand(batch * window_count, *rotary.shape[1:]),
-                    transformer_options,
-                ),
+                attention_output,
                 comfy.ops.cast_to_input(block.scale1, state),
             )
+            del attention_output
+            if diagnostics is not None:
+                diagnostics.record(f"{phase}.residual1", state)
             normed = comfy.rmsnorm.rms_norm(
                 state,
                 block.norm2.weight,
                 block.norm2.eps,
             )
+            mlp_output = _feed_forward(block.ff, normed)
+            if diagnostics is not None:
+                diagnostics.record(f"{phase}.mlp", mlp_output)
             state.addcmul_(
-                _feed_forward(block.ff, normed),
+                mlp_output,
                 comfy.ops.cast_to_input(block.scale2, state),
             )
+            del mlp_output
+            if diagnostics is not None:
+                diagnostics.record(f"{phase}.residual2", state)
+        if diagnostics is not None:
+            diagnostics.snapshot_block("after", block_index, block)
     pixel_y_idx = [value * decoder.patch_size for value in layout.y_idx]
     pixel_y_len = [value * decoder.patch_size for value in layout.y_len]
     pixel_x_idx = [value * decoder.patch_size for value in layout.x_idx]
@@ -1142,6 +1481,7 @@ def _independent_window_tail(
         layout.latent_h * decoder.patch_size,
         layout.latent_w * decoder.patch_size,
         h.device,
+        diagnostics,
     )
     for window_start in range(0, layout.window_count, tiles_per_batch):
         window_end = min(window_start + tiles_per_batch, layout.window_count)
@@ -1165,6 +1505,8 @@ def _independent_window_tail(
             layout.window_h * decoder.patch_size,
             layout.window_w * decoder.patch_size,
         )
+        if diagnostics is not None:
+            diagnostics.record("tail.projection", decoded)
         for local_index, window_index in enumerate(range(window_start, window_end)):
             assembler.add(window_index, decoded[:, local_index])
         if progress is not None:
@@ -1180,9 +1522,15 @@ def _decode_spatial(
     tiles_per_batch,
     progress,
     independent_tail_blocks,
+    diagnostics=None,
 ):
+    if diagnostics is not None:
+        diagnostics.begin_spatial()
+        diagnostics.record("spatial.input", z)
     block_session.before_stage(0)
     z = model.post_quant_conv(z)
+    if diagnostics is not None:
+        diagnostics.record("spatial.post_quant", z)
     return _shared_core_multiband_decoder_forward(
         model,
         z,
@@ -1191,6 +1539,7 @@ def _decode_spatial(
         tiles_per_batch,
         progress,
         independent_tail_blocks,
+        diagnostics,
     )
 
 
@@ -1296,6 +1645,7 @@ class _MultibandPixelAssembler:
         height,
         width,
         device,
+        diagnostics=None,
     ):
         self.y_starts = y_starts
         self.y_lengths = y_lengths
@@ -1303,6 +1653,7 @@ class _MultibandPixelAssembler:
         self.x_lengths = x_lengths
         self.height = height
         self.width = width
+        self.diagnostics = diagnostics
         self.columns = len(x_starts)
         descriptors = [
             (i, j, 0, 0, 0, 0)
@@ -1378,6 +1729,22 @@ class _MultibandPixelAssembler:
             low = _spatial_lowpass(self.low_canvas[:, :, frame_slice])
             high = self.high_canvas[:, :, frame_slice]
             high.sub_(_spatial_lowpass(high)).add_(low)
+        if self.diagnostics is not None:
+            self.diagnostics.record("multiband.output", self.high_canvas)
+            y_boundaries = self.y_starts[1:] + [
+                start + length
+                for start, length in zip(self.y_starts[:-1], self.y_lengths[:-1])
+            ]
+            x_boundaries = self.x_starts[1:] + [
+                start + length
+                for start, length in zip(self.x_starts[:-1], self.x_lengths[:-1])
+            ]
+            self.diagnostics.record_seams(
+                "multiband.output",
+                self.high_canvas,
+                y_boundaries,
+                x_boundaries,
+            )
         self.low_canvas = None
         return self.high_canvas
 
@@ -1553,6 +1920,7 @@ def _decode_temporal(
     progress,
     independent_tail_blocks,
     output_device=None,
+    diagnostics=None,
 ):
     chunk_dec = model.tokens_chunk_size * model.vae_ratio_t
     split_count = int(model.token_drop > 0) + 1
@@ -1583,6 +1951,7 @@ def _decode_temporal(
             tiles_per_batch,
             progress,
             independent_tail_blocks,
+            diagnostics,
         )
 
         for j in range(split_count):
@@ -1610,6 +1979,7 @@ def decode_video(
     attention="sdpa",
     independent_tail_blocks=2,
     *,
+    diagnostics="off",
     output_device=None,
     unload=True,
 ):
@@ -1628,6 +1998,8 @@ def decode_video(
             "H3 VAE independent_tail_blocks must be between 0 and "
             f"{block_count}, got {independent_tail_blocks}"
         )
+    diagnostic = _VAEDiagnostics(diagnostics, vae.device)
+    runtime_diagnostics = diagnostic if diagnostic.enabled else None
     tile_count = _spatial_tile_count(
         latent.shape[-2] * model.vae_ratio,
         latent.shape[-1] * model.vae_ratio,
@@ -1658,6 +2030,12 @@ def decode_video(
     comfy.model_management.load_models_gpu(
         [vae.patcher], memory_required=memory, force_full_load=vae.disable_offload
     )
+    diagnostic.begin(
+        latent,
+        attention,
+        independent_tail_blocks,
+        model.decoder,
+    )
 
     block_session = None
     progress = None
@@ -1667,6 +2045,7 @@ def decode_video(
         mean = model.latents_mean.view(1, -1, 1, 1, 1).to(z)
         std = model.latents_std.view(1, -1, 1, 1, 1).to(z)
         z = z * std + mean
+        diagnostic.record("decode.normalized_latent", z, force=True)
         temporal_chunks = (
             1 if z.shape[2] == 1 else model._decode_temporal_chunks(z.shape[2])[1]
         )
@@ -1676,7 +2055,11 @@ def decode_video(
             z.device,
             "H3 VAE Decode Tiles",
         )
-        block_session = _RetainedWeights(_decoder_weight_stages(model), z.device, True)
+        block_session = _RetainedWeights(
+            _decoder_weight_stages(model),
+            z.device,
+            diagnostic.retain_weights,
+        )
         block_session.start()
         if z.shape[2] == 1:
             dec = _decode_spatial(
@@ -1687,8 +2070,10 @@ def decode_video(
                 batch_tiles,
                 progress,
                 independent_tail_blocks,
+                runtime_diagnostics,
             )[:, :, -1:]
             dec = model._finalize_pixels(dec)
+            diagnostic.record("decode.output", dec, force=True)
             return dec.to(output_device).movedim(1, -1)
         dec = _decode_temporal(
             model,
@@ -1699,13 +2084,16 @@ def decode_video(
             progress,
             independent_tail_blocks,
             output_device,
+            runtime_diagnostics,
         )
+        diagnostic.record("decode.output", dec, force=True)
         return dec.movedim(1, -1)
     finally:
         if progress is not None:
             progress.finish()
         if block_session is not None:
             block_session.finish()
+        diagnostic.finish(model.decoder, independent_tail_blocks)
         _clear_attention_caches(model.decoder)
         if unload:
             vae.patcher.partially_unload(vae.patcher.offload_device, 1e30)
