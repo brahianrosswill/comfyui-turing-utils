@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import logging
 import math
 import queue
@@ -36,7 +35,7 @@ from ...kernel_api import load_turing_sage
 TILE_SIZE = 256
 TILE_OVERLAP = 64
 _AUTO_DECODE_TILE_BATCH_LIMIT = 16
-_AUTO_ENCODE_TILE_BATCH_LIMIT = 2
+_AUTO_ENCODE_TILE_BATCH_LIMIT = 16
 _DECODER_BYTES_PER_FP16_TOKEN = 64 * 1024
 _ENCODER_BYTES_PER_FP16_PIXEL_FRAME = 1800
 _ENCODER_FIXED_WORKSPACE = 256 * 1024**2
@@ -53,329 +52,6 @@ _RTX_VSR_QUALITIES = {
     "high_bitrate_high": "HIGHBITRATE_HIGH",
     "high_bitrate_ultra": "HIGHBITRATE_ULTRA",
 }
-_VAE_DIAGNOSTIC_MODES = {
-    "off",
-    "observe_once",
-    "trace_once",
-    "sync_only",
-    "no_weight_retention_only",
-}
-
-
-class _VAEDiagnostics:
-    def __init__(self, mode, device):
-        if mode not in _VAE_DIAGNOSTIC_MODES:
-            raise ValueError(f"Unknown H3 VAE diagnostic mode: {mode}")
-        self.mode = mode
-        self.device = torch.device(device)
-        self.enabled = mode != "off"
-        self.trace_tensors = mode == "trace_once"
-        self.force_sync = mode == "sync_only"
-        self.retain_weights = mode != "no_weight_retention_only"
-        self.active = False
-        self.spatial_calls = 0
-        self.sync_count = 0
-        self.context = None
-        self.deferred_inputs = []
-        self.records = {}
-        self.scalar_records = {}
-        self.memory_records = []
-
-    @staticmethod
-    def _sample(value, limit=256):
-        sample = value.detach()
-        while sample.numel() > limit:
-            dimension = max(range(sample.ndim), key=lambda index: sample.shape[index])
-            slices = [slice(None)] * sample.ndim
-            slices[dimension] = slice(None, None, 2)
-            sample = sample[tuple(slices)]
-        return sample.contiguous().reshape(-1).float()
-
-    @staticmethod
-    def _digest(sample):
-        payload = sample.cpu().numpy().tobytes()
-        return hashlib.blake2s(payload, digest_size=8).hexdigest()
-
-    @staticmethod
-    def _tensor_pointer(value):
-        try:
-            return int(value.data_ptr())
-        except RuntimeError:
-            return 0
-
-    @staticmethod
-    def _signature_token(value):
-        if value is None:
-            return "none"
-        if isinstance(value, (bool, int, float, str)):
-            return repr(value)
-        return f"{type(value).__name__}@{id(value):x}"
-
-    @staticmethod
-    def _linear_state(module):
-        weight = module.weight
-        qdata = getattr(weight, "_qdata", weight)
-        if isinstance(qdata, (tuple, list)):
-            qdata = qdata[0]
-        params = getattr(weight, "_params", None)
-        layout = getattr(weight, "_layout_cls", type(weight).__name__)
-        orig_dtype = getattr(params, "orig_dtype", None)
-        qdata_ptr = _VAEDiagnostics._tensor_pointer(qdata) if torch.is_tensor(qdata) else 0
-        resident = getattr(module, "_v_weight", None)
-        resident_qdata = getattr(resident, "_qdata", resident)
-        if isinstance(resident_qdata, (tuple, list)):
-            resident_qdata = resident_qdata[0]
-        resident_ptr = (
-            _VAEDiagnostics._tensor_pointer(resident_qdata)
-            if torch.is_tensor(resident_qdata)
-            else 0
-        )
-        prefetch = getattr(module, "_prefetch", None)
-        if prefetch is None:
-            prefetch_state = "none"
-        else:
-            prefetch_state = "resident=%s,signature=%s" % (
-                bool(prefetch.get("resident", False)),
-                _VAEDiagnostics._signature_token(prefetch.get("signature")),
-            )
-        return (
-            f"layout={layout},orig={orig_dtype},weight=0x{qdata_ptr:x},"
-            f"resident=0x{resident_ptr:x},vbar={_VAEDiagnostics._signature_token(getattr(module, '_v', None))},"
-            f"module_signature={_VAEDiagnostics._signature_token(getattr(module, '_v_signature', None))},"
-            f"prefetch=({prefetch_state})"
-        )
-
-    def begin(self, latent, attention, decoder):
-        if not self.enabled:
-            return
-        device_name = str(self.device)
-        capability = "n/a"
-        if self.device.type == "cuda" and torch.cuda.is_available():
-            device_name = torch.cuda.get_device_name(self.device)
-            capability = ".".join(map(str, torch.cuda.get_device_capability(self.device)))
-        self.context = (
-            self.mode,
-            device_name,
-            capability,
-            attention,
-            tuple(latent.shape),
-        )
-        if self.trace_tensors:
-            self.active = True
-            self._log_context("capture begin")
-            self.record("decode.latent_input", latent, force=True)
-            self.memory("decode.begin")
-            self.snapshot_weights(
-                "decode.begin",
-                decoder,
-                2,
-            )
-        elif latent.device.type == "cpu":
-            # Resolve this only after decode so observe/sync/isolation modes do
-            # not insert tensor work or console I/O into the execution path.
-            self.deferred_inputs.append(("decode.latent_input", latent))
-
-    def _log_context(self, state):
-        if self.context is None:
-            return
-        mode, device_name, capability, attention, latent_shape = self.context
-        logging.warning(
-            "[H3 VAE diagnostic] %s mode=%s device=%s sm=%s attention=%s latent=%s",
-            state,
-            mode,
-            device_name,
-            capability,
-            attention,
-            latent_shape,
-        )
-
-    def begin_spatial(self):
-        if not self.trace_tensors:
-            return
-        self.spatial_calls += 1
-        self.active = self.spatial_calls == 1
-        if self.active:
-            logging.warning(
-                "[H3 VAE diagnostic] tracing the first temporal decode chunk only"
-            )
-            self.memory("spatial.begin")
-
-    def record(self, label, value, *, force=False):
-        if not self.trace_tensors or (not force and not self.active):
-            return
-        self._record_tensor(label, value)
-
-    def record_final(self, label, value):
-        if not self.enabled:
-            return
-        self._record_tensor(label, value)
-
-    def _record_tensor(self, label, value):
-        if not torch.is_tensor(value):
-            return
-        if value.numel() == 0:
-            return
-        minimum, maximum = torch.aminmax(value.detach())
-        self.records.setdefault(label, []).append(
-            {
-                "minimum": minimum,
-                "maximum": maximum,
-                "sample": self._sample(value),
-                "shape": tuple(value.shape),
-                "dtype": value.dtype,
-                "device": value.device,
-                "pointer": self._tensor_pointer(value),
-            }
-        )
-
-    def record_scalar(self, label, value):
-        if not self.trace_tensors or not self.active:
-            return
-        self.scalar_records.setdefault(label, []).append(value.detach().float())
-
-    def record_seams(self, label, value, y_boundaries, x_boundaries):
-        if not self.trace_tensors or not self.active:
-            return
-        for boundary in sorted(set(y_boundaries)):
-            if boundary < 2 or boundary + 1 >= value.shape[-2]:
-                continue
-            seam = (value[..., boundary, :] - value[..., boundary - 1, :]).float().abs().mean()
-            nearby = (
-                (value[..., boundary - 1, :] - value[..., boundary - 2, :]).float().abs().mean()
-                + (value[..., boundary + 1, :] - value[..., boundary, :]).float().abs().mean()
-            ).mul_(0.5)
-            self.record_scalar(f"{label}.y_seam_ratio", seam / nearby.clamp_min(1e-12))
-        for boundary in sorted(set(x_boundaries)):
-            if boundary < 2 or boundary + 1 >= value.shape[-1]:
-                continue
-            seam = (value[..., boundary] - value[..., boundary - 1]).float().abs().mean()
-            nearby = (
-                (value[..., boundary - 1] - value[..., boundary - 2]).float().abs().mean()
-                + (value[..., boundary + 1] - value[..., boundary]).float().abs().mean()
-            ).mul_(0.5)
-            self.record_scalar(f"{label}.x_seam_ratio", seam / nearby.clamp_min(1e-12))
-
-    def synchronize(self, label):
-        if not self.force_sync:
-            return
-        if self.device.type == "cuda" and torch.cuda.is_available():
-            torch.cuda.synchronize(self.device)
-            self.sync_count += 1
-
-    def memory(self, label):
-        if not self.enabled or self.device.type != "cuda" or not torch.cuda.is_available():
-            return
-        free, total = torch.cuda.mem_get_info(self.device)
-        self.memory_records.append(
-            (
-                label,
-                torch.cuda.memory_allocated(self.device),
-                torch.cuda.memory_reserved(self.device),
-                free,
-                total,
-            )
-        )
-
-    def snapshot_block(self, phase, block_index, block):
-        if not self.trace_tensors or not self.active:
-            return
-        linears = {
-            "qkv": block.attn.to_qkv,
-            "out": block.attn.to_out,
-            "w1": block.ff.w1,
-            "w2": block.ff.w2,
-        }
-        states = " ; ".join(
-            f"{name}({self._linear_state(module)})" for name, module in linears.items()
-        )
-        logging.warning(
-            "[H3 VAE diagnostic] weights %s block=%d %s",
-            phase,
-            block_index,
-            states,
-        )
-
-    def snapshot_weights(self, phase, decoder, count):
-        if not self.trace_tensors:
-            return
-        blocks = decoder.transformer_blocks
-        first = max(0, len(blocks) - min(int(count), len(blocks)))
-        for block_index in range(first, len(blocks)):
-            self.snapshot_block(phase, block_index, blocks[block_index])
-
-    def finish(self, decoder):
-        if not self.enabled:
-            return
-        if not self.trace_tensors:
-            self._log_context("capture begin")
-        for label, value in self.deferred_inputs:
-            self._record_tensor(label, value)
-        self.deferred_inputs.clear()
-        self.active = self.trace_tensors
-        self.memory("decode.end")
-        if self.trace_tensors:
-            self.snapshot_weights(
-                "decode.end",
-                decoder,
-                2,
-            )
-        for label, entries in self.records.items():
-            minimum = min(float(entry["minimum"].float().cpu()) for entry in entries)
-            maximum = max(float(entry["maximum"].float().cpu()) for entry in entries)
-            finite = math.isfinite(minimum) and math.isfinite(maximum)
-            first_digest = self._digest(entries[0]["sample"])
-            last_digest = self._digest(entries[-1]["sample"])
-            pointers = {entry["pointer"] for entry in entries}
-            logging.warning(
-                "[H3 VAE diagnostic] tensor=%s calls=%d shape=%s dtype=%s device=%s finite=%s min=%.7g max=%.7g absmax=%.7g first=%s last=%s first_ptr=0x%x last_ptr=0x%x pointers=%d",
-                label,
-                len(entries),
-                entries[0]["shape"],
-                entries[0]["dtype"],
-                entries[0]["device"],
-                finite,
-                minimum,
-                maximum,
-                max(abs(minimum), abs(maximum)),
-                first_digest,
-                last_digest,
-                entries[0]["pointer"],
-                entries[-1]["pointer"],
-                len(pointers),
-            )
-        for label, values in self.scalar_records.items():
-            resolved = [float(value.cpu()) for value in values]
-            logging.warning(
-                "[H3 VAE diagnostic] metric=%s calls=%d min=%.5f max=%.5f mean=%.5f",
-                label,
-                len(resolved),
-                min(resolved),
-                max(resolved),
-                sum(resolved) / len(resolved),
-            )
-        for label, allocated, reserved, free, total in self.memory_records:
-            logging.warning(
-                "[H3 VAE diagnostic] memory=%s allocated=%.0fMiB reserved=%.0fMiB free=%.0fMiB total=%.0fMiB",
-                label,
-                allocated / 1024**2,
-                reserved / 1024**2,
-                free / 1024**2,
-                total / 1024**2,
-            )
-        if self.force_sync:
-            logging.warning(
-                "[H3 VAE diagnostic] sync_only completed attention_syncs=%d",
-                self.sync_count,
-            )
-        if not self.retain_weights:
-            logging.warning(
-                "[H3 VAE diagnostic] no_weight_retention_only completed with retained VBAR prefetch disabled"
-            )
-        logging.warning(
-            "[H3 VAE diagnostic] capture complete; diagnostics are disabled outside this decode invocation"
-        )
-
-
 def require_h3_video_vae(vae):
     vae.throw_exception_if_invalid()
     model = vae.first_stage_model
@@ -416,6 +92,7 @@ def _decode_memory_requirement(
     latent_shape,
     tiles_per_batch,
     dtype,
+    persistent_output_bytes=0,
 ):
     model = vae.first_stage_model
     height = latent_shape[-2] * model.vae_ratio
@@ -492,7 +169,12 @@ def _decode_memory_requirement(
         + 2 * height * width * 4
     )
     structural_estimate = int(
-        (transformer_workspace + pixel_workspace) * _DECODE_SAFETY_FACTOR
+        (
+            transformer_workspace
+            + pixel_workspace
+            + max(0, int(persistent_output_bytes))
+        )
+        * _DECODE_SAFETY_FACTOR
     )
     # ComfyUI's estimate describes one internally tiled sample. Preserve its
     # fixed allowance and scale only the structural per-tile workspace here.
@@ -669,8 +351,6 @@ def _projected_attention(
     value,
     rotary_pos_emb,
     transformer_options,
-    diagnostics=None,
-    phase=None,
 ):
     executor = transformer_options.get(ATTENTION_EXECUTOR_KEY)
     if callable(executor):
@@ -696,11 +376,7 @@ def _projected_attention(
             container_factory=AttentionTensorContainer,
         )
         if outcome.supported:
-            output = outcome.output
-            if diagnostics is not None:
-                diagnostics.synchronize(f"{phase}.attention")
-                diagnostics.record(f"{phase}.attention_raw", output)
-            return output.nan_to_num_(0.0)
+            return outcome.output.nan_to_num_(0.0)
 
     query = comfy.rmsnorm.rms_norm(query, module.norm_q.weight, module.norm_q.eps)
     key = comfy.rmsnorm.rms_norm(key, module.norm_k.weight, module.norm_k.eps)
@@ -722,9 +398,6 @@ def _projected_attention(
         skip_reshape=True,
         transformer_options=transformer_options,
     )
-    if diagnostics is not None:
-        diagnostics.synchronize(f"{phase}.attention")
-        diagnostics.record(f"{phase}.attention_raw", out)
     return out.nan_to_num_(0.0)
 
 
@@ -762,8 +435,6 @@ def _asymmetric_projected_attention(
     query_rotary,
     key_rotary,
     transformer_options,
-    diagnostics=None,
-    phase=None,
     qk_normalized=False,
 ):
     """Execute core-query/full-halo attention without padding either side.
@@ -787,9 +458,6 @@ def _asymmetric_projected_attention(
         skip_reshape=True,
         transformer_options=transformer_options,
     )
-    if diagnostics is not None:
-        diagnostics.synchronize(f"{phase}.attention")
-        diagnostics.record(f"{phase}.attention_raw", out)
     return out.nan_to_num_(0.0)
 
 
@@ -798,13 +466,9 @@ def _attention_forward(
     x,
     rotary_pos_emb,
     transformer_options,
-    diagnostics=None,
-    phase=None,
 ):
     batch_size, seq_len, _ = x.shape
     qkv = module.to_qkv(x).view(batch_size, seq_len, -1, 3 * module.dim_head)
-    if diagnostics is not None:
-        diagnostics.record(f"{phase}.qkv", qkv)
     query, key, value = torch.chunk(qkv, 3, dim=-1)
     out = _projected_attention(
         module,
@@ -813,13 +477,8 @@ def _attention_forward(
         value,
         rotary_pos_emb,
         transformer_options,
-        diagnostics,
-        phase,
     )
-    out = module.to_out(out)
-    if diagnostics is not None:
-        diagnostics.record(f"{phase}.to_out", out)
-    return out
+    return module.to_out(out)
 
 
 def _attention_options(attention, device):
@@ -1291,7 +950,6 @@ def _shared_core_multiband_decoder_forward(
     block_session,
     tiles_per_batch,
     progress,
-    diagnostics=None,
     spatial_cache=None,
     overlap_query_threshold=0.0,
     final_full_overlap_blocks=36,
@@ -1333,21 +991,6 @@ def _shared_core_multiband_decoder_forward(
         if block_index > 0:
             block_session.before_stage(block_index)
         attention = block.attn
-        trace_block = (
-            diagnostics
-            if diagnostics is not None
-            and diagnostics.active
-            and block_index == len(blocks) - 1
-            else None
-        )
-        attention_diagnostics = (
-            diagnostics
-            if diagnostics is not None and diagnostics.force_sync
-            else trace_block
-        )
-        phase = f"shared.block{block_index:02d}"
-        if trace_block is not None:
-            trace_block.snapshot_block("before", block_index, block)
         query_image = torch.empty(
             batch,
             layout.image_tokens,
@@ -1387,12 +1030,6 @@ def _shared_core_multiband_decoder_forward(
                 )
             )
             value_image[:, token_start:token_end].copy_(projected_v)
-        if trace_block is not None:
-            trace_block.record(
-                f"{phase}.qkv_image",
-                torch.cat((query_image, key_image, value_image), dim=-1),
-            )
-
         block_threshold = (
             0.0
             if block_index >= final_full_overlap_start
@@ -1534,8 +1171,6 @@ def _shared_core_multiband_decoder_forward(
                     query_rotary,
                     key_rotary,
                     transformer_options,
-                    attention_diagnostics,
-                    phase,
                     qk_normalized=True,
                 ).view(
                     batch,
@@ -1611,9 +1246,6 @@ def _shared_core_multiband_decoder_forward(
                 comfy.ops.cast_to_input(block.scale2, h_slice),
             )
         del image_attention
-        if trace_block is not None:
-            trace_block.record(f"{phase}.residual2", h)
-            trace_block.snapshot_block("after", block_index, block)
 
     return _project_shared_state_windows(
         decoder,
@@ -1621,7 +1253,6 @@ def _shared_core_multiband_decoder_forward(
         layout,
         tiles_per_batch,
         progress,
-        diagnostics,
     )
 
 
@@ -1631,7 +1262,6 @@ def _project_shared_state_windows(
     layout,
     tiles_per_batch,
     progress,
-    diagnostics=None,
 ):
     batch = h.shape[0]
     dim = h.shape[-1]
@@ -1647,7 +1277,6 @@ def _project_shared_state_windows(
         layout.latent_h * decoder.patch_size,
         layout.latent_w * decoder.patch_size,
         h.device,
-        diagnostics,
     )
     for window_start in range(0, layout.window_count, tiles_per_batch):
         window_end = min(window_start + tiles_per_batch, layout.window_count)
@@ -1672,8 +1301,6 @@ def _project_shared_state_windows(
             layout.window_h * decoder.patch_size,
             layout.window_w * decoder.patch_size,
         )
-        if diagnostics is not None:
-            diagnostics.record("window_projection", decoded)
         for local_index, window_index in enumerate(range(window_start, window_end)):
             assembler.add(window_index, decoded[:, local_index])
         if progress is not None:
@@ -1688,18 +1315,12 @@ def _decode_spatial(
     block_session,
     tiles_per_batch,
     progress,
-    diagnostics=None,
     spatial_cache=None,
     overlap_query_threshold=0.0,
     final_full_overlap_blocks=36,
 ):
-    if diagnostics is not None:
-        diagnostics.begin_spatial()
-        diagnostics.record("spatial.input", z)
     block_session.before_stage(0)
     z = model.post_quant_conv(z)
-    if diagnostics is not None:
-        diagnostics.record("spatial.post_quant", z)
     return _shared_core_multiband_decoder_forward(
         model,
         z,
@@ -1707,7 +1328,6 @@ def _decode_spatial(
         block_session,
         tiles_per_batch,
         progress,
-        diagnostics,
         spatial_cache,
         overlap_query_threshold,
         final_full_overlap_blocks,
@@ -1816,7 +1436,6 @@ class _MultibandPixelAssembler:
         height,
         width,
         device,
-        diagnostics=None,
     ):
         self.y_starts = y_starts
         self.y_lengths = y_lengths
@@ -1824,7 +1443,6 @@ class _MultibandPixelAssembler:
         self.x_lengths = x_lengths
         self.height = height
         self.width = width
-        self.diagnostics = diagnostics
         self.columns = len(x_starts)
         descriptors = [
             (i, j, 0, 0, 0, 0)
@@ -1900,22 +1518,6 @@ class _MultibandPixelAssembler:
             low = _spatial_lowpass(self.low_canvas[:, :, frame_slice])
             high = self.high_canvas[:, :, frame_slice]
             high.sub_(_spatial_lowpass(high)).add_(low)
-        if self.diagnostics is not None:
-            self.diagnostics.record("multiband.output", self.high_canvas)
-            y_boundaries = self.y_starts[1:] + [
-                start + length
-                for start, length in zip(self.y_starts[:-1], self.y_lengths[:-1])
-            ]
-            x_boundaries = self.x_starts[1:] + [
-                start + length
-                for start, length in zip(self.x_starts[:-1], self.x_lengths[:-1])
-            ]
-            self.diagnostics.record_seams(
-                "multiband.output",
-                self.high_canvas,
-                y_boundaries,
-                x_boundaries,
-            )
         self.low_canvas = None
         return self.high_canvas
 
@@ -2001,9 +1603,11 @@ def _tiled_encode(
 
 
 class _PixelWriter:
-    def __init__(self, output, model, device):
+    def __init__(self, output, model, device, transform=None):
         self.output = output
         self.model = model
+        self.transform = transform
+        self.transform_closed = False
         self.write_pos = 0
         self.double_buffer = (
             output.device.type == "cpu"
@@ -2031,10 +1635,13 @@ class _PixelWriter:
         copy_frames = min(part_frames, max(0, self.output.shape[2] - self.write_pos))
         if copy_frames <= 0:
             return
-        part = self.model._finalize_pixels(part).to(self.output.dtype)
+        part = part[:, :, :copy_frames]
+        part = self.model._finalize_pixels(part)
+        if self.transform is not None:
+            part = self.transform(part)
+        part = part.to(self.output.dtype)
         start = self.write_pos
         self.write_pos += copy_frames
-        part = part[:, :, :copy_frames]
         if not self.double_buffer:
             self.output[:, :, start : start + copy_frames].copy_(part)
             return
@@ -2077,9 +1684,18 @@ class _PixelWriter:
         self._flush(self.next_slot)
 
     def finish(self):
-        self._flush(0)
-        self._flush(1)
-        return self.output
+        try:
+            self._flush(0)
+            self._flush(1)
+            return self.output
+        finally:
+            self.close_transform()
+
+    def close_transform(self):
+        if self.transform is None or self.transform_closed:
+            return
+        self.transform_closed = True
+        self.transform.finish()
 
 
 def _decode_temporal(
@@ -2090,20 +1706,30 @@ def _decode_temporal(
     tiles_per_batch,
     progress,
     output_device=None,
-    diagnostics=None,
     overlap_query_threshold=0.0,
     final_full_overlap_blocks=36,
+    pixel_transform=None,
 ):
     chunk_dec = model.tokens_chunk_size * model.vae_ratio_t
     split_count = int(model.token_drop > 0) + 1
     if output_device is None:
         output_device = comfy.model_management.intermediate_device()
+    source_shape = model.decode_output_shape(z.shape)
+    output_shape = (
+        pixel_transform.output_shape(source_shape)
+        if pixel_transform is not None
+        else source_shape
+    )
     output = torch.empty(
-        model.decode_output_shape(z.shape),
-        dtype=torch.float32,
+        output_shape,
+        dtype=(
+            pixel_transform.output_dtype
+            if pixel_transform is not None
+            else torch.float32
+        ),
         device=output_device,
     )
-    writer = _PixelWriter(output, model, z.device)
+    writer = _PixelWriter(output, model, z.device, pixel_transform)
     spatial_cache = {}
 
     pad_tokens, num_chunks = model._decode_temporal_chunks(z.shape[2])
@@ -2123,7 +1749,6 @@ def _decode_temporal(
             block_session,
             tiles_per_batch,
             progress,
-            diagnostics,
             spatial_cache,
             overlap_query_threshold,
             final_full_overlap_blocks,
@@ -2153,11 +1778,11 @@ def decode_video(
     latent,
     attention="sdpa",
     *,
-    diagnostics="off",
     output_device=None,
     unload=True,
     overlap_query_threshold=0.0,
     final_full_overlap_blocks=36,
+    _pixel_transform=None,
 ):
     model = require_h3_video_vae(vae)
     # H3 advertises FP16/FP32 to ComfyUI and defaults to FP16 on supported
@@ -2180,10 +1805,6 @@ def decode_video(
             "H3 VAE final_full_overlap_blocks must be between 0 and "
             f"{block_count}, got {final_full_overlap_blocks}"
         )
-    diagnostic = _VAEDiagnostics(diagnostics, vae.device)
-    runtime_diagnostics = (
-        diagnostic if diagnostic.trace_tensors or diagnostic.force_sync else None
-    )
     tile_count = _spatial_tile_count(
         latent.shape[-2] * model.vae_ratio,
         latent.shape[-1] * model.vae_ratio,
@@ -2209,18 +1830,17 @@ def decode_video(
             latent.shape,
             count,
             compute_dtype,
+            (
+                _pixel_transform.output_bytes
+                if _pixel_transform is not None and output_device.type == "cuda"
+                else 0
+            ),
         ),
         _AUTO_DECODE_TILE_BATCH_LIMIT,
     )
     comfy.model_management.load_models_gpu(
         [vae.patcher], memory_required=memory, force_full_load=vae.disable_offload
     )
-    diagnostic.begin(
-        latent,
-        attention,
-        model.decoder,
-    )
-
     block_session = None
     progress = None
     try:
@@ -2229,7 +1849,6 @@ def decode_video(
         mean = model.latents_mean.view(1, -1, 1, 1, 1).to(z)
         std = model.latents_std.view(1, -1, 1, 1, 1).to(z)
         z = z * std + mean
-        diagnostic.record("decode.normalized_latent", z, force=True)
         temporal_chunks = (
             1 if z.shape[2] == 1 else model._decode_temporal_chunks(z.shape[2])[1]
         )
@@ -2242,7 +1861,7 @@ def decode_video(
         block_session = _RetainedWeights(
             _decoder_weight_stages(model),
             z.device,
-            diagnostic.retain_weights,
+            True,
         )
         block_session.start()
         spatial_cache = {}
@@ -2254,13 +1873,27 @@ def decode_video(
                 block_session,
                 batch_tiles,
                 progress,
-                runtime_diagnostics,
                 spatial_cache,
                 overlap_query_threshold,
                 final_full_overlap_blocks,
             )[:, :, -1:]
-            dec = model._finalize_pixels(dec)
-            diagnostic.record_final("decode.output", dec)
+            if _pixel_transform is None:
+                dec = model._finalize_pixels(dec)
+            else:
+                source_shape = tuple(dec.shape)
+                dec_output = torch.empty(
+                    _pixel_transform.output_shape(source_shape),
+                    dtype=_pixel_transform.output_dtype,
+                    device=output_device,
+                )
+                writer = _PixelWriter(
+                    dec_output,
+                    model,
+                    dec.device,
+                    _pixel_transform,
+                )
+                writer.write(dec)
+                dec = writer.finish()
             return dec.to(output_device).movedim(1, -1)
         dec = _decode_temporal(
             model,
@@ -2270,18 +1903,18 @@ def decode_video(
             batch_tiles,
             progress,
             output_device,
-            runtime_diagnostics,
             overlap_query_threshold,
             final_full_overlap_blocks,
+            _pixel_transform,
         )
-        diagnostic.record_final("decode.output", dec)
         return dec.movedim(1, -1)
     finally:
         if progress is not None:
             progress.finish()
         if block_session is not None:
             block_session.finish()
-        diagnostic.finish(model.decoder)
+        if _pixel_transform is not None:
+            _pixel_transform.finish()
         _clear_attention_caches(model.decoder)
         if unload:
             vae.patcher.partially_unload(vae.patcher.offload_device, 1e30)
@@ -2307,38 +1940,13 @@ def _encode_clip(
     )
 
 
-def _encode_temporal(
-    model,
-    x,
-    device,
-    compute_dtype,
-    tile_size,
-    tile_overlap,
-    module_session,
-    tiles_per_batch,
-    progress,
-):
-    z_list = []
-    for start in range(0, x.shape[2], model.clip_length):
-        clip = x[:, :, start : start + model.clip_length].to(device)
-        if clip.dtype != compute_dtype:
-            clip = clip.to(compute_dtype)
-        if clip.shape[2] < model.clip_length:
-            pad = clip[:, :, -1:].repeat(1, 1, model.clip_length - clip.shape[2], 1, 1)
-            clip = torch.cat((clip, pad), dim=2)
-        z_list.append(
-            _encode_clip(
-                model,
-                clip,
-                tile_size,
-                tile_overlap,
-                module_session,
-                tiles_per_batch,
-                progress,
-            )
-        )
-    z = torch.cat(z_list, dim=2)
-    return z[:, :, : -model.token_drop] if model.token_drop > 0 else z
+def _prepare_encoder_clip(clip, process_input, device, compute_dtype):
+    """Prepare one encoder clip without widening an existing FP16 pixel store."""
+
+    if clip.dtype == compute_dtype:
+        clip = clip.to(device=device, dtype=compute_dtype)
+        return process_input(clip)
+    return process_input(clip.float()).to(device=device, dtype=compute_dtype)
 
 
 def _encode_temporal_device(
@@ -2373,7 +1981,12 @@ def _encode_temporal_device(
                 1,
             )
             clip = torch.cat((clip, pad), dim=2)
-        clip = process_input(clip.float()).to(device=device, dtype=compute_dtype)
+        clip = _prepare_encoder_clip(
+            clip,
+            process_input,
+            device,
+            compute_dtype,
+        )
         z_list.append(
             _encode_clip(
                 model,
@@ -2406,6 +2019,7 @@ def _encode_temporal_buffered(
     device_clips = [None, None]
     copy_done = [None, None]
     compute_done = [None, None]
+    normalize_on_device = pixels.dtype == compute_dtype
 
     def prepare(clip_index, slot):
         if copy_done[slot] is not None:
@@ -2415,10 +2029,15 @@ def _encode_temporal_buffered(
         if clip.shape[2] < model.clip_length:
             pad = clip[:, :, -1:].repeat(1, 1, model.clip_length - clip.shape[2], 1, 1)
             clip = torch.cat((clip, pad), dim=2)
-        # Keep the transport path in FP32.  Casting pixels on the host costs a
-        # full extra pass and changes the transfer representation; the VAE
-        # activation cast happens on the GPU immediately before compute.
-        clip = process_input(clip.float())
+        # Generic ComfyUI IMAGE input remains FP32 through host staging. The
+        # fused pixel round trip already owns an FP16 target, so preserve it
+        # and perform the affine VAE normalization after the transfer instead
+        # of widening the complete clip back to FP32 on the CPU.
+        clip = (
+            clip.contiguous()
+            if normalize_on_device
+            else process_input(clip.float())
+        )
         if (
             staging[slot] is None
             or staging[slot].shape != clip.shape
@@ -2450,6 +2069,8 @@ def _encode_temporal_buffered(
         slot = clip_index % 2
         current_stream.wait_event(copy_done[slot])
         clip = device_clips[slot]
+        if normalize_on_device:
+            clip = process_input(clip)
         z_list.append(
             _encode_clip(
                 model,
@@ -2554,9 +2175,11 @@ def encode_video(
             "H3 VAE Encode",
         )
         if pixels.shape[2] == 1:
-            x = vae.process_input(pixels.float()).to(
-                device=vae.device,
-                dtype=compute_dtype,
+            x = _prepare_encoder_clip(
+                pixels,
+                vae.process_input,
+                vae.device,
+                compute_dtype,
             )
             moments = _encode_clip(
                 model,
@@ -2626,20 +2249,18 @@ def encode_video(
             vae.patcher.partially_unload(vae.patcher.offload_device, 1e30)
 
 
-def _pixel_stage_device(vae, source_shape, width, height):
-    batch, channels, frames, source_height, source_width = source_shape
-    source_bytes = batch * channels * frames * source_height * source_width * 4
-    target_bytes = batch * frames * height * width * channels * 2
+def _pixel_roundtrip_stage_device(vae, target_shape):
+    target_bytes = math.prod(target_shape) * 2
     budget = _tile_memory_budget(vae)
     staging_budget = int(budget * 0.35)
-    # Decode activations are gone before the target allocation and the source
-    # is released before encode.  Still leave most of the budget to weights and
-    # one encoder tile, especially on 22 GiB Turing cards.
-    if source_bytes + target_bytes <= staging_budget:
+    # Streaming resize writes decoded chunks directly into the FP16 target, so
+    # no complete source-resolution pixel tensor exists. Leave most of the
+    # budget to decoder/encoder activations and retained weights.
+    if target_bytes <= staging_budget:
         return vae.device
     logging.info(
-        "MiniMax H3 pixel upscale uses CPU FP16 staging: source+target %.0f MiB exceeds the %.0f MiB GPU staging budget",
-        (source_bytes + target_bytes) / 1024**2,
+        "MiniMax H3 pixel round trip uses CPU FP16 staging: target %.0f MiB exceeds the %.0f MiB GPU staging budget",
+        target_bytes / 1024**2,
         staging_budget / 1024**2,
     )
     return torch.device("cpu")
@@ -2675,92 +2296,134 @@ class _RTXVideoSuperResolution:
         return torch.from_dlpack(image).clone()
 
 
-def _resize_video_pixels(
-    pixels,
-    width,
-    height,
-    method,
-    rtx_vsr_quality,
-    compute_device,
-    output_device,
-):
-    if pixels.ndim != 5 or pixels.shape[-1] != 3:
-        raise ValueError(
-            "MiniMax H3 decoded pixels must be [B,T,H,W,3], "
-            f"got {tuple(pixels.shape)}"
-        )
-    batch, frames, source_height, source_width, channels = pixels.shape
-    if width < source_width or height < source_height:
-        raise ValueError(
-            "MiniMax H3 Latent Pixel Upscale does not downscale pixels: "
-            f"source={source_width}x{source_height}, target={width}x{height}"
-        )
-    if method == "rtx_vsr" and (
-        width > source_width * 4 or height > source_height * 4
-    ):
-        raise ValueError("RTX VSR supports at most 4x spatial upscaling")
-    if method == "rtx_vsr" and torch.device(compute_device).type != "cuda":
-        raise RuntimeError("RTX VSR requires a CUDA compute device")
+class _PixelResizeTransform:
+    output_dtype = torch.float16
 
-    output = torch.empty(
-        batch,
-        frames,
-        height,
-        width,
-        channels,
-        dtype=torch.float16,
-        device=output_device,
-    )
-    progress = _TileProgress(
-        batch * frames,
-        compute_device,
-        "H3 Pixel Upscale Frames",
-    )
-    try:
-        if method == "rtx_vsr":
-            effect = _RTXVideoSuperResolution(width, height, rtx_vsr_quality)
+    def __init__(self, source_shape, width, height, method, rtx_vsr_quality, device):
+        batch, channels, frames, source_height, source_width = source_shape
+        if method not in {"bicubic", "bilinear", "nearest-exact", "rtx_vsr"}:
+            raise ValueError(f"Unknown H3 pixel upscale method: {method}")
+        if width < source_width or height < source_height:
+            raise ValueError(
+                "MiniMax H3 Latent Pixel Upscale does not downscale pixels: "
+                f"source={source_width}x{source_height}, target={width}x{height}"
+            )
+        if method == "rtx_vsr" and (
+            width > source_width * 4 or height > source_height * 4
+        ):
+            raise ValueError("RTX VSR supports at most 4x spatial upscaling")
+        if method == "rtx_vsr" and torch.device(device).type != "cuda":
+            raise RuntimeError("RTX VSR requires a CUDA compute device")
+        self.source_shape = tuple(source_shape)
+        self.target_shape = (batch, channels, frames, int(height), int(width))
+        self.width = int(width)
+        self.height = int(height)
+        self.method = method
+        self.device = torch.device(device)
+        self.effect = (
+            _RTXVideoSuperResolution(width, height, rtx_vsr_quality)
+            if method == "rtx_vsr"
+            else None
+        )
+        self.progress_total = batch * frames
+        self.progress = None
+        self.closed = False
+
+    @property
+    def output_bytes(self):
+        return math.prod(self.target_shape) * 2
+
+    def output_shape(self, source_shape):
+        if tuple(source_shape[:3]) != self.source_shape[:3]:
+            raise ValueError(
+                "H3 pixel resize stream changed batch/channel/frame geometry: "
+                f"expected {self.source_shape[:3]}, got {tuple(source_shape[:3])}"
+            )
+        return self.target_shape
+
+    def __call__(self, pixels):
+        if pixels.ndim != 5 or pixels.shape[1] != self.source_shape[1]:
+            raise ValueError(
+                "MiniMax H3 decoded pixels must be [B,C,T,H,W], "
+                f"got {tuple(pixels.shape)}"
+            )
+        batch, channels, frames, source_height, source_width = pixels.shape
+        if self.progress is None:
+            self.progress = _TileProgress(
+                self.progress_total,
+                self.device,
+                "H3 Pixel Upscale Frames",
+            )
+        if (source_height, source_width) != self.source_shape[-2:]:
+            raise ValueError(
+                "H3 pixel resize stream changed spatial geometry: "
+                f"expected {self.source_shape[-2:]}, got {(source_height, source_width)}"
+            )
+        if self.effect is not None:
+            resized = torch.empty(
+                batch,
+                channels,
+                frames,
+                self.height,
+                self.width,
+                dtype=torch.float16,
+                device=pixels.device,
+            )
             for batch_index in range(batch):
                 for frame_index in range(frames):
-                    frame = pixels[batch_index, frame_index].permute(2, 0, 1)
-                    frame = frame.to(compute_device, dtype=torch.float32)
-                    resized = effect(frame).permute(1, 2, 0)
-                    output[batch_index, frame_index].copy_(
-                        resized.to(device=output_device, dtype=torch.float16)
+                    frame = pixels[batch_index, :, frame_index]
+                    resized[batch_index, :, frame_index].copy_(
+                        self.effect(frame).to(dtype=torch.float16)
                     )
-                    progress.update(1)
-            return output
+                    self.progress.update(1)
+            return resized
 
-        if method not in {"bicubic", "bilinear", "nearest-exact"}:
-            raise ValueError(f"Unknown H3 pixel upscale method: {method}")
+        output = torch.empty(
+            batch,
+            channels,
+            frames,
+            self.height,
+            self.width,
+            dtype=torch.float16,
+            device=pixels.device,
+        )
+        kwargs = {}
+        if self.method in {"bicubic", "bilinear"}:
+            kwargs["align_corners"] = False
+            kwargs["antialias"] = False
         for frame_start in range(0, frames, _PIXEL_RESIZE_FRAME_BATCH):
             frame_end = min(frame_start + _PIXEL_RESIZE_FRAME_BATCH, frames)
-            frame_batch = pixels[:, frame_start:frame_end].permute(0, 1, 4, 2, 3)
-            frame_batch = frame_batch.reshape(-1, channels, source_height, source_width)
-            frame_batch = frame_batch.to(compute_device, dtype=torch.float32)
-            kwargs = {}
-            if method in {"bicubic", "bilinear"}:
-                kwargs["align_corners"] = False
-                kwargs["antialias"] = False
-            resized = F.interpolate(
-                frame_batch,
-                size=(height, width),
-                mode=method,
-                **kwargs,
+            frame_batch = pixels[:, :, frame_start:frame_end].permute(0, 2, 1, 3, 4)
+            frame_batch = frame_batch.reshape(
+                batch * (frame_end - frame_start),
+                channels,
+                source_height,
+                source_width,
             )
-            resized = resized.view(
+            resized = F.interpolate(
+                frame_batch.float(),
+                size=(self.height, self.width),
+                mode=self.method,
+                **kwargs,
+            ).view(
                 batch,
                 frame_end - frame_start,
                 channels,
-                height,
-                width,
-            ).permute(0, 1, 3, 4, 2)
-            output[:, frame_start:frame_end].copy_(
-                resized.to(device=output_device, dtype=torch.float16)
+                self.height,
+                self.width,
             )
-            progress.update(batch * (frame_end - frame_start))
+            output[:, :, frame_start:frame_end].copy_(
+                resized.permute(0, 2, 1, 3, 4).to(torch.float16)
+            )
+            self.progress.update(batch * (frame_end - frame_start))
         return output
-    finally:
-        progress.finish()
+
+    def finish(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.progress is not None:
+            self.progress.finish()
 
 
 def upscale_latent_via_pixels(
@@ -2805,10 +2468,19 @@ def upscale_latent_via_pixels(
         logging.info(
             "MiniMax H3 Latent Pixel Upscale target matches the decoded size; running a VAE pixel round trip without resizing"
         )
-    stage_device = _pixel_stage_device(vae, source_shape, width, height)
+    target_shape = (*source_shape[:-2], height, width)
+    stage_device = _pixel_roundtrip_stage_device(vae, target_shape)
+    pixel_transform = _PixelResizeTransform(
+        source_shape,
+        width,
+        height,
+        method,
+        rtx_vsr_quality,
+        vae.device,
+    )
     completed = False
     try:
-        decoded = decode_video(
+        resized = decode_video(
             vae,
             latent,
             attention,
@@ -2816,21 +2488,13 @@ def upscale_latent_via_pixels(
             unload=False,
             overlap_query_threshold=overlap_query_threshold,
             final_full_overlap_blocks=final_full_overlap_blocks,
+            _pixel_transform=pixel_transform,
         )
-        resized = _resize_video_pixels(
-            decoded,
-            width,
-            height,
-            method,
-            rtx_vsr_quality,
-            vae.device,
-            stage_device,
-        )
-        del decoded
         output = encode_video(vae, resized, unload=True)
         completed = True
         return output
     finally:
+        pixel_transform.finish()
         if not completed:
             # encode_video performs the normal unload on success.  This path is
             # essential when decode, resize, or encode raises.

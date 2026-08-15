@@ -50,9 +50,9 @@ only after its CUDA sources or required version change.
   tiling, full-overlap shared-core decode, a deterministic FP32 overlap
   epilogue, global multiband stitching, and retained asynchronous weights.
   `MiniMax H3 Latent Pixel Upscale
-  (Experimental)` combines decode, full-frame GPU resize, and re-encode for a
-  stable second-stage latent; an optional RTX VSR path is loaded only when
-  selected.
+  (Experimental)` streams finalized decode chunks through full-frame spatial
+  resize directly into the re-encode store for a stable second-stage latent;
+  an optional RTX VSR path is loaded only when selected.
 - `Patch MiniMax H3 Block Cache (Experimental)` skips stable transformer-block
   spans by reusing one exact trajectory residual. It provides conservative
   standard, 4-step, and 8-step profiles, isolates sampler branches, prefetches

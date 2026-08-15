@@ -43,36 +43,15 @@ The attention selector applies to every shared decoder Transformer block:
 - `sage`: bundled Turing Sage attention;
 - `w8a8`: quantized QK attention when the installed kernel supports it.
 
-### One-shot diagnostics
-
-The decoder's optional `diagnostics` input is normally `off` and adds no tensor
-statistics or synchronization. Existing workflows that do not contain this
-input continue to use `off`. The available isolation modes are:
-
-- `observe_once` defers input/output fingerprints and memory reporting until
-  decode has completed; it does not consume intermediate CUDA tensors;
-- `trace_once` traces the first temporal chunk, including the final shared
-  block, window projection, multiband output, seam ratios, CUDA memory, and
-  VBAR-backed linear state;
-- `sync_only` synchronizes after every decoder attention call without tracing
-  intermediate tensors;
-- `no_weight_retention_only` disables cross-block retained-weight prefetch for
-  that invocation without tracing intermediate tensors.
-
-Use the same cached latent when comparing modes. A matching
-`decode.latent_input` fingerprint confirms that the VAE received the same
-sample. Compare repeated fresh-process failure rates rather than relying on one
-run because allocator/stream bugs can be intermittent. If only `sync_only` is
-clean, inspect stream lifetime; if only `no_weight_retention_only` is clean,
-inspect VBAR/prefetch state. In a full trace, `finite=False` or an FP16 absolute
-maximum near 65504 identifies numerical overflow. Diagnostics automatically
-stop after that invocation; `trace_once` and `sync_only` are intentionally
-slow.
-
 ## Encode
 
 `MiniMax H3 Video VAE Encode` retains the official 256px/64px tiled encoder
-geometry and ComfyUI-compatible FP32 latent output.
+geometry and ComfyUI-compatible FP32 latent output. It chooses up to sixteen
+simultaneous spatial tiles from the current memory budget and retains one
+encoder weight cycle across all spatial tiles and temporal clips. Generic
+ComfyUI IMAGE input keeps its FP32 host representation; an existing FP16 pixel
+store is transferred and normalized as FP16 on the GPU without first widening
+the complete clip to FP32.
 
 ## Latent Pixel Upscale
 
@@ -80,16 +59,20 @@ geometry and ComfyUI-compatible FP32 latent output.
 bridge in one experimental node:
 
 1. decode the H3 video latent with the optimized decoder;
-2. resize complete RGB frames, never independent pixel tiles;
-3. immediately encode the resized frames back into an H3 video latent.
+2. resize each finalized temporal pixel chunk as complete RGB frames, never as
+   independent spatial tiles;
+3. stream the resized chunks directly into one FP16 target store;
+4. immediately encode that store back into an H3 video latent.
 
-The intermediate pixel store is FP16 because H3's encoder itself consumes
-FP16 by default. It stays on the GPU when the current memory budget allows and
-falls back to CPU FP16 staging for very large targets. Normal interpolation is
-batched on the GPU. The optional `rtx_vsr` method lazily uses NVIDIA's
-`nvidia-vfx` package and has no effect on installations that do not select it.
-RTX VSR input/output remains GPU-resident and each SDK-owned DLPack result is
-cloned before the next frame.
+There is no complete source-resolution pixel store: decode finalization,
+spatial resize, and FP16 target staging form one bounded pipeline. The target
+store stays on the GPU when the current memory budget allows and falls back to
+double-buffered CPU FP16 staging for very large outputs. The target allocation
+is included in decoder auto-batch planning. Normal interpolation is batched on
+the GPU. The optional `rtx_vsr` method lazily uses NVIDIA's `nvidia-vfx`
+package and has no effect on installations that do not select it. RTX VSR
+input/output remains GPU-resident and each SDK-owned DLPack result is cloned
+before the next frame.
 
 Target width and height must be multiples of 32 and must not be smaller than
 the decoded source. A nested H3 AV latent keeps its audio samples and audio
@@ -101,7 +84,7 @@ a separate sampler so denoise strength and scheduling remain explicit.
 
 Both nodes choose the number of simultaneously evaluated windows internally.
 The choice is bounded by current free/reclaimable device memory and conservative
-activation estimates (up to sixteen windows for decode and two for encode). This
+activation estimates (up to sixteen windows for both decode and encode). This
 control is intentionally not exposed in the node UI.
 
 When all decode windows fit in one attention batch, kernel package 0.26.0 uses

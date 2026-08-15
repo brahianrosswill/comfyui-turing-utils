@@ -52,19 +52,6 @@ class MiniMaxH3VideoVAEDecode:
                         "tooltip": "Number of final decoder Transformer blocks that always keep every overlapping window contribution. Earlier blocks may prune low-weight overlap queries using overlap_query_threshold.",
                     },
                 ),
-                "diagnostics": (
-                    [
-                        "off",
-                        "observe_once",
-                        "trace_once",
-                        "sync_only",
-                        "no_weight_retention_only",
-                    ],
-                    {
-                        "default": "off",
-                        "tooltip": "Observe records only after decode and minimally perturbs execution. Trace inspects the first temporal chunk and is slow. Sync-only isolates stream lifetime; no-weight-retention-only isolates VBAR/prefetch. Logs stay local to the terminal.",
-                    },
-                ),
             },
         }
 
@@ -82,7 +69,6 @@ class MiniMaxH3VideoVAEDecode:
         samples,
         vae,
         attention,
-        diagnostics="off",
         overlap_query_threshold=0.0,
         final_full_overlap_blocks=36,
     ):
@@ -95,7 +81,6 @@ class MiniMaxH3VideoVAEDecode:
                 vae,
                 latent,
                 attention,
-                diagnostics=diagnostics,
                 overlap_query_threshold=overlap_query_threshold,
                 final_full_overlap_blocks=final_full_overlap_blocks,
             )
@@ -119,8 +104,9 @@ class MiniMaxH3VideoVAEEncode:
     CATEGORY = "Turing Utils/MiniMax H3"
     DESCRIPTION = (
         "Experimental MiniMax H3 video encoder with FP32 pixel double "
-        "buffering and dynamic weight retention across all tiles. Output "
-        "latents always use ComfyUI-compatible FP32 storage."
+        "buffering, FP16 round-trip fast path, automatic tile batching, and "
+        "dynamic weight retention across all tiles. Output latents always use "
+        "ComfyUI-compatible FP32 storage."
     )
 
     def encode(
@@ -223,9 +209,9 @@ class MiniMaxH3LatentPixelUpscale:
     CATEGORY = "Turing Utils/MiniMax H3"
     EXPERIMENTAL = True
     DESCRIPTION = (
-        "Decode the MiniMax H3 video latent, resize complete RGB frames on the "
-        "GPU, then immediately re-encode them while retaining VAE runtime "
-        "state. Native H3 audio latents are passed through unchanged."
+        "Stream finalized MiniMax H3 decoder chunks through complete-frame GPU "
+        "resize directly into an FP16 target store, then re-encode it while "
+        "retaining VAE runtime state. Native H3 audio latents pass through unchanged."
     )
 
     def upscale(
