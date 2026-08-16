@@ -333,6 +333,89 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 layout.window_count,
             )
 
+    def test_pruned_suffix_linears_are_batched_across_all_windows(self):
+        from comfy.ldm.minimax.vae import ViT3DDecoder
+
+        torch.manual_seed(31)
+        decoder = ViT3DDecoder(
+            patch_size=2,
+            patch_size_t=1,
+            in_channels=4,
+            out_channels=3,
+            num_layers=1,
+            heads=1,
+            dim_head=64,
+            rope_dim_ratio=0.75,
+            operations=torch.nn,
+        ).eval()
+        for parameter in decoder.parameters():
+            torch.nn.init.uniform_(parameter, -0.01, 0.01)
+        model = SimpleNamespace(decoder=decoder, vae_ratio=2)
+        value = torch.randn(1, 4, 1, 6, 6)
+        session = SimpleNamespace(before_stage=lambda _index: None)
+        block = decoder.transformer_blocks[0]
+        calls = {"qkv": [], "out": [], "w1": [], "w2": []}
+
+        def recording_forward(name, forward):
+            def run(input_value, *args, **kwargs):
+                calls[name].append(tuple(input_value.shape))
+                return forward(input_value, *args, **kwargs)
+
+            return run
+
+        with (
+            mock.patch.object(video_vae, "TILE_SIZE", 4),
+            mock.patch.object(video_vae, "TILE_OVERLAP", 2),
+            mock.patch.object(
+                block.attn.to_qkv,
+                "forward",
+                side_effect=recording_forward("qkv", block.attn.to_qkv.forward),
+            ),
+            mock.patch.object(
+                block.attn.to_out,
+                "forward",
+                side_effect=recording_forward("out", block.attn.to_out.forward),
+            ),
+            mock.patch.object(
+                block.ff.w1,
+                "forward",
+                side_effect=recording_forward("w1", block.ff.w1.forward),
+            ),
+            mock.patch.object(
+                block.ff.w2,
+                "forward",
+                side_effect=recording_forward("w2", block.ff.w2.forward),
+            ),
+            torch.inference_mode(),
+        ):
+            layout = video_vae._SharedWindowLayout(model, 1, 6, 6, value.device)
+            result = video_vae._shared_core_multiband_decoder_forward(
+                model,
+                value,
+                video_vae._attention_options("sdpa", value.device),
+                session,
+                3,
+                None,
+                overlap_query_threshold=0.5,
+                final_full_overlap_blocks=0,
+            )
+
+        suffix_shape = (
+            layout.window_count,
+            1 + decoder.num_register_tokens,
+        )
+        self.assertGreater(len(layout.query_groups(0.5)), 1)
+        for name in calls:
+            suffix_calls = [
+                shape for shape in calls[name] if shape[:2] == suffix_shape
+            ]
+            self.assertEqual(len(suffix_calls), 1, name)
+            self.assertGreater(
+                suffix_calls[0][0] * suffix_calls[0][1],
+                video_vae._MIN_FUSED_SWIGLU_ROWS,
+            )
+        self.assertEqual(result.shape[-2:], (12, 12))
+
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_single_tensor_rope_fallback_matches_kitchen(self):
         torch.manual_seed(19)

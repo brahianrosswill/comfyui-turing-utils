@@ -1088,6 +1088,40 @@ def _shared_core_multiband_decoder_forward(
                 )
             )
             value_image[:, token_start:token_end].copy_(projected_v)
+
+        # Every suffix belongs to exactly one query group, but its projection
+        # does not depend on that group's compact core length. Project all
+        # windows together so pruning cannot turn the quantized linears into
+        # thousands of M=5/10/15 calls.
+        suffix_flat = suffix.reshape(
+            batch * layout.window_count,
+            suffix_tokens,
+            dim,
+        )
+        suffix_normed = comfy.rmsnorm.rms_norm(
+            suffix_flat,
+            block.norm1.weight,
+            block.norm1.eps,
+        )
+        suffix_qkv = attention.to_qkv(suffix_normed).view(
+            batch,
+            layout.window_count,
+            suffix_tokens,
+            attention.heads,
+            3 * attention.dim_head,
+        )
+        suffix_q, suffix_k, suffix_v = torch.chunk(suffix_qkv, 3, dim=-1)
+        suffix_q = comfy.rmsnorm.rms_norm(
+            suffix_q,
+            attention.norm_q.weight,
+            attention.norm_q.eps,
+        )
+        suffix_k = comfy.rmsnorm.rms_norm(
+            suffix_k,
+            attention.norm_k.weight,
+            attention.norm_k.eps,
+        )
+        suffix_attention = torch.zeros_like(suffix)
         block_threshold = (
             0.0
             if block_index >= final_full_overlap_start
@@ -1159,47 +1193,34 @@ def _shared_core_multiband_decoder_forward(
                     attention.heads,
                     attention.dim_head,
                 )
-                suffix_group = (
-                    suffix.index_select(1, window_tensor)
-                    .reshape(
-                        batch * window_count,
-                        suffix_tokens,
-                        dim,
-                    )
-                    .clone()
-                )
-                suffix_normed = comfy.rmsnorm.rms_norm(
-                    suffix_group,
-                    block.norm1.weight,
-                    block.norm1.eps,
-                )
-                suffix_qkv = attention.to_qkv(suffix_normed).view(
+                suffix_q_group = suffix_q.index_select(1, window_tensor).reshape(
                     batch * window_count,
                     suffix_tokens,
                     attention.heads,
-                    3 * attention.dim_head,
+                    attention.dim_head,
                 )
-                suffix_q, suffix_k, suffix_v = torch.chunk(suffix_qkv, 3, dim=-1)
-                suffix_q = comfy.rmsnorm.rms_norm(
-                    suffix_q,
-                    attention.norm_q.weight,
-                    attention.norm_q.eps,
+                suffix_k_group = suffix_k.index_select(1, window_tensor).reshape(
+                    batch * window_count,
+                    suffix_tokens,
+                    attention.heads,
+                    attention.dim_head,
                 )
-                suffix_k = comfy.rmsnorm.rms_norm(
-                    suffix_k,
-                    attention.norm_k.weight,
-                    attention.norm_k.eps,
+                suffix_v_group = suffix_v.index_select(1, window_tensor).reshape(
+                    batch * window_count,
+                    suffix_tokens,
+                    attention.heads,
+                    attention.dim_head,
                 )
-                query = torch.cat((query_q, suffix_q), dim=1)
+                query = torch.cat((query_q, suffix_q_group), dim=1)
                 key = torch.cat(
                     (
                         window_key,
-                        suffix_k,
+                        suffix_k_group,
                     ),
                     dim=1,
                 )
                 value = torch.cat(
-                    (window_value, suffix_v),
+                    (window_value, suffix_v_group),
                     dim=1,
                 )
 
@@ -1256,35 +1277,36 @@ def _shared_core_multiband_decoder_forward(
                         accumulated.add_(weighted)
                         image_attention.index_copy_(1, global_indices, accumulated)
 
-                suffix_attention = attended[:, :, core_tokens:].reshape(
-                    batch * window_count, suffix_tokens, dim
-                )
-                suffix_group.addcmul_(
-                    attention.to_out(suffix_attention),
-                    comfy.ops.cast_to_input(block.scale1, suffix_group),
-                )
-                suffix_normed = comfy.rmsnorm.rms_norm(
-                    suffix_group,
-                    block.norm2.weight,
-                    block.norm2.eps,
-                )
-                suffix_group.addcmul_(
-                    _feed_forward(block.ff, suffix_normed),
-                    comfy.ops.cast_to_input(block.scale2, suffix_group),
-                )
-                suffix.index_copy_(
+                suffix_attention.index_copy_(
                     1,
                     window_tensor,
-                    suffix_group.view(
-                        batch,
-                        window_count,
-                        suffix_tokens,
-                        dim,
-                    ),
+                    attended[:, :, core_tokens:],
                 )
         if image_attention is None:
             raise RuntimeError("shared-core overlap produced no image attention")
+
+        # All windows are now present, so keep every suffix linear at the
+        # stable full-window row count as well.
+        suffix_attention_flat = suffix_attention.reshape(
+            batch * layout.window_count,
+            suffix_tokens,
+            dim,
+        )
+        suffix_flat.addcmul_(
+            attention.to_out(suffix_attention_flat),
+            comfy.ops.cast_to_input(block.scale1, suffix_flat),
+        )
+        suffix_normed = comfy.rmsnorm.rms_norm(
+            suffix_flat,
+            block.norm2.weight,
+            block.norm2.eps,
+        )
+        suffix_flat.addcmul_(
+            _feed_forward(block.ff, suffix_normed),
+            comfy.ops.cast_to_input(block.scale2, suffix_flat),
+        )
         del query_image, key_image, value_image
+        del suffix_q, suffix_k, suffix_v, suffix_attention
         for token_start in range(0, layout.image_tokens, linear_chunk):
             token_end = min(token_start + linear_chunk, layout.image_tokens)
             h_slice = h[:, token_start:token_end]
