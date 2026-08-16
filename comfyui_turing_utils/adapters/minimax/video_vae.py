@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import queue
@@ -45,6 +46,7 @@ _MULTIBAND_DOWNSAMPLE = 8
 _MULTIBAND_HIGH_WEIGHT_POWER = 4
 _MULTIBAND_FRAME_CHUNK = 4
 _PIXEL_RESIZE_FRAME_BATCH = 8
+_MIN_FUSED_SWIGLU_ROWS = 64
 _RTX_VSR_QUALITIES = {
     "medium": "MEDIUM",
     "high": "HIGH",
@@ -618,6 +620,33 @@ class _RetainedWeights:
         comfy.model_management.synchronize()
         for modules in self.stages:
             self._clear_modules(modules)
+            for module in modules:
+                module._v_signature = None
+                for name in ("_v_weight", "_v_bias"):
+                    if hasattr(module, name):
+                        delattr(module, name)
+
+
+def _invalidate_retained_weight_views(stages):
+    # A VBAR signature only proves that the virtual allocation is resident. It
+    # does not make a cached tensor view safe to carry into a later decode,
+    # after other workflow nodes may have recycled the backing pages.
+    modules = []
+    seen = set()
+    for stage in stages:
+        for module in stage:
+            if id(module) in seen:
+                continue
+            seen.add(id(module))
+            modules.append(module)
+    if any(hasattr(module, "_prefetch") for module in modules):
+        comfy.model_management.synchronize()
+        _RetainedWeights._clear_modules(modules)
+    for module in modules:
+        module._v_signature = None
+        for name in ("_v_weight", "_v_bias"):
+            if hasattr(module, name):
+                delattr(module, name)
 
 
 def _fused_swiglu_eligible(linear):
@@ -910,9 +939,38 @@ def _shared_spatial_plan(model, x, cache):
 
 
 def _feed_forward(module, value):
-    if _fused_swiglu_eligible(module.w2):
-        return comfy.ops.linear_input_act(module.w2, module.w1(value), "swiglu")
-    return module(value)
+    rows = value.numel() // value.shape[-1]
+    # Kitchen's fused FP16 SwiGLU+INT8 path is not used for the very small
+    # suffix groups produced by aggressive overlap pruning. The ordinary MLP
+    # path still uses the quantized w2 weight, but materializes SwiGLU first.
+    if rows >= _MIN_FUSED_SWIGLU_ROWS and _fused_swiglu_eligible(module.w2):
+        output = comfy.ops.linear_input_act(module.w2, module.w1(value), "swiglu")
+    else:
+        output = module(value)
+    if output.shape != value.shape:
+        raise RuntimeError(
+            f"H3 VAE feed-forward returned {tuple(output.shape)} for input "
+            f"{tuple(value.shape)}"
+        )
+    return output
+
+
+def _latent_fingerprint(latent):
+    value = latent.detach()
+    if value.device.type == "cpu":
+        payload = value.contiguous().view(torch.uint8).numpy().tobytes()
+    else:
+        flat = value.reshape(-1)
+        stride = max(1, flat.numel() // 256)
+        payload = (
+            flat[::stride][:256]
+            .to(device="cpu", dtype=torch.float32)
+            .contiguous()
+            .view(torch.uint8)
+            .numpy()
+            .tobytes()
+        )
+    return hashlib.blake2b(payload, digest_size=8).hexdigest()
 
 
 def _reshape_decoder_patches(
@@ -1822,6 +1880,15 @@ def decode_video(
         overlap_query_threshold,
         final_full_overlap_blocks,
     )
+    storage_ptr = latent.untyped_storage().data_ptr()
+    logging.info(
+        "H3 VAE decode input: shape=%s dtype=%s device=%s storage=0x%x fingerprint=%s",
+        tuple(latent.shape),
+        latent.dtype,
+        latent.device,
+        storage_ptr,
+        _latent_fingerprint(latent),
+    )
     batch_tiles, memory = _select_tiles_per_batch(
         vae,
         tile_count,
@@ -1858,8 +1925,10 @@ def decode_video(
             z.device,
             "H3 VAE Decode Tiles",
         )
+        weight_stages = _decoder_weight_stages(model)
+        _invalidate_retained_weight_views(weight_stages)
         block_session = _RetainedWeights(
-            _decoder_weight_stages(model),
+            weight_stages,
             z.device,
             True,
         )

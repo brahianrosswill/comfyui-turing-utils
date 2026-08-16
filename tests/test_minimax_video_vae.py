@@ -185,6 +185,81 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         self.assertLess(pruned_queries, full_queries)
         self.assertGreaterEqual(pruned_queries, layout.image_tokens)
 
+    def test_aggressive_overlap_pruning_creates_small_suffix_batches(self):
+        model = SimpleNamespace(vae_ratio=16)
+        layout = video_vae._SharedWindowLayout(
+            model,
+            7,
+            48,
+            84,
+            torch.device("cpu"),
+        )
+        groups = layout.query_groups(0.5)
+        window_counts = [int(group[0].numel()) for group in groups.values()]
+        self.assertEqual(layout.window_count, 28)
+        self.assertIn(1, window_counts)
+        self.assertTrue(
+            any(
+                count * 5 < video_vae._MIN_FUSED_SWIGLU_ROWS
+                for count in window_counts
+            )
+        )
+
+    def test_small_feed_forward_batches_bypass_fused_swiglu(self):
+        module = mock.Mock()
+        module.w1 = mock.Mock()
+        module.w2 = object()
+        module.side_effect = lambda value: value.add(1)
+        small = torch.zeros(1, 5, 8)
+        with (
+            mock.patch.object(video_vae, "_fused_swiglu_eligible", return_value=True),
+            mock.patch.object(video_vae.comfy.ops, "linear_input_act") as fused,
+        ):
+            actual = video_vae._feed_forward(module, small)
+        torch.testing.assert_close(actual, torch.ones_like(small))
+        module.assert_called_once_with(small)
+        module.w1.assert_not_called()
+        fused.assert_not_called()
+
+    def test_large_feed_forward_batches_keep_fused_swiglu(self):
+        module = mock.Mock()
+        projected = torch.zeros(1, 64, 16)
+        module.w1 = mock.Mock(return_value=projected)
+        module.w2 = object()
+        value = torch.zeros(1, 64, 8)
+        expected = torch.ones_like(value)
+        with (
+            mock.patch.object(video_vae, "_fused_swiglu_eligible", return_value=True),
+            mock.patch.object(
+                video_vae.comfy.ops,
+                "linear_input_act",
+                return_value=expected,
+            ) as fused,
+        ):
+            actual = video_vae._feed_forward(module, value)
+        self.assertIs(actual, expected)
+        module.assert_not_called()
+        module.w1.assert_called_once_with(value)
+        fused.assert_called_once_with(module.w2, projected, "swiglu")
+
+    def test_feed_forward_rejects_incomplete_output_shape(self):
+        module = mock.Mock(return_value=torch.zeros(1, 5, 7))
+        module.w2 = object()
+        with (
+            mock.patch.object(video_vae, "_fused_swiglu_eligible", return_value=False),
+            self.assertRaisesRegex(RuntimeError, "feed-forward returned"),
+        ):
+            video_vae._feed_forward(module, torch.zeros(1, 5, 8))
+
+    def test_latent_fingerprint_is_stable_and_value_sensitive(self):
+        latent = torch.arange(96, dtype=torch.float32).reshape(1, 3, 4, 4, 2)
+        first = video_vae._latent_fingerprint(latent)
+        second = video_vae._latent_fingerprint(latent.clone())
+        changed = latent.clone()
+        changed.flatten()[47] += 1
+        self.assertEqual(first, second)
+        self.assertNotEqual(first, video_vae._latent_fingerprint(changed))
+
     def test_spatial_plan_is_cached_for_matching_temporal_chunks(self):
         cache = {}
         model = object()
@@ -916,6 +991,65 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         self.assertEqual(session.started, 0)
         self.assertFalse(session.enabled)
         self.assertFalse(hasattr(module, "_prefetch"))
+
+    def test_retained_weight_views_are_invalidated_between_decodes(self):
+        module = SimpleNamespace(
+            _prefetch={"signature": object()},
+            _v_signature=object(),
+            _v_weight=object(),
+            _v_bias=object(),
+        )
+
+        def clear(modules):
+            for item in modules:
+                delattr(item, "_prefetch")
+
+        with (
+            mock.patch.object(
+                video_vae.comfy.model_management,
+                "synchronize",
+            ) as synchronize,
+            mock.patch.object(
+                video_vae._RetainedWeights,
+                "_clear_modules",
+                side_effect=clear,
+            ) as cleanup,
+        ):
+            video_vae._invalidate_retained_weight_views([[module], [module]])
+
+        synchronize.assert_called_once_with()
+        cleanup.assert_called_once_with([module])
+        self.assertIsNone(module._v_signature)
+        self.assertFalse(hasattr(module, "_v_weight"))
+        self.assertFalse(hasattr(module, "_v_bias"))
+
+    def test_decoder_backend_switching_preserves_cached_latent(self):
+        vae = mock.Mock()
+        vae.device = torch.device("cpu")
+        latent = torch.arange(48, dtype=torch.float32).reshape(1, 3, 2, 4, 2)
+        original = latent.clone()
+        fingerprints = []
+
+        def decode(_vae, value, attention, **_kwargs):
+            fingerprints.append((attention, video_vae._latent_fingerprint(value)))
+            return torch.zeros(1, 2, 4, 4, 3)
+
+        with (
+            mock.patch.object(nodes, "require_h3_video_vae"),
+            mock.patch.object(nodes, "decode_video", side_effect=decode),
+            mock.patch.object(
+                nodes.comfy.model_management,
+                "cuda_device_context",
+                return_value=nullcontext(),
+            ),
+        ):
+            node = nodes.MiniMaxH3VideoVAEDecode()
+            for backend in ("sdpa", "w8a8", "sdpa"):
+                node.decode({"samples": latent}, vae, backend)
+
+        self.assertEqual([item[0] for item in fingerprints], ["sdpa", "w8a8", "sdpa"])
+        self.assertEqual(len({item[1] for item in fingerprints}), 1)
+        torch.testing.assert_close(latent, original)
 
     def test_retained_weights_release_prefix_when_cycle_does_not_fit(self):
         modules = [
