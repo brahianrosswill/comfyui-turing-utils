@@ -45,14 +45,8 @@ _ENCODE_SAFETY_FACTOR = 1.05
 _MULTIBAND_DOWNSAMPLE = 8
 _MULTIBAND_HIGH_WEIGHT_POWER = 4
 _MULTIBAND_FRAME_CHUNK = 4
-_PIXEL_RESIZE_FRAME_BATCH = 8
-_RTX_VSR_QUALITIES = {
-    "medium": "MEDIUM",
-    "high": "HIGH",
-    "ultra": "ULTRA",
-    "high_bitrate_high": "HIGHBITRATE_HIGH",
-    "high_bitrate_ultra": "HIGHBITRATE_ULTRA",
-}
+
+
 def require_h3_video_vae(vae):
     vae.throw_exception_if_invalid()
     model = vae.first_stage_model
@@ -93,7 +87,6 @@ def _decode_memory_requirement(
     latent_shape,
     tiles_per_batch,
     dtype,
-    persistent_output_bytes=0,
 ):
     model = vae.first_stage_model
     height = latent_shape[-2] * model.vae_ratio
@@ -170,12 +163,7 @@ def _decode_memory_requirement(
         + 2 * height * width * 4
     )
     structural_estimate = int(
-        (
-            transformer_workspace
-            + pixel_workspace
-            + max(0, int(persistent_output_bytes))
-        )
-        * _DECODE_SAFETY_FACTOR
+        (transformer_workspace + pixel_workspace) * _DECODE_SAFETY_FACTOR
     )
     # ComfyUI's estimate describes one internally tiled sample. Preserve its
     # fixed allowance and scale only the structural per-tile workspace here.
@@ -1612,11 +1600,9 @@ def _tiled_encode(
 
 
 class _PixelWriter:
-    def __init__(self, output, model, device, transform=None):
+    def __init__(self, output, model, device):
         self.output = output
         self.model = model
-        self.transform = transform
-        self.transform_closed = False
         self.write_pos = 0
         self.double_buffer = (
             output.device.type == "cpu"
@@ -1646,8 +1632,6 @@ class _PixelWriter:
             return
         part = part[:, :, :copy_frames]
         part = self.model._finalize_pixels(part)
-        if self.transform is not None:
-            part = self.transform(part)
         part = part.to(self.output.dtype)
         start = self.write_pos
         self.write_pos += copy_frames
@@ -1672,7 +1656,7 @@ class _PixelWriter:
                 self.copy_stream = None
                 self.staging = [None, None]
                 logging.warning(
-                    "H3 VAE could not allocate a pinned decoder buffer; using synchronous FP32 pixel copies"
+                    "H3 VAE could not allocate a pinned decoder buffer; using synchronous pixel copies"
                 )
                 self.output[:, :, start : start + copy_frames].copy_(part)
                 return
@@ -1693,18 +1677,9 @@ class _PixelWriter:
         self._flush(self.next_slot)
 
     def finish(self):
-        try:
-            self._flush(0)
-            self._flush(1)
-            return self.output
-        finally:
-            self.close_transform()
-
-    def close_transform(self):
-        if self.transform is None or self.transform_closed:
-            return
-        self.transform_closed = True
-        self.transform.finish()
+        self._flush(0)
+        self._flush(1)
+        return self.output
 
 
 def _decode_temporal(
@@ -1714,30 +1689,20 @@ def _decode_temporal(
     tiles_per_batch,
     progress,
     output_device=None,
+    output_dtype=torch.float32,
     overlap_query_threshold=0.0,
     final_full_overlap_blocks=36,
-    pixel_transform=None,
 ):
     chunk_dec = model.tokens_chunk_size * model.vae_ratio_t
     split_count = int(model.token_drop > 0) + 1
     if output_device is None:
         output_device = comfy.model_management.intermediate_device()
-    source_shape = model.decode_output_shape(z.shape)
-    output_shape = (
-        pixel_transform.output_shape(source_shape)
-        if pixel_transform is not None
-        else source_shape
-    )
     output = torch.empty(
-        output_shape,
-        dtype=(
-            pixel_transform.output_dtype
-            if pixel_transform is not None
-            else torch.float32
-        ),
+        model.decode_output_shape(z.shape),
+        dtype=output_dtype,
         device=output_device,
     )
-    writer = _PixelWriter(output, model, z.device, pixel_transform)
+    writer = _PixelWriter(output, model, z.device)
     spatial_cache = {}
 
     pad_tokens, num_chunks = model._decode_temporal_chunks(z.shape[2])
@@ -1788,7 +1753,6 @@ def decode_video(
     output_device=None,
     overlap_query_threshold=0.0,
     final_full_overlap_blocks=36,
-    _pixel_transform=None,
 ):
     model = require_h3_video_vae(vae)
     # H3 advertises FP16/FP32 to ComfyUI and defaults to FP16 on supported
@@ -1798,6 +1762,7 @@ def decode_video(
     if output_device is None:
         output_device = vae.output_device
     output_device = torch.device(output_device)
+    output_dtype = vae.vae_output_dtype()
     block_count = len(model.decoder.transformer_blocks)
     overlap_query_threshold = float(overlap_query_threshold)
     if not 0.0 <= overlap_query_threshold < 1.0:
@@ -1823,7 +1788,7 @@ def decode_video(
     )
     prefetch_dynamic_vbars = vae.patcher.is_dynamic()
     logging.info(
-        "Experimental H3 VAE shared-core multiband decoder active: windows=%d duplicate_spatial_ratio=%.2fx overlap_threshold=%.4f final_full_overlap_blocks=%d weight_lifecycle=%s",
+        "H3 VAE shared-core multiband decoder active: windows=%d duplicate_spatial_ratio=%.2fx overlap_threshold=%.4f final_full_overlap_blocks=%d weight_lifecycle=%s",
         tile_count,
         duplicate_ratio,
         overlap_query_threshold,
@@ -1847,11 +1812,6 @@ def decode_video(
             latent.shape,
             count,
             compute_dtype,
-            (
-                _pixel_transform.output_bytes
-                if _pixel_transform is not None and output_device.type == "cuda"
-                else 0
-            ),
         ),
         _AUTO_DECODE_TILE_BATCH_LIMIT,
     )
@@ -1889,24 +1849,12 @@ def decode_video(
                 overlap_query_threshold,
                 final_full_overlap_blocks,
             )[:, :, -1:]
-            if _pixel_transform is None:
-                dec = model._finalize_pixels(dec)
-            else:
-                source_shape = tuple(dec.shape)
-                dec_output = torch.empty(
-                    _pixel_transform.output_shape(source_shape),
-                    dtype=_pixel_transform.output_dtype,
-                    device=output_device,
-                )
-                writer = _PixelWriter(
-                    dec_output,
-                    model,
-                    dec.device,
-                    _pixel_transform,
-                )
-                writer.write(dec)
-                dec = writer.finish()
-            return dec.to(output_device).movedim(1, -1)
+            dec = model._finalize_pixels(dec)
+            return dec.to(
+                device=output_device,
+                dtype=output_dtype,
+                copy=True,
+            ).movedim(1, -1)
         dec = _decode_temporal(
             model,
             z,
@@ -1914,16 +1862,14 @@ def decode_video(
             batch_tiles,
             progress,
             output_device,
+            output_dtype,
             overlap_query_threshold,
             final_full_overlap_blocks,
-            _pixel_transform,
         )
         return dec.movedim(1, -1)
     finally:
         if progress is not None:
             progress.finish()
-        if _pixel_transform is not None:
-            _pixel_transform.finish()
         _clear_attention_caches(model.decoder)
 
 
@@ -1968,13 +1914,7 @@ def _encode_temporal_device(
     tiles_per_batch,
     progress,
 ):
-    """Normalize and transfer one temporal clip at a time.
-
-    In particular, do not materialize a complete FP32 normalized copy of a
-    GPU-resident upscaled video.  The encoder consumes FP16 clips, so keeping
-    the persistent pixel buffer in FP16 is both exact for its input domain and
-    substantially lowers the fused decode/resize/encode peak.
-    """
+    """Normalize and transfer one temporal clip at a time."""
 
     z_list = []
     for start in range(0, pixels.shape[2], model.clip_length):
@@ -2036,10 +1976,8 @@ def _encode_temporal_buffered(
         if clip.shape[2] < model.clip_length:
             pad = clip[:, :, -1:].repeat(1, 1, model.clip_length - clip.shape[2], 1, 1)
             clip = torch.cat((clip, pad), dim=2)
-        # Generic ComfyUI IMAGE input remains FP32 through host staging. The
-        # fused pixel round trip already owns an FP16 target, so preserve it
-        # and perform the affine VAE normalization after the transfer instead
-        # of widening the complete clip back to FP32 on the CPU.
+        # Preserve a compute-dtype input and apply VAE normalization after the
+        # transfer. Other input dtypes follow ComfyUI's FP32 normalization path.
         clip = (
             clip.contiguous()
             if normalize_on_device
@@ -2236,252 +2174,8 @@ def encode_video(vae, pixels):
         latent_mean = model.latents_mean.view(1, -1, 1, 1, 1).to(mean)
         latent_std = model.latents_std.view(1, -1, 1, 1, 1).to(mean)
         return ((mean - latent_mean) / latent_std).to(
-            device=vae.output_device, dtype=torch.float32
+            device=vae.output_device, dtype=vae.vae_output_dtype()
         )
     finally:
         if progress is not None:
             progress.finish()
-
-
-def _pixel_roundtrip_stage_device(vae, target_shape):
-    target_bytes = math.prod(target_shape) * 2
-    budget = _tile_memory_budget(vae)
-    staging_budget = int(budget * 0.35)
-    # Streaming resize writes decoded chunks directly into the FP16 target, so
-    # no complete source-resolution pixel tensor exists. Leave most of the
-    # budget to decoder/encoder activations and ComfyUI-managed weight pages.
-    if target_bytes <= staging_budget:
-        return vae.device
-    logging.info(
-        "MiniMax H3 pixel round trip uses CPU FP16 staging: target %.0f MiB exceeds the %.0f MiB GPU staging budget",
-        target_bytes / 1024**2,
-        staging_budget / 1024**2,
-    )
-    return torch.device("cpu")
-
-
-class _RTXVideoSuperResolution:
-    def __init__(self, width, height, quality):
-        try:
-            from nvvfx import VideoSuperRes
-        except (ImportError, OSError) as error:
-            raise RuntimeError(
-                "RTX VSR requires NVIDIA's optional nvidia-vfx package and a "
-                "supported recent NVIDIA driver; install it in ComfyUI's Python environment"
-            ) from error
-
-        quality_name = _RTX_VSR_QUALITIES.get(quality)
-        if quality_name is None:
-            raise ValueError(f"Unknown RTX VSR quality: {quality}")
-        quality_value = getattr(VideoSuperRes.QualityLevel, quality_name, None)
-        if quality_value is None:
-            raise RuntimeError(
-                f"The installed nvidia-vfx package does not provide {quality_name}"
-            )
-        self.effect = VideoSuperRes(quality=quality_value)
-        self.effect.output_width = int(width)
-        self.effect.output_height = int(height)
-        self.effect.load()
-
-    def __call__(self, frame):
-        result = self.effect.run(frame.float().contiguous())
-        image = getattr(result, "image", result)
-        # The SDK owns and reuses this DLPack storage on its next invocation.
-        return torch.from_dlpack(image).clone()
-
-
-class _PixelResizeTransform:
-    output_dtype = torch.float16
-
-    def __init__(self, source_shape, width, height, method, rtx_vsr_quality, device):
-        batch, channels, frames, source_height, source_width = source_shape
-        if method not in {"bicubic", "bilinear", "nearest-exact", "rtx_vsr"}:
-            raise ValueError(f"Unknown H3 pixel upscale method: {method}")
-        if width < source_width or height < source_height:
-            raise ValueError(
-                "MiniMax H3 Latent Pixel Upscale does not downscale pixels: "
-                f"source={source_width}x{source_height}, target={width}x{height}"
-            )
-        if method == "rtx_vsr" and (
-            width > source_width * 4 or height > source_height * 4
-        ):
-            raise ValueError("RTX VSR supports at most 4x spatial upscaling")
-        if method == "rtx_vsr" and torch.device(device).type != "cuda":
-            raise RuntimeError("RTX VSR requires a CUDA compute device")
-        self.source_shape = tuple(source_shape)
-        self.target_shape = (batch, channels, frames, int(height), int(width))
-        self.width = int(width)
-        self.height = int(height)
-        self.method = method
-        self.device = torch.device(device)
-        self.effect = (
-            _RTXVideoSuperResolution(width, height, rtx_vsr_quality)
-            if method == "rtx_vsr"
-            else None
-        )
-        self.progress_total = batch * frames
-        self.progress = None
-        self.closed = False
-
-    @property
-    def output_bytes(self):
-        return math.prod(self.target_shape) * 2
-
-    def output_shape(self, source_shape):
-        if tuple(source_shape[:3]) != self.source_shape[:3]:
-            raise ValueError(
-                "H3 pixel resize stream changed batch/channel/frame geometry: "
-                f"expected {self.source_shape[:3]}, got {tuple(source_shape[:3])}"
-            )
-        return self.target_shape
-
-    def __call__(self, pixels):
-        if pixels.ndim != 5 or pixels.shape[1] != self.source_shape[1]:
-            raise ValueError(
-                "MiniMax H3 decoded pixels must be [B,C,T,H,W], "
-                f"got {tuple(pixels.shape)}"
-            )
-        batch, channels, frames, source_height, source_width = pixels.shape
-        if self.progress is None:
-            self.progress = _TileProgress(
-                self.progress_total,
-                self.device,
-                "H3 Pixel Upscale Frames",
-            )
-        if (source_height, source_width) != self.source_shape[-2:]:
-            raise ValueError(
-                "H3 pixel resize stream changed spatial geometry: "
-                f"expected {self.source_shape[-2:]}, got {(source_height, source_width)}"
-            )
-        if self.effect is not None:
-            resized = torch.empty(
-                batch,
-                channels,
-                frames,
-                self.height,
-                self.width,
-                dtype=torch.float16,
-                device=pixels.device,
-            )
-            for batch_index in range(batch):
-                for frame_index in range(frames):
-                    frame = pixels[batch_index, :, frame_index]
-                    resized[batch_index, :, frame_index].copy_(
-                        self.effect(frame).to(dtype=torch.float16)
-                    )
-                    self.progress.update(1)
-            return resized
-
-        output = torch.empty(
-            batch,
-            channels,
-            frames,
-            self.height,
-            self.width,
-            dtype=torch.float16,
-            device=pixels.device,
-        )
-        kwargs = {}
-        if self.method in {"bicubic", "bilinear"}:
-            kwargs["align_corners"] = False
-            kwargs["antialias"] = False
-        for frame_start in range(0, frames, _PIXEL_RESIZE_FRAME_BATCH):
-            frame_end = min(frame_start + _PIXEL_RESIZE_FRAME_BATCH, frames)
-            frame_batch = pixels[:, :, frame_start:frame_end].permute(0, 2, 1, 3, 4)
-            frame_batch = frame_batch.reshape(
-                batch * (frame_end - frame_start),
-                channels,
-                source_height,
-                source_width,
-            )
-            resized = F.interpolate(
-                frame_batch.float(),
-                size=(self.height, self.width),
-                mode=self.method,
-                **kwargs,
-            ).view(
-                batch,
-                frame_end - frame_start,
-                channels,
-                self.height,
-                self.width,
-            )
-            output[:, :, frame_start:frame_end].copy_(
-                resized.permute(0, 2, 1, 3, 4).to(torch.float16)
-            )
-            self.progress.update(batch * (frame_end - frame_start))
-        return output
-
-    def finish(self):
-        if self.closed:
-            return
-        self.closed = True
-        if self.progress is not None:
-            self.progress.finish()
-
-
-def upscale_latent_via_pixels(
-    vae,
-    latent,
-    width,
-    height,
-    method="bicubic",
-    rtx_vsr_quality="high",
-    attention="sdpa",
-    overlap_query_threshold=0.0,
-    final_full_overlap_blocks=36,
-):
-    model = require_h3_video_vae(vae)
-    if latent.ndim != 5 or latent.shape[1] != 24:
-        raise ValueError(
-            "MiniMax H3 video latent must be [B,24,T,H,W], "
-            f"got {tuple(latent.shape)}"
-        )
-    width = int(width)
-    height = int(height)
-    if width <= 0 or height <= 0 or width % 32 or height % 32:
-        raise ValueError(
-            f"Target width and height must be positive multiples of 32, got {width}x{height}"
-        )
-    if method not in {"bicubic", "bilinear", "nearest-exact", "rtx_vsr"}:
-        raise ValueError(f"Unknown H3 pixel upscale method: {method}")
-    if method == "rtx_vsr" and rtx_vsr_quality not in _RTX_VSR_QUALITIES:
-        raise ValueError(f"Unknown RTX VSR quality: {rtx_vsr_quality}")
-    source_shape = model.decode_output_shape(latent.shape)
-    source_height, source_width = source_shape[-2:]
-    if width < source_width or height < source_height:
-        raise ValueError(
-            "MiniMax H3 Latent Pixel Upscale does not downscale pixels: "
-            f"source={source_width}x{source_height}, target={width}x{height}"
-        )
-    if method == "rtx_vsr" and (
-        width > source_width * 4 or height > source_height * 4
-    ):
-        raise ValueError("RTX VSR supports at most 4x spatial upscaling")
-    if width == source_width and height == source_height:
-        logging.info(
-            "MiniMax H3 Latent Pixel Upscale target matches the decoded size; running a VAE pixel round trip without resizing"
-        )
-    target_shape = (*source_shape[:-2], height, width)
-    stage_device = _pixel_roundtrip_stage_device(vae, target_shape)
-    pixel_transform = _PixelResizeTransform(
-        source_shape,
-        width,
-        height,
-        method,
-        rtx_vsr_quality,
-        vae.device,
-    )
-    try:
-        resized = decode_video(
-            vae,
-            latent,
-            attention,
-            output_device=stage_device,
-            overlap_query_threshold=overlap_query_threshold,
-            final_full_overlap_blocks=final_full_overlap_blocks,
-            _pixel_transform=pixel_transform,
-        )
-        return encode_video(vae, resized)
-    finally:
-        pixel_transform.finish()

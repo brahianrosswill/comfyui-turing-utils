@@ -1,8 +1,10 @@
 # MiniMax H3 Video VAE
 
-The two experimental MiniMax H3 VAE nodes provide a focused Turing execution
-path for the official H3 video VAE. They accept the normal ComfyUI `VAE`,
-`LATENT`, and `IMAGE` types and do not require the Turing Utils model loader.
+The MiniMax H3 VAE nodes provide a focused Turing execution path for the
+official H3 video VAE. They accept the normal ComfyUI `VAE`, `LATENT`, and
+`IMAGE` types and do not require the Turing Utils model loader. The decoder is
+the production path, and the encoder follows the same public ComfyUI VAE
+storage contract.
 
 ## Decode
 
@@ -46,40 +48,12 @@ The attention selector applies to every shared decoder Transformer block:
 ## Encode
 
 `MiniMax H3 Video VAE Encode` retains the official 256px/64px tiled encoder
-geometry and ComfyUI-compatible FP32 latent output. It chooses up to sixteen
-simultaneous spatial tiles from the current memory budget. Encoder stages use
-ComfyUI's dynamic-VBAR prefetch queue, which returns each stage before moving
-to the next instead of pinning one complete encoder weight cycle. Generic
-ComfyUI IMAGE input keeps its FP32 host representation; an existing FP16 pixel
-store is transferred and normalized as FP16 on the GPU without first widening
-the complete clip to FP32.
-
-## Latent Pixel Upscale
-
-`MiniMax H3 Latent Pixel Upscale` performs the quality-preserving two-stage
-bridge in one experimental node:
-
-1. decode the H3 video latent with the optimized decoder;
-2. resize each finalized temporal pixel chunk as complete RGB frames, never as
-   independent spatial tiles;
-3. stream the resized chunks directly into one FP16 target store;
-4. immediately encode that store back into an H3 video latent.
-
-There is no complete source-resolution pixel store: decode finalization,
-spatial resize, and FP16 target staging form one bounded pipeline. The target
-store stays on the GPU when the current memory budget allows and falls back to
-double-buffered CPU FP16 staging for very large outputs. The target allocation
-is included in decoder auto-batch planning. Normal interpolation is batched on
-the GPU. The optional `rtx_vsr` method lazily uses NVIDIA's `nvidia-vfx`
-package and has no effect on installations that do not select it. RTX VSR
-input/output remains GPU-resident and each SDK-owned DLPack result is cloned
-before the next frame.
-
-Target width and height must be multiples of 32 and must not be smaller than
-the decoded source. A nested H3 AV latent keeps its audio samples and audio
-mask unchanged; only the video latent and its spatial noise mask are replaced.
-This node does not add noise or choose a second-stage sigma. Feed its output to
-a separate sampler so denoise strength and scheduling remain explicit.
+geometry. It chooses up to sixteen simultaneous spatial tiles from the current
+memory budget. Encoder stages use ComfyUI's dynamic-VBAR prefetch queue, which
+returns each stage before moving to the next instead of pinning one complete
+encoder weight cycle. Pixel preparation, moments, and latent normalization keep
+their numerically sensitive FP32 steps; the published latent is converted only
+at the boundary to `vae.vae_output_dtype()`, matching the official VAE wrapper.
 
 ## Automatic execution
 
@@ -97,12 +71,14 @@ unsupported dtypes automatically use that ordered Python fallback.
 Both paths use ComfyUI's official short-lived prefetch queues. Decoder weights
 are leased one Transformer block at a time and encoder weights one execution
 stage at a time; unpinned VBAR pages may remain resident when memory allows,
-but the plugin does not retain or evict them itself. Decode uses asynchronous
-FP32 pixel double buffering; encode uses asynchronous input buffering when
-pinned host memory is available. The nodes publish completed-tile progress to
-both ComfyUI and the terminal, while model residency and cleanup remain owned
-by ComfyUI's dynamic-memory manager.
+but the plugin does not retain or evict them itself. After FP32 pixel
+finalization, decode uses asynchronous output-dtype double buffering; encode
+uses asynchronous input buffering when pinned host memory is available. The
+nodes publish completed-tile progress to both ComfyUI and the terminal, while
+model residency and cleanup remain owned by ComfyUI's dynamic-memory manager.
 
-These nodes are experimental. The fixed tiling policy is deliberate: discarded
-arbitrary-size and alternate stitching strategies were removed after producing
-visible grids, blur, or unnecessary duplicated token work.
+The decoder's fixed tiling policy is deliberate: discarded arbitrary-size and
+alternate stitching strategies were removed after producing visible grids,
+blur, or unnecessary duplicated token work. Positive
+`overlap_query_threshold` values remain an optional experimental speed/quality
+control; zero is the stable decoder default.

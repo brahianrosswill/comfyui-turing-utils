@@ -46,14 +46,11 @@ only after its CUDA sources or required version change.
 - `H3 Concat AV Latent` combines standalone H3 video and audio latents into the
   model's native nested AV latent. `H3 Separate AV Latent` splits the streams
   again; both nodes preserve matching video/audio noise masks.
-- `MiniMax H3 Video VAE Decode/Encode (Experimental)` provide fixed 256px H3
+- `MiniMax H3 Video VAE Decode/Encode` provide fixed 256px H3
   tiling, full-overlap shared-core decode, a deterministic FP32 overlap
   epilogue, global multiband stitching, and ComfyUI-managed block-level weight
-  prefetch.
-  `MiniMax H3 Latent Pixel Upscale
-  (Experimental)` streams finalized decode chunks through full-frame spatial
-  resize directly into the re-encode store for a stable second-stage latent;
-  an optional RTX VSR path is loaded only when selected.
+  prefetch. Their public tensors follow ComfyUI's configured VAE intermediate
+  dtype while numerically sensitive accumulation remains FP32.
 - `Patch MiniMax H3 Block Cache (Experimental)` skips stable transformer-block
   spans by reusing one exact trajectory residual. It provides conservative
   standard, 4-step, and 8-step profiles, isolates sampler branches, prefetches
