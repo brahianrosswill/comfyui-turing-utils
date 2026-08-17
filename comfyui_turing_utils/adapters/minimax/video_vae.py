@@ -30,12 +30,11 @@ from ...attention.protocol import (
     RMSNormSpec,
     RotaryEmbeddingSpec,
 )
-from ...kernel_api import load_turing_sage
 
 
 TILE_SIZE = 256
 TILE_OVERLAP = 64
-_AUTO_DECODE_TILE_BATCH_LIMIT = 16
+_AUTO_DECODE_TILE_BATCH_LIMIT = 4
 _AUTO_ENCODE_TILE_BATCH_LIMIT = 16
 _DECODER_BYTES_PER_FP16_TOKEN = 64 * 1024
 _ENCODER_BYTES_PER_FP16_PIXEL_FRAME = 1800
@@ -46,7 +45,6 @@ _MULTIBAND_DOWNSAMPLE = 8
 _MULTIBAND_HIGH_WEIGHT_POWER = 4
 _MULTIBAND_FRAME_CHUNK = 4
 _PIXEL_RESIZE_FRAME_BATCH = 8
-_MIN_FUSED_SWIGLU_ROWS = 64
 _RTX_VSR_QUALITIES = {
     "medium": "MEDIUM",
     "high": "HIGH",
@@ -808,7 +806,7 @@ class _SharedWindowLayout:
 
 
 class _SharedSpatialPlan:
-    """Decode-session cache for immutable window and RoPE metadata."""
+    """Immutable window and RoPE metadata for one spatial decode call."""
 
     def __init__(self, model, latent_t, latent_h, latent_w, device, dtype):
         decoder = model.decoder
@@ -837,17 +835,6 @@ class _SharedSpatialPlan:
             device=device,
         )
         self._query_groups = {}
-        self._overlap_maps = None
-        self._overlap_backend_logged = False
-        try:
-            turing_sage = load_turing_sage()
-            self.overlap_blend = (
-                turing_sage.overlap_blend_compiled
-                if turing_sage.overlap_blend_available()
-                else None
-            )
-        except (AttributeError, ImportError, OSError):
-            self.overlap_blend = None
 
     def query_groups(self, minimum_weight):
         key = float(minimum_weight)
@@ -857,68 +844,19 @@ class _SharedSpatialPlan:
             self._query_groups[key] = groups
         return groups
 
-    def overlap_maps(self):
-        if self._overlap_maps is not None:
-            return self._overlap_maps
-        layout = self.layout
-        local_map = torch.full(
-            (layout.image_tokens, layout.window_count),
-            -1,
-            dtype=torch.int32,
-            device=layout.token_indices.device,
-        )
-        weight_map = torch.zeros(
-            (layout.image_tokens, layout.window_count),
-            dtype=torch.float32,
-            device=layout.token_indices.device,
-        )
-        for (
-            windows,
-            global_indices,
-            _local_indices,
-            weights,
-        ) in self.query_groups(0.0).values():
-            window_grid = windows[:, None].expand_as(global_indices)
-            flat_global = global_indices.reshape(-1)
-            flat_window = window_grid.reshape(-1)
-            # The epilogue consumes compact query outputs, so map global
-            # tokens to their position in that output rather than implicitly
-            # assuming it always equals the original K/V window position.
-            query_positions = torch.arange(
-                global_indices.shape[1],
-                dtype=torch.int32,
-                device=global_indices.device,
-            ).expand_as(global_indices)
-            local_map[flat_global, flat_window] = query_positions.reshape(-1)
-            weight_map[flat_global, flat_window] = weights.reshape(-1)
-        self._overlap_maps = (local_map.contiguous(), weight_map.contiguous())
-        return self._overlap_maps
-
-
-def _shared_spatial_plan(model, x, cache):
-    key = (
+def _shared_spatial_plan(model, x):
+    return _SharedSpatialPlan(
+        model,
         int(x.shape[2]),
         int(x.shape[3]),
         int(x.shape[4]),
-        x.device.type,
-        x.device.index,
+        x.device,
         x.dtype,
     )
-    if cache is None:
-        return _SharedSpatialPlan(model, *key[:3], x.device, x.dtype)
-    plan = cache.get(key)
-    if plan is None:
-        plan = _SharedSpatialPlan(model, *key[:3], x.device, x.dtype)
-        cache[key] = plan
-    return plan
 
 
 def _feed_forward(module, value):
-    rows = value.numel() // value.shape[-1]
-    # Kitchen's fused FP16 SwiGLU+INT8 path is not used for the very small
-    # suffix groups produced by aggressive overlap pruning. The ordinary MLP
-    # path still uses the quantized w2 weight, but materializes SwiGLU first.
-    if rows >= _MIN_FUSED_SWIGLU_ROWS and _fused_swiglu_eligible(module.w2):
+    if _fused_swiglu_eligible(module.w2):
         output = comfy.ops.linear_input_act(module.w2, module.w1(value), "swiglu")
     else:
         output = module(value)
@@ -989,7 +927,10 @@ def _shared_core_multiband_decoder_forward(
 ):
     decoder = model.decoder
     batch, _, latent_t, latent_h, latent_w = x.shape
-    plan = _shared_spatial_plan(model, x, spatial_cache)
+    # Keep each temporal decode chunk independent. Reusing the spatial plan
+    # changed the lifetime and layout of RoPE/query metadata compared with the
+    # last known-good full-overlap decoder, for negligible runtime benefit.
+    plan = _shared_spatial_plan(model, x)
     layout = plan.layout
     h = decoder.x_embedder(x.flatten(2).transpose(1, 2))
     dim = h.shape[-1]
@@ -1024,16 +965,18 @@ def _shared_core_multiband_decoder_forward(
         if block_index > 0:
             block_session.before_stage(block_index)
         attention = block.attn
-        query_image = torch.empty(
+        # Preserve the projected QKV layout until after each window group has
+        # been gathered. Q/K normalization is deliberately performed on the
+        # contiguous, concatenated window tensors below, matching the last
+        # known-good full-overlap execution path.
+        qkv_image = torch.empty(
             batch,
             layout.image_tokens,
             attention.heads,
-            attention.dim_head,
+            3 * attention.dim_head,
             dtype=h.dtype,
             device=h.device,
         )
-        key_image = torch.empty_like(query_image)
-        value_image = torch.empty_like(query_image)
         for token_start in range(0, layout.image_tokens, linear_chunk):
             token_end = min(token_start + linear_chunk, layout.image_tokens)
             normed = comfy.rmsnorm.rms_norm(
@@ -1047,90 +990,22 @@ def _shared_core_multiband_decoder_forward(
                 attention.heads,
                 3 * attention.dim_head,
             )
-            projected_q, projected_k, projected_v = torch.chunk(projected, 3, dim=-1)
-            query_image[:, token_start:token_end].copy_(
-                comfy.rmsnorm.rms_norm(
-                    projected_q,
-                    attention.norm_q.weight,
-                    attention.norm_q.eps,
-                )
-            )
-            key_image[:, token_start:token_end].copy_(
-                comfy.rmsnorm.rms_norm(
-                    projected_k,
-                    attention.norm_k.weight,
-                    attention.norm_k.eps,
-                )
-            )
-            value_image[:, token_start:token_end].copy_(projected_v)
+            qkv_image[:, token_start:token_end].copy_(projected)
 
-        # Every suffix belongs to exactly one query group, but its projection
-        # does not depend on that group's compact core length. Project all
-        # windows together so pruning cannot turn the quantized linears into
-        # thousands of M=5/10/15 calls.
-        suffix_flat = suffix.reshape(
-            batch * layout.window_count,
-            suffix_tokens,
-            dim,
-        )
-        suffix_normed = comfy.rmsnorm.rms_norm(
-            suffix_flat,
-            block.norm1.weight,
-            block.norm1.eps,
-        )
-        suffix_qkv = attention.to_qkv(suffix_normed).view(
-            batch,
-            layout.window_count,
-            suffix_tokens,
-            attention.heads,
-            3 * attention.dim_head,
-        )
-        suffix_q, suffix_k, suffix_v = torch.chunk(suffix_qkv, 3, dim=-1)
-        suffix_q = comfy.rmsnorm.rms_norm(
-            suffix_q,
-            attention.norm_q.weight,
-            attention.norm_q.eps,
-        )
-        suffix_k = comfy.rmsnorm.rms_norm(
-            suffix_k,
-            attention.norm_k.weight,
-            attention.norm_k.eps,
-        )
-        suffix_attention = torch.zeros_like(suffix)
         block_threshold = (
             0.0
             if block_index >= final_full_overlap_start
             else overlap_query_threshold
         )
         query_groups = plan.query_groups(block_threshold)
-        full_group = query_groups.get(layout.window_tokens)
-        fused_overlap = bool(
-            block_threshold == 0.0
-            and plan.overlap_blend is not None
-            and tiles_per_batch >= layout.window_count
-            and len(query_groups) == 1
-            and full_group is not None
-            and int(full_group[0].numel()) == layout.window_count
-        )
-        if fused_overlap and not plan._overlap_backend_logged:
-            logging.info(
-                "MiniMax H3 VAE deterministic overlap epilogue active: windows=%d tokens=%d",
-                layout.window_count,
-                layout.image_tokens,
-            )
-            plan._overlap_backend_logged = True
         # Attention results from overlapping windows represent different local
-        # contexts. The bundled epilogue performs the complete deterministic
-        # FP32 partition-of-unity reduction in one launch when every window
-        # fits in one attention batch. Smaller batches and pruned schedules
-        # retain the exact sequential FP32 fallback.
-        image_attention = None
-        if not fused_overlap:
-            image_attention = torch.zeros(
-                h.shape,
-                dtype=torch.float32,
-                device=h.device,
-            )
+        # contexts. Accumulate the deterministic partition-of-unity blend in
+        # FP32 and in window order; this is the numerically validated path.
+        image_attention = torch.zeros(
+            h.shape,
+            dtype=torch.float32,
+            device=h.device,
+        )
         for core_tokens in sorted(query_groups):
             (
                 grouped_windows,
@@ -1149,53 +1024,56 @@ def _shared_core_multiband_decoder_forward(
                 query_local_indices = grouped_local_indices[group_slice]
                 query_weights = grouped_weights[group_slice]
 
-                window_key = key_image[:, key_indices].reshape(
+                window_qkv = qkv_image[:, key_indices].reshape(
                     batch * window_count,
                     layout.window_tokens,
                     attention.heads,
-                    attention.dim_head,
+                    3 * attention.dim_head,
                 )
-                window_value = value_image[:, key_indices].reshape(
-                    batch * window_count,
-                    layout.window_tokens,
-                    attention.heads,
-                    attention.dim_head,
-                )
-                query_q = query_image[:, query_global_indices]
+                query_q = qkv_image[:, query_global_indices][
+                    ..., : attention.dim_head
+                ]
                 query_q = query_q.reshape(
                     batch * window_count,
                     core_tokens,
                     attention.heads,
                     attention.dim_head,
                 )
-                suffix_q_group = suffix_q.index_select(1, window_tensor).reshape(
+                suffix_group = (
+                    suffix.index_select(1, window_tensor)
+                    .reshape(
+                        batch * window_count,
+                        suffix_tokens,
+                        dim,
+                    )
+                    .clone()
+                )
+                suffix_normed = comfy.rmsnorm.rms_norm(
+                    suffix_group,
+                    block.norm1.weight,
+                    block.norm1.eps,
+                )
+                suffix_qkv = attention.to_qkv(suffix_normed).view(
                     batch * window_count,
                     suffix_tokens,
                     attention.heads,
-                    attention.dim_head,
+                    3 * attention.dim_head,
                 )
-                suffix_k_group = suffix_k.index_select(1, window_tensor).reshape(
-                    batch * window_count,
-                    suffix_tokens,
-                    attention.heads,
-                    attention.dim_head,
+                suffix_q, suffix_k, suffix_v = torch.chunk(
+                    suffix_qkv, 3, dim=-1
                 )
-                suffix_v_group = suffix_v.index_select(1, window_tensor).reshape(
-                    batch * window_count,
-                    suffix_tokens,
-                    attention.heads,
-                    attention.dim_head,
-                )
-                query = torch.cat((query_q, suffix_q_group), dim=1)
+                query = torch.cat((query_q, suffix_q), dim=1)
                 key = torch.cat(
                     (
-                        window_key,
-                        suffix_k_group,
+                        window_qkv[
+                            ..., attention.dim_head : 2 * attention.dim_head
+                        ],
+                        suffix_k,
                     ),
                     dim=1,
                 )
                 value = torch.cat(
-                    (window_value, suffix_v_group),
+                    (window_qkv[..., 2 * attention.dim_head :], suffix_v),
                     dim=1,
                 )
 
@@ -1225,7 +1103,6 @@ def _shared_core_multiband_decoder_forward(
                     query_rotary,
                     key_rotary,
                     transformer_options,
-                    qk_normalized=True,
                 ).view(
                     batch,
                     window_count,
@@ -1233,55 +1110,46 @@ def _shared_core_multiband_decoder_forward(
                     dim,
                 )
 
-                if fused_overlap:
-                    local_map, overlap_weights = plan.overlap_maps()
-                    image_attention = plan.overlap_blend(
-                        attended[:, :, :core_tokens],
-                        local_map,
-                        overlap_weights,
+                for local_index, global_indices in enumerate(query_global_indices):
+                    weighted = attended[:, local_index, :core_tokens].mul(
+                        query_weights[local_index].view(1, -1, 1)
                     )
-                else:
-                    for local_index, global_indices in enumerate(query_global_indices):
-                        weighted = attended[:, local_index, :core_tokens].mul(
-                            query_weights[local_index].view(1, -1, 1)
-                        )
-                        # Every index is unique inside one window, and windows
-                        # are consumed serially here. Avoid CUDA index_add
-                        # atomics: their reduction order is not guaranteed.
-                        accumulated = image_attention.index_select(1, global_indices)
-                        accumulated.add_(weighted)
-                        image_attention.index_copy_(1, global_indices, accumulated)
+                    # Every index is unique inside one window, and windows are
+                    # consumed serially here. Avoid CUDA index_add atomics:
+                    # their reduction order is not guaranteed.
+                    accumulated = image_attention.index_select(1, global_indices)
+                    accumulated.add_(weighted)
+                    image_attention.index_copy_(1, global_indices, accumulated)
 
-                suffix_attention.index_copy_(
+                suffix_attention = attended[:, :, core_tokens:].reshape(
+                    batch * window_count,
+                    suffix_tokens,
+                    dim,
+                )
+                suffix_group.addcmul_(
+                    attention.to_out(suffix_attention),
+                    comfy.ops.cast_to_input(block.scale1, suffix_group),
+                )
+                suffix_normed = comfy.rmsnorm.rms_norm(
+                    suffix_group,
+                    block.norm2.weight,
+                    block.norm2.eps,
+                )
+                suffix_group.addcmul_(
+                    _feed_forward(block.ff, suffix_normed),
+                    comfy.ops.cast_to_input(block.scale2, suffix_group),
+                )
+                suffix.index_copy_(
                     1,
                     window_tensor,
-                    attended[:, :, core_tokens:],
+                    suffix_group.view(
+                        batch,
+                        window_count,
+                        suffix_tokens,
+                        dim,
+                    ),
                 )
-        if image_attention is None:
-            raise RuntimeError("shared-core overlap produced no image attention")
-
-        # All windows are now present, so keep every suffix linear at the
-        # stable full-window row count as well.
-        suffix_attention_flat = suffix_attention.reshape(
-            batch * layout.window_count,
-            suffix_tokens,
-            dim,
-        )
-        suffix_flat.addcmul_(
-            attention.to_out(suffix_attention_flat),
-            comfy.ops.cast_to_input(block.scale1, suffix_flat),
-        )
-        suffix_normed = comfy.rmsnorm.rms_norm(
-            suffix_flat,
-            block.norm2.weight,
-            block.norm2.eps,
-        )
-        suffix_flat.addcmul_(
-            _feed_forward(block.ff, suffix_normed),
-            comfy.ops.cast_to_input(block.scale2, suffix_flat),
-        )
-        del query_image, key_image, value_image
-        del suffix_q, suffix_k, suffix_v, suffix_attention
+        del qkv_image
         for token_start in range(0, layout.image_tokens, linear_chunk):
             token_end = min(token_start + linear_chunk, layout.image_tokens)
             h_slice = h[:, token_start:token_end]
@@ -1785,7 +1653,6 @@ def _decode_temporal(
         device=output_device,
     )
     writer = _PixelWriter(output, model, z.device, pixel_transform)
-    spatial_cache = {}
 
     pad_tokens, num_chunks = model._decode_temporal_chunks(z.shape[2])
     if pad_tokens > 0:
@@ -1804,7 +1671,7 @@ def _decode_temporal(
             block_session,
             tiles_per_batch,
             progress,
-            spatial_cache,
+            None,
             overlap_query_threshold,
             final_full_overlap_blocks,
         )
@@ -1928,7 +1795,6 @@ def decode_video(
             True,
         )
         block_session.start()
-        spatial_cache = {}
         if z.shape[2] == 1:
             dec = _decode_spatial(
                 model,
@@ -1937,7 +1803,7 @@ def decode_video(
                 block_session,
                 batch_tiles,
                 progress,
-                spatial_cache,
+                None,
                 overlap_query_threshold,
                 final_full_overlap_blocks,
             )[:, :, -1:]

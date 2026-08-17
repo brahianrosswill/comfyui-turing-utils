@@ -84,13 +84,12 @@ a separate sampler so denoise strength and scheduling remain explicit.
 
 Both nodes choose the number of simultaneously evaluated windows internally.
 The choice is bounded by current free/reclaimable device memory and conservative
-activation estimates (up to sixteen windows for both decode and encode). This
-control is intentionally not exposed in the node UI.
+activation estimates (up to four decode windows and sixteen encode windows).
+This control is intentionally not exposed in the node UI.
 
-When all decode windows fit in one attention batch, kernel package 0.26.0 uses
-a single deterministic SM75 overlap epilogue. It accumulates window outputs in
-FP32 in fixed window order and writes the model dtype once. Smaller batches and
-pruned schedules fall back to the equivalent ordered FP32 Python path.
+The decoder uses the validated ordered FP32 Python overlap reduction for every
+batch size. The optional SM75 overlap epilogue remains available in the kernel
+package for isolated validation, but is not used by the production H3 VAE path.
 
 Both paths retain prefetched weights across spatial windows and temporal chunks
 when memory allows. Decode uses asynchronous FP32 pixel double buffering;

@@ -185,7 +185,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         self.assertLess(pruned_queries, full_queries)
         self.assertGreaterEqual(pruned_queries, layout.image_tokens)
 
-    def test_aggressive_overlap_pruning_creates_small_suffix_batches(self):
+    def test_aggressive_overlap_pruning_creates_single_window_suffix_groups(self):
         model = SimpleNamespace(vae_ratio=16)
         layout = video_vae._SharedWindowLayout(
             model,
@@ -198,28 +198,27 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         window_counts = [int(group[0].numel()) for group in groups.values()]
         self.assertEqual(layout.window_count, 28)
         self.assertIn(1, window_counts)
-        self.assertTrue(
-            any(
-                count * 5 < video_vae._MIN_FUSED_SWIGLU_ROWS
-                for count in window_counts
-            )
-        )
 
-    def test_small_feed_forward_batches_bypass_fused_swiglu(self):
+    def test_small_feed_forward_batches_keep_fused_swiglu(self):
         module = mock.Mock()
-        module.w1 = mock.Mock()
+        projected = torch.zeros(1, 5, 16)
+        module.w1 = mock.Mock(return_value=projected)
         module.w2 = object()
-        module.side_effect = lambda value: value.add(1)
         small = torch.zeros(1, 5, 8)
+        expected = torch.ones_like(small)
         with (
             mock.patch.object(video_vae, "_fused_swiglu_eligible", return_value=True),
-            mock.patch.object(video_vae.comfy.ops, "linear_input_act") as fused,
+            mock.patch.object(
+                video_vae.comfy.ops,
+                "linear_input_act",
+                return_value=expected,
+            ) as fused,
         ):
             actual = video_vae._feed_forward(module, small)
-        torch.testing.assert_close(actual, torch.ones_like(small))
-        module.assert_called_once_with(small)
-        module.w1.assert_not_called()
-        fused.assert_not_called()
+        self.assertIs(actual, expected)
+        module.assert_not_called()
+        module.w1.assert_called_once_with(small)
+        fused.assert_called_once_with(module.w2, projected, "swiglu")
 
     def test_large_feed_forward_batches_keep_fused_swiglu(self):
         module = mock.Mock()
@@ -260,20 +259,23 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(first, video_vae._latent_fingerprint(changed))
 
-    def test_spatial_plan_is_cached_for_matching_temporal_chunks(self):
-        cache = {}
+    def test_spatial_plan_is_fresh_for_each_temporal_chunk(self):
         model = object()
         value = torch.zeros(1, 4, 2, 3, 5)
-        plan = object()
+        plans = [object(), object()]
         with mock.patch.object(
-            video_vae, "_SharedSpatialPlan", return_value=plan
+            video_vae, "_SharedSpatialPlan", side_effect=plans
         ) as constructor:
-            first = video_vae._shared_spatial_plan(model, value, cache)
-            second = video_vae._shared_spatial_plan(model, value, cache)
-        self.assertIs(first, plan)
-        self.assertIs(second, plan)
-        constructor.assert_called_once_with(
-            model, 2, 3, 5, value.device, value.dtype
+            first = video_vae._shared_spatial_plan(model, value)
+            second = video_vae._shared_spatial_plan(model, value)
+        self.assertIs(first, plans[0])
+        self.assertIs(second, plans[1])
+        self.assertEqual(constructor.call_count, 2)
+        constructor.assert_has_calls(
+            [
+                mock.call(model, 2, 3, 5, value.device, value.dtype),
+                mock.call(model, 2, 3, 5, value.device, value.dtype),
+            ]
         )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
@@ -333,7 +335,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 layout.window_count,
             )
 
-    def test_pruned_suffix_linears_are_batched_across_all_windows(self):
+    def test_pruned_suffix_linears_are_isolated_by_query_group(self):
         from comfy.ldm.minimax.vae import ViT3DDecoder
 
         torch.manual_seed(31)
@@ -400,19 +402,17 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 final_full_overlap_blocks=0,
             )
 
-        suffix_shape = (
-            layout.window_count,
-            1 + decoder.num_register_tokens,
-        )
+        suffix_tokens = 1 + decoder.num_register_tokens
         self.assertGreater(len(layout.query_groups(0.5)), 1)
         for name in calls:
             suffix_calls = [
-                shape for shape in calls[name] if shape[:2] == suffix_shape
+                shape for shape in calls[name] if shape[1] == suffix_tokens
             ]
-            self.assertEqual(len(suffix_calls), 1, name)
-            self.assertGreater(
-                suffix_calls[0][0] * suffix_calls[0][1],
-                video_vae._MIN_FUSED_SWIGLU_ROWS,
+            self.assertGreater(len(suffix_calls), 1, name)
+            self.assertEqual(
+                sum(shape[0] for shape in suffix_calls),
+                layout.window_count,
+                name,
             )
         self.assertEqual(result.shape[-2:], (12, 12))
 
@@ -903,7 +903,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 4,
             )
         self.assertEqual((selected, estimate), (3, 30))
-        self.assertEqual(video_vae._AUTO_DECODE_TILE_BATCH_LIMIT, 16)
+        self.assertEqual(video_vae._AUTO_DECODE_TILE_BATCH_LIMIT, 4)
         self.assertEqual(video_vae._AUTO_ENCODE_TILE_BATCH_LIMIT, 16)
 
     def test_tile_progress_uses_comfy_progress_bar(self):

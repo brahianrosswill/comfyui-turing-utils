@@ -23,9 +23,9 @@ Every stable public tensor operator is registered through
 raw W8A8 contraction used by the grouped-codebook path and regression tests, BF16
 epilogue, ConvRot activation fusions, normalization fusions, fixed and varlen
 Sage, dense W8A8, Sol, and fused Q/K RMSNorm+RoPE+INT8 preprocessing.
-The same extension also provides the deterministic FP32 overlap epilogue used
-by the MiniMax H3 shared-core VAE decoder when every spatial window fits in one
-attention batch.
+The same extension also provides a deterministic FP32 overlap epilogue for
+isolated validation. The production MiniMax H3 shared-core VAE decoder keeps
+the validated ordered Python reduction for all batch sizes.
 Prequantized Python state objects deliberately stay
 outside this boundary because they are ComfyUI tensor-lifetime coordination,
 not graph-level tensor operators.
