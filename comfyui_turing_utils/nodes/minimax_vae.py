@@ -60,8 +60,8 @@ class MiniMaxH3VideoVAEDecode:
     CATEGORY = "Turing Utils/MiniMax H3"
     DESCRIPTION = (
         "Experimental MiniMax H3 video decoder with automatic W8A8 SwiGLU "
-        "fusion, FP32 pixel double buffering, and dynamic weight retention "
-        "across all tiles in one invocation."
+        "fusion, FP32 pixel double buffering, and ComfyUI-managed block-level "
+        "dynamic-weight prefetch."
     )
 
     def decode(
@@ -105,8 +105,8 @@ class MiniMaxH3VideoVAEEncode:
     DESCRIPTION = (
         "Experimental MiniMax H3 video encoder with FP32 pixel double "
         "buffering, FP16 round-trip fast path, automatic tile batching, and "
-        "dynamic weight retention across all tiles. Output latents always use "
-        "ComfyUI-compatible FP32 storage."
+        "ComfyUI-managed block-level dynamic-weight prefetch. Output latents "
+        "always use ComfyUI-compatible FP32 storage."
     )
 
     def encode(

@@ -48,7 +48,8 @@ only after its CUDA sources or required version change.
   again; both nodes preserve matching video/audio noise masks.
 - `MiniMax H3 Video VAE Decode/Encode (Experimental)` provide fixed 256px H3
   tiling, full-overlap shared-core decode, a deterministic FP32 overlap
-  epilogue, global multiband stitching, and retained asynchronous weights.
+  epilogue, global multiband stitching, and ComfyUI-managed block-level weight
+  prefetch.
   `MiniMax H3 Latent Pixel Upscale
   (Experimental)` streams finalized decode chunks through full-frame spatial
   resize directly into the re-encode store for a stable second-stage latent;

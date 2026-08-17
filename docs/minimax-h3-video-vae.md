@@ -47,8 +47,9 @@ The attention selector applies to every shared decoder Transformer block:
 
 `MiniMax H3 Video VAE Encode` retains the official 256px/64px tiled encoder
 geometry and ComfyUI-compatible FP32 latent output. It chooses up to sixteen
-simultaneous spatial tiles from the current memory budget and retains one
-encoder weight cycle across all spatial tiles and temporal clips. Generic
+simultaneous spatial tiles from the current memory budget. Encoder stages use
+ComfyUI's dynamic-VBAR prefetch queue, which returns each stage before moving
+to the next instead of pinning one complete encoder weight cycle. Generic
 ComfyUI IMAGE input keeps its FP32 host representation; an existing FP16 pixel
 store is transferred and normalized as FP16 on the GPU without first widening
 the complete clip to FP32.
@@ -91,11 +92,14 @@ The decoder uses the validated ordered FP32 Python overlap reduction for every
 batch size. The optional SM75 overlap epilogue remains available in the kernel
 package for isolated validation, but is not used by the production H3 VAE path.
 
-Both paths retain prefetched weights across spatial windows and temporal chunks
-when memory allows. Decode uses asynchronous FP32 pixel double buffering;
-encode uses asynchronous input buffering when pinned host memory is available.
-The nodes publish completed-tile progress to both ComfyUI and the terminal,
-then release the VAE weights through ComfyUI's normal dynamic-memory manager.
+Both paths use ComfyUI's official short-lived prefetch queues. Decoder weights
+are leased one Transformer block at a time and encoder weights one execution
+stage at a time; unpinned VBAR pages may remain resident when memory allows,
+but the plugin does not retain or evict them itself. Decode uses asynchronous
+FP32 pixel double buffering; encode uses asynchronous input buffering when
+pinned host memory is available. The nodes publish completed-tile progress to
+both ComfyUI and the terminal, while model residency and cleanup remain owned
+by ComfyUI's dynamic-memory manager.
 
 These nodes are experimental. The fixed tiling policy is deliberate: discarded
 arbitrary-size and alternate stitching strategies were removed after producing

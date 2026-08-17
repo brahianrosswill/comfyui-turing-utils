@@ -14,11 +14,11 @@ from tqdm.auto import tqdm
 
 import comfy.memory_management
 import comfy.model_management
+import comfy.model_prefetch
 import comfy.ops
 import comfy.quant_ops
 import comfy.rmsnorm
 import comfy.utils
-import comfy_aimdo.model_vbar
 from comfy.ldm.minimax import vae as h3_vae
 from comfy.ldm.modules.attention import AttentionTensorContainer
 
@@ -481,9 +481,17 @@ def _attention_forward(
     return module.to_out(out)
 
 
-def _attention_options(attention, device):
+def _attention_options(
+    attention,
+    device,
+    *,
+    prefetch_dynamic_vbars=False,
+):
     override = make_attention_override(attention, device)
-    options = {"optimized_attention_override": override}
+    options = {
+        "optimized_attention_override": override,
+        "prefetch_dynamic_vbars": bool(prefetch_dynamic_vbars),
+    }
     executor = getattr(override, "prepared_attention_executor", None)
     if callable(executor):
         options[ATTENTION_EXECUTOR_KEY] = executor
@@ -499,127 +507,6 @@ def _clear_attention_caches(decoder):
         ):
             if hasattr(attention, name):
                 delattr(attention, name)
-
-
-def _vbar_modules(module):
-    return [child for child in module.modules() if hasattr(child, "_v")]
-
-
-def _decoder_weight_stages(model):
-    stages = []
-    for index, block in enumerate(model.decoder.transformer_blocks):
-        modules = _vbar_modules(block)
-        if index == 0:
-            modules = (
-                _vbar_modules(model.post_quant_conv)
-                + _vbar_modules(model.decoder.x_embedder)
-                + modules
-            )
-        if index == len(model.decoder.transformer_blocks) - 1:
-            modules += _vbar_modules(model.decoder.norm_out)
-            modules += _vbar_modules(model.decoder.proj_out)
-        stages.append(modules)
-    return stages
-
-
-def _encoder_weight_stages(model):
-    stages = [_vbar_modules(model.encoder.conv_in)]
-    for down in model.encoder.down:
-        stages.extend(_vbar_modules(block) for block in down.block)
-        if hasattr(down, "downsample"):
-            stages.append(_vbar_modules(down.downsample))
-    stages.append(
-        _vbar_modules(model.encoder.norm_out)
-        + _vbar_modules(model.encoder.conv_out)
-        + _vbar_modules(model.quant_conv)
-    )
-    return stages
-
-
-class _RetainedWeights:
-    def __init__(self, stages, device, enabled):
-        self.device = device
-        self.enabled = enabled and not comfy.model_management.is_device_cpu(device)
-        self.non_blocking = (
-            comfy.model_management.NUM_STREAMS > 0
-            and comfy.model_management.device_supports_non_blocking(device)
-        )
-        self.stages = stages
-        self.streams = []
-        self.started = 0
-        self.attempted = False
-        if not self.enabled:
-            return
-        if not any(self.stages):
-            self.enabled = False
-
-    @staticmethod
-    def _clear_modules(modules):
-        for module in modules:
-            prefetch = getattr(module, "_prefetch", None)
-            if prefetch is None:
-                continue
-            for param_key in ("weight", "bias"):
-                lowvram = getattr(module, param_key + "_lowvram_function", None)
-                if lowvram is not None:
-                    lowvram.clear_prepared()
-            if prefetch["signature"] is not None:
-                comfy_aimdo.model_vbar.vbar_unpin(module._v)
-            delattr(module, "_prefetch")
-
-    def _prefetch(self, index):
-        if not self.enabled or index >= len(self.stages) or index < self.started:
-            return
-        self.attempted = True
-        modules = self.stages[index]
-        if not modules:
-            self.streams.append(None)
-            self.started += 1
-            return
-        registerable_size = sum(
-            comfy.memory_management.vram_aligned_size([module.weight, module.bias])
-            for module in modules
-        )
-        stream = comfy.ops.cast_modules_with_vbar(
-            modules, None, self.device, None, self.non_blocking
-        )
-        if not comfy.model_management.args.fast_disk:
-            comfy.model_management.ensure_pin_registerable(registerable_size)
-        if any(module._prefetch["signature"] is None for module in modules):
-            comfy.model_management.sync_stream(self.device, stream)
-            comfy.model_management.current_stream(self.device).synchronize()
-            self._clear_modules(modules)
-            for retained in self.stages[: self.started]:
-                self._clear_modules(retained)
-            self.enabled = False
-            logging.warning(
-                "H3 VAE could not retain the complete weight cycle; released the retained prefix and switched to synchronous streaming"
-            )
-            return
-        self.streams.append(stream)
-        self.started += 1
-
-    def start(self):
-        self._prefetch(0)
-
-    def before_stage(self, index):
-        if not self.enabled:
-            return
-        comfy.model_management.sync_stream(self.device, self.streams[index])
-        self.streams[index] = None
-        self._prefetch(index + 1)
-
-    def finish(self):
-        if not self.attempted:
-            return
-        # An exception can interrupt cast_modules_with_vbar before its stream is
-        # returned to us. Synchronize the device before releasing prefetch pins
-        # in that case as well as on the normal path. VBAR signatures and cached
-        # tensor views belong to AIMDO; its generation check invalidates them
-        # automatically if the backing pages are recycled.
-        comfy.model_management.synchronize()
-        for modules in self.stages:
-            self._clear_modules(modules)
 
 
 def _fused_swiglu_eligible(linear):
@@ -918,7 +805,6 @@ def _shared_core_multiband_decoder_forward(
     model,
     x,
     transformer_options,
-    block_session,
     tiles_per_batch,
     progress,
     spatial_cache=None,
@@ -960,10 +846,18 @@ def _shared_core_multiband_decoder_forward(
         max(0, int(final_full_overlap_blocks)), len(blocks)
     )
     final_full_overlap_start = len(blocks) - final_full_overlap_blocks
+    prefetch_queue = comfy.model_prefetch.make_prefetch_queue(
+        blocks,
+        h.device,
+        transformer_options,
+    )
 
     for block_index, block in enumerate(blocks):
-        if block_index > 0:
-            block_session.before_stage(block_index)
+        comfy.model_prefetch.prefetch_queue_pop(
+            prefetch_queue,
+            h.device,
+            block,
+        )
         attention = block.attn
         # Preserve the projected QKV layout until after each window group has
         # been gathered. Q/K normalization is deliberately performed on the
@@ -1170,6 +1064,12 @@ def _shared_core_multiband_decoder_forward(
             )
         del image_attention
 
+    comfy.model_prefetch.prefetch_queue_pop(
+        prefetch_queue,
+        h.device,
+        None,
+    )
+
     return _project_shared_state_windows(
         decoder,
         h,
@@ -1235,20 +1135,17 @@ def _decode_spatial(
     model,
     z,
     transformer_options,
-    block_session,
     tiles_per_batch,
     progress,
     spatial_cache=None,
     overlap_query_threshold=0.0,
     final_full_overlap_blocks=36,
 ):
-    block_session.before_stage(0)
     z = model.post_quant_conv(z)
     return _shared_core_multiband_decoder_forward(
         model,
         z,
         transformer_options,
-        block_session,
         tiles_per_batch,
         progress,
         spatial_cache,
@@ -1445,26 +1342,50 @@ class _MultibandPixelAssembler:
         return self.high_canvas
 
 
-def _encode_moments(model, x, module_session):
-    if module_session is None:
+def _encoder_prefetch_stages(model):
+    stages = [model.encoder.conv_in]
+    for down in model.encoder.down:
+        stages.extend(down.block)
+        if hasattr(down, "downsample"):
+            stages.append(down.downsample)
+    stages.extend((model.encoder.conv_out, model.quant_conv))
+    return stages
+
+
+def _encode_moments(model, x, prefetch_dynamic_vbars=False):
+    if not prefetch_dynamic_vbars:
         return model._encode_moments(x)
 
-    stage = 0
-    module_session.before_stage(stage)
-    h = model.encoder.conv_in(x)
-    stage += 1
+    stages = _encoder_prefetch_stages(model)
+    prefetch_queue = comfy.model_prefetch.make_prefetch_queue(
+        stages,
+        x.device,
+        {"prefetch_dynamic_vbars": bool(prefetch_dynamic_vbars)},
+    )
+
+    def run(module, value):
+        comfy.model_prefetch.prefetch_queue_pop(
+            prefetch_queue,
+            value.device,
+            module,
+        )
+        return module(value)
+
+    h = run(model.encoder.conv_in, x)
     for down in model.encoder.down:
         for block in down.block:
-            module_session.before_stage(stage)
-            h = block(h)
-            stage += 1
+            h = run(block, h)
         if hasattr(down, "downsample"):
-            module_session.before_stage(stage)
-            h = down.downsample(h)
-            stage += 1
-    module_session.before_stage(stage)
+            h = run(down.downsample, h)
     h = torch.nn.functional.silu(model.encoder.norm_out(h))
-    return model.quant_conv(model.encoder.conv_out(h))
+    h = run(model.encoder.conv_out, h)
+    moments = run(model.quant_conv, h)
+    comfy.model_prefetch.prefetch_queue_pop(
+        prefetch_queue,
+        moments.device,
+        None,
+    )
+    return moments
 
 
 def _tiled_encode(
@@ -1472,7 +1393,7 @@ def _tiled_encode(
     x,
     tile_size,
     tile_overlap,
-    module_session=None,
+    prefetch_dynamic_vbars=False,
     tiles_per_batch=1,
     progress=None,
 ):
@@ -1498,7 +1419,7 @@ def _tiled_encode(
             for _i, _j, i_pos, i_len, j_pos, j_len in group
         ]
         batched = inputs[0] if len(inputs) == 1 else torch.cat(inputs, dim=0)
-        encoded = _encode_moments(model, batched, module_session)
+        encoded = _encode_moments(model, batched, prefetch_dynamic_vbars)
         for (i, j, *_bounds), tile in zip(group, encoded.split(source_batch, dim=0)):
             rows[i][j] = tile
         if progress is not None:
@@ -1625,7 +1546,6 @@ def _decode_temporal(
     model,
     z,
     transformer_options,
-    block_session,
     tiles_per_batch,
     progress,
     output_device=None,
@@ -1668,7 +1588,6 @@ def _decode_temporal(
             model,
             clip_z,
             transformer_options,
-            block_session,
             tiles_per_batch,
             progress,
             None,
@@ -1736,12 +1655,14 @@ def decode_video(
     duplicate_ratio = tile_count * tile_tokens / (
         latent.shape[-2] * latent.shape[-1]
     )
+    prefetch_dynamic_vbars = vae.patcher.is_dynamic()
     logging.info(
-        "Experimental H3 VAE shared-core multiband decoder active: windows=%d duplicate_spatial_ratio=%.2fx overlap_threshold=%.4f final_full_overlap_blocks=%d",
+        "Experimental H3 VAE shared-core multiband decoder active: windows=%d duplicate_spatial_ratio=%.2fx overlap_threshold=%.4f final_full_overlap_blocks=%d weight_lifecycle=%s",
         tile_count,
         duplicate_ratio,
         overlap_query_threshold,
         final_full_overlap_blocks,
+        "comfy_block_prefetch" if prefetch_dynamic_vbars else "resident",
     )
     storage_ptr = latent.untyped_storage().data_ptr()
     logging.info(
@@ -1771,10 +1692,13 @@ def decode_video(
     comfy.model_management.load_models_gpu(
         [vae.patcher], memory_required=memory, force_full_load=vae.disable_offload
     )
-    block_session = None
     progress = None
     try:
-        transformer_options = _attention_options(attention, vae.device)
+        transformer_options = _attention_options(
+            attention,
+            vae.device,
+            prefetch_dynamic_vbars=prefetch_dynamic_vbars,
+        )
         z = latent.to(device=vae.device, dtype=compute_dtype)
         mean = model.latents_mean.view(1, -1, 1, 1, 1).to(z)
         std = model.latents_std.view(1, -1, 1, 1, 1).to(z)
@@ -1788,19 +1712,11 @@ def decode_video(
             z.device,
             "H3 VAE Decode Tiles",
         )
-        weight_stages = _decoder_weight_stages(model)
-        block_session = _RetainedWeights(
-            weight_stages,
-            z.device,
-            True,
-        )
-        block_session.start()
         if z.shape[2] == 1:
             dec = _decode_spatial(
                 model,
                 z,
                 transformer_options,
-                block_session,
                 batch_tiles,
                 progress,
                 None,
@@ -1829,7 +1745,6 @@ def decode_video(
             model,
             z,
             transformer_options,
-            block_session,
             batch_tiles,
             progress,
             output_device,
@@ -1841,8 +1756,6 @@ def decode_video(
     finally:
         if progress is not None:
             progress.finish()
-        if block_session is not None:
-            block_session.finish()
         if _pixel_transform is not None:
             _pixel_transform.finish()
         _clear_attention_caches(model.decoder)
@@ -1853,7 +1766,7 @@ def _encode_clip(
     clip,
     tile_size,
     tile_overlap,
-    module_session=None,
+    prefetch_dynamic_vbars=False,
     tiles_per_batch=1,
     progress=None,
 ):
@@ -1862,7 +1775,7 @@ def _encode_clip(
         model._normalize_pixels(clip),
         tile_size,
         tile_overlap,
-        module_session,
+        prefetch_dynamic_vbars,
         tiles_per_batch,
         progress,
     )
@@ -1885,7 +1798,7 @@ def _encode_temporal_device(
     compute_dtype,
     tile_size,
     tile_overlap,
-    module_session,
+    prefetch_dynamic_vbars,
     tiles_per_batch,
     progress,
 ):
@@ -1921,7 +1834,7 @@ def _encode_temporal_device(
                 clip,
                 tile_size,
                 tile_overlap,
-                module_session,
+                prefetch_dynamic_vbars,
                 tiles_per_batch,
                 progress,
             )
@@ -1938,7 +1851,7 @@ def _encode_temporal_buffered(
     device,
     tile_size,
     tile_overlap,
-    module_session,
+    prefetch_dynamic_vbars,
     tiles_per_batch,
     progress,
 ):
@@ -2005,7 +1918,7 @@ def _encode_temporal_buffered(
                 clip,
                 tile_size,
                 tile_overlap,
-                module_session,
+                prefetch_dynamic_vbars,
                 tiles_per_batch,
                 progress,
             )
@@ -2080,13 +1993,9 @@ def encode_video(vae, pixels):
         [vae.patcher], memory_required=memory, force_full_load=vae.disable_offload
     )
 
-    module_session = None
     progress = None
     try:
-        module_session = _RetainedWeights(
-            _encoder_weight_stages(model), vae.device, True
-        )
-        module_session.start()
+        prefetch_dynamic_vbars = vae.patcher.is_dynamic()
         temporal_clips = (
             1
             if pixels.shape[2] == 1
@@ -2109,7 +2018,7 @@ def encode_video(vae, pixels):
                 x,
                 tile_size,
                 tile_overlap,
-                module_session,
+                prefetch_dynamic_vbars,
                 batch_tiles,
                 progress,
             )[:, :, -1:]
@@ -2123,7 +2032,7 @@ def encode_video(vae, pixels):
                     vae.device,
                     tile_size,
                     tile_overlap,
-                    module_session,
+                    prefetch_dynamic_vbars,
                     batch_tiles,
                     progress,
                 )
@@ -2140,7 +2049,7 @@ def encode_video(vae, pixels):
                     compute_dtype,
                     tile_size,
                     tile_overlap,
-                    module_session,
+                    prefetch_dynamic_vbars,
                     batch_tiles,
                     progress,
                 )
@@ -2153,7 +2062,7 @@ def encode_video(vae, pixels):
                 compute_dtype,
                 tile_size,
                 tile_overlap,
-                module_session,
+                prefetch_dynamic_vbars,
                 batch_tiles,
                 progress,
             )
@@ -2166,8 +2075,6 @@ def encode_video(vae, pixels):
     finally:
         if progress is not None:
             progress.finish()
-        if module_session is not None:
-            module_session.finish()
 
 
 def _pixel_roundtrip_stage_device(vae, target_shape):
@@ -2176,7 +2083,7 @@ def _pixel_roundtrip_stage_device(vae, target_shape):
     staging_budget = int(budget * 0.35)
     # Streaming resize writes decoded chunks directly into the FP16 target, so
     # no complete source-resolution pixel tensor exists. Leave most of the
-    # budget to decoder/encoder activations and retained weights.
+    # budget to decoder/encoder activations and ComfyUI-managed weight pages.
     if target_bytes <= staging_budget:
         return vae.device
     logging.info(

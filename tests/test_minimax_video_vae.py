@@ -67,9 +67,59 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             actual = video_vae._encode_moments(
                 model,
                 x.clone(),
-                SimpleNamespace(before_stage=lambda _index: None),
+                prefetch_dynamic_vbars=True,
             )
         self.assertTrue(torch.equal(actual, expected))
+
+    def test_encoder_consumes_official_prefetch_queue_in_execution_order(self):
+        from comfy.ldm.minimax.vae import EncoderFCN3D
+
+        encoder = EncoderFCN3D(
+            ch=32,
+            ch_mult=[1],
+            space_down=[1],
+            time_down=[1],
+            num_res_blocks=1,
+            in_channels=3,
+            z_channels=4,
+        )
+        model = SimpleNamespace(
+            encoder=encoder,
+            quant_conv=torch.nn.Conv3d(8, 8, 1),
+        )
+        value = torch.randn(1, 3, 2, 8, 8)
+        queue = object()
+        with (
+            mock.patch.object(
+                video_vae.comfy.model_prefetch,
+                "make_prefetch_queue",
+                return_value=queue,
+            ) as make_queue,
+            mock.patch.object(
+                video_vae.comfy.model_prefetch,
+                "prefetch_queue_pop",
+            ) as pop_queue,
+            torch.inference_mode(),
+        ):
+            video_vae._encode_moments(
+                model,
+                value,
+                prefetch_dynamic_vbars=True,
+            )
+
+        stages = video_vae._encoder_prefetch_stages(model)
+        make_queue.assert_called_once_with(
+            stages,
+            value.device,
+            {"prefetch_dynamic_vbars": True},
+        )
+        self.assertEqual(
+            pop_queue.call_args_list,
+            [
+                *(mock.call(queue, value.device, stage) for stage in stages),
+                mock.call(queue, value.device, None),
+            ],
+        )
 
     def test_split_tiles_covers_exact_extent(self):
         for length in (128, 256, 480, 720, 848, 1280):
@@ -304,7 +354,6 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         model = SimpleNamespace(decoder=decoder, vae_ratio=2)
         x = torch.randn(1, 4, 2, 4, 5, device="cuda", dtype=torch.float16)
         options = video_vae._attention_options("sdpa", x.device)
-        session = SimpleNamespace(before_stage=lambda _index: None)
         with (
             mock.patch.object(video_vae, "TILE_SIZE", 4),
             mock.patch.object(video_vae, "TILE_OVERLAP", 2),
@@ -316,7 +365,6 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 model,
                 x.clone(),
                 options,
-                session,
                 1,
                 None,
             )
@@ -324,7 +372,6 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 model,
                 x.clone(),
                 options,
-                session,
                 3,
                 progress,
             )
@@ -354,7 +401,6 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             torch.nn.init.uniform_(parameter, -0.01, 0.01)
         model = SimpleNamespace(decoder=decoder, vae_ratio=2)
         value = torch.randn(1, 4, 1, 6, 6)
-        session = SimpleNamespace(before_stage=lambda _index: None)
         block = decoder.transformer_blocks[0]
         calls = {"qkv": [], "out": [], "w1": [], "w2": []}
 
@@ -395,7 +441,6 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 model,
                 value,
                 video_vae._attention_options("sdpa", value.device),
-                session,
                 3,
                 None,
                 overlap_query_threshold=0.5,
@@ -415,6 +460,60 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 name,
             )
         self.assertEqual(result.shape[-2:], (12, 12))
+
+    def test_decoder_consumes_official_prefetch_queue_per_block(self):
+        from comfy.ldm.minimax.vae import ViT3DDecoder
+
+        decoder = ViT3DDecoder(
+            patch_size=2,
+            patch_size_t=1,
+            in_channels=4,
+            out_channels=3,
+            num_layers=1,
+            heads=1,
+            dim_head=64,
+            rope_dim_ratio=0.75,
+            operations=torch.nn,
+        ).eval()
+        model = SimpleNamespace(decoder=decoder, vae_ratio=2)
+        value = torch.randn(1, 4, 1, 2, 2)
+        options = video_vae._attention_options(
+            "sdpa",
+            value.device,
+            prefetch_dynamic_vbars=True,
+        )
+        queue = object()
+        with (
+            mock.patch.object(video_vae, "TILE_SIZE", 4),
+            mock.patch.object(video_vae, "TILE_OVERLAP", 2),
+            mock.patch.object(
+                video_vae.comfy.model_prefetch,
+                "make_prefetch_queue",
+                return_value=queue,
+            ) as make_queue,
+            mock.patch.object(
+                video_vae.comfy.model_prefetch,
+                "prefetch_queue_pop",
+            ) as pop_queue,
+            torch.inference_mode(),
+        ):
+            video_vae._shared_core_multiband_decoder_forward(
+                model,
+                value,
+                options,
+                1,
+                None,
+            )
+
+        blocks = list(decoder.transformer_blocks)
+        make_queue.assert_called_once_with(blocks, value.device, options)
+        self.assertEqual(
+            pop_queue.call_args_list,
+            [
+                *(mock.call(queue, value.device, block) for block in blocks),
+                mock.call(queue, value.device, None),
+            ],
+        )
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
     def test_single_tensor_rope_fallback_matches_kitchen(self):
@@ -510,7 +609,6 @@ class MiniMaxVideoVAETest(unittest.TestCase):
     def test_decode_spatial_routes_fixed_boundary_policy(self):
         expected = object()
         model = SimpleNamespace(post_quant_conv=lambda value: value)
-        session = mock.Mock()
         with mock.patch.object(
             video_vae, "_shared_core_multiband_decoder_forward", return_value=expected
         ) as run:
@@ -518,14 +616,12 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 model,
                 "latent",
                 {},
-                session,
                 4,
                 None,
             )
         self.assertIs(actual, expected)
-        session.before_stage.assert_called_once_with(0)
         run.assert_called_once_with(
-            model, "latent", {}, session, 4, None, None, 0.0, 36
+            model, "latent", {}, 4, None, None, 0.0, 36
         )
 
     def test_shared_state_uses_windowed_multiband_projection(self):
@@ -550,7 +646,6 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 model,
                 x,
                 {},
-                mock.Mock(),
                 1,
                 None,
             )
@@ -1023,88 +1118,6 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             )
         self.assertEqual(normalized, [("cuda", torch.float16)])
 
-    def test_retained_weights_marks_failed_first_stage_for_cleanup(self):
-        module = SimpleNamespace(
-            _v=object(),
-            weight=torch.empty(4),
-            bias=None,
-        )
-
-        def failed_prefetch(modules, *_args):
-            for item in modules:
-                item._prefetch = {"signature": None}
-            return None
-
-        with (
-            mock.patch.object(video_vae.comfy.model_management, "NUM_STREAMS", 1),
-            mock.patch.object(
-                video_vae.comfy.model_management,
-                "device_supports_non_blocking",
-                return_value=True,
-            ),
-            mock.patch.object(
-                video_vae.comfy.ops,
-                "cast_modules_with_vbar",
-                side_effect=failed_prefetch,
-            ),
-            mock.patch.object(
-                video_vae.comfy.model_management,
-                "sync_stream",
-            ),
-            mock.patch.object(
-                video_vae.comfy.model_management,
-                "synchronize",
-            ),
-            mock.patch.object(
-                video_vae.comfy.model_management,
-                "current_stream",
-                return_value=SimpleNamespace(synchronize=lambda: None),
-            ),
-        ):
-            session = video_vae._RetainedWeights([[module]], torch.device("cuda"), True)
-            session.start()
-
-        self.assertTrue(session.attempted)
-        self.assertEqual(session.started, 0)
-        self.assertFalse(session.enabled)
-        self.assertFalse(hasattr(module, "_prefetch"))
-
-    def test_retained_weight_cleanup_preserves_aimdo_vbar_views(self):
-        signature = object()
-        weight_view = object()
-        bias_view = object()
-        module = SimpleNamespace(
-            _v=object(),
-            weight=torch.empty(4),
-            bias=None,
-            _prefetch={"signature": signature},
-            _v_signature=signature,
-            _v_weight=weight_view,
-            _v_bias=bias_view,
-        )
-        with (
-            mock.patch.object(
-                video_vae.comfy.model_management,
-                "synchronize",
-            ) as synchronize,
-            mock.patch.object(
-                video_vae.comfy_aimdo.model_vbar,
-                "vbar_unpin",
-            ) as unpin,
-        ):
-            session = video_vae._RetainedWeights(
-                [[module]], torch.device("cuda"), True
-            )
-            session.attempted = True
-            session.finish()
-
-        synchronize.assert_called_once_with()
-        unpin.assert_called_once_with(module._v)
-        self.assertFalse(hasattr(module, "_prefetch"))
-        self.assertIs(module._v_signature, signature)
-        self.assertIs(module._v_weight, weight_view)
-        self.assertIs(module._v_bias, bias_view)
-
     def test_decoder_backend_switching_preserves_cached_latent(self):
         vae = mock.Mock()
         vae.device = torch.device("cpu")
@@ -1132,139 +1145,6 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         self.assertEqual([item[0] for item in fingerprints], ["sdpa", "w8a8", "sdpa"])
         self.assertEqual(len({item[1] for item in fingerprints}), 1)
         torch.testing.assert_close(latent, original)
-
-    def test_retained_weights_release_prefix_when_cycle_does_not_fit(self):
-        modules = [
-            SimpleNamespace(_v=object(), weight=torch.empty(4), bias=None)
-            for _ in range(2)
-        ]
-        calls = 0
-        unpinned = []
-
-        def prefetch(items, *_args):
-            nonlocal calls
-            signature = object() if calls == 0 else None
-            calls += 1
-            for item in items:
-                item._prefetch = {"signature": signature}
-            return None
-
-        with (
-            mock.patch.object(video_vae.comfy.model_management, "NUM_STREAMS", 1),
-            mock.patch.object(
-                video_vae.comfy.model_management,
-                "device_supports_non_blocking",
-                return_value=True,
-            ),
-            mock.patch.object(
-                video_vae.comfy.ops,
-                "cast_modules_with_vbar",
-                side_effect=prefetch,
-            ),
-            mock.patch.object(video_vae.comfy.model_management, "sync_stream"),
-            mock.patch.object(
-                video_vae.comfy.model_management,
-                "current_stream",
-                return_value=SimpleNamespace(synchronize=lambda: None),
-            ),
-            mock.patch.object(
-                video_vae.comfy_aimdo.model_vbar,
-                "vbar_unpin",
-                side_effect=lambda alloc: unpinned.append(alloc),
-            ),
-        ):
-            session = video_vae._RetainedWeights(
-                [[modules[0]], [modules[1]]], torch.device("cuda"), True
-            )
-            session.start()
-            session.before_stage(0)
-
-        self.assertFalse(session.enabled)
-        self.assertEqual(unpinned, [modules[0]._v])
-        self.assertTrue(all(not hasattr(item, "_prefetch") for item in modules))
-
-    def test_retained_weights_stay_pinned_until_session_finish(self):
-        modules = [
-            SimpleNamespace(_v=object(), weight=torch.empty(4), bias=None)
-            for _ in range(2)
-        ]
-        unpinned = []
-
-        def successful_prefetch(items, *_args):
-            for item in items:
-                item._prefetch = {"signature": object()}
-            return None
-
-        with (
-            mock.patch.object(video_vae.comfy.model_management, "NUM_STREAMS", 1),
-            mock.patch.object(
-                video_vae.comfy.model_management,
-                "device_supports_non_blocking",
-                return_value=True,
-            ),
-            mock.patch.object(
-                video_vae.comfy.ops,
-                "cast_modules_with_vbar",
-                side_effect=successful_prefetch,
-            ),
-            mock.patch.object(
-                video_vae.comfy_aimdo.model_vbar,
-                "vbar_unpin",
-                side_effect=lambda alloc: unpinned.append(alloc),
-            ),
-            mock.patch.object(
-                video_vae.comfy.model_management,
-                "sync_stream",
-            ),
-            mock.patch.object(
-                video_vae.comfy.model_management,
-                "synchronize",
-            ),
-        ):
-            session = video_vae._RetainedWeights(
-                [[modules[0]], [modules[1]]], torch.device("cuda"), True
-            )
-            session.start()
-            session.before_stage(0)
-            session.before_stage(1)
-            self.assertEqual(unpinned, [])
-            session.finish()
-
-        self.assertEqual(unpinned, [modules[0]._v, modules[1]._v])
-        self.assertTrue(all(not hasattr(item, "_prefetch") for item in modules))
-
-    def test_retained_weights_work_without_async_streams(self):
-        module = SimpleNamespace(_v=object(), weight=torch.empty(4), bias=None)
-
-        def successful_prefetch(items, *_args):
-            for item in items:
-                item._prefetch = {"signature": object()}
-            return None
-
-        with (
-            mock.patch.object(video_vae.comfy.model_management, "NUM_STREAMS", 0),
-            mock.patch.object(
-                video_vae.comfy.ops,
-                "cast_modules_with_vbar",
-                side_effect=successful_prefetch,
-            ) as cast,
-            mock.patch.object(
-                video_vae.comfy_aimdo.model_vbar,
-                "vbar_unpin",
-            ),
-            mock.patch.object(
-                video_vae.comfy.model_management,
-                "synchronize",
-            ),
-        ):
-            session = video_vae._RetainedWeights([[module]], torch.device("cuda"), True)
-            session.start()
-            session.before_stage(0)
-            session.finish()
-
-        self.assertFalse(session.non_blocking)
-        self.assertEqual(cast.call_args.args[-1], False)
-        self.assertFalse(hasattr(module, "_prefetch"))
 
     def test_custom_decode_preserves_temporal_length_and_values(self):
         from comfy.ldm.minimax.vae import MiniMaxH3VideoVAE
@@ -1294,7 +1174,6 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 model,
                 z.clone(),
                 {},
-                SimpleNamespace(before_stage=lambda _index: None),
                 1,
                 None,
                 output_device=torch.device("cpu"),
@@ -1339,7 +1218,6 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 model,
                 z.clone(),
                 {},
-                SimpleNamespace(before_stage=lambda _index: None),
                 1,
                 None,
                 output_device=torch.device("cpu"),
