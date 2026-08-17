@@ -790,16 +790,12 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         self.assertEqual((instances[0].output_width, instances[0].output_height), (12, 8))
         torch.testing.assert_close(actual, torch.ones_like(frame))
 
-    def test_fused_pixel_roundtrip_retains_vae_until_encode(self):
+    def test_fused_pixel_roundtrip_delegates_vae_lifecycle_to_manager(self):
         latent = torch.zeros(1, 24, 2, 2, 3)
         decoded = torch.zeros(1, 5, 32, 48, 3)
         resized = torch.zeros(1, 5, 64, 96, 3, dtype=torch.float16)
         encoded = torch.zeros(1, 24, 2, 4, 6)
-        patcher = SimpleNamespace(
-            offload_device=torch.device("cpu"),
-            partially_unload=mock.Mock(),
-        )
-        vae = SimpleNamespace(device=torch.device("cpu"), patcher=patcher)
+        vae = SimpleNamespace(device=torch.device("cpu"))
         model = SimpleNamespace(
             decode_output_shape=lambda _shape: (1, 3, 5, 32, 48)
         )
@@ -831,7 +827,6 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             latent,
             "sdpa",
             output_device=torch.device("cpu"),
-            unload=False,
             overlap_query_threshold=0.0,
             final_full_overlap_blocks=36,
             _pixel_transform=transform,
@@ -845,8 +840,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             vae.device,
         )
         transform.finish.assert_called()
-        encode.assert_called_once_with(vae, resized, unload=True)
-        patcher.partially_unload.assert_not_called()
+        encode.assert_called_once_with(vae, resized)
 
     def test_pixel_upscale_node_preserves_h3_audio_and_resizes_video_mask(self):
         video = torch.zeros(1, 24, 2, 2, 3)
@@ -1075,36 +1069,41 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         self.assertFalse(session.enabled)
         self.assertFalse(hasattr(module, "_prefetch"))
 
-    def test_retained_weight_views_are_invalidated_between_decodes(self):
+    def test_retained_weight_cleanup_preserves_aimdo_vbar_views(self):
+        signature = object()
+        weight_view = object()
+        bias_view = object()
         module = SimpleNamespace(
-            _prefetch={"signature": object()},
-            _v_signature=object(),
-            _v_weight=object(),
-            _v_bias=object(),
+            _v=object(),
+            weight=torch.empty(4),
+            bias=None,
+            _prefetch={"signature": signature},
+            _v_signature=signature,
+            _v_weight=weight_view,
+            _v_bias=bias_view,
         )
-
-        def clear(modules):
-            for item in modules:
-                delattr(item, "_prefetch")
-
         with (
             mock.patch.object(
                 video_vae.comfy.model_management,
                 "synchronize",
             ) as synchronize,
             mock.patch.object(
-                video_vae._RetainedWeights,
-                "_clear_modules",
-                side_effect=clear,
-            ) as cleanup,
+                video_vae.comfy_aimdo.model_vbar,
+                "vbar_unpin",
+            ) as unpin,
         ):
-            video_vae._invalidate_retained_weight_views([[module], [module]])
+            session = video_vae._RetainedWeights(
+                [[module]], torch.device("cuda"), True
+            )
+            session.attempted = True
+            session.finish()
 
         synchronize.assert_called_once_with()
-        cleanup.assert_called_once_with([module])
-        self.assertIsNone(module._v_signature)
-        self.assertFalse(hasattr(module, "_v_weight"))
-        self.assertFalse(hasattr(module, "_v_bias"))
+        unpin.assert_called_once_with(module._v)
+        self.assertFalse(hasattr(module, "_prefetch"))
+        self.assertIs(module._v_signature, signature)
+        self.assertIs(module._v_weight, weight_view)
+        self.assertIs(module._v_bias, bias_view)
 
     def test_decoder_backend_switching_preserves_cached_latent(self):
         vae = mock.Mock()

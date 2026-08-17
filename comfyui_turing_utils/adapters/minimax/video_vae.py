@@ -615,38 +615,13 @@ class _RetainedWeights:
         if not self.attempted:
             return
         # An exception can interrupt cast_modules_with_vbar before its stream is
-        # returned to us.  Synchronize the device before removing any VBAR
-        # signature in that case as well as on the normal path.
+        # returned to us. Synchronize the device before releasing prefetch pins
+        # in that case as well as on the normal path. VBAR signatures and cached
+        # tensor views belong to AIMDO; its generation check invalidates them
+        # automatically if the backing pages are recycled.
         comfy.model_management.synchronize()
         for modules in self.stages:
             self._clear_modules(modules)
-            for module in modules:
-                module._v_signature = None
-                for name in ("_v_weight", "_v_bias"):
-                    if hasattr(module, name):
-                        delattr(module, name)
-
-
-def _invalidate_retained_weight_views(stages):
-    # A VBAR signature only proves that the virtual allocation is resident. It
-    # does not make a cached tensor view safe to carry into a later decode,
-    # after other workflow nodes may have recycled the backing pages.
-    modules = []
-    seen = set()
-    for stage in stages:
-        for module in stage:
-            if id(module) in seen:
-                continue
-            seen.add(id(module))
-            modules.append(module)
-    if any(hasattr(module, "_prefetch") for module in modules):
-        comfy.model_management.synchronize()
-        _RetainedWeights._clear_modules(modules)
-    for module in modules:
-        module._v_signature = None
-        for name in ("_v_weight", "_v_bias"):
-            if hasattr(module, name):
-                delattr(module, name)
 
 
 def _fused_swiglu_eligible(linear):
@@ -1859,7 +1834,6 @@ def decode_video(
     attention="sdpa",
     *,
     output_device=None,
-    unload=True,
     overlap_query_threshold=0.0,
     final_full_overlap_blocks=36,
     _pixel_transform=None,
@@ -1948,7 +1922,6 @@ def decode_video(
             "H3 VAE Decode Tiles",
         )
         weight_stages = _decoder_weight_stages(model)
-        _invalidate_retained_weight_views(weight_stages)
         block_session = _RetainedWeights(
             weight_stages,
             z.device,
@@ -2007,8 +1980,6 @@ def decode_video(
         if _pixel_transform is not None:
             _pixel_transform.finish()
         _clear_attention_caches(model.decoder)
-        if unload:
-            vae.patcher.partially_unload(vae.patcher.offload_device, 1e30)
 
 
 def _encode_clip(
@@ -2216,12 +2187,7 @@ def _prepare_encode_pixels(vae, pixels):
     return pixels.movedim(-1, 1)
 
 
-def encode_video(
-    vae,
-    pixels,
-    *,
-    unload=True,
-):
+def encode_video(vae, pixels):
     model = require_h3_video_vae(vae)
     pixels = _prepare_encode_pixels(vae, pixels)
     compute_dtype = vae.vae_dtype
@@ -2336,8 +2302,6 @@ def encode_video(
             progress.finish()
         if module_session is not None:
             module_session.finish()
-        if unload:
-            vae.patcher.partially_unload(vae.patcher.offload_device, 1e30)
 
 
 def _pixel_roundtrip_stage_device(vae, target_shape):
@@ -2569,24 +2533,16 @@ def upscale_latent_via_pixels(
         rtx_vsr_quality,
         vae.device,
     )
-    completed = False
     try:
         resized = decode_video(
             vae,
             latent,
             attention,
             output_device=stage_device,
-            unload=False,
             overlap_query_threshold=overlap_query_threshold,
             final_full_overlap_blocks=final_full_overlap_blocks,
             _pixel_transform=pixel_transform,
         )
-        output = encode_video(vae, resized, unload=True)
-        completed = True
-        return output
+        return encode_video(vae, resized)
     finally:
         pixel_transform.finish()
-        if not completed:
-            # encode_video performs the normal unload on success.  This path is
-            # essential when decode, resize, or encode raises.
-            vae.patcher.partially_unload(vae.patcher.offload_device, 1e30)
