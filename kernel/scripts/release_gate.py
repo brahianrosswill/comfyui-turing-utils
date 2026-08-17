@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = ROOT / "kernel"
 COMFYUI_ROOT = ROOT.parents[1]
-EXPECTED_VERSION = "0.26.0"
+EXPECTED_VERSION = "0.27.0"
 
 
 def _run(command: list[str], *, cwd: Path = ROOT, env=None) -> None:
@@ -117,6 +117,9 @@ def _static_gate() -> None:
     fused_binding = (KERNEL / "csrc/turing/sage/pybind_fused.cpp").read_text(
         encoding="utf-8"
     )
+    overlap_source = (KERNEL / "csrc/turing/sage/overlap_blend.cu").read_text(
+        encoding="utf-8"
+    )
     for path, source, marker in (
         (KERNEL / "setup.py", setup_source, '"csrc/turing/sage/qk_preprocess.cu"'),
         (KERNEL / "setup.py", setup_source, '"csrc/turing/sage/overlap_blend.cu"'),
@@ -139,6 +142,21 @@ def _static_gate() -> None:
             KERNEL / "csrc/turing/sage/pybind_fused.cpp",
             fused_binding,
             "overlap_blend_cuda",
+        ),
+        (
+            KERNEL / "csrc/turing/sage/fused.h",
+            fused_header,
+            "overlap_accumulate_cuda",
+        ),
+        (
+            KERNEL / "csrc/turing/sage/pybind_fused.cpp",
+            fused_binding,
+            "overlap_accumulate_cuda",
+        ),
+        (
+            KERNEL / "csrc/turing/sage/overlap_blend.cu",
+            overlap_source,
+            "overlap_accumulate_kernel",
         ),
     ):
         if marker not in source:

@@ -80,6 +80,55 @@ __global__ void overlap_blend_kernel(
   }
 }
 
+template <typename T>
+__global__ void overlap_accumulate_kernel(
+    const T *__restrict__ window_values,
+    const int32_t *__restrict__ local_indices,
+    const float *__restrict__ weights,
+    const int32_t *__restrict__ output_indices,
+    float *__restrict__ output,
+    int windows,
+    int window_tokens,
+    int output_tokens,
+    int channels,
+    int64_t value_stride_batch,
+    int64_t value_stride_window,
+    int64_t value_stride_token) {
+  const int affected_token = static_cast<int>(blockIdx.x);
+  const int output_token = output_indices[affected_token];
+  if (output_token < 0 || output_token >= output_tokens) return;
+  const int batch = static_cast<int>(blockIdx.y);
+  extern __shared__ unsigned char shared_bytes[];
+  int32_t *shared_local = reinterpret_cast<int32_t *>(shared_bytes);
+  float *shared_weight = reinterpret_cast<float *>(shared_local + windows);
+  for (int window = threadIdx.x; window < windows; window += blockDim.x) {
+    const int map_offset = affected_token * windows + window;
+    shared_local[window] = local_indices[map_offset];
+    shared_weight[window] = weights[map_offset];
+  }
+  __syncthreads();
+
+  for (int channel = threadIdx.x; channel < channels; channel += blockDim.x) {
+    const int64_t output_offset =
+        (static_cast<int64_t>(batch) * output_tokens + output_token) * channels +
+        channel;
+    float accumulated = output[output_offset];
+#pragma unroll 1
+    for (int window = 0; window < windows; ++window) {
+      const int local = shared_local[window];
+      if (local < 0 || local >= window_tokens) continue;
+      const int64_t value_offset =
+          static_cast<int64_t>(batch) * value_stride_batch +
+          static_cast<int64_t>(window) * value_stride_window +
+          static_cast<int64_t>(local) * value_stride_token + channel;
+      const float weighted = __fmul_rn(
+          shared_weight[window], overlap_to_float(window_values[value_offset]));
+      accumulated = __fadd_rn(accumulated, weighted);
+    }
+    output[output_offset] = accumulated;
+  }
+}
+
 }  // namespace
 
 at::Tensor overlap_blend_cuda(
@@ -144,4 +193,85 @@ at::Tensor overlap_blend_cuda(
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return output;
+}
+
+void overlap_accumulate_cuda(
+    at::Tensor window_values,
+    at::Tensor local_indices,
+    at::Tensor weights,
+    at::Tensor output_indices,
+    at::Tensor output) {
+  TORCH_CHECK(window_values.is_cuda(), "window_values must be a CUDA tensor");
+  TORCH_CHECK(local_indices.is_cuda() && weights.is_cuda() &&
+                  output_indices.is_cuda() && output.is_cuda(),
+              "overlap accumulation tensors must be CUDA tensors");
+  TORCH_CHECK(window_values.device() == local_indices.device() &&
+                  window_values.device() == weights.device() &&
+                  window_values.device() == output_indices.device() &&
+                  window_values.device() == output.device(),
+              "overlap accumulation tensors must share one CUDA device");
+  TORCH_CHECK(window_values.dim() == 4,
+              "window_values must be [batch, windows, tokens, channels]");
+  TORCH_CHECK(local_indices.dim() == 2 && weights.sizes() == local_indices.sizes(),
+              "overlap maps must be matching [global_tokens, windows] tensors");
+  TORCH_CHECK(output.dim() == 3,
+              "output must be [batch, global_tokens, channels]");
+  TORCH_CHECK(local_indices.scalar_type() == at::ScalarType::Int,
+              "local_indices must use int32");
+  TORCH_CHECK(output_indices.dim() == 1 &&
+                  output_indices.scalar_type() == at::ScalarType::Int,
+              "output_indices must be one-dimensional int32");
+  TORCH_CHECK(weights.scalar_type() == at::ScalarType::Float,
+              "weights must use float32");
+  TORCH_CHECK(output.scalar_type() == at::ScalarType::Float,
+              "output must use float32");
+  TORCH_CHECK(window_values.scalar_type() == at::ScalarType::Half ||
+                  window_values.scalar_type() == at::ScalarType::BFloat16,
+              "window_values must use float16 or bfloat16");
+  TORCH_CHECK(window_values.stride(3) == 1,
+              "window_values channels must be contiguous");
+  TORCH_CHECK(local_indices.is_contiguous() && weights.is_contiguous() &&
+                  output_indices.is_contiguous() && output.is_contiguous(),
+              "overlap maps, output indices, and output must be contiguous");
+
+  const int batch = static_cast<int>(window_values.size(0));
+  const int windows = static_cast<int>(window_values.size(1));
+  const int window_tokens = static_cast<int>(window_values.size(2));
+  const int affected_tokens = static_cast<int>(local_indices.size(0));
+  const int output_tokens = static_cast<int>(output.size(1));
+  const int channels = static_cast<int>(window_values.size(3));
+  TORCH_CHECK(windows > 0 && windows <= 64,
+              "overlap accumulation supports between 1 and 64 windows");
+  TORCH_CHECK(local_indices.size(1) == windows,
+              "overlap map window count must match window_values");
+  TORCH_CHECK(output_indices.size(0) == affected_tokens,
+              "output_indices must match the overlap-map token count");
+  TORCH_CHECK(output.size(0) == batch &&
+                  output.size(2) == channels,
+              "output shape must match batch, global tokens, and channels");
+  TORCH_CHECK(batch > 0 && window_tokens > 0 && affected_tokens > 0 &&
+                  output_tokens > 0 && channels > 0,
+              "overlap accumulation dimensions must be positive");
+  const dim3 grid(affected_tokens, batch);
+  const size_t shared_memory = static_cast<size_t>(windows) *
+      (sizeof(int32_t) + sizeof(float));
+  const auto stream = c10::cuda::getCurrentCUDAStream(
+      window_values.get_device()).stream();
+  DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FP16(
+      window_values.scalar_type(), T, {
+        overlap_accumulate_kernel<T><<<grid, kThreads, shared_memory, stream>>>(
+            reinterpret_cast<const T *>(window_values.data_ptr()),
+            local_indices.data_ptr<int32_t>(),
+            weights.data_ptr<float>(),
+            output_indices.data_ptr<int32_t>(),
+            output.data_ptr<float>(),
+            windows,
+            window_tokens,
+            output_tokens,
+            channels,
+            window_values.stride(0),
+            window_values.stride(1),
+            window_values.stride(2));
+      });
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

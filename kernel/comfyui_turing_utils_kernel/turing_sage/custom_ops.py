@@ -27,6 +27,39 @@ def _overlap_blend_fake(window_values, local_indices, weights):
     )
 
 
+@torch.library.custom_op(
+    "turing_utils::overlap_accumulate",
+    mutates_args=("output",),
+)
+def overlap_accumulate_op(
+    window_values: torch.Tensor,
+    local_indices: torch.Tensor,
+    weights: torch.Tensor,
+    output_indices: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    from .core import overlap_accumulate
+
+    overlap_accumulate(
+        window_values,
+        local_indices,
+        weights,
+        output_indices,
+        output,
+    )
+
+
+@overlap_accumulate_op.register_fake
+def _overlap_accumulate_fake(
+    window_values,
+    local_indices,
+    weights,
+    output_indices,
+    output,
+):
+    return None
+
+
 @torch.library.custom_op("turing_utils::qk_rms_rope_int8", mutates_args=())
 def qk_rms_rope_int8(
     query: torch.Tensor,

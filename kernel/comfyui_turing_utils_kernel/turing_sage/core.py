@@ -258,6 +258,41 @@ def overlap_blend(
     )
 
 
+@_on_input_device
+def overlap_accumulate(
+    window_values: torch.Tensor,
+    local_indices: torch.Tensor,
+    weights: torch.Tensor,
+    output_indices: torch.Tensor,
+    output: torch.Tensor,
+) -> None:
+    """Accumulate one ordered window subbatch into an existing FP32 output."""
+    if window_values.ndim != 4:
+        raise ValueError("window_values must be [batch, windows, tokens, channels]")
+    if local_indices.ndim != 2 or weights.shape != local_indices.shape:
+        raise ValueError("overlap maps must be matching two-dimensional tensors")
+    if output_indices.ndim != 1 or output_indices.shape[0] != local_indices.shape[0]:
+        raise ValueError("output_indices must match the overlap-map token count")
+    if output.ndim != 3 or tuple(output.shape[::2]) != (
+        window_values.shape[0],
+        window_values.shape[-1],
+    ):
+        raise ValueError("output must match the window batch and channel dimensions")
+    if int(window_values.shape[1]) != int(local_indices.shape[1]):
+        raise ValueError("overlap map window count does not match window_values")
+    if output.dtype != torch.float32:
+        raise TypeError("overlap accumulation output must use float32")
+    _fused.overlap_accumulate_cuda(
+        window_values,
+        local_indices.to(device=window_values.device, dtype=torch.int32).contiguous(),
+        weights.to(device=window_values.device, dtype=torch.float32).contiguous(),
+        output_indices.to(
+            device=window_values.device, dtype=torch.int32
+        ).contiguous(),
+        output,
+    )
+
+
 def _short_sequence_attention(
     q: torch.Tensor,
     k: torch.Tensor,

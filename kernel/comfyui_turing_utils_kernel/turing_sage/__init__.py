@@ -100,6 +100,37 @@ def overlap_blend_compiled(window_values, local_indices, weights):
     return overlap_blend_op(window_values, local_indices, weights)
 
 
+def overlap_accumulate_available() -> bool:
+    if not available():
+        return False
+    try:
+        module = importlib.import_module(
+            "comfyui_turing_utils_kernel._sage_fused_sm75"
+        )
+    except (ImportError, OSError):
+        return False
+    return hasattr(module, "overlap_accumulate_cuda")
+
+
+def overlap_accumulate_compiled(
+    window_values,
+    local_indices,
+    weights,
+    output_indices,
+    output,
+):
+    from .custom_ops import overlap_accumulate_op
+
+    overlap_accumulate_op(
+        window_values,
+        local_indices,
+        weights,
+        output_indices,
+        output,
+    )
+    return output
+
+
 def sageattn(*args, **kwargs):
     """Run the stable bundled SM75 Sage attention implementation."""
     from .core import sageattn as implementation
@@ -460,6 +491,8 @@ def run_attention_correctness_gate(*args, **kwargs):
 __all__ = [
     "available",
     "fused_qk_preprocessing_available",
+    "overlap_accumulate_available",
+    "overlap_accumulate_compiled",
     "overlap_blend_available",
     "overlap_blend_compiled",
     "prequantize_sageattn",

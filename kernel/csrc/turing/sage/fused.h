@@ -127,3 +127,10 @@ at::Tensor overlap_blend_cuda(
                 at::Tensor window_values,
                 at::Tensor local_indices,
                 at::Tensor weights);
+
+void overlap_accumulate_cuda(
+                at::Tensor window_values,
+                at::Tensor local_indices,
+                at::Tensor weights,
+                at::Tensor output_indices,
+                at::Tensor output);

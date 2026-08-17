@@ -12,6 +12,36 @@ import comfyui_turing_utils_kernel as kernel  # noqa: E402
 
 
 class KernelCustomOpContractTest(unittest.TestCase):
+    def test_overlap_accumulate_fake_contract_is_a_mutating_fullgraph_leaf(self):
+        values = torch.empty((2, 3, 11, 64), dtype=torch.float16, device="meta")
+        local_indices = torch.empty((19, 3), dtype=torch.int32, device="meta")
+        weights = torch.empty((19, 3), dtype=torch.float32, device="meta")
+        output_indices = torch.empty((19,), dtype=torch.int32, device="meta")
+        output = torch.empty((2, 31, 64), dtype=torch.float32, device="meta")
+        compiled = torch.compile(
+            lambda value, local, weight, indices, destination: (
+                kernel.turing_sage.overlap_accumulate_compiled(
+                    value,
+                    local,
+                    weight,
+                    indices,
+                    destination,
+                )
+            ),
+            backend="eager",
+            fullgraph=True,
+        )
+        actual = compiled(
+            values,
+            local_indices,
+            weights,
+            output_indices,
+            output,
+        )
+        self.assertEqual(actual.shape, output.shape)
+        self.assertEqual(actual.dtype, torch.float32)
+        self.assertEqual(actual.device.type, "meta")
+
     def test_overlap_blend_fake_contract_is_a_fullgraph_leaf(self):
         values = torch.empty((2, 5, 17, 64), dtype=torch.float16, device="meta")
         local_indices = torch.empty((31, 5), dtype=torch.int32, device="meta")
@@ -81,6 +111,85 @@ class KernelCustomOpContractTest(unittest.TestCase):
             )
             torch.testing.assert_close(first, expected, rtol=0.0, atol=tolerance)
             self.assertTrue(torch.equal(first, second))
+
+    @unittest.skipUnless(
+        torch.cuda.is_available()
+        and kernel.turing_sage.overlap_accumulate_available(),
+        "the rebuilt CUDA streaming overlap accumulator is required",
+    )
+    def test_overlap_accumulate_matches_sequential_fp32_reference(self):
+        torch.manual_seed(53)
+        batch, tokens, channels, output_tokens = 2, 13, 80, 37
+        for dtype in (torch.float16, torch.bfloat16):
+            destination = torch.randn(
+                batch,
+                output_tokens,
+                channels,
+                dtype=torch.float32,
+                device="cuda",
+            )
+            expected = destination.clone()
+            payloads = []
+            for windows, affected_tokens in ((3, 17), (2, 11)):
+                values = torch.randn(
+                    batch,
+                    windows,
+                    tokens,
+                    channels,
+                    dtype=dtype,
+                    device="cuda",
+                )
+                output_indices = torch.randperm(
+                    output_tokens,
+                    device="cuda",
+                    dtype=torch.int64,
+                )[:affected_tokens].sort().values.to(torch.int32)
+                local_indices = torch.full(
+                    (affected_tokens, windows),
+                    -1,
+                    dtype=torch.int32,
+                    device="cuda",
+                )
+                weights = torch.zeros(
+                    (affected_tokens, windows),
+                    dtype=torch.float32,
+                    device="cuda",
+                )
+                for row in range(affected_tokens):
+                    for window in range(windows):
+                        if (row + window) % 3:
+                            local_indices[row, window] = (
+                                row * 5 + window
+                            ) % tokens
+                            weights[row, window] = 0.2 + 0.1 * window
+                for row in range(affected_tokens):
+                    output_index = int(output_indices[row])
+                    for window in range(windows):
+                        local = int(local_indices[row, window])
+                        if local >= 0:
+                            expected[:, output_index].add_(
+                                values[:, window, local].float()
+                                * weights[row, window]
+                            )
+                payloads.append(
+                    (values, local_indices, weights, output_indices)
+                )
+
+            results = []
+            for _repeat in range(2):
+                actual = destination.clone()
+                for values, local_indices, weights, output_indices in payloads:
+                    returned = kernel.turing_sage.overlap_accumulate_compiled(
+                        values,
+                        local_indices,
+                        weights,
+                        output_indices,
+                        actual,
+                    )
+                    self.assertIs(returned, actual)
+                results.append(actual)
+            torch.testing.assert_close(results[0], expected, rtol=0.0, atol=0.0)
+            self.assertTrue(torch.equal(results[0], results[1]))
 
     def test_convrot_fake_contracts(self):
         x = torch.empty((3, 512), dtype=torch.bfloat16, device="meta")

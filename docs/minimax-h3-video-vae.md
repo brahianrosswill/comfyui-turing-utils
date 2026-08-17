@@ -85,12 +85,14 @@ a separate sampler so denoise strength and scheduling remain explicit.
 
 Both nodes choose the number of simultaneously evaluated windows internally.
 The choice is bounded by current free/reclaimable device memory and conservative
-activation estimates (up to four decode windows and sixteen encode windows).
+activation estimates (up to sixteen windows for both decode and encode).
 This control is intentionally not exposed in the node UI.
 
-The decoder uses the validated ordered FP32 Python overlap reduction for every
-batch size. The optional SM75 overlap epilogue remains available in the kernel
-package for isolated validation, but is not used by the production H3 VAE path.
+With kernel ABI 0.27 or newer, the decoder streams each attention subbatch into
+the global FP32 canvas through a deterministic SM75 accumulator. Compact
+inverse maps live only for the current decode, and kernel launches retain the
+same group/window order as the validated Python reduction. Older kernels and
+unsupported dtypes automatically use that ordered Python fallback.
 
 Both paths use ComfyUI's official short-lived prefetch queues. Decoder weights
 are leased one Transformer block at a time and encoder weights one execution

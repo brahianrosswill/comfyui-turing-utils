@@ -249,6 +249,131 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         self.assertEqual(layout.window_count, 28)
         self.assertIn(1, window_counts)
 
+    def test_streaming_overlap_maps_preserve_compact_window_order(self):
+        model = SimpleNamespace(vae_ratio=2)
+        with (
+            mock.patch.object(video_vae, "TILE_SIZE", 12),
+            mock.patch.object(video_vae, "TILE_OVERLAP", 4),
+        ):
+            layout = video_vae._SharedWindowLayout(
+                model,
+                2,
+                10,
+                15,
+                torch.device("cpu"),
+            )
+            plan = object.__new__(video_vae._SharedSpatialPlan)
+            plan.layout = layout
+            plan._query_groups = {}
+            plan._overlap_batch_maps = {}
+            groups = plan.query_groups(0.08)
+            maps = plan.overlap_batch_maps(0.08, 2)
+
+        for core_tokens in sorted(groups):
+            windows, global_indices, _local_indices, weights = groups[core_tokens]
+            for group_start in range(0, windows.numel(), 2):
+                window_count = min(2, windows.numel() - group_start)
+                group_slice = slice(group_start, group_start + window_count)
+                output_indices, local_map, weight_map = maps[
+                    (core_tokens, group_start)
+                ]
+                expected_global = global_indices[group_slice]
+                expected_weights = weights[group_slice]
+                rows = torch.searchsorted(
+                    output_indices.to(torch.long),
+                    expected_global,
+                )
+                columns = torch.arange(window_count)[:, None].expand_as(rows)
+                expected_local = torch.arange(
+                    core_tokens,
+                    dtype=torch.int32,
+                )[None, :].expand_as(expected_global)
+                self.assertTrue(
+                    torch.equal(local_map[rows, columns], expected_local)
+                )
+                torch.testing.assert_close(
+                    weight_map[rows, columns],
+                    expected_weights,
+                )
+                self.assertEqual(
+                    output_indices.numel(),
+                    torch.unique(expected_global).numel(),
+                )
+
+    def test_streaming_overlap_adapter_matches_ordered_fallback(self):
+        from comfy.ldm.minimax.vae import ViT3DDecoder
+
+        torch.manual_seed(59)
+        decoder = ViT3DDecoder(
+            patch_size=2,
+            patch_size_t=1,
+            in_channels=4,
+            out_channels=3,
+            num_layers=1,
+            heads=1,
+            dim_head=64,
+            rope_dim_ratio=0.75,
+            operations=torch.nn,
+        ).half().eval()
+        for parameter in decoder.parameters():
+            torch.nn.init.uniform_(parameter, -0.01, 0.01)
+        model = SimpleNamespace(decoder=decoder, vae_ratio=2)
+        value = torch.randn(1, 4, 1, 6, 6, dtype=torch.float16)
+        calls = []
+
+        def accumulate(values, local_indices, weights, output_indices, output):
+            calls.append((values.shape, local_indices.shape))
+            for row, output_index in enumerate(output_indices):
+                for window in range(values.shape[1]):
+                    local_index = int(local_indices[row, window])
+                    if local_index >= 0:
+                        output[:, int(output_index)].add_(
+                            values[:, window, local_index].float()
+                            * weights[row, window]
+                        )
+            return output
+
+        unavailable = SimpleNamespace(
+            overlap_accumulate_available=lambda: False,
+        )
+        available = SimpleNamespace(
+            overlap_accumulate_available=lambda: True,
+            overlap_accumulate_compiled=accumulate,
+        )
+        options = video_vae._attention_options("sdpa", value.device)
+        with (
+            mock.patch.object(video_vae, "TILE_SIZE", 4),
+            mock.patch.object(video_vae, "TILE_OVERLAP", 2),
+            mock.patch.object(video_vae, "load_turing_sage", return_value=unavailable),
+            torch.inference_mode(),
+        ):
+            expected = video_vae._shared_core_multiband_decoder_forward(
+                model,
+                value.clone(),
+                options,
+                3,
+                None,
+                overlap_query_threshold=0.5,
+                final_full_overlap_blocks=0,
+            )
+        with (
+            mock.patch.object(video_vae, "TILE_SIZE", 4),
+            mock.patch.object(video_vae, "TILE_OVERLAP", 2),
+            mock.patch.object(video_vae, "load_turing_sage", return_value=available),
+            torch.inference_mode(),
+        ):
+            actual = video_vae._shared_core_multiband_decoder_forward(
+                model,
+                value.clone(),
+                options,
+                3,
+                None,
+                overlap_query_threshold=0.5,
+                final_full_overlap_blocks=0,
+            )
+        self.assertGreater(len(calls), 0)
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
     def test_small_feed_forward_batches_keep_fused_swiglu(self):
         module = mock.Mock()
         projected = torch.zeros(1, 5, 16)
@@ -309,17 +434,20 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertNotEqual(first, video_vae._latent_fingerprint(changed))
 
-    def test_spatial_plan_is_fresh_for_each_temporal_chunk(self):
+    def test_spatial_plan_cache_is_scoped_to_one_decode(self):
         model = object()
         value = torch.zeros(1, 4, 2, 3, 5)
         plans = [object(), object()]
+        cache = {}
         with mock.patch.object(
             video_vae, "_SharedSpatialPlan", side_effect=plans
         ) as constructor:
-            first = video_vae._shared_spatial_plan(model, value)
-            second = video_vae._shared_spatial_plan(model, value)
+            first = video_vae._shared_spatial_plan(model, value, cache)
+            second = video_vae._shared_spatial_plan(model, value, cache)
+            uncached = video_vae._shared_spatial_plan(model, value)
         self.assertIs(first, plans[0])
-        self.assertIs(second, plans[1])
+        self.assertIs(second, plans[0])
+        self.assertIs(uncached, plans[1])
         self.assertEqual(constructor.call_count, 2)
         constructor.assert_has_calls(
             [
@@ -382,7 +510,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 layout.window_count,
             )
 
-    def test_pruned_suffix_linears_are_isolated_by_query_group(self):
+    def test_pruned_suffix_linears_are_batched_across_all_windows(self):
         from comfy.ldm.minimax.vae import ViT3DDecoder
 
         torch.manual_seed(31)
@@ -453,10 +581,10 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             suffix_calls = [
                 shape for shape in calls[name] if shape[1] == suffix_tokens
             ]
-            self.assertGreater(len(suffix_calls), 1, name)
+            self.assertEqual(len(suffix_calls), 1, name)
             self.assertEqual(
-                sum(shape[0] for shape in suffix_calls),
-                layout.window_count,
+                suffix_calls[0][:2],
+                (layout.window_count, suffix_tokens),
                 name,
             )
         self.assertEqual(result.shape[-2:], (12, 12))
@@ -998,7 +1126,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 4,
             )
         self.assertEqual((selected, estimate), (3, 30))
-        self.assertEqual(video_vae._AUTO_DECODE_TILE_BATCH_LIMIT, 4)
+        self.assertEqual(video_vae._AUTO_DECODE_TILE_BATCH_LIMIT, 16)
         self.assertEqual(video_vae._AUTO_ENCODE_TILE_BATCH_LIMIT, 16)
 
     def test_tile_progress_uses_comfy_progress_bar(self):
