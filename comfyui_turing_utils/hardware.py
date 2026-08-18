@@ -32,4 +32,14 @@ def is_supported_turing_device(device: torch.device) -> bool:
     return not any(model in name for model in _TURING_WITHOUT_TENSOR_CORES)
 
 
-__all__ = ["is_supported_turing_device"]
+def is_supported_attention_device(device: torch.device) -> bool:
+    """Return whether bundled integer attention can target ``device``."""
+    if is_supported_turing_device(device):
+        return True
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return False
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return torch.cuda.get_device_capability(index) >= (8, 0)
+
+
+__all__ = ["is_supported_attention_device", "is_supported_turing_device"]

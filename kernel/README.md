@@ -1,7 +1,7 @@
 # comfyui-turing-utils-kernel
 
-Separately installed CUDA/PyTorch extension for the ComfyUI plugin's exact-sm75
-runtime. Version 0.27.0 contains legacy packed W4A8 and grouped-codebook W4A8
+Separately installed CUDA/PyTorch extension for the ComfyUI plugin's quantized
+runtime. Version 0.28.0 contains legacy packed W4A8 and grouped-codebook W4A8
 Tensor Core GEMMs, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, bundled Sage attention, pure-INT8 W8A8 attention,
@@ -69,11 +69,13 @@ is present, the build downloads a pinned NVIDIA wheel and verifies its SHA256.
 The default build targets only `sm_75`, which keeps normal Turing installs and
 Windows rebuilds small. Override it with `COMFYUI_TURING_UTILS_ARCH_LIST` to
 build the portable core extension for Ampere (`8.0;8.6`), Ada (`8.9`), Hopper
-(`9.0`), or a combined wheel. Bundled Sage/Sol are exact-sm75 specializations
-and are built only when the list contains `7.5`; non-Turing plugin dispatch uses
-Comfy Kitchen or the selected ComfyUI backend rather than these sm75 kernels.
-`7.5+PTX` permits compatible A40 validation without introducing Ampere-only
-instructions.
+(`9.0`/`9.0a`), or a combined wheel. Attention extensions are built for every
+requested architecture at sm75 or newer. Stable dense Sage remains an
+exact-sm75 runtime choice; native Ampere+ Sol delegates protected dense work to
+Comfy Kitchen W8A8 or the installed SageAttention backend. The historical
+`_sm75` extension suffix is retained as an ABI name. `7.5+PTX` remains useful
+for compatibility validation, while an `8.6` build enables native A40
+async-copy and INT8 MMA instructions.
 
 ```bash
 COMFYUI_TURING_UTILS_ARCH_LIST="7.5;8.0;8.6;8.9;9.0" \

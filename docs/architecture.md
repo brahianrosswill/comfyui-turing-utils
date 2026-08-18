@@ -27,7 +27,7 @@ comfyui-turing-utils/
 │   ├── comfyui_turing_utils_kernel/
 │   │   ├── ops.py               # linear/fusion custom ops
 │   │   └── turing_sage/         # attention API, quantization and scheduling
-│   ├── csrc/turing/             # exact-SM75 CUDA/C++ sources
+│   ├── csrc/turing/             # Turing fusions plus shared sm75+ attention
 │   ├── scripts/                 # validation and benchmarks
 │   └── setup.py
 ├── docs/
@@ -64,7 +64,7 @@ built-in adapters without importing ComfyUI node definitions.
 | `attention/integration.py` | model-neutral projected-QKV handoff and attention-site registry |
 | `attention/layout.py` | versioned Query/KV modality topology contract and provider registry |
 | `attention/patches.py` | attention overrides and loader-independent ModelPatcher installation |
-| `attention/tuning.py` | explicit experimental SM75 launch/quantization policy metadata |
+| `attention/tuning.py` | explicit experimental launch/quantization policy metadata |
 | `quantization/convrot.py` | ConvRot metadata parsing and model/CLIP loading services |
 | `quantization/dispatch.py` | W8A8/W4A8/W4A4 activation quantization and GEMM dispatch |
 | `quantization/fusions.py` | model-independent fused activation and normalization operations |

@@ -31,7 +31,6 @@ from .stable import (
     finish_turing_attention_output,
     inspect_turing_attention_call,
     normalize_turing_attention_tensors,
-    turing_sage_attention,
 )
 from .tuning import attention_kernel_tuning
 from ..kernel_api import load_turing_sage
@@ -56,9 +55,9 @@ def _sparse_dense_baseline(
     **kwargs,
 ) -> torch.Tensor:
     if reason not in _LOGGED_SPARSE_DENSE_REASONS:
-        LOG.info("Sol sparse attention uses stable Sage for %s", reason)
+        LOG.info("Sol sparse attention uses the selected dense backend for %s", reason)
         _LOGGED_SPARSE_DENSE_REASONS.add(reason)
-    return turing_sage_attention(fallback, q, k, v, heads, **kwargs)
+    return fallback(q, k, v, heads, **kwargs)
 
 
 def _sparse_prefix_tokens(
@@ -543,7 +542,7 @@ def turing_sol_sparse_attention(
     )
     if kernel_key not in _LOGGED_SPARSE_KERNELS:
         LOG.info(
-            "Turing Sol sparse attention active: dtype=%s Q=%s K=%s "
+            "Bundled Sol sparse attention active: dtype=%s Q=%s K=%s "
             "min_sequence=%d prefix_policy=%s dense_query_ranges=%s exact_kv_ranges=%s "
             "selected_qk=int8 score_domain=int8_consistent threshold=%.2f "
             "skipped_residual=%s local_radius=1 "

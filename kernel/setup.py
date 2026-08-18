@@ -338,7 +338,10 @@ def _arch_list() -> str:
     # Production installs target exact Turing by default.  Developers and wheel
     # builders can still request Ampere, Ada, Hopper, or PTX explicitly without
     # making every local Turing install compile unused architectures.
-    value = os.environ.get("COMFYUI_TURING_UTILS_ARCH_LIST", "7.5")
+    value = os.environ.get(
+        "COMFYUI_TURING_UTILS_ARCH_LIST",
+        os.environ.get("TORCH_CUDA_ARCH_LIST", "7.5"),
+    )
     arches = []
     for raw in value.replace(",", ";").split(";"):
         arch = raw.strip()
@@ -351,7 +354,10 @@ def _arch_list() -> str:
 
 
 ARCH_LIST = _arch_list()
-os.environ.setdefault("TORCH_CUDA_ARCH_LIST", ARCH_LIST)
+# The plugin-specific setting is authoritative.  Mirroring the normalized
+# value also prevents a stale global Torch setting from silently producing a
+# wheel for a different architecture than setup.py advertises.
+os.environ["TORCH_CUDA_ARCH_LIST"] = ARCH_LIST
 CUTLASS_INCLUDE_DIR = _cutlass_include_dir()
 CCCL_INCLUDE_DIRS = _windows_cccl_include_dirs()
 
@@ -457,31 +463,21 @@ core_ext = CUDAExtension(
 )
 
 
-def _includes_sm75() -> bool:
-    return any(arch.split("+")[0] == "7.5" for arch in ARCH_LIST.split(";") if arch)
-
-
-def _includes_sm75_ptx() -> bool:
-    return any(arch.upper() == "7.5+PTX" for arch in ARCH_LIST.split(";") if arch)
+def _includes_integer_attention_arch() -> bool:
+    for arch in ARCH_LIST.split(";"):
+        base = arch.split("+")[0]
+        match = re.match(r"^(\d+)\.(\d+)", base)
+        if match and (int(match.group(1)), int(match.group(2))) >= (7, 5):
+            return True
+    return False
 
 
 ext_modules = [core_ext]
-if _includes_sm75():
-    sm75_nvcc_flags = [
+if _includes_integer_attention_arch():
+    attention_nvcc_flags = [
         *NVCC_FLAGS,
         "--use_fast_math",
-        "-gencode",
-        "arch=compute_75,code=sm_75",
     ]
-    if _includes_sm75_ptx():
-        # A newer validation GPU JITs compute_75 PTX, so compilation cannot
-        # introduce Ampere instructions or BF16 hardware paths.
-        sm75_nvcc_flags.extend(
-            [
-                "-gencode",
-                "arch=compute_75,code=compute_75",
-            ]
-        )
     sage_include_dirs = [
         str((ROOT / "csrc" / "turing").resolve()),
         str((ROOT / "csrc" / "turing" / "sage").resolve()),
@@ -499,7 +495,7 @@ if _includes_sm75():
                     "csrc/turing/sage/quant_v_int8_cuda_sm75.cu",
                 ],
                 include_dirs=sage_include_dirs,
-                extra_compile_args={"cxx": CXX_FLAGS, "nvcc": sm75_nvcc_flags},
+                extra_compile_args={"cxx": CXX_FLAGS, "nvcc": attention_nvcc_flags},
             ),
             CUDAExtension(
                 name="comfyui_turing_utils_kernel._sage_fused_sm75",
@@ -510,7 +506,7 @@ if _includes_sm75():
                     "csrc/turing/sage/overlap_blend.cu",
                 ],
                 include_dirs=sage_include_dirs,
-                extra_compile_args={"cxx": CXX_FLAGS, "nvcc": sm75_nvcc_flags},
+                extra_compile_args={"cxx": CXX_FLAGS, "nvcc": attention_nvcc_flags},
             ),
         ]
     )
@@ -518,7 +514,7 @@ if _includes_sm75():
 
 setup(
     name="comfyui-turing-utils-kernel",
-    version="0.27.0",
+    version="0.28.0",
     packages=find_packages(where=str(ROOT)),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

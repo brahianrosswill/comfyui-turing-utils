@@ -1,5 +1,5 @@
 /*
- * Experimental Sol-style sparse attention for SM75.
+ * Production Sol-style sparse attention for sm75 and newer architectures.
  *
  * One 64-token centroid per block feeds an input-adaptive mean + tau * std
  * threshold. Each Query CTA performs routing directly before its FP32 online
@@ -113,7 +113,7 @@ struct AttentionGeometry
   static_assert(
       kRouteStorageOffset + kMaxRouteBytes + kProxyScratchBytes <=
           kAttentionSharedBytes,
-      "SM75 fused routing metadata must fit beside the 16-block summaries");
+      "fused routing metadata must fit beside the 16-block summaries");
 };
 
 static_assert(AttentionGeometry<128>::kAttentionSharedBytes <= 64 * 1024);
@@ -623,13 +623,13 @@ __global__ void sparse_attention_kernel(
       "Sol residual geometry must be 1x64 or 2x32");
   static_assert(
       KeyStages == 1 || KeyStages == 2,
-      "SM75 exact attention stages must cover 64 or 128 K tokens");
+      "exact attention stages must cover 64 or 128 K tokens");
   static_assert(!ForceDense || KeyStages == 1);
   static_assert(!IsCausal || ForceDense,
                 "causal masking is supported only by dense W8A8");
   static_assert(
       G::kAttentionSharedBytes <= 64 * 1024,
-      "SM75 sparse attention exceeds the architectural shared-memory limit");
+      "sparse attention exceeds the configured shared-memory limit");
   extern __shared__ int8_t shared_bytes[];
   smem_t<SwizzleMode::k128B, G::kHalfPacks> shared_correction_query(shared_bytes);
   smem_t<SwizzleMode::k128B, G::kHalfPacks> shared_summary_key(
@@ -1325,7 +1325,7 @@ void launch_sparse_threshold_attention(
       sparse_attention_kernel<HeadDim, T, UseW8A8, ForceDense, IsCausal,
                               Varlen, ResidualSubblocks, KeyStages>;
   configure_dynamic_shared_memory(
-      attention_kernel, G::kAttentionSharedBytes, "SM75 sparse attention");
+      attention_kernel, G::kAttentionSharedBytes, "Sol sparse attention");
   attention_kernel<<<
       attention_grid,
       attention_block,

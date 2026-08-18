@@ -5,6 +5,14 @@ import importlib
 import torch
 
 
+def _integer_attention_device(device: torch.device) -> bool:
+    return bool(
+        device.type == "cuda"
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability(device) >= (7, 5)
+    )
+
+
 def available() -> bool:
     try:
         importlib.import_module("comfyui_turing_utils_kernel._sage_qattn_sm75")
@@ -346,12 +354,10 @@ def sol_sparse_sageattn_from_prequantized(*args, **kwargs):
 
 
 def preflight_sparse(device: torch.device) -> None:
-    if device.type != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError(f"Turing sparse attention requires CUDA, got {device}")
-    if torch.cuda.get_device_capability(device) != (7, 5):
-        raise RuntimeError(f"Turing sparse attention requires sm75, got {device}")
+    if not _integer_attention_device(device):
+        raise RuntimeError(f"Sol sparse attention requires sm75 or newer, got {device}")
     if not sparse_available():
-        raise RuntimeError("the Turing Sol sparse extension is not built")
+        raise RuntimeError("the Sol sparse attention extension is not built")
 
     with torch.inference_mode(), torch.cuda.device(device):
         for head_dim in (64, 128):
@@ -381,18 +387,16 @@ def preflight_sparse(device: torch.device) -> None:
                 or not torch.allclose(output.float(), reference, rtol=0.08, atol=0.06)
             ):
                 raise RuntimeError(
-                    f"Turing sparse attention BF16 D={head_dim} self-test failed"
+                    f"Sol sparse attention BF16 D={head_dim} self-test failed"
                 )
         torch.cuda.synchronize(device)
 
 
 def preflight_w8a8(device: torch.device) -> None:
-    if device.type != "cuda" or not torch.cuda.is_available():
-        raise RuntimeError(f"Turing W8A8 attention requires CUDA, got {device}")
-    if torch.cuda.get_device_capability(device) != (7, 5):
-        raise RuntimeError(f"Turing W8A8 attention requires sm75, got {device}")
+    if not _integer_attention_device(device):
+        raise RuntimeError(f"W8A8 attention requires sm75 or newer, got {device}")
     if not w8a8_available():
-        raise RuntimeError("the Turing W8A8 attention extension is not built")
+        raise RuntimeError("the W8A8 attention extension is not built")
 
     with torch.inference_mode(), torch.cuda.device(device):
         for head_dim in (64, 128):

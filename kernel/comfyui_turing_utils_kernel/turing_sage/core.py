@@ -790,9 +790,9 @@ def prequantize_sol_sageattn(
     if not q.is_cuda:
         raise ValueError("Input tensors must be on CUDA")
     if tensor_layout != "HND":
-        raise ValueError("Turing Sol sparse attention currently requires HND layout")
+        raise ValueError("Sol sparse attention currently requires HND layout")
     if q.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError("Turing sparse Q/K/V must be float16 or bfloat16")
+        raise TypeError("Sol sparse Q/K/V must be float16 or bfloat16")
     if q.device != k.device or q.device != v.device:
         raise ValueError("Q/K/V must be on the same device")
     if q.dtype != k.dtype or q.dtype != v.dtype:
@@ -800,7 +800,7 @@ def prequantize_sol_sageattn(
     _validate_fixed_qkv(q, k, v, tensor_layout)
     head_dim = q.size(-1)
     if not 0 < head_dim <= 128:
-        raise ValueError("Turing Sol sparse attention requires head_dim in [1, 128]")
+        raise ValueError("Sol sparse attention requires head_dim in [1, 128]")
     if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
         raise ValueError("the last Q/K/V dimension must be contiguous")
     kernel_head_dim = 64 if head_dim <= 64 else 128
@@ -930,7 +930,7 @@ def sol_sparse_sageattn(
     rotate_qk: bool = True,
     stabilize_k: bool = True,
 ):
-    """SM75 Sol attention with online routing and modality-aware exact ranges."""
+    """Native sm75+ Sol attention with online routing and exact modal ranges."""
     if not use_w8a8:
         sparse_query_blocks, _, sparse_block_count = _sol_block_policy(
             q.device,

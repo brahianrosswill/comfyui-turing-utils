@@ -9,7 +9,10 @@ from collections.abc import Callable
 import torch
 
 from ..kernel_api import kernel_version, load_turing_sage
-from ..quantization.dispatch import is_supported_turing_device
+from ..hardware import (
+    is_supported_attention_device as _is_supported_attention_device,
+    is_supported_turing_device,
+)
 from .tuning import attention_kernel_tuning
 from .protocol import QKTransformSpec
 
@@ -37,6 +40,10 @@ _LOGGED_TURING_KERNELS: set[tuple] = set()
 _LOGGED_TURING_FALLBACKS: set[str] = set()
 _LOGGED_SPARSE_KERNELS: set[tuple] = set()
 _LOGGED_SPARSE_DENSE_REASONS: set[str] = set()
+
+
+def is_supported_attention_device(device: torch.device) -> bool:
+    return is_supported_turing_device(device) or _is_supported_attention_device(device)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -86,8 +93,13 @@ def inspect_turing_attention_call(
         raise ValueError(f"unsupported Turing attention kernel: {kernel}")
     if not isinstance(q, torch.Tensor) or not isinstance(k, torch.Tensor) or not isinstance(v, torch.Tensor):
         return None, "Q/K/V are not tensors"
-    if not is_supported_turing_device(q.device):
-        return None, "Q/K/V are not on a supported sm75 GPU"
+    device_supported = (
+        is_supported_attention_device(q.device)
+        if kernel == "sol"
+        else is_supported_turing_device(q.device)
+    )
+    if not device_supported:
+        return None, "Q/K/V are not on a supported CUDA Tensor Core GPU"
     if mask is not None:
         return None, "an attention mask was supplied"
     if not low_precision_attention:
@@ -499,8 +511,8 @@ def preflight_bundled(device: torch.device) -> None:
 
 
 def preflight_bundled_sparse(device: torch.device) -> None:
-    if not is_supported_turing_device(device):
-        raise RuntimeError(f"unsupported Turing device {device}")
+    if not is_supported_attention_device(device):
+        raise RuntimeError(f"unsupported Sol attention device {device}")
     index = device.index if device.index is not None else torch.cuda.current_device()
     if index in _PREFLIGHTED_SPARSE_DEVICES:
         return
@@ -509,8 +521,8 @@ def preflight_bundled_sparse(device: torch.device) -> None:
 
 
 def preflight_bundled_w8a8(device: torch.device) -> None:
-    if not is_supported_turing_device(device):
-        raise RuntimeError(f"unsupported Turing device {device}")
+    if not is_supported_attention_device(device):
+        raise RuntimeError(f"unsupported integer attention device {device}")
     index = device.index if device.index is not None else torch.cuda.current_device()
     if index in _PREFLIGHTED_W8A8_DEVICES:
         return

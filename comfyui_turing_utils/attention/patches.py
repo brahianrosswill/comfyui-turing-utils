@@ -7,6 +7,7 @@ from collections.abc import Callable
 
 import torch
 
+from ..profiling import CUDA_PHASE_PROFILER
 from .layout import (
     ATTENTION_LAYOUT_REQUIREMENT_KEY,
     attention_semantic_layout,
@@ -41,6 +42,7 @@ from .stable import (
     SPARSE_ROUTING_THRESHOLD,
     SPARSE_SKIPPED_RESIDUAL,
     SPARSE_USE_W8A8,
+    AttentionBackend,
     _BACKENDS,
     _comfy_attention_function,
     _select_attention_backend,
@@ -48,6 +50,7 @@ from .stable import (
     bundled_sparse_available,
     bundled_w8a8_available,
     fused_qk_preprocessing_available,
+    is_supported_attention_device,
     is_supported_turing_device,
     inspect_turing_attention_call,
     normalize_attention_backend,
@@ -62,7 +65,9 @@ from .stable import (
     turing_sage_attention,
     turing_w8a8_attention,
 )
-from ..profiling import CUDA_PHASE_PROFILER
+
+
+_LOGGED_EXTERNAL_BACKEND_REJECTIONS: set[tuple[str, str]] = set()
 
 
 def _profiled(phase: str, function: Callable, /, *args, **kwargs):
@@ -279,6 +284,81 @@ def _dtype_compatible_fallback(original: Callable, *args, **kwargs):
     return original(*args, **kwargs)
 
 
+def _recoverable_external_backend_rejection(error: Exception) -> bool:
+    if isinstance(error, torch.OutOfMemoryError):
+        return False
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "alignment",
+            "not implemented",
+            "not supported",
+            "unsupported",
+            "no kernel image",
+            "requires cuda",
+        )
+    )
+
+
+def _external_backend_call(
+    backend: AttentionBackend,
+    target: Callable,
+    fallback: Callable,
+    *args,
+    **kwargs,
+):
+    try:
+        return target(*args, **kwargs)
+    except (RuntimeError, NotImplementedError) as error:
+        if (
+            backend.option != "w8a8"
+            or not _recoverable_external_backend_rejection(error)
+        ):
+            raise
+        key = (backend.attention_function, str(error).splitlines()[0])
+        if key not in _LOGGED_EXTERNAL_BACKEND_REJECTIONS:
+            LOG.warning(
+                "External %s attention rejected this call (%s); using the "
+                "pre-existing ComfyUI attention backend",
+                backend.attention_function,
+                key[1],
+            )
+            _LOGGED_EXTERNAL_BACKEND_REJECTIONS.add(key)
+        return fallback(*args, **kwargs)
+
+
+def _make_external_container_function(
+    backend: AttentionBackend,
+    target: Callable,
+) -> Callable:
+    fallback = _default_attention_fallback()
+
+    def container_function(q, k, v, heads: int, *args, **kwargs):
+        q.peek(), k.peek(), v.peek()
+        query, key, value = q.take(), k.take(), v.take()
+        compatible_fallback = lambda *fallback_args, **fallback_kwargs: (
+            _dtype_compatible_fallback(
+                fallback,
+                *fallback_args,
+                **fallback_kwargs,
+            )
+        )
+        return _external_backend_call(
+            backend,
+            target,
+            compatible_fallback,
+            query,
+            key,
+            value,
+            heads,
+            *args,
+            **kwargs,
+        )
+
+    return container_function
+
+
 def _uses_turing_bf16_sdpa(q, k, v) -> bool:
     return bool(
         all(isinstance(tensor, torch.Tensor) for tensor in (q, k, v))
@@ -395,7 +475,7 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
             return fallback(*args, **kwargs)
         if backend.option == "sdpa" and len(args) >= 4:
             return _turing_sdpa_fp16(target, *args, **kwargs)
-        return target(*args, **kwargs)
+        return _external_backend_call(backend, target, fallback, *args, **kwargs)
 
     attention_override.turing_utils_attention_backend = backend.option
     attention_override.turing_utils_attention_implementation = implementation
@@ -413,7 +493,10 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
         not bundled_turing
         and callable(getattr(target, "container_function", None))
     ):
-        attention_override.container_function = target.container_function
+        attention_override.container_function = _make_external_container_function(
+            backend,
+            target,
+        )
     return attention_override
 
 
@@ -466,31 +549,82 @@ def make_sparse_attention_override(
         raise ValueError("dense_prefix_layers must be non-negative")
     if dense_suffix_layers < 0:
         raise ValueError("dense_suffix_layers must be non-negative")
-    if not is_supported_turing_device(device):
-        raise RuntimeError("Sol sparse attention requires an sm75 Turing GPU")
+    if not is_supported_attention_device(device):
+        raise RuntimeError(
+            "Sol sparse attention requires a CUDA Tensor Core GPU (sm75 or newer)"
+        )
     if not bundled_sparse_available():
         raise RuntimeError(
-            "The Turing Sol sparse extension is unavailable. "
-            "Rebuild comfyui-turing-utils-kernel 0.23.0 or newer with sm75 enabled."
+            "The bundled Sol sparse extension is unavailable. Rebuild "
+            "comfyui-turing-utils-kernel 0.28.0 or newer with "
+            "COMFYUI_TURING_UTILS_ARCH_LIST including the target GPU architecture."
         )
-    preflight_bundled(device)
     preflight_bundled_sparse(device)
     if use_w8a8:
         if not bundled_w8a8_available():
             raise RuntimeError(
-                "Sol W8A8 requires comfyui-turing-utils-kernel 0.23.0 or newer"
+                "Sol W8A8 requires comfyui-turing-utils-kernel 0.28.0 or newer"
             )
-        preflight_bundled_w8a8(device)
     schedule_state: dict[str, object] = {}
     debug_route_keys: set[tuple] = set()
     debug_route_state: dict[tuple, list[tuple[torch.Tensor, int, int]]] = {}
     debug_dense_reasons: set[str] = set()
-    dense_prepared_executor = _make_dense_prepared_executor(
-        "w8a8" if use_w8a8 else "sage"
+    dense_override = make_attention_override(
+        "w8a8" if use_w8a8 else "sage", device=device
     )
+    if use_w8a8 and not is_supported_turing_device(device):
+        preflight_bundled_w8a8(device)
+    dense_prepared_executor = getattr(
+        dense_override, "prepared_attention_executor", None
+    )
+    dense_container = getattr(dense_override, "container_function", None)
     sparse_capabilities = AttentionBackendCapabilities(
         supports_semantic_sparse=True,
     )
+
+    def run_dense_prepared(request: PreparedAttention) -> AttentionExecutionOutcome:
+        if callable(dense_prepared_executor):
+            return dense_prepared_executor(request)
+        return AttentionExecutionOutcome.unsupported(
+            "the selected dense backend does not expose prepared attention"
+        )
+
+    def run_dense_container(
+        q,
+        k,
+        v,
+        heads,
+        *,
+        mask,
+        attn_precision,
+        skip_reshape,
+        skip_output_reshape,
+        **kwargs,
+    ):
+        if callable(dense_container):
+            return dense_container(
+                q,
+                k,
+                v,
+                heads,
+                mask=mask,
+                attn_precision=attn_precision,
+                skip_reshape=skip_reshape,
+                skip_output_reshape=skip_output_reshape,
+                **kwargs,
+            )
+        return dense_override(
+            _default_attention_fallback(),
+            q.take(),
+            k.take(),
+            v.take(),
+            heads,
+            mask=mask,
+            attn_precision=attn_precision,
+            skip_reshape=skip_reshape,
+            skip_output_reshape=skip_output_reshape,
+            **kwargs,
+        )
 
     def route_debug_context(transformer_options, kernel_key: tuple):
         layer_index, layer_count = _attention_layer_metadata(transformer_options)
@@ -633,7 +767,7 @@ def make_sparse_attention_override(
             dense_prefix_layers,
             dense_suffix_layers,
         ):
-            return dense_prepared_executor(request)
+            return run_dense_prepared(request)
 
         query_view, key_view, value_view = request.peek_qkv()
         sol_call, reason = inspect_sol_attention_call(
@@ -659,7 +793,7 @@ def make_sparse_attention_override(
             },
         )
         if reason is not None:
-            return dense_prepared_executor(request)
+            return run_dense_prepared(request)
         reason = _prepared_call_mismatch(request, sol_call.attention)
         if reason is not None:
             return AttentionExecutionOutcome.unsupported(reason)
@@ -715,7 +849,7 @@ def make_sparse_attention_override(
     prepared_executor.capabilities = sparse_capabilities
 
     def attention_override(original: Callable, *args, **kwargs):
-        fallback = lambda *fallback_args, **fallback_kwargs: _dtype_compatible_fallback(
+        fallback = lambda *fallback_args, **fallback_kwargs: dense_override(
             original, *fallback_args, **fallback_kwargs
         )
         transformer_options = kwargs.get("transformer_options")
@@ -734,7 +868,7 @@ def make_sparse_attention_override(
             debug_key = f"schedule:{schedule_state.get('step')}"
             if debug_key not in debug_dense_reasons:
                 LOG.warning(
-                    "[Turing sparse debug] stable Sage selected by dense schedule: "
+                    "[Sol sparse debug] dense backend selected by schedule: "
                     "step=%s/%s prefix_steps=%s suffix_steps=%s",
                     schedule_state.get("step"),
                     schedule_state.get("sampling_steps"),
@@ -747,14 +881,13 @@ def make_sparse_attention_override(
             debug_key = f"layer:{layer_index}"
             if debug_key not in debug_dense_reasons:
                 LOG.warning(
-                    "[Turing sparse debug] stable Sage selected for protected layer %s/%s",
+                    "[Sol sparse debug] dense backend selected for protected layer %s/%s",
                     layer_index,
                     layer_count,
                 )
                 debug_dense_reasons.add(debug_key)
         if dense_schedule or dense_layer:
-            dense_attention = turing_w8a8_attention if use_w8a8 else turing_sage_attention
-            return dense_attention(fallback, *args, **kwargs)
+            return fallback(*args, **kwargs)
         debug_context = None
         if debug_route_density:
             layer_index, layer_count = _attention_layer_metadata(transformer_options)
@@ -790,10 +923,6 @@ def make_sparse_attention_override(
         )
 
     if split_prequantization_available():
-        dense_container = _make_dense_container_function(
-            "w8a8" if use_w8a8 else "sage"
-        )
-
         def container_function(
             q,
             k,
@@ -816,7 +945,7 @@ def make_sparse_attention_override(
                 dense_prefix_layers,
                 dense_suffix_layers,
             ):
-                return dense_container(
+                return run_dense_container(
                     q,
                     k,
                     v,
@@ -846,7 +975,7 @@ def make_sparse_attention_override(
                 kwargs=kwargs,
             )
             if reason is not None:
-                return dense_container(
+                return run_dense_container(
                     q,
                     k,
                     v,
@@ -898,7 +1027,10 @@ def make_sparse_attention_override(
         attention_override.container_function = container_function
 
     attention_override.turing_utils_attention_backend = "sol_sparse_attn"
-    attention_override.turing_utils_attention_implementation = "bundled_turing_sol_sparse"
+    attention_override.turing_utils_attention_implementation = "bundled_sol_sparse"
+    attention_override.turing_utils_dense_implementation = (
+        dense_override.turing_utils_attention_implementation
+    )
     if fused_qk_preprocessing_available():
         attention_override.prepared_attention_executor = prepared_executor
     return attention_override
@@ -965,7 +1097,12 @@ def apply_sparse_attention_patch(
         transformer_options.pop(ATTENTION_EXECUTOR_KEY, None)
     transformer_options["turing_utils_attention_backend"] = "sol_sparse_attn"
     transformer_options["turing_utils_attention_implementation"] = (
-        "bundled_turing_sol_sparse"
+        "bundled_sol_sparse"
+    )
+    dense_implementation = getattr(
+        override,
+        "turing_utils_dense_implementation",
+        "selected_dense_backend",
     )
     LOG.info(
         "Sol sparse attention patch enabled: threshold=%.2f "
@@ -985,7 +1122,7 @@ def apply_sparse_attention_patch(
         dense_suffix_steps,
         dense_prefix_layers,
         dense_suffix_layers,
-        "bundled_turing_w8a8" if use_w8a8 else "bundled_turing_sage",
+        dense_implementation,
         "u8xs8_tensorcore" if use_w8a8 else "fp16_tensorcore",
         debug_route_density,
     )

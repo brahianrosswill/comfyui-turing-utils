@@ -172,11 +172,10 @@ class TuringAttentionContractTest(unittest.TestCase):
         baseline = mock.Mock(return_value=q)
         with (
             mock.patch("attention.is_supported_turing_device", return_value=True),
-            mock.patch("attention.turing_sage_attention", baseline),
             mock.patch("attention._sol_sparse_sageattn") as sparse,
         ):
             output = turing_attention.turing_sol_sparse_attention(
-                mock.Mock(),
+                baseline,
                 q,
                 q,
                 q,
@@ -235,11 +234,10 @@ class TuringAttentionContractTest(unittest.TestCase):
         baseline = mock.Mock(return_value=q)
         with (
             mock.patch("attention.is_supported_turing_device", return_value=True),
-            mock.patch("attention.turing_sage_attention", baseline),
             mock.patch("attention._sol_sparse_sageattn") as sparse,
         ):
             output = turing_attention.turing_sol_sparse_attention(
-                mock.Mock(), q, q, q, 4,
+                baseline, q, q, q, 4,
                 skip_reshape=True,
             )
         self.assertIs(output, q)
@@ -413,15 +411,14 @@ class TuringAttentionContractTest(unittest.TestCase):
         q = torch.zeros((1, 4096, 4 * 64), dtype=torch.bfloat16)
         baseline = mock.Mock(return_value=q)
         with (
-            mock.patch("attention.turing_sage_attention", baseline),
             mock.patch("attention._sol_sparse_sageattn") as sparse,
         ):
             output = turing_attention.turing_sol_sparse_attention(
-                mock.Mock(), q, q, q, 4
+                baseline, q, q, q, 4
             )
         self.assertIs(output, q)
         baseline.assert_called_once()
-        self.assertIs(baseline.call_args.args[1], q)
+        self.assertIs(baseline.call_args.args[0], q)
         sparse.assert_not_called()
 
     def test_experimental_sparse_forwards_patch_parameters(self):

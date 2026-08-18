@@ -427,11 +427,15 @@ instantiations exclude them. Their complete checkpoint and reproduction steps
 are documented in
 [`kernel/experiments/turing_sage_variants`](../kernel/experiments/turing_sage_variants/README.md).
 
-On non-Turing GPUs the selected backend is deterministic: W8A8 uses Comfy
-Kitchen, Sage uses the registered SageAttention function, and SDPA uses
+On non-Turing GPUs the selected dense backend is deterministic: W8A8 uses
+Comfy Kitchen, Sage uses the registered SageAttention function, and SDPA uses
 ComfyUI's PyTorch implementation. Flash Attention is not a loader option. An
 all-FP32 call that cannot enter external Sage uses ComfyUI's PyTorch attention
-implementation deterministically.
+implementation deterministically. Sol is the exception to the former
+"non-Turing means no local attention" rule: kernel 0.28.0 can compile its
+integer routing/exact core natively for Ampere, Ada, and Hopper, while every
+protected dense step or layer still delegates to those architecture-native
+dense backends.
 
 The loader log reports `w8a8 via bundled_turing_w8a8` or
 `sage via bundled_turing_sage` for local SM75 implementations. Sol logs the
@@ -466,7 +470,9 @@ in the tested contractions; no production documentation claims otherwise.
 
 ## Validation boundary
 
-Release builds target sm75 for bundled Sage. Static tests validate dispatch,
+The default release build still targets sm75 only. An explicit
+`COMFYUI_TURING_UTILS_ARCH_LIST` can add native Ampere, Ada, or Hopper Sol
+cubins without changing that default. Static tests validate dispatch,
 fallbacks, loader independence, shapes, dtypes, spill-free SM75 resources for
 every compiled core/attention/preprocessing family, the public symbol boundary,
 and exclusion of the retired Sage1/Sage2 variants. For compatible A40
@@ -485,3 +491,13 @@ An A40 run validates numerical behavior, allocation shapes, and the absence of
 Ampere-only source dependencies. It JITs compute_75 PTX and selects the same
 CTA schedule used on sm75. This does not replace the final exact-sm75 occupancy
 and end-to-end test.
+
+For native Ampere acceptance, use `COMFYUI_TURING_UTILS_ARCH_LIST="8.6"`.
+The resulting attention cubins use the `__CUDA_ARCH__ >= 800` async-copy and
+INT8 MMA paths; A40 preflight covers BF16 D64/D128 GQA for both Sol and W8A8.
+The historical `_sage_*_sm75` module names remain stable ABI identifiers.
+On the initial native-sm86 direction check (`N=4096`, H8, D128, BF16), dense
+W8A8 measured 0.840 ms, Sol FP16-PV 0.428 ms, and Sol W8A8 0.417 ms at 19.7%
+route density. Their output cosine against dense W8A8 was 0.9985 and 0.9982,
+respectively. These figures verify native dispatch and arithmetic; they are not
+an H3 end-to-end or visual-quality claim.

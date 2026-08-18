@@ -59,7 +59,7 @@ class KernelSetupTest(unittest.TestCase):
             header.parent.mkdir(parents=True, exist_ok=True)
             header.touch()
 
-    def test_sage_compute75_ptx_is_opt_in_and_keeps_sm75(self):
+    def test_attention_compute75_ptx_uses_requested_architecture(self):
         environment = {
             "COMFYUI_TURING_UTILS_ARCH_LIST": "7.5+PTX",
         }
@@ -70,7 +70,9 @@ class KernelSetupTest(unittest.TestCase):
             mock.patch("torch.utils.cpp_extension.BuildExtension", object()),
             mock.patch("setuptools.setup") as setup,
         ):
-            runpy.run_path(str(SETUP_PATH), run_name="__turing_utils_linux_setup_test__")
+            namespace = runpy.run_path(
+                str(SETUP_PATH), run_name="__turing_utils_linux_setup_test__"
+            )
 
         extensions = setup.call_args.kwargs["ext_modules"]
         self.assertEqual(
@@ -78,9 +80,8 @@ class KernelSetupTest(unittest.TestCase):
             ["comfyui_turing_utils_kernel._C", "comfyui_turing_utils_kernel._sage_qattn_sm75", "comfyui_turing_utils_kernel._sage_fused_sm75"],
         )
         flags = extensions[1].kwargs["extra_compile_args"]["nvcc"]
-        self.assertIn("arch=compute_75,code=sm_75", flags)
-        self.assertIn("arch=compute_75,code=compute_75", flags)
-        self.assertNotIn("arch=compute_86,code=sm_86", flags)
+        self.assertEqual(namespace["ARCH_LIST"], "7.5+PTX")
+        self.assertNotIn("-gencode", flags)
         self.assertNotIn("-DCOMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS", flags)
         self.assertIn("-std=c++17", flags)
         self.assertIn(
@@ -95,7 +96,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(
             "csrc/turing/sage/overlap_blend.cu", extensions[2].kwargs["sources"]
         )
-        self.assertEqual(setup.call_args.kwargs["version"], "0.27.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.28.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -107,7 +108,7 @@ class KernelSetupTest(unittest.TestCase):
             PLUGIN_ROOT / "kernel" / "scripts" / "build_wheel.py"
         ).read_text(encoding="utf-8")
         self.assertIn(
-            'os.environ.get("COMFYUI_TURING_UTILS_ARCH_LIST", "7.5")',
+            'os.environ.get("TORCH_CUDA_ARCH_LIST", "7.5")',
             setup_source,
         )
         self.assertIn('{"75", "80", "86", "89", "90"}', setup_source)
@@ -134,8 +135,51 @@ class KernelSetupTest(unittest.TestCase):
         self.assertEqual(namespace["ARCH_LIST"], "8.0;8.6;8.9;9.0")
         self.assertEqual(
             [extension.name for extension in setup.call_args.kwargs["ext_modules"]],
-            ["comfyui_turing_utils_kernel._C"],
+            [
+                "comfyui_turing_utils_kernel._C",
+                "comfyui_turing_utils_kernel._sage_qattn_sm75",
+                "comfyui_turing_utils_kernel._sage_fused_sm75",
+            ],
         )
+        self.assertIn(
+            "csrc/turing/sage/sol_sparse_cuda_sm75.cu",
+            setup.call_args.kwargs["ext_modules"][1].kwargs["sources"],
+        )
+
+    def test_plugin_arch_setting_overrides_stale_torch_arch_setting(self):
+        environment = {
+            "COMFYUI_TURING_UTILS_ARCH_LIST": "8.6",
+            "TORCH_CUDA_ARCH_LIST": "7.5",
+        }
+        with (
+            mock.patch.object(platform, "system", return_value="Linux"),
+            mock.patch.dict(os.environ, environment, clear=False),
+            mock.patch("torch.utils.cpp_extension.CUDAExtension", side_effect=self._extension),
+            mock.patch("torch.utils.cpp_extension.BuildExtension", object()),
+            mock.patch("setuptools.setup"),
+        ):
+            namespace = runpy.run_path(
+                str(SETUP_PATH), run_name="__turing_utils_arch_precedence_test__"
+            )
+            torch_arch_list = os.environ["TORCH_CUDA_ARCH_LIST"]
+
+        self.assertEqual(namespace["ARCH_LIST"], "8.6")
+        self.assertEqual(torch_arch_list, "8.6")
+
+    def test_sm90a_arch_suffix_builds_integer_attention(self):
+        environment = {"COMFYUI_TURING_UTILS_ARCH_LIST": "9.0a"}
+        with (
+            mock.patch.object(platform, "system", return_value="Linux"),
+            mock.patch.dict(os.environ, environment, clear=False),
+            mock.patch("torch.utils.cpp_extension.CUDAExtension", side_effect=self._extension),
+            mock.patch("torch.utils.cpp_extension.BuildExtension", object()),
+            mock.patch("setuptools.setup") as setup,
+        ):
+            runpy.run_path(
+                str(SETUP_PATH), run_name="__turing_utils_sm90a_setup_test__"
+            )
+
+        self.assertEqual(len(setup.call_args.kwargs["ext_modules"]), 3)
 
     def test_retired_sage2_fp8_helpers_are_not_compiled(self):
         sage_dir = PLUGIN_ROOT / "kernel" / "csrc" / "turing" / "sage"
@@ -167,7 +211,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.27.0")
+        self.assertEqual(metadata["project"]["version"], "0.28.0")
 
     def test_overlap_epilogue_is_self_contained_and_deterministic_by_design(self):
         source = (
@@ -315,7 +359,14 @@ class KernelSetupTest(unittest.TestCase):
 
             extensions = self._run_windows_setup(prefix)
 
-        self.assertEqual([extension.name for extension in extensions], ["comfyui_turing_utils_kernel._C"])
+        self.assertEqual(
+            [extension.name for extension in extensions],
+            [
+                "comfyui_turing_utils_kernel._C",
+                "comfyui_turing_utils_kernel._sage_qattn_sm75",
+                "comfyui_turing_utils_kernel._sage_fused_sm75",
+            ],
+        )
         self.assertEqual(extensions[0].kwargs["include_dirs"][1], str(conda_include.resolve()))
         self.assertIn(str(cccl.resolve()), extensions[0].kwargs["include_dirs"])
         self.assertIn("/std:c++20", extensions[0].kwargs["extra_compile_args"]["cxx"])

@@ -15,6 +15,7 @@ sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from comfyui_turing_utils import precision as bf16_policy  # noqa: E402
+from comfyui_turing_utils import hardware  # noqa: E402
 from comfyui_turing_utils.quantization import dispatch as turing_ops  # noqa: E402
 from comfy_kitchen.backends import cuda as kitchen_cuda  # noqa: E402
 
@@ -288,6 +289,22 @@ class BF16PolicyTest(unittest.TestCase):
         ):
             self.assertTrue(turing_ops.is_supported_turing_device(torch.device("cuda", 1)))
             self.assertFalse(turing_ops.is_supported_turing_device(torch.device("cuda", 0)))
+
+    def test_integer_attention_supports_ampere_and_newer(self):
+        with (
+            mock.patch("torch.cuda.is_available", return_value=True),
+            mock.patch(
+                "torch.cuda.get_device_capability",
+                side_effect=lambda index: ((7, 5), (8, 0), (8, 9), (9, 0))[index],
+            ),
+            mock.patch("torch.cuda.get_device_name", return_value="NVIDIA A100"),
+        ):
+            self.assertTrue(hardware.is_supported_attention_device(torch.device("cuda", 0)))
+            self.assertTrue(hardware.is_supported_attention_device(torch.device("cuda", 1)))
+            self.assertTrue(hardware.is_supported_attention_device(torch.device("cuda", 2)))
+            self.assertTrue(hardware.is_supported_attention_device(torch.device("cuda", 3)))
+
+        self.assertFalse(hardware.is_supported_attention_device(torch.device("cpu")))
 
     def test_gtx_16_series_is_not_treated_as_supported_turing(self):
         with (

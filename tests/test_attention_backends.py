@@ -450,6 +450,55 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertIs(captured["q"], q)
         self.assertIs(out, q)
 
+    def test_external_w8a8_recoverable_rejection_uses_original_backend(self):
+        kitchen = mock.Mock(
+            side_effect=RuntimeError("Q/K strides must preserve 4-element alignment")
+        )
+        kitchen.container_function = mock.Mock()
+        original = mock.Mock(return_value="fallback")
+        with mock.patch(
+            "comfy.ldm.modules.attention.get_attention_function",
+            side_effect=lambda name, default: (
+                kitchen if name == "comfy_kitchen_int8" else default
+            ),
+        ):
+            override = attention_backends.make_attention_override("w8a8")
+
+        q = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+        self.assertEqual(
+            override(original, q, q, q, 2, skip_reshape=True),
+            "fallback",
+        )
+        original.assert_called_once()
+
+    def test_external_w8a8_container_rejection_preserves_fallback_inputs(self):
+        kitchen = mock.Mock(side_effect=RuntimeError("kernel is not supported"))
+        kitchen.container_function = mock.Mock()
+        fallback = mock.Mock(return_value="fallback")
+        with (
+            mock.patch(
+                "comfy.ldm.modules.attention.get_attention_function",
+                side_effect=lambda name, default: (
+                    kitchen if name == "comfy_kitchen_int8" else default
+                ),
+            ),
+            mock.patch("attention._default_attention_fallback", return_value=fallback),
+        ):
+            override = attention_backends.make_attention_override("w8a8")
+
+        containers = tuple(
+            comfy_attention.AttentionTensorContainer(
+                torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+            )
+            for _ in range(3)
+        )
+        self.assertEqual(
+            override.container_function(*containers, 2, skip_reshape=True),
+            "fallback",
+        )
+        fallback.assert_called_once()
+        self.assertTrue(all(container.tensor is None for container in containers))
+
     def test_sage_fp32_fallback_runs_through_comfy_attention_wrapper(self):
         model = FakeModel()
         with (
@@ -663,7 +712,17 @@ class AttentionBackendsTest(unittest.TestCase):
                 "w8a8", device=torch.device("cuda", 0)
             )
         self.assertEqual(override.turing_utils_attention_implementation, "comfy:comfy_kitchen_int8")
-        self.assertIs(override.container_function, kitchen.container_function)
+        containers = tuple(
+            comfy_attention.AttentionTensorContainer(
+                torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
+            )
+            for _ in range(3)
+        )
+        self.assertEqual(
+            override.container_function(*containers, 2, skip_reshape=True),
+            "kitchen",
+        )
+        self.assertTrue(all(container.tensor is None for container in containers))
 
     def test_legacy_sage_alias_uses_external_sage_on_non_turing_device(self):
         sage = mock.Mock(return_value="sage")
@@ -733,7 +792,7 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertIsInstance(sparse.call_args.kwargs["debug_route_state"], dict)
         self.assertEqual(
             override.turing_utils_attention_implementation,
-            "bundled_turing_sol_sparse",
+            "bundled_sol_sparse",
         )
 
     def test_sparse_override_uses_stable_sage_for_first_and_last_layers(self):
@@ -820,6 +879,37 @@ class AttentionBackendsTest(unittest.TestCase):
         sparse.assert_called_once()
         self.assertTrue(sparse.call_args.kwargs["use_w8a8"])
 
+    def test_sparse_ampere_uses_bundled_sol_and_kitchen_dense_backend(self):
+        kitchen = mock.Mock(return_value="dense")
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=False),
+            mock.patch("attention.is_supported_attention_device", return_value=True),
+            mock.patch("attention.bundled_sparse_available", return_value=True),
+            mock.patch("attention.bundled_w8a8_available", return_value=True),
+            mock.patch("attention.preflight_bundled_sparse") as sparse_preflight,
+            mock.patch("attention.preflight_bundled_w8a8") as w8a8_preflight,
+            mock.patch(
+                "comfy.ldm.modules.attention.get_attention_function",
+                side_effect=lambda name, default: (
+                    kitchen if name == "comfy_kitchen_int8" else default
+                ),
+            ),
+        ):
+            override = attention_backends.make_sparse_attention_override(
+                torch.device("cuda", 0), use_w8a8=True
+            )
+
+        sparse_preflight.assert_called_once_with(torch.device("cuda", 0))
+        w8a8_preflight.assert_called_once_with(torch.device("cuda", 0))
+        self.assertEqual(
+            override.turing_utils_attention_implementation,
+            "bundled_sol_sparse",
+        )
+        self.assertEqual(
+            override.turing_utils_dense_implementation,
+            "comfy:comfy_kitchen_int8",
+        )
+
     def test_overlapping_dense_layer_ranges_bypass_sol_for_every_layer(self):
         q = torch.zeros((1, 2, 4096, 128), dtype=torch.bfloat16)
         with (
@@ -856,10 +946,11 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertEqual(dense.call_count, 50)
         sparse.assert_not_called()
 
-    def test_experimental_sparse_rejects_non_turing_device(self):
+    def test_sparse_rejects_unsupported_device(self):
         with (
             mock.patch("attention.is_supported_turing_device", return_value=False),
-            self.assertRaisesRegex(RuntimeError, "sm75 Turing"),
+            mock.patch("attention.is_supported_attention_device", return_value=False),
+            self.assertRaisesRegex(RuntimeError, "CUDA Tensor Core GPU"),
         ):
             attention_backends.make_sparse_attention_override(torch.device("cuda", 0))
 

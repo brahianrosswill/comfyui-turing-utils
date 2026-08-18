@@ -3,7 +3,7 @@
 Compatibility and performance extensions that fill gaps in ComfyUI on older
 NVIDIA Turing GPUs. The plugin currently provides ConvRot W8A8/W4A8/W4A4
 support, exact-sm75 BF16 activation storage, bundled Turing Sage/W8A8
-attention, and focused Wan/Bernini utilities.
+attention, native sm75+ Sol sparse attention, and focused Wan/Bernini utilities.
 
 ## Requirements
 
@@ -12,7 +12,9 @@ attention, and focused Wan/Bernini utilities.
 - Python 3.10 or newer
 - PyTorch with CUDA and ComfyUI
 - `comfy-kitchen>=0.2.26` for ConvRot model integration
-- the independently installed `comfyui-turing-utils-kernel>=0.23.0` on exact sm75
+- the independently installed `comfyui-turing-utils-kernel>=0.28.0` for native
+  Sol on Ampere or newer; exact-sm75 installs also provide the local dense
+  attention and quantized-linear paths
 
 Grouped-codebook `asym_w4a8_int8` checkpoints require kernel 0.24.0. Existing
 W8A8, W4A4, legacy W4A8, and attention paths keep their earlier minimum.
@@ -66,7 +68,7 @@ only after its CUDA sources or required version change.
   long-sequence sparse backend. It uses an input-adaptive statistical threshold,
   keeps one 64-token skipped-block centroid by default, accepts semantic
   multimodal layout metadata, and exposes integer dense-step safeguards,
-  dense first/last-layer protection, the SM75 W8A8 PV path by default, and an
+  dense first/last-layer protection, the native integer W8A8 PV path by default, and an
   internal automatic short-sequence crossover.
 - `Patch Turing Attention Kernel Tuning (Experimental)` overrides the logical
   CTA-K schedule and the fused Hadamard/adaptive-anchor quality controls for
@@ -116,13 +118,21 @@ Sol remains an independent patch rather than a loader option because its
 quality/performance policy is intentionally configurable. Connect the model
 through the Sol patch node to enable it explicitly. The
 kernel accepts FP16/BF16/FP32 Q/K/V, GQA, head dimensions 1--128, unequal Q/K,
-and unmasked non-causal sequences; incompatible or short calls use bundled
-stable Sage. Automatic semantic protection requires separate Query/K layout
+and unmasked non-causal sequences; incompatible or short calls use the selected
+architecture-native dense backend. Automatic semantic protection requires separate Query/K layout
 metadata for unequal sequences; ambiguous single-sequence metadata falls back
 instead of applying the wrong ranges.
 
-Online Sol routing and the bundled dense/Sol W8A8 backends require kernel
-package 0.23.0. Adapter-protected Query blocks run through the
+The bundled Sol core is native on sm75, Ampere, Ada, and Hopper when those
+architectures are included in the kernel build. Exact-sm75 protected dense
+steps/layers use bundled Sage or W8A8. On newer GPUs they delegate to the
+installed SageAttention or Comfy Kitchen W8A8 backend, so Sol does not replace
+an architecture-specific dense implementation with the Turing schedule. The
+extension filenames retain their historical `_sm75` suffix as a Python ABI
+name; it no longer describes the only cubin that can be built.
+
+Online Sol routing on Ampere or newer requires kernel package 0.28.0.
+Adapter-protected Query blocks run through the
 selected exact dense backend, while every sparse Query keeps protected modality
 blocks as exact K/V sinks. Selected blocks reuse stable Sage's INT8 Tensor Core
 QK path. Routing and exact selected-block QK both derive from the
@@ -204,6 +214,9 @@ python kernel/scripts/benchmark_backends.py --device cuda:0 --suite all
 
 Compatible A40 runs validate numerical behavior and allocation shapes but do
 not replace final exact-sm75 occupancy and end-to-end testing.
+For native A40 validation, build with
+`COMFYUI_TURING_UTILS_ARCH_LIST="8.6"`; this emits sm86 cubins and enables the
+Ampere async-copy and INT8 MMA specializations rather than JITing compute_75.
 
 ## License
 
