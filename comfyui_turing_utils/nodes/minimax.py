@@ -6,9 +6,17 @@ import torch
 
 import comfy.nested_tensor
 import comfy.utils
+import folder_paths
 from comfy_api.latest import io
 from ..adapters.minimax.block_cache import install_minimax_block_cache
+from ..adapters.minimax.latent_upscaler import (
+    load_h3_latent_upscaler,
+    upscale_h3_latent,
+)
 from .wan import WanVideoFramesPadding, repeat_last_frame
+
+
+H3LatentUpscaleModel = io.Custom("TURING_UTILS_H3_LATENT_UPSCALE_MODEL")
 
 
 def _is_h3_frame_count(frame_count: int) -> bool:
@@ -279,3 +287,82 @@ class H3SeparateAVLatent(io.ComfyNode):
             video_latent["noise_mask"] = video_mask
             audio_latent["noise_mask"] = audio_mask
         return io.NodeOutput(video_latent, audio_latent)
+
+
+class MiniMaxH3LatentUpscaleModelLoader(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="TuringUtilsMiniMaxH3LatentUpscaleModelLoader",
+            display_name="Load MiniMax H3 Latent Upscaler",
+            category="Turing Utils/loaders",
+            description=(
+                "Load an attention-free 3D MiniMax H3 latent upscaler from "
+                "models/latent_upscale_models with ComfyUI-managed VRAM offloading."
+            ),
+            inputs=[
+                io.Combo.Input(
+                    "model_name",
+                    options=folder_paths.get_filename_list("latent_upscale_models"),
+                ),
+                io.Combo.Input(
+                    "precision",
+                    options=["auto", "fp16", "bf16", "fp32"],
+                    default="auto",
+                    tooltip=(
+                        "Auto selects the efficient native compute type for the current device. "
+                        "FP16 is normally preferred on Turing."
+                    ),
+                ),
+            ],
+            outputs=[H3LatentUpscaleModel.Output(display_name="upscale_model")],
+        )
+
+    @classmethod
+    def execute(cls, model_name: str, precision: str) -> io.NodeOutput:
+        return io.NodeOutput(load_h3_latent_upscaler(model_name, precision))
+
+
+class MiniMaxH3LatentUpscale(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="TuringUtilsMiniMaxH3LatentUpscale",
+            display_name="MiniMax H3 Latent Upscale",
+            category="Turing Utils/latent",
+            description=(
+                "Learned spatial upscale for MiniMax H3 AV latents. The video stream and "
+                "FL2AV keyframe latents are enlarged together; audio and Ref2AV references "
+                "remain unchanged, so conditioning does not need to be rebuilt."
+            ),
+            inputs=[
+                H3LatentUpscaleModel.Input("upscale_model"),
+                io.Latent.Input("latent"),
+                io.Conditioning.Input("conditioning"),
+                io.Float.Input(
+                    "scale",
+                    default=2.0,
+                    min=1.0,
+                    max=4.0,
+                    step=0.1,
+                    tooltip=(
+                        "Spatial latent upscale multiplier. Time and audio are preserved. "
+                        "Output H/W are rounded up to H3's 2x2 latent patch grid."
+                    ),
+                ),
+            ],
+            outputs=[
+                io.Latent.Output(display_name="latent"),
+                io.Conditioning.Output(display_name="conditioning"),
+            ],
+        )
+
+    @classmethod
+    def execute(cls, upscale_model, latent, conditioning, scale: float) -> io.NodeOutput:
+        output_latent, output_conditioning = upscale_h3_latent(
+            upscale_model,
+            latent,
+            conditioning,
+            scale,
+        )
+        return io.NodeOutput(output_latent, output_conditioning)

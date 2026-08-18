@@ -8,6 +8,8 @@ from .nodes.minimax import (
     H3ConcatAVLatent,
     H3SeparateAVLatent,
     MiniMaxH3BlockCachePatch,
+    MiniMaxH3LatentUpscale,
+    MiniMaxH3LatentUpscaleModelLoader,
     MiniMaxH3VideoFramesPadding,
 )
 from .nodes.minimax_vae import (
@@ -26,6 +28,8 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsBerniniInpaintCondition": BerniniInpaintCondition,
     "TuringUtilsH3ConcatAVLatent": H3ConcatAVLatent,
     "TuringUtilsH3SeparateAVLatent": H3SeparateAVLatent,
+    "TuringUtilsMiniMaxH3LatentUpscaleModelLoader": MiniMaxH3LatentUpscaleModelLoader,
+    "TuringUtilsMiniMaxH3LatentUpscale": MiniMaxH3LatentUpscale,
     "TuringUtilsMiniMaxH3BlockCachePatch": MiniMaxH3BlockCachePatch,
     "TuringUtilsSolSparseAttentionPatch": SolSparseAttentionPatch,
     "TuringUtilsAttentionKernelTuningPatch": AttentionKernelTuningPatch,
@@ -43,6 +47,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsBerniniInpaintCondition": "Bernini Inpaint Condition",
     "TuringUtilsH3ConcatAVLatent": "H3 Concat AV Latent",
     "TuringUtilsH3SeparateAVLatent": "H3 Separate AV Latent",
+    "TuringUtilsMiniMaxH3LatentUpscaleModelLoader": "Load MiniMax H3 Latent Upscaler",
+    "TuringUtilsMiniMaxH3LatentUpscale": "MiniMax H3 Latent Upscale",
     "TuringUtilsMiniMaxH3BlockCachePatch": "Patch MiniMax H3 Block Cache (Experimental)",
     "TuringUtilsSolSparseAttentionPatch": "Patch Sol Sparse Attention",
     "TuringUtilsAttentionKernelTuningPatch": "Patch Turing Attention Kernel Tuning (Experimental)",

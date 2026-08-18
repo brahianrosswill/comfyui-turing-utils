@@ -77,6 +77,8 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsBerniniInpaintCondition",
                 "TuringUtilsH3ConcatAVLatent",
                 "TuringUtilsH3SeparateAVLatent",
+                "TuringUtilsMiniMaxH3LatentUpscaleModelLoader",
+                "TuringUtilsMiniMaxH3LatentUpscale",
                 "TuringUtilsMiniMaxH3BlockCachePatch",
                 "TuringUtilsSolSparseAttentionPatch",
                 "TuringUtilsAttentionKernelTuningPatch",

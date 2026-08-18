@@ -53,6 +53,15 @@ only after its CUDA sources or required version change.
 - `H3 Concat AV Latent` combines standalone H3 video and audio latents into the
   model's native nested AV latent. `H3 Separate AV Latent` splits the streams
   again; both nodes preserve matching video/audio noise masks.
+- `Load MiniMax H3 Latent Upscaler` loads the attention-free 3D learned latent
+  upscaler through ComfyUI's normal offload lifecycle. Place compatible weights
+  from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
+  in `models/latent_upscale_models/`.
+- `MiniMax H3 Latent Upscale` enlarges only the video stream by a continuous
+  1x--4x multiplier and passes the audio stream through exactly. It accepts and
+  returns one `CONDITIONING`: FL2AV first/last keyframe latents are enlarged by
+  the same learned model, while Ref2AV image/video/audio references retain their
+  independent geometry. No text or VAE conditioning stage is rerun.
 - `MiniMax H3 Video VAE Decode/Encode` provide fixed 256px H3
   tiling, full-overlap shared-core decode, a deterministic FP32 overlap
   epilogue, global multiband stitching, and ComfyUI-managed block-level weight
