@@ -344,6 +344,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         with (
             mock.patch.object(video_vae, "TILE_SIZE", 4),
             mock.patch.object(video_vae, "TILE_OVERLAP", 2),
+            mock.patch.object(video_vae, "is_supported_turing_device", return_value=True),
             mock.patch.object(video_vae, "load_turing_sage", return_value=unavailable),
             torch.inference_mode(),
         ):
@@ -359,6 +360,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         with (
             mock.patch.object(video_vae, "TILE_SIZE", 4),
             mock.patch.object(video_vae, "TILE_OVERLAP", 2),
+            mock.patch.object(video_vae, "is_supported_turing_device", return_value=True),
             mock.patch.object(video_vae, "load_turing_sage", return_value=available),
             torch.inference_mode(),
         ):
@@ -373,6 +375,27 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             )
         self.assertGreater(len(calls), 0)
         torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)
+
+    def test_streaming_overlap_kernel_is_not_selected_off_turing(self):
+        model = SimpleNamespace(
+            decoder=SimpleNamespace(num_register_tokens=0, pos_embed=lambda rotary: rotary),
+            vae_ratio=2,
+        )
+        with (
+            mock.patch.object(video_vae, "is_supported_turing_device", return_value=False),
+            mock.patch.object(video_vae, "load_turing_sage") as load_kernel,
+            mock.patch.object(video_vae, "_SharedWindowLayout") as layout_type,
+            mock.patch.object(video_vae.h3_vae, "create_token_ids", return_value=torch.zeros(1, 1, 3)),
+        ):
+            layout_type.return_value.window_h = 1
+            layout_type.return_value.window_w = 1
+            layout_type.return_value.window_tokens = 1
+            plan = video_vae._SharedSpatialPlan(
+                model, 1, 1, 1, torch.device("cpu"), torch.float16
+            )
+
+        self.assertIsNone(plan.overlap_accumulate)
+        load_kernel.assert_not_called()
 
     def test_small_feed_forward_batches_keep_fused_swiglu(self):
         module = mock.Mock()

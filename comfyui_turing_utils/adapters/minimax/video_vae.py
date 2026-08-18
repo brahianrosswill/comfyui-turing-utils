@@ -30,6 +30,7 @@ from ...attention.protocol import (
     RMSNormSpec,
     RotaryEmbeddingSpec,
 )
+from ...hardware import is_supported_turing_device
 from ...kernel_api import load_turing_sage
 
 
@@ -713,15 +714,14 @@ class _SharedSpatialPlan:
         self._query_groups = {}
         self._overlap_batch_maps = {}
         self._overlap_backend_logged = False
-        try:
-            turing_sage = load_turing_sage()
-            self.overlap_accumulate = (
-                turing_sage.overlap_accumulate_compiled
-                if turing_sage.overlap_accumulate_available()
-                else None
-            )
-        except (AttributeError, ImportError, OSError, RuntimeError):
-            self.overlap_accumulate = None
+        self.overlap_accumulate = None
+        if is_supported_turing_device(device):
+            try:
+                turing_sage = load_turing_sage()
+                if turing_sage.overlap_accumulate_available():
+                    self.overlap_accumulate = turing_sage.overlap_accumulate_compiled
+            except (AttributeError, ImportError, OSError, RuntimeError):
+                pass
 
     def query_groups(self, minimum_weight):
         key = float(minimum_weight)
