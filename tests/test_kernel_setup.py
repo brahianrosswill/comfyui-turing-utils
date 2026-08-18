@@ -96,35 +96,39 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(
             "csrc/turing/sage/overlap_blend.cu", extensions[2].kwargs["sources"]
         )
-        self.assertEqual(setup.call_args.kwargs["version"], "0.28.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.28.1")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
         })
 
-    def test_default_arch_is_turing_and_explicit_hopper_remains_supported(self):
+    def test_visible_gpu_arches_are_default_and_explicit_multiarch_is_supported(self):
         setup_source = SETUP_PATH.read_text(encoding="utf-8")
         wheel_source = (
             PLUGIN_ROOT / "kernel" / "scripts" / "build_wheel.py"
         ).read_text(encoding="utf-8")
         self.assertIn(
-            'os.environ.get("TORCH_CUDA_ARCH_LIST", "7.5")',
+            "def _visible_cuda_arches()",
             setup_source,
         )
         self.assertIn('{"75", "80", "86", "89", "90"}', setup_source)
-        self.assertIn('DEFAULT_ARCH_LIST = "7.5"', wheel_source)
+        self.assertIn('default=None', wheel_source)
+        self.assertIn('defaults to all visible supported GPUs', wheel_source)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             include_dir = Path(temp_dir) / "cutlass" / "include"
             self._make_cutlass_headers(include_dir)
             environment = {
-                "COMFYUI_TURING_UTILS_ARCH_LIST": "8.0;8.6;8.9;90",
+                "COMFYUI_TURING_UTILS_ARCH_LIST": "8.0;8.6;8.9;90;8.6",
                 "COMFYUI_TURING_UTILS_CUTLASS_INCLUDE_DIR": str(include_dir),
             }
             with (
                 mock.patch.dict(os.environ, environment, clear=True),
                 mock.patch.object(platform, "system", return_value="Linux"),
-                mock.patch("torch.utils.cpp_extension.CUDAExtension", side_effect=self._extension),
+                mock.patch(
+                    "torch.utils.cpp_extension.CUDAExtension",
+                    side_effect=self._extension,
+                ),
                 mock.patch("torch.utils.cpp_extension.BuildExtension", object()),
                 mock.patch("setuptools.setup") as setup,
             ):
@@ -145,6 +149,58 @@ class KernelSetupTest(unittest.TestCase):
             "csrc/turing/sage/sol_sparse_cuda_sm75.cu",
             setup.call_args.kwargs["ext_modules"][1].kwargs["sources"],
         )
+
+    def test_default_arch_detects_all_unique_visible_gpu_capabilities(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            include_dir = Path(temp_dir) / "cutlass" / "include"
+            self._make_cutlass_headers(include_dir)
+            environment = {
+                "COMFYUI_TURING_UTILS_CUTLASS_INCLUDE_DIR": str(include_dir),
+            }
+            with (
+                mock.patch.dict(os.environ, environment, clear=True),
+                mock.patch.object(platform, "system", return_value="Linux"),
+                mock.patch("torch.cuda.is_available", return_value=True),
+                mock.patch("torch.cuda.device_count", return_value=3),
+                mock.patch(
+                    "torch.cuda.get_device_capability",
+                    side_effect=((8, 6), (7, 5), (8, 6)),
+                ),
+                mock.patch(
+                    "torch.utils.cpp_extension.CUDAExtension",
+                    side_effect=self._extension,
+                ),
+                mock.patch("torch.utils.cpp_extension.BuildExtension", object()),
+                mock.patch("setuptools.setup") as setup,
+            ):
+                namespace = runpy.run_path(
+                    str(SETUP_PATH), run_name="__turing_utils_autoarch_setup_test__"
+                )
+
+        self.assertEqual(namespace["ARCH_LIST"], "7.5;8.6")
+        self.assertEqual(len(setup.call_args.kwargs["ext_modules"]), 3)
+
+    def test_default_arch_falls_back_to_turing_without_a_visible_gpu(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            include_dir = Path(temp_dir) / "cutlass" / "include"
+            self._make_cutlass_headers(include_dir)
+            environment = {
+                "COMFYUI_TURING_UTILS_CUTLASS_INCLUDE_DIR": str(include_dir),
+            }
+            with (
+                mock.patch.dict(os.environ, environment, clear=True),
+                mock.patch.object(platform, "system", return_value="Linux"),
+                mock.patch("torch.cuda.is_available", return_value=False),
+                mock.patch("torch.utils.cpp_extension.CUDAExtension", side_effect=self._extension),
+                mock.patch("torch.utils.cpp_extension.BuildExtension", object()),
+                mock.patch("setuptools.setup") as setup,
+            ):
+                namespace = runpy.run_path(
+                    str(SETUP_PATH), run_name="__turing_utils_no_gpu_setup_test__"
+                )
+
+        self.assertEqual(namespace["ARCH_LIST"], "7.5")
+        self.assertEqual(len(setup.call_args.kwargs["ext_modules"]), 3)
 
     def test_plugin_arch_setting_overrides_stale_torch_arch_setting(self):
         environment = {
@@ -211,7 +267,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.28.0")
+        self.assertEqual(metadata["project"]["version"], "0.28.1")
 
     def test_overlap_epilogue_is_self_contained_and_deterministic_by_design(self):
         source = (

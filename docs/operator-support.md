@@ -17,6 +17,8 @@ ComfyUI nodes
 
 The plugin and kernel package remain independently installable. A Python-only
 plugin update does not rebuild CUDA. Sparse attention remains an explicit patch.
+Kernel builds target all unique visible supported CUDA architectures unless a
+cross-compilation list is supplied explicitly.
 The loader defaults to bundled W8A8 on supported Turing GPUs and Comfy Kitchen
 INT8 attention on newer architectures; Sage and SDPA remain explicit choices.
 If Kitchen rejects a shape or an incompatible installed binary at runtime, the

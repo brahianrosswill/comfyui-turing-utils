@@ -28,6 +28,11 @@ cd comfyui-turing-utils
 python -m pip install -v --no-build-isolation -e ./kernel
 ```
 
+The kernel build detects every visible supported CUDA architecture and removes
+duplicates. A machine with a 2080 Ti and a 3070 therefore builds `7.5;8.6` in
+one install. Set `COMFYUI_TURING_UTILS_ARCH_LIST` only for cross-compilation or
+to override the visible-device set. GPU-less build hosts fall back to `7.5`.
+
 The custom node and CUDA package have separate installation lifecycles.
 Python-only plugin updates never invoke a compiler or JIT; rebuild the kernel
 only after its CUDA sources or required version change.

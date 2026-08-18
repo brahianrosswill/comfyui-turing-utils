@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = ROOT / "kernel"
 COMFYUI_ROOT = ROOT.parents[1]
-EXPECTED_VERSION = "0.28.0"
+EXPECTED_VERSION = "0.28.1"
 
 
 def _run(command: list[str], *, cwd: Path = ROOT, env=None) -> None:
@@ -78,7 +78,8 @@ def _static_gate() -> None:
     for marker in (
         "CUDA_TOOLKIT_VERSION = _cuda_toolkit_version()",
         "def _normalize_cxx_standard(",
-        'os.environ.get("TORCH_CUDA_ARCH_LIST", "7.5")',
+        "def _visible_cuda_arches()",
+        'os.environ.get("TORCH_CUDA_ARCH_LIST")',
         'os.environ["TORCH_CUDA_ARCH_LIST"] = ARCH_LIST',
         'return "c++20" if cuda_version is None or cuda_version >= (12, 0) else "c++17"',
         '"COMFYUI_TURING_UTILS_NVCC_CXX_STANDARD", DEFAULT_CXX_STANDARD',
@@ -89,7 +90,8 @@ def _static_gate() -> None:
             )
     wheel_builder = (KERNEL / "scripts/build_wheel.py").read_text(encoding="utf-8")
     for marker in (
-        'DEFAULT_ARCH_LIST = "7.5"',
+        'default=None',
+        'defaults to all visible supported GPUs',
         "def configure_cuda_home(",
         'prefix / "Library" if platform.system() == "Windows" else prefix',
         'env.setdefault("CUDA_HOME", str(root.resolve()))',

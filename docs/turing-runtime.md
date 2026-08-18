@@ -470,13 +470,14 @@ in the tested contractions; no production documentation claims otherwise.
 
 ## Validation boundary
 
-The default release build still targets sm75 only. An explicit
-`COMFYUI_TURING_UTILS_ARCH_LIST` can add native Ampere, Ada, or Hopper Sol
-cubins without changing that default. Static tests validate dispatch,
-fallbacks, loader independence, shapes, dtypes, spill-free SM75 resources for
-every compiled core/attention/preprocessing family, the public symbol boundary,
-and exclusion of the retired Sage1/Sage2 variants. For compatible A40
-validation, build with:
+Local builds detect and deduplicate all visible supported GPU capabilities. A
+mixed Turing/Ampere host therefore emits both cubins automatically. An explicit
+`COMFYUI_TURING_UTILS_ARCH_LIST` remains available for cross-compilation;
+GPU-less builders use a conservative sm75 fallback. Static tests validate
+dispatch, fallbacks, loader independence, shapes, dtypes, spill-free SM75
+resources for every compiled core/attention/preprocessing family, the public
+symbol boundary, and exclusion of the retired Sage1/Sage2 variants. For
+compatible A40 validation, build with:
 
 ```bash
 COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX" \

@@ -18,6 +18,7 @@ if IS_WINDOWS:
     # cl.exe output reliably on non-English Windows installations.
     os.environ.setdefault("VSLANG", "1033")
 
+import torch
 from setuptools import find_packages, setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 
@@ -334,14 +335,28 @@ def _windows_cccl_include_dirs() -> list[str]:
     )
 
 
-def _arch_list() -> str:
-    # Production installs target exact Turing by default.  Developers and wheel
-    # builders can still request Ampere, Ada, Hopper, or PTX explicitly without
-    # making every local Turing install compile unused architectures.
-    value = os.environ.get(
-        "COMFYUI_TURING_UTILS_ARCH_LIST",
-        os.environ.get("TORCH_CUDA_ARCH_LIST", "7.5"),
+def _visible_cuda_arches() -> tuple[str, ...]:
+    try:
+        if not torch.cuda.is_available():
+            return ()
+        capabilities = {
+            tuple(torch.cuda.get_device_capability(index))
+            for index in range(torch.cuda.device_count())
+        }
+    except (OSError, RuntimeError):
+        return ()
+    return tuple(
+        f"{major}.{minor}"
+        for major, minor in sorted(capabilities)
+        if (major, minor) >= (7, 5)
     )
+
+
+def _arch_list() -> str:
+    explicit = os.environ.get("COMFYUI_TURING_UTILS_ARCH_LIST")
+    if explicit is None:
+        explicit = os.environ.get("TORCH_CUDA_ARCH_LIST")
+    value = explicit or ";".join(_visible_cuda_arches()) or "7.5"
     arches = []
     for raw in value.replace(",", ";").split(";"):
         arch = raw.strip()
@@ -349,7 +364,8 @@ def _arch_list() -> str:
             continue
         if arch in {"75", "80", "86", "89", "90"}:
             arch = f"{arch[0]}.{arch[1]}"
-        arches.append(arch)
+        if arch not in arches:
+            arches.append(arch)
     return ";".join(arches)
 
 
@@ -358,6 +374,7 @@ ARCH_LIST = _arch_list()
 # value also prevents a stale global Torch setting from silently producing a
 # wheel for a different architecture than setup.py advertises.
 os.environ["TORCH_CUDA_ARCH_LIST"] = ARCH_LIST
+print(f"comfyui-turing-utils-kernel: CUDA architectures {ARCH_LIST}")
 CUTLASS_INCLUDE_DIR = _cutlass_include_dir()
 CCCL_INCLUDE_DIRS = _windows_cccl_include_dirs()
 
@@ -514,7 +531,7 @@ if _includes_integer_attention_arch():
 
 setup(
     name="comfyui-turing-utils-kernel",
-    version="0.28.0",
+    version="0.28.1",
     packages=find_packages(where=str(ROOT)),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

@@ -10,7 +10,6 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_ARCH_LIST = "7.5"
 
 
 def run(cmd: list[str], env: dict[str, str]) -> None:
@@ -40,13 +39,18 @@ def configure_cuda_home(env: dict[str, str]) -> Path | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build a comfyui-turing-utils-kernel wheel.")
-    parser.add_argument("--arch-list", default=os.environ.get("COMFYUI_TURING_UTILS_ARCH_LIST", DEFAULT_ARCH_LIST))
+    parser.add_argument(
+        "--arch-list",
+        default=None,
+        help="CUDA architectures to compile; defaults to all visible supported GPUs.",
+    )
     parser.add_argument("--with-isolation", action="store_true", help="Use PEP 517 build isolation.")
     parser.add_argument("--skip-build-deps", action="store_true", help="Do not install pip/build/wheel/ninja.")
     args = parser.parse_args()
 
     env = os.environ.copy()
-    env["COMFYUI_TURING_UTILS_ARCH_LIST"] = args.arch_list
+    if args.arch_list:
+        env["COMFYUI_TURING_UTILS_ARCH_LIST"] = args.arch_list
     nvcc = configure_cuda_home(env)
 
     if platform.system() == "Windows":
