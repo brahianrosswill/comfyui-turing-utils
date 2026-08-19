@@ -3,7 +3,7 @@ from __future__ import annotations
 from .nodes.attention import AttentionKernelTuningPatch, SolSparseAttentionPatch
 from .nodes.bernini import BerniniContextWindowsCore, BerniniInpaintCondition
 from .nodes.loaders import ConvRotCLIPLoader, ConvRotDiffusionModelLoader
-from .nodes.media import VideoMotionContactSheet
+from .nodes.media import ResizeImageIfPresent, VideoMotionContactSheet
 from .nodes.minimax import (
     H3ConcatAVLatent,
     H3SeparateAVLatent,
@@ -33,6 +33,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsMiniMaxH3BlockCachePatch": MiniMaxH3BlockCachePatch,
     "TuringUtilsSolSparseAttentionPatch": SolSparseAttentionPatch,
     "TuringUtilsAttentionKernelTuningPatch": AttentionKernelTuningPatch,
+    "TuringUtilsResizeImageIfPresent": ResizeImageIfPresent,
     "TuringUtilsVideoMotionContactSheet": VideoMotionContactSheet,
     "TuringUtilsMiniMaxH3VideoVAEDecode": MiniMaxH3VideoVAEDecode,
     "TuringUtilsMiniMaxH3VideoVAEEncode": MiniMaxH3VideoVAEEncode,
@@ -52,6 +53,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsMiniMaxH3BlockCachePatch": "Patch MiniMax H3 Block Cache (Experimental)",
     "TuringUtilsSolSparseAttentionPatch": "Patch Sol Sparse Attention",
     "TuringUtilsAttentionKernelTuningPatch": "Patch Turing Attention Kernel Tuning (Experimental)",
+    "TuringUtilsResizeImageIfPresent": "Resize Image If Present",
     "TuringUtilsVideoMotionContactSheet": "Video Motion Contact Sheet (Experimental)",
     "TuringUtilsMiniMaxH3VideoVAEDecode": "MiniMax H3 Video VAE Decode",
     "TuringUtilsMiniMaxH3VideoVAEEncode": "MiniMax H3 Video VAE Encode",

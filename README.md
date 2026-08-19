@@ -50,6 +50,10 @@ only after its CUDA sources or required version change.
   selectable absolute or official relative temporal positions.
 - `Wan Video Frames Padding` exposes Wan-compatible frame padding.
 - `MiniMax H3 Video Frames Padding` pads to H3's `17*n+5` frame grid.
+- `Resize Image If Present` resizes, crops, or pads an optional image and mask.
+  With no image connected it returns no image, so one graph can safely feed
+  optional first- or last-frame conditioning sockets without making a black
+  placeholder frame.
 - `H3 Concat AV Latent` combines standalone H3 video and audio latents into the
   model's native nested AV latent. `H3 Separate AV Latent` splits the streams
   again; both nodes preserve matching video/audio noise masks.
