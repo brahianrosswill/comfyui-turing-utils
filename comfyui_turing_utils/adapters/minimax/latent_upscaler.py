@@ -79,6 +79,8 @@ _PRECISION_DTYPES = {
     "fp32": torch.float32,
 }
 
+H3_VIDEO_VAE_SPATIAL_DOWNSAMPLE = 16
+
 
 def _normalization(channels: int, *, device=None, dtype=None):
     return comfy.ops.disable_weight_init.GroupNorm(
@@ -582,13 +584,18 @@ def upscale_h3_latent(upscale_model, latent, conditioning, scale: float):
     """Upscale by a total spatial-pixel multiplier without rebuilding conditioning."""
     if scale < 1.0 or scale > 16.0:
         raise ValueError(f"scale must be between 1.0 and 16.0, got {scale}")
-    if scale == 1.0:
-        return latent, conditioning
     if not isinstance(latent, dict) or "samples" not in latent:
         raise ValueError("latent must be a LATENT dictionary")
 
     video, audio = _av_streams(latent["samples"])
     source_height, source_width = map(int, video.shape[-2:])
+    if scale == 1.0:
+        return (
+            latent,
+            conditioning,
+            source_width * H3_VIDEO_VAE_SPATIAL_DOWNSAMPLE,
+            source_height * H3_VIDEO_VAE_SPATIAL_DOWNSAMPLE,
+        )
     # The public upscaler is conditioned on a linear H/W multiplier, while the
     # node exposes the more useful total spatial-pixel (and token) multiplier.
     linear_scale = math.sqrt(float(scale))
@@ -628,4 +635,9 @@ def upscale_h3_latent(upscale_model, latent, conditioning, scale: float):
             )
 
     output_conditioning = None if conditioning is None else _sync_conditioning(conditioning, outputs)
-    return output_latent, output_conditioning
+    return (
+        output_latent,
+        output_conditioning,
+        target_width * H3_VIDEO_VAE_SPATIAL_DOWNSAMPLE,
+        target_height * H3_VIDEO_VAE_SPATIAL_DOWNSAMPLE,
+    )

@@ -355,15 +355,17 @@ class MiniMaxH3LatentUpscale(io.ComfyNode):
             outputs=[
                 io.Latent.Output(display_name="latent"),
                 io.Conditioning.Output(display_name="conditioning"),
+                io.Int.Output("width", tooltip="Aligned pixel width produced by the upscaled H3 video latent."),
+                io.Int.Output("height", tooltip="Aligned pixel height produced by the upscaled H3 video latent."),
             ],
         )
 
     @classmethod
     def execute(cls, upscale_model, latent, conditioning=None, scale: float = 2.0) -> io.NodeOutput:
-        output_latent, output_conditioning = upscale_h3_latent(
+        output_latent, output_conditioning, width, height = upscale_h3_latent(
             upscale_model,
             latent,
             conditioning,
             scale,
         )
-        return io.NodeOutput(output_latent, output_conditioning)
+        return io.NodeOutput(output_latent, output_conditioning, width, height)
