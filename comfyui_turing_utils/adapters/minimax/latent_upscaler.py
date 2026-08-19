@@ -590,7 +590,7 @@ def upscale_h3_latent(upscale_model, latent, conditioning, scale: float):
     source_height, source_width = map(int, video.shape[-2:])
     target_height = _target_axis(source_height, scale)
     target_width = _target_axis(source_width, scale)
-    keyframes = _conditioning_keyframes(conditioning, source_height, source_width)
+    keyframes = [] if conditioning is None else _conditioning_keyframes(conditioning, source_height, source_width)
     outputs = _upscale_tensors(
         upscale_model,
         [video, *keyframes],
@@ -623,4 +623,5 @@ def upscale_h3_latent(upscale_model, latent, conditioning, scale: float):
                 target_width,
             )
 
-    return output_latent, _sync_conditioning(conditioning, outputs)
+    output_conditioning = None if conditioning is None else _sync_conditioning(conditioning, outputs)
+    return output_latent, output_conditioning

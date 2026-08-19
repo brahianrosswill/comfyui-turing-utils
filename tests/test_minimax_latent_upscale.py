@@ -77,6 +77,7 @@ class MiniMaxH3LatentUpscaleTest(unittest.TestCase):
             "conditioning",
             "scale",
         ])
+        self.assertTrue(upscale.inputs[2].optional)
 
     @mock.patch("comfy.model_management.load_models_gpu")
     def test_fl2av_upscales_video_keyframes_and_video_mask(self, load_models_gpu):
@@ -178,6 +179,22 @@ class MiniMaxH3LatentUpscaleTest(unittest.TestCase):
         self.assertIs(output[0], latent)
         self.assertIs(output[1], conditioning)
         load_models_gpu.assert_not_called()
+
+    @mock.patch("comfy.model_management.load_models_gpu")
+    def test_unconnected_conditioning_only_upscales_the_latent(self, load_models_gpu):
+        patcher = _FakePatcher()
+        video = torch.randn(1, 24, 2, 4, 6)
+
+        output_latent, output_conditioning = MiniMaxH3LatentUpscale.execute(
+            upscale_model=patcher,
+            latent={"samples": video},
+            scale=1.5,
+        ).result
+
+        self.assertEqual(tuple(output_latent["samples"].shape), (1, 24, 2, 6, 10))
+        self.assertIsNone(output_conditioning)
+        self.assertEqual(len(patcher.model.calls), 1)
+        load_models_gpu.assert_called_once()
 
     def test_detected_3d_architecture_round_trips_numerically(self):
         torch.manual_seed(1)

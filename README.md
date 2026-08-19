@@ -62,10 +62,11 @@ only after its CUDA sources or required version change.
   from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
   in `models/latent_upscale_models/`.
 - `MiniMax H3 Latent Upscale` enlarges only the video stream by a continuous
-  1x--4x multiplier and passes the audio stream through exactly. It accepts and
-  returns one `CONDITIONING`: FL2AV first/last keyframe latents are enlarged by
-  the same learned model, while Ref2AV image/video/audio references retain their
-  independent geometry. No text or VAE conditioning stage is rerun.
+  1x--4x multiplier and passes the audio stream through exactly. Its optional
+  `CONDITIONING` input enlarges FL2AV first/last keyframe latents with the same
+  learned model, while Ref2AV image/video/audio references retain their
+  independent geometry. Without it, only the AV latent is processed. No text
+  or VAE conditioning stage is rerun.
 - `MiniMax H3 Video VAE Decode/Encode` provide fixed 256px H3
   tiling, full-overlap shared-core decode, a deterministic FP32 overlap
   epilogue, global multiband stitching, and ComfyUI-managed block-level weight

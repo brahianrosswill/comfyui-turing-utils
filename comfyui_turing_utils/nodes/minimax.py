@@ -332,13 +332,13 @@ class MiniMaxH3LatentUpscale(io.ComfyNode):
             category="Turing Utils/latent",
             description=(
                 "Learned spatial upscale for MiniMax H3 AV latents. The video stream and "
-                "FL2AV keyframe latents are enlarged together; audio and Ref2AV references "
-                "remain unchanged, so conditioning does not need to be rebuilt."
+                "optional FL2AV keyframe latents are enlarged together; audio and Ref2AV "
+                "references remain unchanged."
             ),
             inputs=[
                 H3LatentUpscaleModel.Input("upscale_model"),
                 io.Latent.Input("latent"),
-                io.Conditioning.Input("conditioning"),
+                io.Conditioning.Input("conditioning", optional=True, tooltip="Optional FL2AV conditioning whose first/last keyframe latents should follow the same spatial upscale."),
                 io.Float.Input(
                     "scale",
                     default=2.0,
@@ -358,7 +358,7 @@ class MiniMaxH3LatentUpscale(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, upscale_model, latent, conditioning, scale: float) -> io.NodeOutput:
+    def execute(cls, upscale_model, latent, conditioning=None, scale: float = 2.0) -> io.NodeOutput:
         output_latent, output_conditioning = upscale_h3_latent(
             upscale_model,
             latent,
