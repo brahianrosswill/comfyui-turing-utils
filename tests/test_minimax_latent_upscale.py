@@ -114,16 +114,16 @@ class MiniMaxH3LatentUpscaleTest(unittest.TestCase):
 
         output_video, output_audio = output_latent["samples"].unbind()
         output_video_mask, output_audio_mask = output_latent["noise_mask"].unbind()
-        self.assertEqual(tuple(output_video.shape), (1, 24, 3, 8, 12))
+        self.assertEqual(tuple(output_video.shape), (1, 24, 3, 6, 8))
         self.assertIs(output_audio, audio)
-        self.assertEqual(tuple(output_video_mask.shape), (1, 24, 3, 8, 12))
+        self.assertEqual(tuple(output_video_mask.shape), (1, 24, 3, 6, 8))
         self.assertIs(output_audio_mask, audio_mask)
         self.assertEqual(output_latent["metadata"], "preserved")
 
         synced_options = output_conditioning[0][1]
         self.assertIs(output_conditioning[0][0], embedding)
-        self.assertEqual(tuple(synced_options["minimax_keyframes"][0]["latent"].shape), (1, 24, 1, 8, 12))
-        self.assertEqual(tuple(synced_options["minimax_keyframes"][1]["latent"].shape), (1, 24, 1, 8, 12))
+        self.assertEqual(tuple(synced_options["minimax_keyframes"][0]["latent"].shape), (1, 24, 1, 6, 8))
+        self.assertEqual(tuple(synced_options["minimax_keyframes"][1]["latent"].shape), (1, 24, 1, 6, 8))
         self.assertIs(synced_options["minimax_refs"], refs)
         self.assertNotIn("layout", synced_options)
 
@@ -131,6 +131,7 @@ class MiniMaxH3LatentUpscaleTest(unittest.TestCase):
         self.assertIs(options["minimax_keyframes"][0]["latent"], first)
         self.assertIn("layout", options)
         self.assertEqual(len(patcher.model.calls), 2)  # main video and batched keyframes
+        self.assertAlmostEqual(patcher.model.calls[0][1], 2.0**0.5)
         load_models_gpu.assert_called_once()
 
     @mock.patch("comfy.model_management.load_models_gpu")
@@ -158,7 +159,7 @@ class MiniMaxH3LatentUpscaleTest(unittest.TestCase):
         ).result
 
         output_video, output_audio = output_latent["samples"].unbind()
-        self.assertEqual(tuple(output_video.shape), (1, 24, 2, 6, 10))
+        self.assertEqual(tuple(output_video.shape), (1, 24, 2, 6, 8))
         self.assertIs(output_audio, audio)
         self.assertIs(output_conditioning[0][1], conditioning[0][1])
         self.assertIs(output_conditioning[0][1]["minimax_refs"][0]["latent"], reference)
@@ -191,7 +192,7 @@ class MiniMaxH3LatentUpscaleTest(unittest.TestCase):
             scale=1.5,
         ).result
 
-        self.assertEqual(tuple(output_latent["samples"].shape), (1, 24, 2, 6, 10))
+        self.assertEqual(tuple(output_latent["samples"].shape), (1, 24, 2, 6, 8))
         self.assertIsNone(output_conditioning)
         self.assertEqual(len(patcher.model.calls), 1)
         load_models_gpu.assert_called_once()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from dataclasses import dataclass
 
@@ -578,9 +579,9 @@ def _resize_video_mask(mask: torch.Tensor, target_height: int, target_width: int
 
 
 def upscale_h3_latent(upscale_model, latent, conditioning, scale: float):
-    """Upscale target video and FL2AV keyframes without rebuilding conditioning."""
-    if scale < 1.0 or scale > 4.0:
-        raise ValueError(f"scale must be between 1.0 and 4.0, got {scale}")
+    """Upscale by a total spatial-pixel multiplier without rebuilding conditioning."""
+    if scale < 1.0 or scale > 16.0:
+        raise ValueError(f"scale must be between 1.0 and 16.0, got {scale}")
     if scale == 1.0:
         return latent, conditioning
     if not isinstance(latent, dict) or "samples" not in latent:
@@ -588,13 +589,16 @@ def upscale_h3_latent(upscale_model, latent, conditioning, scale: float):
 
     video, audio = _av_streams(latent["samples"])
     source_height, source_width = map(int, video.shape[-2:])
-    target_height = _target_axis(source_height, scale)
-    target_width = _target_axis(source_width, scale)
+    # The public upscaler is conditioned on a linear H/W multiplier, while the
+    # node exposes the more useful total spatial-pixel (and token) multiplier.
+    linear_scale = math.sqrt(float(scale))
+    target_height = _target_axis(source_height, linear_scale)
+    target_width = _target_axis(source_width, linear_scale)
     keyframes = [] if conditioning is None else _conditioning_keyframes(conditioning, source_height, source_width)
     outputs = _upscale_tensors(
         upscale_model,
         [video, *keyframes],
-        scale,
+        linear_scale,
         target_height,
         target_width,
     )

@@ -331,7 +331,7 @@ class MiniMaxH3LatentUpscale(io.ComfyNode):
             display_name="MiniMax H3 Latent Upscale",
             category="Turing Utils/latent",
             description=(
-                "Learned spatial upscale for MiniMax H3 AV latents. The video stream and "
+                "Learned spatial pixel-count upscale for MiniMax H3 AV latents. The video stream and "
                 "optional FL2AV keyframe latents are enlarged together; audio and Ref2AV "
                 "references remain unchanged."
             ),
@@ -343,10 +343,11 @@ class MiniMaxH3LatentUpscale(io.ComfyNode):
                     "scale",
                     default=2.0,
                     min=1.0,
-                    max=4.0,
+                    max=16.0,
                     step=0.1,
                     tooltip=(
-                        "Spatial latent upscale multiplier. Time and audio are preserved. "
+                        "Total spatial pixel/token multiplier. For example, 2.0 scales H/W "
+                        "by sqrt(2), while 4.0 scales H/W by 2. Time and audio are preserved. "
                         "Output H/W are rounded up to H3's 2x2 latent patch grid."
                     ),
                 ),
