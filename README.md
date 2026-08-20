@@ -57,6 +57,18 @@ only after its CUDA sources or required version change.
 - `H3 Concat AV Latent` combines standalone H3 video and audio latents into the
   model's native nested AV latent. `H3 Separate AV Latent` splits the streams
   again; both nodes preserve matching video/audio noise masks.
+- `H3 Latent Info` reports the decoded pixel width, height, frame count, and
+  H3's 24 FPS model rate without running the VAE.
+- `H3 First/Last Frame Reference` encodes keyframe anchors and exposes separate
+  first- and last-frame outputs. `H3 Image/Video/Audio Reference` encode dynamic
+  generic reference sets without allocating a target latent. Visual references
+  can optionally align to the decoded canvas of a connected `latent`; otherwise
+  their native canvas is center-cropped to a 32-pixel grid.
+- `H3 Semantic Reference` performs the Qwen3-VL presentation encode once from
+  the prompt and reference objects. `H3 Build Conditioning` combines that
+  reusable semantic result with structure-equivalent VAE references and an H3
+  target latent. This permits low-resolution semantic images and separately
+  encoded high-resolution DiT keyframes without rerunning Qwen.
 - `Load MiniMax H3 Latent Upscaler` loads the attention-free 3D learned latent
   upscaler through ComfyUI's normal offload lifecycle. Place compatible weights
   from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
