@@ -18,7 +18,6 @@ H3_MODEL_FPS = 24.0
 H3_QWEN_VIDEO_FPS = 2.0
 H3_PIXEL_ALIGNMENT = 32
 H3_SPATIAL_DOWNSCALE = 16
-H3_REFERENCE_MAX_SHORT_EDGE = 2048
 
 H3KeyframesReferenceType = io.Custom("TURING_UTILS_H3_KEYFRAMES_REFERENCE")
 H3ImageReferenceType = io.Custom("TURING_UTILS_H3_IMAGE_REFERENCE")
@@ -144,14 +143,23 @@ def _align_keyframe_pixels(image: torch.Tensor, latent, name: str) -> torch.Tens
     ).movedim(1, -1)
 
 
-def _align_reference_pixels(image: torch.Tensor, latent, name: str) -> torch.Tensor:
+def _align_reference_pixels(
+    image: torch.Tensor,
+    latent,
+    name: str,
+    megapixels: float,
+) -> torch.Tensor:
     image = _validate_pixels(image, name)
     height, width = int(image.shape[1]), int(image.shape[2])
     if latent is None:
-        scale = min(1.0, H3_REFERENCE_MAX_SHORT_EDGE / min(width, height))
+        megapixels = float(megapixels)
+        if not math.isfinite(megapixels) or megapixels <= 0.0:
+            raise ValueError("megapixels must be finite and positive")
+        target_area = megapixels * 1_000_000.0
     else:
         target_width, target_height, _, _ = h3_latent_info(latent)
-        scale = min(1.0, math.sqrt((target_width * target_height) / (width * height)))
+        target_area = target_width * target_height
+    scale = min(1.0, math.sqrt(target_area / (width * height)))
     aligned_width = max(
         H3_PIXEL_ALIGNMENT,
         round(width * scale / H3_PIXEL_ALIGNMENT) * H3_PIXEL_ALIGNMENT,
@@ -431,10 +439,18 @@ class H3ImageReference(io.ComfyNode):
             description=(
                 "Encode dynamic H3 reference images without cropping or upscaling. "
                 "A latent applies match-area sizing; without one, the short edge is "
-                "limited to the 2048-pixel max reference budget."
+                "limited by the megapixel budget."
             ),
             inputs=[
                 io.Vae.Input("vae"),
+                io.Float.Input(
+                    "megapixels",
+                    default=1.0,
+                    min=0.01,
+                    max=16.0,
+                    step=0.05,
+                    tooltip="Maximum source area when latent is not connected; smaller images are not enlarged.",
+                ),
                 io.Latent.Input("latent", optional=True),
                 io.Autogrow.Input(
                     "images",
@@ -451,10 +467,10 @@ class H3ImageReference(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, vae, latent=None, images=None) -> io.NodeOutput:
+    def execute(cls, vae, megapixels=1.0, latent=None, images=None) -> io.NodeOutput:
         items = []
         for name, image in _dynamic_entries(images):
-            pixels = _align_reference_pixels(image[:1], latent, name)
+            pixels = _align_reference_pixels(image[:1], latent, name, float(megapixels))
             items.append(
                 {
                     "image": pixels,
@@ -475,10 +491,18 @@ class H3VideoReference(io.ComfyNode):
                 "Encode dynamic H3 reference videos that were resampled to 24 FPS "
                 "upstream, plus index-paired soundtracks. Qwen receives a 2 FPS view; "
                 "the DiT receives the full VAE latent. A latent applies match-area "
-                "sizing; without one, the short edge uses the 2048-pixel max budget."
+                "sizing; without one, the megapixel budget limits source area."
             ),
             inputs=[
                 io.Vae.Input("video_vae"),
+                io.Float.Input(
+                    "megapixels",
+                    default=1.0,
+                    min=0.01,
+                    max=16.0,
+                    step=0.05,
+                    tooltip="Maximum source area when latent is not connected; smaller videos are not enlarged.",
+                ),
                 io.Vae.Input("audio_vae", optional=True),
                 io.Latent.Input("latent", optional=True),
                 io.Autogrow.Input(
@@ -512,6 +536,7 @@ class H3VideoReference(io.ComfyNode):
     def execute(
         cls,
         video_vae,
+        megapixels=1.0,
         audio_vae=None,
         latent=None,
         videos=None,
@@ -525,7 +550,7 @@ class H3VideoReference(io.ComfyNode):
         for name, video in _dynamic_entries(videos):
             frames = _validate_pixels(video, name)
             frames = _trim_h3_reference_video(frames)
-            frames = _align_reference_pixels(frames, latent, name)
+            frames = _align_reference_pixels(frames, latent, name, float(megapixels))
             visual_latent = _encode_visual(video_vae, frames, name)
             soundtrack = soundtracks.get(_dynamic_suffix(name))
             audio_latent = None

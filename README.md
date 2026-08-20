@@ -62,8 +62,9 @@ only after its CUDA sources or required version change.
 - `H3 Keyframes` encodes the first and optional last keyframe as one ordered,
   extensible reference. `H3 Image/Video/Audio Reference` encode dynamic
   generic reference sets without allocating a target latent. Visual references
-  use match-area sizing when a `latent` is connected and the 2048-pixel max
-  short-edge budget otherwise; neither mode crops or enlarges the source.
+  use match-area sizing when a `latent` is connected and a configurable
+  megapixel area budget otherwise; neither mode crops or deliberately enlarges
+  the source. The default unbound reference budget is 1.0 megapixel.
   Video reference inputs must be resampled to 24 FPS by their upstream loaders.
 - `H3 Semantic Reference` performs the Qwen3-VL presentation encode once from
   the prompt and reference objects. `H3 Build Conditioning` combines that

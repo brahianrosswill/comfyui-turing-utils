@@ -124,7 +124,7 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
         self.assertEqual(tuple(reference.items[0]["image"].shape), (1, 96, 128, 3))
         self.assertEqual(tuple(reference.items[0]["latent"].shape), (1, 24, 1, 6, 8))
 
-    def test_image_reference_without_latent_uses_uncropped_max_sizing(self):
+    def test_image_reference_without_latent_uses_uncropped_megapixel_budget(self):
         vae = _FakeVideoVAE()
         image = torch.rand(1, 67, 99, 3)
 
@@ -132,6 +132,19 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
 
         self.assertEqual(tuple(reference.items[0]["image"].shape), (1, 64, 96, 3))
         self.assertEqual(tuple(reference.items[0]["latent"].shape), (1, 24, 1, 4, 6))
+
+    def test_image_reference_megapixel_budget_only_downscales_large_inputs(self):
+        vae = _FakeVideoVAE()
+        image = torch.rand(1, 128, 256, 3)
+
+        reference = H3ImageReference.execute(
+            vae,
+            megapixels=0.01,
+            images={"image_0": image},
+        ).result[0]
+
+        self.assertEqual(tuple(reference.items[0]["image"].shape), (1, 64, 128, 3))
+        self.assertEqual(tuple(reference.items[0]["latent"].shape), (1, 24, 1, 4, 8))
 
     def test_image_reference_with_latent_matches_area_without_upscaling(self):
         vae = _FakeVideoVAE()
@@ -174,6 +187,7 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
             "source_fps",
             [item.id for item in H3VideoReference.define_schema().inputs],
         )
+        self.assertEqual(H3VideoReference.define_schema().inputs[1].id, "megapixels")
 
         reference = H3VideoReference.execute(
             video_vae,
