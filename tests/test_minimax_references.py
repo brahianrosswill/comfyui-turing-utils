@@ -124,7 +124,7 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
         self.assertEqual(tuple(reference.items[0]["image"].shape), (1, 96, 128, 3))
         self.assertEqual(tuple(reference.items[0]["latent"].shape), (1, 24, 1, 6, 8))
 
-    def test_image_reference_without_latent_center_crops_to_32_pixel_grid(self):
+    def test_image_reference_without_latent_uses_uncropped_max_sizing(self):
         vae = _FakeVideoVAE()
         image = torch.rand(1, 67, 99, 3)
 
@@ -133,7 +133,35 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
         self.assertEqual(tuple(reference.items[0]["image"].shape), (1, 64, 96, 3))
         self.assertEqual(tuple(reference.items[0]["latent"].shape), (1, 24, 1, 4, 6))
 
-    def test_video_reference_normalizes_fps_and_pairs_audio_by_index(self):
+    def test_image_reference_with_latent_matches_area_without_upscaling(self):
+        vae = _FakeVideoVAE()
+        latent = {"samples": torch.zeros(1, 24, 2, 6, 8)}
+        image = torch.rand(1, 64, 64, 3)
+
+        reference = H3ImageReference.execute(
+            vae,
+            latent=latent,
+            images={"image_0": image},
+        ).result[0]
+
+        self.assertEqual(tuple(reference.items[0]["image"].shape), (1, 64, 64, 3))
+        self.assertEqual(tuple(reference.items[0]["latent"].shape), (1, 24, 1, 4, 4))
+
+    def test_image_reference_with_latent_preserves_aspect_in_match_mode(self):
+        vae = _FakeVideoVAE()
+        latent = {"samples": torch.zeros(1, 24, 2, 6, 8)}
+        image = torch.rand(1, 256, 256, 3)
+
+        reference = H3ImageReference.execute(
+            vae,
+            latent=latent,
+            images={"image_0": image},
+        ).result[0]
+
+        self.assertEqual(tuple(reference.items[0]["image"].shape), (1, 96, 96, 3))
+        self.assertEqual(tuple(reference.items[0]["latent"].shape), (1, 24, 1, 6, 6))
+
+    def test_video_reference_accepts_24_fps_and_pairs_audio_by_index(self):
         video_vae = _FakeVideoVAE()
         audio_vae = _FakeAudioVAE()
         frames = torch.rand(31, 70, 100, 3)
@@ -142,9 +170,13 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
             "sample_rate": 32000,
         }
 
+        self.assertNotIn(
+            "source_fps",
+            [item.id for item in H3VideoReference.define_schema().inputs],
+        )
+
         reference = H3VideoReference.execute(
             video_vae,
-            30.0,
             audio_vae=audio_vae,
             videos={"video_2": frames},
             video_audios={"video_audio_2": audio},
@@ -156,6 +188,20 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
         self.assertEqual(tuple(item["qwen_frames"].shape), (2, 64, 96, 3))
         self.assertEqual(item["timestamps"], [0.0, 0.5])
         self.assertEqual(tuple(item["audio_latent"].shape), (1, 32, 2, 10))
+
+    def test_video_reference_with_latent_matches_area_without_upscaling(self):
+        video_vae = _FakeVideoVAE()
+        latent = {"samples": torch.zeros(1, 24, 2, 6, 8)}
+        frames = torch.rand(22, 64, 64, 3)
+
+        reference = H3VideoReference.execute(
+            video_vae,
+            latent=latent,
+            videos={"video_0": frames},
+        ).result[0]
+
+        self.assertEqual(tuple(reference.items[0]["qwen_frames"].shape), (2, 64, 64, 3))
+        self.assertEqual(tuple(reference.items[0]["latent"].shape), (1, 24, 7, 4, 4))
 
     def test_semantic_combines_official_keyframe_and_reference_presentations(self):
         clip = _FakeClip()

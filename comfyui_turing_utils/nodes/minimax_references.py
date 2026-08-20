@@ -18,6 +18,7 @@ H3_MODEL_FPS = 24.0
 H3_QWEN_VIDEO_FPS = 2.0
 H3_PIXEL_ALIGNMENT = 32
 H3_SPATIAL_DOWNSCALE = 16
+H3_REFERENCE_MAX_SHORT_EDGE = 2048
 
 H3KeyframesReferenceType = io.Custom("TURING_UTILS_H3_KEYFRAMES_REFERENCE")
 H3ImageReferenceType = io.Custom("TURING_UTILS_H3_IMAGE_REFERENCE")
@@ -133,13 +134,38 @@ def _crop_to_alignment(image: torch.Tensor, name: str) -> torch.Tensor:
     return image[:, top : top + aligned_height, left : left + aligned_width]
 
 
-def _align_pixels(image: torch.Tensor, latent, name: str) -> torch.Tensor:
+def _align_keyframe_pixels(image: torch.Tensor, latent, name: str) -> torch.Tensor:
     image = _validate_pixels(image, name)
     if latent is None:
         return _crop_to_alignment(image, name)
     width, height, _, _ = h3_latent_info(latent)
     return comfy.utils.common_upscale(
         image.movedim(-1, 1), width, height, "lanczos", "center"
+    ).movedim(1, -1)
+
+
+def _align_reference_pixels(image: torch.Tensor, latent, name: str) -> torch.Tensor:
+    image = _validate_pixels(image, name)
+    height, width = int(image.shape[1]), int(image.shape[2])
+    if latent is None:
+        scale = min(1.0, H3_REFERENCE_MAX_SHORT_EDGE / min(width, height))
+    else:
+        target_width, target_height, _, _ = h3_latent_info(latent)
+        scale = min(1.0, math.sqrt((target_width * target_height) / (width * height)))
+    aligned_width = max(
+        H3_PIXEL_ALIGNMENT,
+        round(width * scale / H3_PIXEL_ALIGNMENT) * H3_PIXEL_ALIGNMENT,
+    )
+    aligned_height = max(
+        H3_PIXEL_ALIGNMENT,
+        round(height * scale / H3_PIXEL_ALIGNMENT) * H3_PIXEL_ALIGNMENT,
+    )
+    return comfy.utils.common_upscale(
+        image.movedim(-1, 1),
+        aligned_width,
+        aligned_height,
+        "lanczos",
+        "disabled",
     ).movedim(1, -1)
 
 
@@ -214,30 +240,11 @@ def _dynamic_suffix(name: str) -> int:
     return int(match.group(1)) if match else -1
 
 
-def _resample_video_frames(frames: torch.Tensor, source_fps: float) -> torch.Tensor:
-    if not math.isfinite(source_fps) or source_fps <= 0.0:
-        raise ValueError("source_fps must be finite and positive")
-    frame_count = int(frames.shape[0])
-    if frame_count < 1:
-        raise ValueError("reference video contains no frames")
-    if math.isclose(source_fps, H3_MODEL_FPS, rel_tol=0.0, abs_tol=1e-6):
-        return frames
-    target_count = max(
-        1,
-        math.floor((frame_count - 1) * H3_MODEL_FPS / source_fps) + 1,
-    )
-    indices = torch.arange(target_count, dtype=torch.float64, device=frames.device)
-    indices = (
-        (indices * source_fps / H3_MODEL_FPS).round().long().clamp_(max=frame_count - 1)
-    )
-    return frames.index_select(0, indices)
-
-
 def _trim_h3_reference_video(frames: torch.Tensor) -> torch.Tensor:
     frame_count = int(frames.shape[0])
     if frame_count < 5:
         raise ValueError(
-            "H3 reference videos require at least five frames after 24 FPS conversion"
+            "H3 reference videos require at least five input frames at 24 FPS"
         )
     valid_count = frame_count - (frame_count - 5) % 17
     return frames[:valid_count]
@@ -399,7 +406,7 @@ class H3Keyframes(io.ComfyNode):
         def prepare(value, role):
             if value is None:
                 return None
-            pixels = _align_pixels(value[:1], latent, role)
+            pixels = _align_keyframe_pixels(value[:1], latent, role)
             return {
                 "image": pixels,
                 "latent": _encode_visual(vae, pixels, role),
@@ -422,8 +429,9 @@ class H3ImageReference(io.ComfyNode):
             display_name="H3 Image Reference",
             category="Turing Utils/conditioning/minimax",
             description=(
-                "Encode a dynamic set of H3 reference images. An optional latent "
-                "aligns every image to its decoded pixel canvas."
+                "Encode dynamic H3 reference images without cropping or upscaling. "
+                "A latent applies match-area sizing; without one, the short edge is "
+                "limited to the 2048-pixel max reference budget."
             ),
             inputs=[
                 io.Vae.Input("vae"),
@@ -446,7 +454,7 @@ class H3ImageReference(io.ComfyNode):
     def execute(cls, vae, latent=None, images=None) -> io.NodeOutput:
         items = []
         for name, image in _dynamic_entries(images):
-            pixels = _align_pixels(image[:1], latent, name)
+            pixels = _align_reference_pixels(image[:1], latent, name)
             items.append(
                 {
                     "image": pixels,
@@ -464,14 +472,13 @@ class H3VideoReference(io.ComfyNode):
             display_name="H3 Video Reference",
             category="Turing Utils/conditioning/minimax",
             description=(
-                "Encode dynamic 24 FPS H3 reference videos and index-paired soundtracks. "
-                "Qwen receives a 2 FPS view; the DiT receives the full VAE latent."
+                "Encode dynamic H3 reference videos that were resampled to 24 FPS "
+                "upstream, plus index-paired soundtracks. Qwen receives a 2 FPS view; "
+                "the DiT receives the full VAE latent. A latent applies match-area "
+                "sizing; without one, the short edge uses the 2048-pixel max budget."
             ),
             inputs=[
                 io.Vae.Input("video_vae"),
-                io.Float.Input(
-                    "source_fps", default=24.0, min=0.01, max=240.0, step=0.01
-                ),
                 io.Vae.Input("audio_vae", optional=True),
                 io.Latent.Input("latent", optional=True),
                 io.Autogrow.Input(
@@ -479,7 +486,8 @@ class H3VideoReference(io.ComfyNode):
                     optional=True,
                     template=io.Autogrow.TemplatePrefix(
                         input=io.Image.Input(
-                            "video", tooltip="Consecutive source_fps video frames"
+                            "video",
+                            tooltip="Consecutive frames already resampled to 24 FPS",
                         ),
                         prefix="video_",
                         min=0,
@@ -504,7 +512,6 @@ class H3VideoReference(io.ComfyNode):
     def execute(
         cls,
         video_vae,
-        source_fps: float,
         audio_vae=None,
         latent=None,
         videos=None,
@@ -517,9 +524,8 @@ class H3VideoReference(io.ComfyNode):
         items = []
         for name, video in _dynamic_entries(videos):
             frames = _validate_pixels(video, name)
-            frames = _resample_video_frames(frames, float(source_fps))
             frames = _trim_h3_reference_video(frames)
-            frames = _align_pixels(frames, latent, name)
+            frames = _align_reference_pixels(frames, latent, name)
             visual_latent = _encode_visual(video_vae, frames, name)
             soundtrack = soundtracks.get(_dynamic_suffix(name))
             audio_latent = None
