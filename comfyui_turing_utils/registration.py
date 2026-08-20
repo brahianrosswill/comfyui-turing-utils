@@ -69,7 +69,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsH3ConcatAVLatent": "H3 Concat AV Latent",
     "TuringUtilsH3SeparateAVLatent": "H3 Separate AV Latent",
     "TuringUtilsH3LatentInfo": "H3 Latent Info",
-    "TuringUtilsH3FirstLastFrameReference": "H3 First/Last Frame Reference",
+    "TuringUtilsH3FirstLastFrameReference": "H3 First-Last-Frame Reference",
     "TuringUtilsH3ImageReference": "H3 Image Reference",
     "TuringUtilsH3VideoReference": "H3 Video Reference",
     "TuringUtilsH3AudioReference": "H3 Audio Reference",

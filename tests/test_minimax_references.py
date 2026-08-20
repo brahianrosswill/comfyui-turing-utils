@@ -87,6 +87,7 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
         semantic = H3SemanticReference.define_schema()
         build = H3BuildConditioning.define_schema()
 
+        self.assertEqual(frame.display_name, "H3 First-Last-Frame Reference")
         self.assertEqual([item.id for item in frame.inputs], [
             "vae", "latent", "first_frame", "last_frame",
         ])

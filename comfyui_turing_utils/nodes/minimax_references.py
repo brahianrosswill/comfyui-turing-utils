@@ -280,7 +280,7 @@ def _frame_reference(value, role: str):
     if value is None:
         return None
     if not isinstance(value, H3FrameReferenceData) or value.role != role:
-        raise ValueError(f"{role} must come from the matching H3 First/Last Frame Reference output")
+        raise ValueError(f"{role} must come from the matching H3 First-Last-Frame Reference output")
     return value
 
 
@@ -352,10 +352,10 @@ class H3FirstLastFrameReference(io.ComfyNode):
     def define_schema(cls):
         return io.Schema(
             node_id="TuringUtilsH3FirstLastFrameReference",
-            display_name="H3 First/Last Frame Reference",
+            display_name="H3 First-Last-Frame Reference",
             category="Turing Utils/conditioning/minimax",
             description=(
-                "Encode H3 first/last-frame anchors. With an optional latent, images "
+                "Encode H3 first-last-frame anchors. With an optional latent, images "
                 "are cover-resized and cropped to its decoded pixel canvas."
             ),
             inputs=[
@@ -599,7 +599,7 @@ class H3BuildConditioning(io.ComfyNode):
             category="Turing Utils/conditioning/minimax",
             description=(
                 "Combine a reusable Qwen semantic reference with current-resolution "
-                "first/last, image, video, and audio VAE references."
+                "first-last-frame, image, video, and audio VAE references."
             ),
             inputs=[
                 H3SemanticReferenceType.Input("semantic_reference"),
@@ -651,7 +651,7 @@ class H3BuildConditioning(io.ComfyNode):
                 raise ValueError(
                     f"{role} latent {tuple(visual.shape)} does not match target H3 "
                     f"spatial grid {tuple(target_video.shape[-2:])}; connect the same "
-                    "latent to H3 First/Last Frame Reference or resize upstream"
+                    "latent to H3 First-Last-Frame Reference or resize upstream"
                 )
             keyframes.append(
                 {"resolved_frame_index": frame_index, "latent": visual}

@@ -59,7 +59,7 @@ only after its CUDA sources or required version change.
   again; both nodes preserve matching video/audio noise masks.
 - `H3 Latent Info` reports the decoded pixel width, height, frame count, and
   H3's 24 FPS model rate without running the VAE.
-- `H3 First/Last Frame Reference` encodes keyframe anchors and exposes separate
+- `H3 First-Last-Frame Reference` encodes keyframe anchors and exposes separate
   first- and last-frame outputs. `H3 Image/Video/Audio Reference` encode dynamic
   generic reference sets without allocating a target latent. Visual references
   can optionally align to the decoded canvas of a connected `latent`; otherwise
