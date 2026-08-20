@@ -135,16 +135,16 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
 
     def test_image_reference_megapixel_budget_only_downscales_large_inputs(self):
         vae = _FakeVideoVAE()
-        image = torch.rand(1, 128, 256, 3)
+        image = torch.rand(1, 256, 512, 3)
 
         reference = H3ImageReference.execute(
             vae,
-            megapixels=0.01,
+            megapixels=0.1,
             images={"image_0": image},
         ).result[0]
 
-        self.assertEqual(tuple(reference.items[0]["image"].shape), (1, 64, 128, 3))
-        self.assertEqual(tuple(reference.items[0]["latent"].shape), (1, 24, 1, 4, 8))
+        self.assertEqual(tuple(reference.items[0]["image"].shape), (1, 224, 448, 3))
+        self.assertEqual(tuple(reference.items[0]["latent"].shape), (1, 24, 1, 14, 28))
 
     def test_image_reference_with_latent_matches_area_without_upscaling(self):
         vae = _FakeVideoVAE()

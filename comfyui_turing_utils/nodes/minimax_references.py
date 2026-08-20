@@ -446,9 +446,9 @@ class H3ImageReference(io.ComfyNode):
                 io.Float.Input(
                     "megapixels",
                     default=1.0,
-                    min=0.01,
+                    min=0.1,
                     max=16.0,
-                    step=0.05,
+                    step=0.1,
                     tooltip="Maximum source area when latent is not connected; smaller images are not enlarged.",
                 ),
                 io.Latent.Input("latent", optional=True),
@@ -498,9 +498,9 @@ class H3VideoReference(io.ComfyNode):
                 io.Float.Input(
                     "megapixels",
                     default=1.0,
-                    min=0.01,
+                    min=0.1,
                     max=16.0,
-                    step=0.05,
+                    step=0.1,
                     tooltip="Maximum source area when latent is not connected; smaller videos are not enlarged.",
                 ),
                 io.Vae.Input("audio_vae", optional=True),
