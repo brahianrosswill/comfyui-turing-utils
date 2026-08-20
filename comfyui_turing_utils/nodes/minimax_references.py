@@ -19,9 +19,7 @@ H3_QWEN_VIDEO_FPS = 2.0
 H3_PIXEL_ALIGNMENT = 32
 H3_SPATIAL_DOWNSCALE = 16
 
-H3FirstLastFrameReferenceType = io.Custom(
-    "TURING_UTILS_H3_FIRST_LAST_FRAME_REFERENCE"
-)
+H3KeyframesReferenceType = io.Custom("TURING_UTILS_H3_KEYFRAMES_REFERENCE")
 H3ImageReferenceType = io.Custom("TURING_UTILS_H3_IMAGE_REFERENCE")
 H3VideoReferenceType = io.Custom("TURING_UTILS_H3_VIDEO_REFERENCE")
 H3AudioReferenceType = io.Custom("TURING_UTILS_H3_AUDIO_REFERENCE")
@@ -30,18 +28,15 @@ H3SemanticReferenceType = io.Custom("TURING_UTILS_H3_SEMANTIC_REFERENCE")
 
 @dataclass(frozen=True)
 class H3ReferenceManifest:
-    first_frame: bool = False
-    last_frame: bool = False
+    keyframe_anchors: tuple[str, ...] = ()
     image_count: int = 0
     video_audio: tuple[bool, ...] = ()
     audio_count: int = 0
 
 
 @dataclass(frozen=True)
-class H3FrameReferenceData:
-    role: str
-    image: torch.Tensor
-    latent: torch.Tensor
+class H3KeyframesReferenceData:
+    items: tuple[dict, ...]
 
 
 @dataclass(frozen=True)
@@ -78,12 +73,12 @@ def _video_latent(latent) -> torch.Tensor:
         if not streams:
             raise ValueError("H3 AV latent contains no video stream")
         samples = streams[0]
-    if (
-        not torch.is_tensor(samples)
-        or samples.ndim != 5
-        or int(samples.shape[1]) != 24
-    ):
-        shape = tuple(samples.shape) if hasattr(samples, "shape") else type(samples).__name__
+    if not torch.is_tensor(samples) or samples.ndim != 5 or int(samples.shape[1]) != 24:
+        shape = (
+            tuple(samples.shape)
+            if hasattr(samples, "shape")
+            else type(samples).__name__
+        )
         raise ValueError(f"Expected H3 video latent [B,24,T,H,W], got {shape}")
     return samples
 
@@ -165,11 +160,19 @@ def _encode_visual(vae, pixels: torch.Tensor, name: str) -> torch.Tensor:
 
 
 def _encode_audio(audio_vae, audio, name: str) -> torch.Tensor:
-    if not isinstance(audio, dict) or "waveform" not in audio or "sample_rate" not in audio:
+    if (
+        not isinstance(audio, dict)
+        or "waveform" not in audio
+        or "sample_rate" not in audio
+    ):
         raise ValueError(f"{name} must be an AUDIO dictionary")
     waveform = audio["waveform"]
     if not torch.is_tensor(waveform) or waveform.ndim != 3:
-        shape = tuple(waveform.shape) if hasattr(waveform, "shape") else type(waveform).__name__
+        shape = (
+            tuple(waveform.shape)
+            if hasattr(waveform, "shape")
+            else type(waveform).__name__
+        )
         raise ValueError(f"{name} waveform must be [B,C,L], got {shape}")
     source_rate = int(audio["sample_rate"])
     target_rate = int(getattr(audio_vae, "audio_sample_rate", 32000))
@@ -188,7 +191,10 @@ def _encode_audio(audio_vae, audio, name: str) -> torch.Tensor:
 
 def _natural_key(value: str) -> tuple[str, int]:
     match = re.search(r"(\d+)$", str(value))
-    return (str(value)[: match.start()] if match else str(value), int(match.group(1)) if match else -1)
+    return (
+        str(value)[: match.start()] if match else str(value),
+        int(match.group(1)) if match else -1,
+    )
 
 
 def _dynamic_entries(values) -> tuple[tuple[str, object], ...]:
@@ -196,7 +202,9 @@ def _dynamic_entries(values) -> tuple[tuple[str, object], ...]:
         return ()
     return tuple(
         (str(key), value)
-        for key, value in sorted(values.items(), key=lambda item: _natural_key(str(item[0])))
+        for key, value in sorted(
+            values.items(), key=lambda item: _natural_key(str(item[0]))
+        )
         if value is not None
     )
 
@@ -219,32 +227,38 @@ def _resample_video_frames(frames: torch.Tensor, source_fps: float) -> torch.Ten
         math.floor((frame_count - 1) * H3_MODEL_FPS / source_fps) + 1,
     )
     indices = torch.arange(target_count, dtype=torch.float64, device=frames.device)
-    indices = (indices * source_fps / H3_MODEL_FPS).round().long().clamp_(max=frame_count - 1)
+    indices = (
+        (indices * source_fps / H3_MODEL_FPS).round().long().clamp_(max=frame_count - 1)
+    )
     return frames.index_select(0, indices)
 
 
 def _trim_h3_reference_video(frames: torch.Tensor) -> torch.Tensor:
     frame_count = int(frames.shape[0])
     if frame_count < 5:
-        raise ValueError("H3 reference videos require at least five frames after 24 FPS conversion")
+        raise ValueError(
+            "H3 reference videos require at least five frames after 24 FPS conversion"
+        )
     valid_count = frame_count - (frame_count - 5) % 17
     return frames[:valid_count]
 
 
 def _manifest(
-    first_frame: H3FrameReferenceData | None,
-    last_frame: H3FrameReferenceData | None,
+    keyframes_reference: H3KeyframesReferenceData | None,
     image_reference: H3ImageReferenceData | None,
     video_reference: H3VideoReferenceData | None,
     audio_reference: H3AudioReferenceData | None,
 ) -> H3ReferenceManifest:
     return H3ReferenceManifest(
-        first_frame=first_frame is not None,
-        last_frame=last_frame is not None,
+        keyframe_anchors=tuple(item["anchor"] for item in keyframes_reference.items)
+        if keyframes_reference
+        else (),
         image_count=len(image_reference.items) if image_reference else 0,
         video_audio=tuple(
             item["audio_latent"] is not None for item in video_reference.items
-        ) if video_reference else (),
+        )
+        if video_reference
+        else (),
         audio_count=len(audio_reference.items) if audio_reference else 0,
     )
 
@@ -257,8 +271,7 @@ def _reference_presentation(
     presentation = []
     if image_reference:
         presentation.extend(
-            {"type": "image", "data": item["image"]}
-            for item in image_reference.items
+            {"type": "image", "data": item["image"]} for item in image_reference.items
         )
     if video_reference:
         for item in video_reference.items:
@@ -276,18 +289,26 @@ def _reference_presentation(
     return presentation
 
 
-def _frame_reference(value, role: str):
+def _keyframes_reference(value):
     if value is None:
         return None
-    if not isinstance(value, H3FrameReferenceData) or value.role != role:
-        raise ValueError(f"{role} must come from the matching H3 First-Last-Frame Reference output")
+    if not isinstance(value, H3KeyframesReferenceData):
+        raise ValueError("keyframes_reference must come from H3 Keyframes")
     return value
 
 
-def _tokenize_semantic(clip, prompt: str, first_frame, last_frame, presentation):
-    images = [item.image for item in (first_frame, last_frame) if item is not None]
+def _tokenize_semantic(clip, prompt: str, keyframes_reference, presentation):
+    images = (
+        [item["image"] for item in keyframes_reference.items]
+        if keyframes_reference
+        else []
+    )
     if not images:
-        return clip.tokenize(prompt, minimax_ref_items=presentation) if presentation else clip.tokenize(prompt)
+        return (
+            clip.tokenize(prompt, minimax_ref_items=presentation)
+            if presentation
+            else clip.tokenize(prompt)
+        )
     if not presentation:
         return clip.tokenize(prompt, images=images)
 
@@ -303,7 +324,9 @@ def _tokenize_semantic(clip, prompt: str, first_frame, last_frame, presentation)
             raise ValueError
         return {key: [keyframe_rows[0] + reference_rows[0]]}
     except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("clip is not a compatible MiniMax H3 Qwen3-VL encoder") from error
+        raise ValueError(
+            "clip is not a compatible MiniMax H3 Qwen3-VL encoder"
+        ) from error
 
 
 def _reference_blocks(
@@ -329,7 +352,9 @@ def _reference_blocks(
                 "latent_t": int(item["latent"].shape[2]),
                 "latent_h": int(item["latent"].shape[-2]),
                 "latent_w": int(item["latent"].shape[-1]),
-                "ref_audio_t": int(item["audio_latent"].shape[-1]) if item["audio_latent"] is not None else 0,
+                "ref_audio_t": int(item["audio_latent"].shape[-1])
+                if item["audio_latent"] is not None
+                else 0,
                 "latent": item["latent"],
                 "audio_latent": item["audio_latent"],
             }
@@ -347,16 +372,16 @@ def _reference_blocks(
     return refs
 
 
-class H3FirstLastFrameReference(io.ComfyNode):
+class H3Keyframes(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="TuringUtilsH3FirstLastFrameReference",
-            display_name="H3 First-Last-Frame Reference",
+            node_id="TuringUtilsH3Keyframes",
+            display_name="H3 Keyframes",
             category="Turing Utils/conditioning/minimax",
             description=(
-                "Encode H3 first-last-frame anchors. With an optional latent, images "
-                "are cover-resized and cropped to its decoded pixel canvas."
+                "Encode H3 keyframe anchors as one ordered reference. With an optional "
+                "latent, images are cover-resized and cropped to its decoded pixel canvas."
             ),
             inputs=[
                 io.Vae.Input("vae"),
@@ -364,24 +389,29 @@ class H3FirstLastFrameReference(io.ComfyNode):
                 io.Image.Input("first_frame", optional=True),
                 io.Image.Input("last_frame", optional=True),
             ],
-            outputs=[
-                H3FirstLastFrameReferenceType.Output("first_frame"),
-                H3FirstLastFrameReferenceType.Output("last_frame"),
-            ],
+            outputs=[H3KeyframesReferenceType.Output("keyframes_reference")],
         )
 
     @classmethod
-    def execute(cls, vae, latent=None, first_frame=None, last_frame=None) -> io.NodeOutput:
+    def execute(
+        cls, vae, latent=None, first_frame=None, last_frame=None
+    ) -> io.NodeOutput:
         def prepare(value, role):
             if value is None:
                 return None
             pixels = _align_pixels(value[:1], latent, role)
-            return H3FrameReferenceData(role, pixels, _encode_visual(vae, pixels, role))
+            return {
+                "image": pixels,
+                "latent": _encode_visual(vae, pixels, role),
+            }
 
-        return io.NodeOutput(
-            prepare(first_frame, "first_frame"),
-            prepare(last_frame, "last_frame"),
-        )
+        items = []
+        for anchor, value in (("first", first_frame), ("last", last_frame)):
+            item = prepare(value, f"{anchor}_frame")
+            if item is not None:
+                item["anchor"] = anchor
+                items.append(item)
+        return io.NodeOutput(H3KeyframesReferenceData(tuple(items)))
 
 
 class H3ImageReference(io.ComfyNode):
@@ -439,14 +469,18 @@ class H3VideoReference(io.ComfyNode):
             ),
             inputs=[
                 io.Vae.Input("video_vae"),
-                io.Float.Input("source_fps", default=24.0, min=0.01, max=240.0, step=0.01),
+                io.Float.Input(
+                    "source_fps", default=24.0, min=0.01, max=240.0, step=0.01
+                ),
                 io.Vae.Input("audio_vae", optional=True),
                 io.Latent.Input("latent", optional=True),
                 io.Autogrow.Input(
                     "videos",
                     optional=True,
                     template=io.Autogrow.TemplatePrefix(
-                        input=io.Image.Input("video", tooltip="Consecutive source_fps video frames"),
+                        input=io.Image.Input(
+                            "video", tooltip="Consecutive source_fps video frames"
+                        ),
                         prefix="video_",
                         min=0,
                         max=16,
@@ -491,17 +525,26 @@ class H3VideoReference(io.ComfyNode):
             audio_latent = None
             if soundtrack is not None:
                 if audio_vae is None:
-                    raise ValueError(f"{name} has a soundtrack but audio_vae is not connected")
-                audio_latent = _encode_audio(audio_vae, soundtrack, f"{name} soundtrack")
+                    raise ValueError(
+                        f"{name} has a soundtrack but audio_vae is not connected"
+                    )
+                audio_latent = _encode_audio(
+                    audio_vae, soundtrack, f"{name} soundtrack"
+                )
             sample_stride = int(H3_MODEL_FPS / H3_QWEN_VIDEO_FPS)
-            indices = torch.arange(0, int(frames.shape[0]), sample_stride, device=frames.device)
+            indices = torch.arange(
+                0, int(frames.shape[0]), sample_stride, device=frames.device
+            )
             qwen_frames = frames.index_select(0, indices)
             items.append(
                 {
                     "latent": visual_latent,
                     "audio_latent": audio_latent,
                     "qwen_frames": qwen_frames,
-                    "timestamps": [index / H3_QWEN_VIDEO_FPS for index in range(int(qwen_frames.shape[0]))],
+                    "timestamps": [
+                        index / H3_QWEN_VIDEO_FPS
+                        for index in range(int(qwen_frames.shape[0]))
+                    ],
                 }
             )
         return io.NodeOutput(H3VideoReferenceData(tuple(items)))
@@ -555,8 +598,7 @@ class H3SemanticReference(io.ComfyNode):
             inputs=[
                 io.Clip.Input("clip"),
                 io.String.Input("prompt", multiline=True, dynamic_prompts=True),
-                H3FirstLastFrameReferenceType.Input("first_frame", optional=True),
-                H3FirstLastFrameReferenceType.Input("last_frame", optional=True),
+                H3KeyframesReferenceType.Input("keyframes_reference", optional=True),
                 H3ImageReferenceType.Input("image_reference", optional=True),
                 H3VideoReferenceType.Input("video_reference", optional=True),
                 H3AudioReferenceType.Input("audio_reference", optional=True),
@@ -569,23 +611,22 @@ class H3SemanticReference(io.ComfyNode):
         cls,
         clip,
         prompt: str,
-        first_frame=None,
-        last_frame=None,
+        keyframes_reference=None,
         image_reference=None,
         video_reference=None,
         audio_reference=None,
     ) -> io.NodeOutput:
-        first_frame = _frame_reference(first_frame, "first_frame")
-        last_frame = _frame_reference(last_frame, "last_frame")
+        keyframes_reference = _keyframes_reference(keyframes_reference)
         manifest = _manifest(
-            first_frame, last_frame, image_reference, video_reference, audio_reference
+            keyframes_reference,
+            image_reference,
+            video_reference,
+            audio_reference,
         )
         presentation = _reference_presentation(
             image_reference, video_reference, audio_reference
         )
-        tokens = _tokenize_semantic(
-            clip, prompt, first_frame, last_frame, presentation
-        )
+        tokens = _tokenize_semantic(clip, prompt, keyframes_reference, presentation)
         conditioning = clip.encode_from_tokens_scheduled(tokens)
         return io.NodeOutput(H3SemanticReferenceData(conditioning, manifest))
 
@@ -604,8 +645,7 @@ class H3BuildConditioning(io.ComfyNode):
             inputs=[
                 H3SemanticReferenceType.Input("semantic_reference"),
                 io.Latent.Input("latent"),
-                H3FirstLastFrameReferenceType.Input("first_frame", optional=True),
-                H3FirstLastFrameReferenceType.Input("last_frame", optional=True),
+                H3KeyframesReferenceType.Input("keyframes_reference", optional=True),
                 H3ImageReferenceType.Input("image_reference", optional=True),
                 H3VideoReferenceType.Input("video_reference", optional=True),
                 H3AudioReferenceType.Input("audio_reference", optional=True),
@@ -618,18 +658,19 @@ class H3BuildConditioning(io.ComfyNode):
         cls,
         semantic_reference,
         latent,
-        first_frame=None,
-        last_frame=None,
+        keyframes_reference=None,
         image_reference=None,
         video_reference=None,
         audio_reference=None,
     ) -> io.NodeOutput:
         if not isinstance(semantic_reference, H3SemanticReferenceData):
             raise ValueError("semantic_reference must come from H3 Semantic Reference")
-        first_frame = _frame_reference(first_frame, "first_frame")
-        last_frame = _frame_reference(last_frame, "last_frame")
+        keyframes_reference = _keyframes_reference(keyframes_reference)
         manifest = _manifest(
-            first_frame, last_frame, image_reference, video_reference, audio_reference
+            keyframes_reference,
+            image_reference,
+            video_reference,
+            audio_reference,
         )
         if manifest != semantic_reference.manifest:
             raise ValueError(
@@ -640,22 +681,20 @@ class H3BuildConditioning(io.ComfyNode):
         target_video = _video_latent(latent)
         frame_count = _frame_count_from_latent_t(int(target_video.shape[2]))
         keyframes = []
-        for role, item, frame_index in (
-            ("first_frame", first_frame, 0),
-            ("last_frame", last_frame, frame_count - 1),
-        ):
-            if item is None:
-                continue
-            visual = _validate_visual_latent(item.latent, role)
-            if int(visual.shape[2]) != 1 or tuple(visual.shape[-2:]) != tuple(target_video.shape[-2:]):
+        for item in keyframes_reference.items if keyframes_reference else ():
+            anchor = item["anchor"]
+            role = f"{anchor}_frame"
+            frame_index = 0 if anchor == "first" else frame_count - 1
+            visual = _validate_visual_latent(item["latent"], role)
+            if int(visual.shape[2]) != 1 or tuple(visual.shape[-2:]) != tuple(
+                target_video.shape[-2:]
+            ):
                 raise ValueError(
                     f"{role} latent {tuple(visual.shape)} does not match target H3 "
                     f"spatial grid {tuple(target_video.shape[-2:])}; connect the same "
-                    "latent to H3 First-Last-Frame Reference or resize upstream"
+                    "latent to H3 Keyframes or resize upstream"
                 )
-            keyframes.append(
-                {"resolved_frame_index": frame_index, "latent": visual}
-            )
+            keyframes.append({"resolved_frame_index": frame_index, "latent": visual})
 
         refs = _reference_blocks(image_reference, video_reference, audio_reference)
         values = {"minimax_frame_count": frame_count}
@@ -698,8 +737,8 @@ __all__ = [
     "H3AudioReference",
     "H3AudioReferenceData",
     "H3BuildConditioning",
-    "H3FirstLastFrameReference",
-    "H3FrameReferenceData",
+    "H3Keyframes",
+    "H3KeyframesReferenceData",
     "H3ImageReference",
     "H3ImageReferenceData",
     "H3LatentInfo",

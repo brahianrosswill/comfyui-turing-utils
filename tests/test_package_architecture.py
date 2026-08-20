@@ -26,15 +26,16 @@ class PackageArchitectureTest(unittest.TestCase):
                     modules = [node.module or ""]
                 else:
                     continue
-                if any(name.startswith("comfyui_turing_utils_kernel") for name in modules):
+                if any(
+                    name.startswith("comfyui_turing_utils_kernel") for name in modules
+                ):
                     offenders.append(str(path.relative_to(ROOT)))
         self.assertEqual(offenders, [])
 
     def test_attention_depends_on_layout_contract_not_minimax_adapter(self):
         attention_root = ROOT / "comfyui_turing_utils" / "attention"
         source = "\n".join(
-            path.read_text(encoding="utf-8")
-            for path in attention_root.glob("*.py")
+            path.read_text(encoding="utf-8") for path in attention_root.glob("*.py")
         )
         self.assertNotIn("adapters.minimax", source)
         self.assertIn("ensure_attention_layout_provider", source)
@@ -78,7 +79,7 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsH3ConcatAVLatent",
                 "TuringUtilsH3SeparateAVLatent",
                 "TuringUtilsH3LatentInfo",
-                "TuringUtilsH3FirstLastFrameReference",
+                "TuringUtilsH3Keyframes",
                 "TuringUtilsH3ImageReference",
                 "TuringUtilsH3VideoReference",
                 "TuringUtilsH3AudioReference",
