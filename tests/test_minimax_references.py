@@ -17,6 +17,7 @@ from comfyui_turing_utils.adapters.minimax.conditioning import (  # noqa: E402
 )
 from comfyui_turing_utils.nodes.minimax_references import (  # noqa: E402
     H3BuildConditioning,
+    H3_MAX_KEYFRAME_REFERENCES,
     H3KeyframeReference,
     H3KeyframeReferenceData,
     H3ImageReference,
@@ -95,31 +96,58 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
             [
                 "vae",
                 "latent",
-                "image",
+                "images",
             ],
         )
+        self.assertEqual(frame.inputs[2].template.prefix, "image_")
+        self.assertEqual(frame.inputs[2].template.min, 0)
+        self.assertEqual(frame.inputs[2].template.max, H3_MAX_KEYFRAME_REFERENCES)
         self.assertEqual(
-            [item.id for item in frame.outputs],
-            ["keyframe_reference"],
+            [item.id for item in frame.outputs[:3]],
+            ["keyframe_0", "keyframe_1", "keyframe_2"],
         )
+        self.assertEqual(len(frame.outputs), H3_MAX_KEYFRAME_REFERENCES)
         self.assertEqual(
             [item.id for item in semantic.inputs][2:4],
             ["first_frame", "last_frame"],
         )
+        self.assertNotIn("keyframes_reference", [item.id for item in semantic.inputs])
         self.assertEqual(
             [item.id for item in build.inputs][1:4],
             ["latent", "first_frame", "last_frame"],
         )
+        self.assertNotIn("keyframes_reference", [item.id for item in build.inputs])
 
     def test_frame_reference_aligns_to_target_latent_canvas(self):
         vae = _FakeVideoVAE()
         latent = {"samples": torch.zeros(1, 24, 2, 6, 8)}
         image = torch.rand(1, 90, 70, 3)
 
-        reference = H3KeyframeReference.execute(vae, image, latent=latent).result[0]
+        outputs = H3KeyframeReference.execute(
+            vae,
+            latent=latent,
+            images={"image_0": image},
+        ).result
+        reference = outputs[0]
 
         self.assertEqual(tuple(reference.image.shape), (1, 96, 128, 3))
         self.assertEqual(tuple(reference.latent.shape), (1, 24, 1, 6, 8))
+        self.assertEqual(len(outputs), H3_MAX_KEYFRAME_REFERENCES)
+        self.assertTrue(all(output is None for output in outputs[1:]))
+
+    def test_keyframe_outputs_follow_dynamic_input_order(self):
+        vae = _FakeVideoVAE()
+        image_2 = torch.rand(1, 64, 96, 3)
+        image_10 = torch.rand(1, 96, 128, 3)
+
+        outputs = H3KeyframeReference.execute(
+            vae,
+            images={"image_10": image_10, "image_2": image_2},
+        ).result
+
+        self.assertEqual(tuple(outputs[0].image.shape), (1, 64, 96, 3))
+        self.assertEqual(tuple(outputs[1].image.shape), (1, 96, 128, 3))
+        self.assertTrue(all(output is None for output in outputs[2:]))
 
     def test_image_reference_without_latent_uses_uncropped_megapixel_budget(self):
         vae = _FakeVideoVAE()

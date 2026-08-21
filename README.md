@@ -60,9 +60,10 @@ only after its CUDA sources or required version change.
   again; both nodes preserve matching video/audio noise masks.
 - `H3 Latent Info` reports the decoded pixel width, height, frame count, and
   H3's 24 FPS model rate without running the VAE.
-- `H3 Keyframe Reference` encodes one role-free, reusable keyframe. Its output
-  can connect to either the independent first- or last-frame socket on the
-  semantic/build nodes, including both roles across different sampling branches.
+- `H3 Keyframe Reference` dynamically adds `image_N` inputs and matching
+  `keyframe_N` outputs. Every output is role-free and reusable: it can connect
+  to either the independent first- or last-frame socket on the semantic/build
+  nodes, including both roles across different sampling branches.
   `H3 Image/Video/Audio Reference` encode dynamic
   generic reference sets without allocating a target latent. Visual references
   use match-area sizing when a `latent` is connected and a configurable
