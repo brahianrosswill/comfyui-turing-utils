@@ -79,7 +79,7 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsH3ConcatAVLatent",
                 "TuringUtilsH3SeparateAVLatent",
                 "TuringUtilsH3LatentInfo",
-                "TuringUtilsH3Keyframes",
+                "TuringUtilsH3KeyframeReference",
                 "TuringUtilsH3ImageReference",
                 "TuringUtilsH3VideoReference",
                 "TuringUtilsH3AudioReference",

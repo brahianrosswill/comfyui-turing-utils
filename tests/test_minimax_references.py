@@ -17,8 +17,8 @@ from comfyui_turing_utils.adapters.minimax.conditioning import (  # noqa: E402
 )
 from comfyui_turing_utils.nodes.minimax_references import (  # noqa: E402
     H3BuildConditioning,
-    H3Keyframes,
-    H3KeyframesReferenceData,
+    H3KeyframeReference,
+    H3KeyframeReferenceData,
     H3ImageReference,
     H3ImageReferenceData,
     H3LatentInfo,
@@ -84,32 +84,31 @@ class _PayloadHolder:
 
 
 class MiniMaxH3ReferencesTest(unittest.TestCase):
-    def test_schema_uses_one_extensible_keyframes_reference(self):
-        frame = H3Keyframes.define_schema()
+    def test_schema_assigns_keyframe_roles_at_semantic_and_build_boundaries(self):
+        frame = H3KeyframeReference.define_schema()
         semantic = H3SemanticReference.define_schema()
         build = H3BuildConditioning.define_schema()
 
-        self.assertEqual(frame.display_name, "H3 Keyframes")
+        self.assertEqual(frame.display_name, "H3 Keyframe Reference")
         self.assertEqual(
             [item.id for item in frame.inputs],
             [
                 "vae",
                 "latent",
-                "first_frame",
-                "last_frame",
+                "image",
             ],
         )
         self.assertEqual(
             [item.id for item in frame.outputs],
-            ["keyframes_reference"],
+            ["keyframe_reference"],
         )
         self.assertEqual(
-            semantic.inputs[2].id,
-            "keyframes_reference",
+            [item.id for item in semantic.inputs][2:4],
+            ["first_frame", "last_frame"],
         )
         self.assertEqual(
-            [item.id for item in build.inputs][1:3],
-            ["latent", "keyframes_reference"],
+            [item.id for item in build.inputs][1:4],
+            ["latent", "first_frame", "last_frame"],
         )
 
     def test_frame_reference_aligns_to_target_latent_canvas(self):
@@ -117,12 +116,10 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
         latent = {"samples": torch.zeros(1, 24, 2, 6, 8)}
         image = torch.rand(1, 90, 70, 3)
 
-        reference = H3Keyframes.execute(vae, latent=latent, first_frame=image).result[0]
+        reference = H3KeyframeReference.execute(vae, image, latent=latent).result[0]
 
-        self.assertEqual(len(reference.items), 1)
-        self.assertEqual(reference.items[0]["anchor"], "first")
-        self.assertEqual(tuple(reference.items[0]["image"].shape), (1, 96, 128, 3))
-        self.assertEqual(tuple(reference.items[0]["latent"].shape), (1, 24, 1, 6, 8))
+        self.assertEqual(tuple(reference.image.shape), (1, 96, 128, 3))
+        self.assertEqual(tuple(reference.latent.shape), (1, 24, 1, 6, 8))
 
     def test_image_reference_without_latent_uses_uncropped_megapixel_budget(self):
         vae = _FakeVideoVAE()
@@ -219,14 +216,9 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
 
     def test_semantic_combines_official_keyframe_and_reference_presentations(self):
         clip = _FakeClip()
-        keyframes = H3KeyframesReferenceData(
-            (
-                {
-                    "anchor": "first",
-                    "image": torch.rand(1, 64, 64, 3),
-                    "latent": torch.zeros(1, 24, 1, 4, 4),
-                },
-            )
+        keyframe = H3KeyframeReferenceData(
+            image=torch.rand(1, 64, 64, 3),
+            latent=torch.zeros(1, 24, 1, 4, 4),
         )
         images = H3ImageReferenceData(
             (
@@ -240,7 +232,7 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
         semantic = H3SemanticReference.execute(
             clip,
             "prompt",
-            keyframes_reference=keyframes,
+            first_frame=keyframe,
             image_reference=images,
         ).result[0]
 
@@ -255,20 +247,15 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
         )
         self.assertEqual(
             semantic.manifest,
-            H3ReferenceManifest(keyframe_anchors=("first",), image_count=1),
+            H3ReferenceManifest(first_frame=True, image_count=1),
         )
 
     def test_build_conditioning_places_keyframe_and_generic_reference_together(self):
         target = {"samples": torch.zeros(1, 24, 7, 6, 8)}
         first_latent = torch.zeros(1, 24, 1, 6, 8)
-        keyframes = H3KeyframesReferenceData(
-            (
-                {
-                    "anchor": "first",
-                    "image": torch.rand(1, 96, 128, 3),
-                    "latent": first_latent,
-                },
-            )
+        keyframe = H3KeyframeReferenceData(
+            image=torch.rand(1, 96, 128, 3),
+            latent=first_latent,
         )
         images = H3ImageReferenceData(
             (
@@ -281,13 +268,13 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
         base = [[torch.zeros(1, 2, 3), {"kept": True}]]
         semantic = H3SemanticReferenceData(
             base,
-            H3ReferenceManifest(keyframe_anchors=("first",), image_count=1),
+            H3ReferenceManifest(first_frame=True, image_count=1),
         )
 
         conditioning = H3BuildConditioning.execute(
             semantic,
             target,
-            keyframes_reference=keyframes,
+            first_frame=keyframe,
             image_reference=images,
         ).result[0]
         options = conditioning[0][1]
@@ -299,6 +286,37 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
         self.assertIs(options["minimax_refs"][0]["latent"], images.items[0]["latent"])
         self.assertTrue(options["kept"])
         self.assertNotIn("minimax_keyframes", base[0][1])
+
+    def test_one_keyframe_reference_can_fill_both_roles(self):
+        clip = _FakeClip()
+        latent = torch.zeros(1, 24, 1, 6, 8)
+        keyframe = H3KeyframeReferenceData(
+            image=torch.rand(1, 96, 128, 3),
+            latent=latent,
+        )
+
+        semantic = H3SemanticReference.execute(
+            clip,
+            "prompt",
+            first_frame=keyframe,
+            last_frame=keyframe,
+        ).result[0]
+        conditioning = H3BuildConditioning.execute(
+            semantic,
+            {"samples": torch.zeros(1, 24, 7, 6, 8)},
+            first_frame=keyframe,
+            last_frame=keyframe,
+        ).result[0]
+
+        self.assertEqual(
+            semantic.manifest,
+            H3ReferenceManifest(first_frame=True, last_frame=True),
+        )
+        self.assertEqual(clip.encoded["qwen3vl_32b"][0][:2], [("keyframe", 0), ("keyframe", 1)])
+        keyframes = conditioning[0][1]["minimax_keyframes"]
+        self.assertEqual([item["resolved_frame_index"] for item in keyframes], [0, 21])
+        self.assertIs(keyframes[0]["latent"], latent)
+        self.assertIs(keyframes[1]["latent"], latent)
 
     def test_build_rejects_different_semantic_structure(self):
         semantic = H3SemanticReferenceData(
