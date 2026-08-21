@@ -22,6 +22,7 @@ from ..attention import (
     apply_attention_backend,
     normalize_attention_backend,
 )
+from ..adapters.dynamic_vram import install_dynamic_vram_sample_fence
 from ..adapters.registry import apply_model_adapters
 from ..precision import (
     normalize_turing_convrot_weight_dtypes,
@@ -509,6 +510,7 @@ def load_convrot_model(
         loaded.codebook_w4a8,
         loaded.w8a8,
     )
+    install_dynamic_vram_sample_fence(model, load_device)
     apply_model_adapters(model, load_device)
     apply_attention_backend(model, attention_backend, device=load_device)
     model.cached_patcher_init = (
