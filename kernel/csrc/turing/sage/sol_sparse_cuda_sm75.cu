@@ -45,6 +45,7 @@ constexpr int kSummaryTileTokens = 16;
 constexpr int kMaxRouteBytes = kMaxRouteWords * sizeof(uint32_t);
 constexpr int kProxyScratchBytes =
     kWarps * kSummaryTileTokens * sizeof(float);
+constexpr int kSlaQueryBlockTokens = 128;
 
 __device__ __forceinline__ bool route_convrot_negative_sign(int channel)
 {
@@ -310,6 +311,140 @@ __global__ void key_summary_stats_kernel(
       fmaxf(square_sum * reciprocal - mean * mean, 0.0f);
 }
 
+template <int HeadDim>
+__global__ void sla_query_summary_kernel(
+    const int8_t *__restrict__ query_int8,
+    const float *__restrict__ query_scale,
+    half *__restrict__ query_summary,
+    int query_length,
+    int num_heads,
+    int num_query_blocks_64,
+    int64_t stride_batch,
+    int64_t stride_head,
+    int64_t stride_sequence)
+{
+  const int query_block = blockIdx.x;
+  const int head = blockIdx.y;
+  const int batch = blockIdx.z;
+  const int dimension = threadIdx.x;
+  const int token_start = query_block * kSlaQueryBlockTokens;
+  const int token_count = min(kSlaQueryBlockTokens, query_length - token_start);
+  const int8_t *head_query = query_int8 +
+      batch * stride_batch + head * stride_head;
+  const float *head_scale = query_scale +
+      (static_cast<int64_t>(batch) * num_heads + head) *
+          num_query_blocks_64 * kWarps;
+  float sum = 0.0f;
+  for (int token = 0; token < token_count; ++token)
+  {
+    const int global_token = token_start + token;
+    const float scale = head_scale[
+        (global_token / kBlockTokens) * kWarps +
+        (global_token % kBlockTokens) / (kBlockTokens / kWarps)];
+    sum = fmaf(
+        static_cast<float>(
+            head_query[static_cast<int64_t>(global_token) * stride_sequence +
+                       dimension]),
+        scale,
+        sum);
+  }
+  const int num_query_blocks_128 =
+      div_ceil(query_length, kSlaQueryBlockTokens);
+  const int64_t output_index =
+      ((static_cast<int64_t>(batch) * num_heads + head) *
+           num_query_blocks_128 +
+       query_block) *
+          HeadDim +
+      dimension;
+  query_summary[output_index] = __float2half_rn(
+      sum / static_cast<float>(token_count));
+}
+
+template <int HeadDim>
+__global__ void sla_key_summary_kernel(
+    const int8_t *__restrict__ key_int8,
+    const float *__restrict__ key_scale,
+    half *__restrict__ key_summary,
+    int key_length,
+    int num_heads,
+    int num_key_blocks,
+    int64_t stride_batch,
+    int64_t stride_head,
+    int64_t stride_sequence)
+{
+  const int key_block = blockIdx.x;
+  const int head = blockIdx.y;
+  const int batch = blockIdx.z;
+  const int dimension = threadIdx.x;
+  const int token_start = key_block * kBlockTokens;
+  const int token_count = min(kBlockTokens, key_length - token_start);
+  const int8_t *head_key = key_int8 + batch * stride_batch + head * stride_head;
+  int quantized_sum = 0;
+  for (int token = 0; token < token_count; ++token)
+  {
+    quantized_sum += static_cast<int>(
+        head_key[static_cast<int64_t>(token_start + token) * stride_sequence +
+                 dimension]);
+  }
+  const float scale = key_scale[
+      (static_cast<int64_t>(batch) * num_heads + head) * num_key_blocks +
+      key_block];
+  const int64_t output_index =
+      ((static_cast<int64_t>(batch) * num_heads + head) * num_key_blocks +
+       key_block) *
+          HeadDim +
+      dimension;
+  key_summary[output_index] = __float2half_rn(
+      static_cast<float>(quantized_sum) * scale /
+      static_cast<float>(token_count));
+}
+
+__global__ void sla_topk_route_kernel(
+    const int32_t *__restrict__ topk_indices,
+    uint32_t *__restrict__ route_words,
+    int64_t index_count,
+    int topk,
+    int route_word_count,
+    int num_key_blocks)
+{
+  const int64_t index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index >= index_count)
+    return;
+  const int key_block = topk_indices[index];
+  if (key_block < 0 || key_block >= num_key_blocks)
+    return;
+  const int64_t route_row = index / topk;
+  atomicOr(
+      route_words + route_row * route_word_count +
+          key_block / kRouteWordBits,
+      1U << (key_block % kRouteWordBits));
+}
+
+__global__ void sla_exact_route_kernel(
+    const uint8_t *__restrict__ exact_kv_blocks,
+    uint32_t *__restrict__ route_words,
+    int64_t route_rows,
+    int route_word_count,
+    int num_key_blocks)
+{
+  const int64_t index =
+      static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t total_words = route_rows * route_word_count;
+  if (index >= total_words)
+    return;
+  const int word_index = index % route_word_count;
+  uint32_t exact_word = 0;
+#pragma unroll
+  for (int bit = 0; bit < kRouteWordBits; ++bit)
+  {
+    const int key_block = word_index * kRouteWordBits + bit;
+    if (key_block < num_key_blocks && exact_kv_blocks[key_block])
+      exact_word |= 1U << bit;
+  }
+  route_words[index] |= exact_word;
+}
+
 __device__ __forceinline__ void block_reduce_pair(
     float &first,
     float &second,
@@ -572,7 +707,8 @@ __device__ __forceinline__ void load_quantized_value_tile(
 }
 
 template <int HeadDim, typename T, bool UseW8A8, bool ForceDense,
-          bool IsCausal, bool Varlen, int ResidualSubblocks, int KeyStages>
+          bool IsCausal, bool Varlen, int ResidualSubblocks, int KeyStages,
+          bool ExternalRoute = false>
 __global__ void sparse_attention_kernel(
     const int8_t *__restrict__ query_int8,
     const int8_t *__restrict__ key_int8,
@@ -588,6 +724,7 @@ __global__ void sparse_attention_kernel(
     const float *__restrict__ key_summary_variance,
     const uint8_t *__restrict__ sparse_query_blocks,
     const uint8_t *__restrict__ exact_kv_blocks,
+    const uint32_t *__restrict__ external_route_words,
     unsigned long long *__restrict__ selected_count,
     const int32_t *__restrict__ cu_seqlens_q,
     const int32_t *__restrict__ cu_seqlens_k,
@@ -625,6 +762,7 @@ __global__ void sparse_attention_kernel(
       KeyStages == 1 || KeyStages == 2,
       "exact attention stages must cover 64 or 128 K tokens");
   static_assert(!ForceDense || KeyStages == 1);
+  static_assert(!ExternalRoute || (!ForceDense && !Varlen && !IsCausal));
   static_assert(!IsCausal || ForceDense,
                 "causal masking is supported only by dense W8A8");
   static_assert(
@@ -725,6 +863,44 @@ __global__ void sparse_attention_kernel(
   RouteWords local_route{};
 
   if constexpr (!ForceDense)
+  {
+  if constexpr (ExternalRoute)
+  {
+    const int route_word_count =
+        (active_key_blocks + kRouteWordBits - 1) / kRouteWordBits;
+    const int sla_query_blocks =
+        (num_query_blocks + 1) / 2;
+    const uint32_t *route_head = external_route_words +
+        ((static_cast<int64_t>(batch) * num_query_heads + query_head) *
+             sla_query_blocks +
+         query_block / 2) *
+            route_word_count;
+    const int route_lane = threadIdx.x;
+    local_route.word0 = route_lane < route_word_count
+        ? route_head[route_lane]
+        : 0;
+    local_route.word1 = route_lane + WARP_SIZE < route_word_count
+        ? route_head[route_lane + WARP_SIZE]
+        : 0;
+    local_route.word2 = route_lane + 2 * WARP_SIZE < route_word_count
+        ? route_head[route_lane + 2 * WARP_SIZE]
+        : 0;
+    local_route.word3 = route_lane + 3 * WARP_SIZE < route_word_count
+        ? route_head[route_lane + 3 * WARP_SIZE]
+        : 0;
+    if (selected_count != nullptr && sparse_query && threadIdx.y == 0)
+    {
+      unsigned int count = __popc(local_route.word0) +
+          __popc(local_route.word1) + __popc(local_route.word2) +
+          __popc(local_route.word3);
+#pragma unroll
+      for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+        count += __shfl_down_sync(0xffffffff, count, offset);
+      if (threadIdx.x == 0)
+        atomicAdd(selected_count, static_cast<unsigned long long>(count));
+    }
+  }
+  else
   {
   // Route from the same INT8 Q and per-16-token scales consumed by exact Sage.
   // Keeping this tile in shared memory also avoids another global Q read when
@@ -1001,6 +1177,7 @@ __global__ void sparse_attention_kernel(
   }
   __syncthreads();
   }
+  }
 
   // Selected blocks retain exact token-level attention. Q/K are quantized once
   // with the production Sage per-16-row Q and per-64-row K scales, then use the
@@ -1031,7 +1208,7 @@ __global__ void sparse_attention_kernel(
       continue;
     if constexpr (!ForceDense)
     {
-      if (!route_selected(local_route, key_block))
+      if (sparse_query && !route_selected(local_route, key_block))
         continue;
     }
     load_int8_tile<HeadDim>(
@@ -1345,6 +1522,7 @@ void launch_sparse_threshold_attention(
       key_summary_variance.data_ptr<float>(),
       sparse_query_blocks.data_ptr<uint8_t>(),
       exact_kv_blocks.data_ptr<uint8_t>(),
+      nullptr,
       selected_count.numel()
           ? reinterpret_cast<unsigned long long *>(selected_count.data_ptr<int64_t>())
           : nullptr,
@@ -1491,6 +1669,141 @@ void dispatch_sparse_threshold_attention(
   }
 #undef DISPATCH_FORMAT
 #undef LAUNCH_VARIANT
+}
+
+template <int HeadDim, typename T, bool UseW8A8, int KeyStages>
+void launch_sla_attention(
+    at::Tensor query_int8,
+    at::Tensor key_int8,
+    at::Tensor value,
+    at::Tensor value_int8,
+    at::Tensor value_scale,
+    at::Tensor output,
+    at::Tensor query_scale,
+    at::Tensor key_scale,
+    at::Tensor route_words,
+    at::Tensor sparse_query_blocks,
+    at::Tensor selected_count,
+    float softmax_scale)
+{
+  using G = AttentionGeometry<HeadDim>;
+  const int batch_size = query_int8.size(0);
+  const int num_query_heads = query_int8.size(1);
+  const int num_kv_heads = key_int8.size(1);
+  const int query_length = query_int8.size(2);
+  const int key_length = key_int8.size(2);
+  const int num_query_blocks = div_ceil(query_length, kBlockTokens);
+  const int num_key_blocks = div_ceil(key_length, kBlockTokens);
+  dim3 attention_grid(num_query_blocks, num_query_heads, batch_size);
+  dim3 attention_block(WARP_SIZE, kWarps);
+  auto attention_kernel =
+      sparse_attention_kernel<HeadDim, T, UseW8A8, false, false, false,
+                              1, KeyStages, true>;
+  configure_dynamic_shared_memory(
+      attention_kernel, G::kAttentionSharedBytes, "SLA sparse attention");
+  attention_kernel<<<
+      attention_grid,
+      attention_block,
+      G::kAttentionSharedBytes,
+      c10::cuda::getCurrentCUDAStream()>>>(
+      query_int8.data_ptr<int8_t>(),
+      key_int8.data_ptr<int8_t>(),
+      reinterpret_cast<const T *>(value.data_ptr()),
+      UseW8A8 ? value_int8.data_ptr<int8_t>() : nullptr,
+      UseW8A8 ? value_scale.data_ptr<float>() : nullptr,
+      reinterpret_cast<T *>(output.data_ptr()),
+      query_scale.data_ptr<float>(),
+      key_scale.data_ptr<float>(),
+      nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      sparse_query_blocks.data_ptr<uint8_t>(),
+      nullptr,
+      reinterpret_cast<const uint32_t *>(route_words.data_ptr<int32_t>()),
+      selected_count.numel()
+          ? reinterpret_cast<unsigned long long *>(selected_count.data_ptr<int64_t>())
+          : nullptr,
+      nullptr,
+      nullptr,
+      nullptr,
+      query_length,
+      key_length,
+      num_query_heads,
+      num_kv_heads,
+      num_query_blocks,
+      num_key_blocks,
+      0,
+      query_int8.stride(0),
+      query_int8.stride(1),
+      query_int8.stride(2),
+      key_int8.stride(0),
+      key_int8.stride(1),
+      key_int8.stride(2),
+      value.stride(0),
+      value.stride(1),
+      value.stride(2),
+      UseW8A8 ? value_int8.size(3) : 0,
+      0,
+      output.stride(0),
+      output.stride(1),
+      output.stride(2),
+      0.0f,
+      softmax_scale,
+      0);
+  check_launch("SLA sparse attention");
+}
+
+void dispatch_sla_attention(
+    at::Tensor query_int8,
+    at::Tensor key_int8,
+    at::Tensor value,
+    at::Tensor value_int8,
+    at::Tensor value_scale,
+    at::Tensor output,
+    at::Tensor query_scale,
+    at::Tensor key_scale,
+    at::Tensor route_words,
+    at::Tensor sparse_query_blocks,
+    at::Tensor selected_count,
+    float softmax_scale,
+    bool use_w8a8,
+    int key_tile_tokens)
+{
+#define LAUNCH_SLA(HEAD_DIM, SCALAR, W8A8, STAGES)                           \
+  launch_sla_attention<HEAD_DIM, SCALAR, W8A8, STAGES>(                     \
+      query_int8, key_int8, value, value_int8, value_scale, output,          \
+      query_scale, key_scale, route_words, sparse_query_blocks,              \
+      selected_count, softmax_scale)
+#define DISPATCH_SLA(HEAD_DIM, SCALAR)                                      \
+  do                                                                         \
+  {                                                                          \
+    if (use_w8a8 && key_tile_tokens == 128)                                  \
+      LAUNCH_SLA(HEAD_DIM, SCALAR, true, 2);                                 \
+    else if (use_w8a8)                                                       \
+      LAUNCH_SLA(HEAD_DIM, SCALAR, true, 1);                                 \
+    else if (key_tile_tokens == 128)                                         \
+      LAUNCH_SLA(HEAD_DIM, SCALAR, false, 2);                                \
+    else                                                                     \
+      LAUNCH_SLA(HEAD_DIM, SCALAR, false, 1);                                \
+  } while (false)
+  const int head_dim = query_int8.size(-1);
+  if (output.scalar_type() == at::ScalarType::Half)
+  {
+    if (head_dim == 64)
+      DISPATCH_SLA(64, half);
+    else
+      DISPATCH_SLA(128, half);
+  }
+  else
+  {
+    if (head_dim == 64)
+      DISPATCH_SLA(64, nv_bfloat16);
+    else
+      DISPATCH_SLA(128, nv_bfloat16);
+  }
+#undef DISPATCH_SLA
+#undef LAUNCH_SLA
 }
 
 constexpr int kVarlenValueChannelTile = 8;
@@ -1663,6 +1976,260 @@ __global__ void quantize_varlen_value_kernel(
 }
 
 } // namespace
+
+std::vector<at::Tensor> sla_qk_block_summaries(
+    at::Tensor query_int8,
+    at::Tensor key_int8,
+    at::Tensor query_scale,
+    at::Tensor key_scale)
+{
+  CHECK_CUDA(query_int8);
+  CHECK_CUDA(key_int8);
+  CHECK_CUDA(query_scale);
+  CHECK_CUDA(key_scale);
+  CHECK_LASTDIM_CONTIGUOUS(query_int8);
+  CHECK_LASTDIM_CONTIGUOUS(key_int8);
+  CHECK_CONTIGUOUS(query_scale);
+  CHECK_CONTIGUOUS(key_scale);
+  CHECK_DIMS(query_int8, 4);
+  CHECK_DIMS(key_int8, 4);
+  CHECK_DIMS(query_scale, 3);
+  CHECK_DIMS(key_scale, 3);
+  CHECK_DTYPE(query_int8, at::ScalarType::Char);
+  CHECK_DTYPE(key_int8, at::ScalarType::Char);
+  CHECK_DTYPE(query_scale, at::ScalarType::Float);
+  CHECK_DTYPE(key_scale, at::ScalarType::Float);
+  TORCH_CHECK(
+      query_int8.device() == key_int8.device() &&
+          query_int8.device() == query_scale.device() &&
+          query_int8.device() == key_scale.device(),
+      "SLA Q/K summary tensors must share one CUDA device");
+  TORCH_CHECK(
+      query_int8.size(0) == key_int8.size(0) &&
+          query_int8.size(3) == key_int8.size(3),
+      "SLA Q/K summary shapes are incompatible");
+  const int batch_size = query_int8.size(0);
+  const int query_heads = query_int8.size(1);
+  const int key_heads = key_int8.size(1);
+  const int query_length = query_int8.size(2);
+  const int key_length = key_int8.size(2);
+  const int head_dim = query_int8.size(3);
+  TORCH_CHECK(
+      head_dim == 64 || head_dim == 128,
+      "SLA summaries require head_dim 64 or 128");
+  TORCH_CHECK(
+      key_heads > 0 && query_heads % key_heads == 0,
+      "SLA Query heads must be divisible by KV heads");
+  const int query_blocks_64 = div_ceil(query_length, kBlockTokens);
+  const int query_blocks_128 = div_ceil(query_length, kSlaQueryBlockTokens);
+  const int key_blocks = div_ceil(key_length, kBlockTokens);
+  TORCH_CHECK(
+      query_scale.sizes() == at::IntArrayRef(
+          {batch_size, query_heads, query_blocks_64 * kWarps}),
+      "SLA Query scale shape is incompatible");
+  TORCH_CHECK(
+      key_scale.sizes() ==
+          at::IntArrayRef({batch_size, key_heads, key_blocks}),
+      "SLA Key scale shape is incompatible");
+  const auto half_options = query_int8.options().dtype(at::ScalarType::Half);
+  at::Tensor query_summary = at::empty(
+      {batch_size, query_heads, query_blocks_128, head_dim}, half_options);
+  at::Tensor key_summary = at::empty(
+      {batch_size, key_heads, key_blocks, head_dim}, half_options);
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+#define LAUNCH_SLA_SUMMARIES(HEAD_DIM)                                       \
+  sla_query_summary_kernel<HEAD_DIM><<<                                     \
+      dim3(query_blocks_128, query_heads, batch_size),                       \
+      HEAD_DIM, 0, stream>>>(                                                \
+      query_int8.data_ptr<int8_t>(), query_scale.data_ptr<float>(),          \
+      reinterpret_cast<half *>(query_summary.data_ptr()),                    \
+      query_length, query_heads, query_blocks_64,                            \
+      query_int8.stride(0), query_int8.stride(1), query_int8.stride(2));     \
+  sla_key_summary_kernel<HEAD_DIM><<<                                       \
+      dim3(key_blocks, key_heads, batch_size),                               \
+      HEAD_DIM, 0, stream>>>(                                                \
+      key_int8.data_ptr<int8_t>(), key_scale.data_ptr<float>(),              \
+      reinterpret_cast<half *>(key_summary.data_ptr()),                      \
+      key_length, key_heads, key_blocks,                                     \
+      key_int8.stride(0), key_int8.stride(1), key_int8.stride(2))
+  if (head_dim == 64)
+  {
+    LAUNCH_SLA_SUMMARIES(64);
+  }
+  else
+  {
+    LAUNCH_SLA_SUMMARIES(128);
+  }
+#undef LAUNCH_SLA_SUMMARIES
+  check_launch("SLA Q/K block summaries");
+  return {query_summary, key_summary};
+}
+
+at::Tensor sla_build_route_words(
+    at::Tensor topk_indices,
+    at::Tensor exact_kv_blocks,
+    int num_key_blocks)
+{
+  CHECK_CUDA(topk_indices);
+  CHECK_CUDA(exact_kv_blocks);
+  CHECK_CONTIGUOUS(topk_indices);
+  CHECK_CONTIGUOUS(exact_kv_blocks);
+  CHECK_DIMS(topk_indices, 4);
+  CHECK_DIMS(exact_kv_blocks, 1);
+  CHECK_DTYPE(topk_indices, at::ScalarType::Int);
+  CHECK_DTYPE(exact_kv_blocks, at::ScalarType::Byte);
+  TORCH_CHECK(
+      topk_indices.device() == exact_kv_blocks.device(),
+      "SLA route tensors must share one CUDA device");
+  TORCH_CHECK(num_key_blocks > 0 && num_key_blocks <= kMaxKeyBlocks,
+              "SLA route K block count is outside the supported range");
+  TORCH_CHECK(exact_kv_blocks.numel() == num_key_blocks,
+              "SLA exact-KV policy size is incompatible");
+  const int topk = topk_indices.size(3);
+  TORCH_CHECK(topk > 0 && topk <= num_key_blocks,
+              "SLA Top-K must be in [1, num_key_blocks]");
+  const int route_word_count = div_ceil(num_key_blocks, kRouteWordBits);
+  at::Tensor route_words = at::zeros(
+      {topk_indices.size(0), topk_indices.size(1), topk_indices.size(2),
+       route_word_count},
+      topk_indices.options());
+  const int Threads = 256;
+  const int64_t index_count = topk_indices.numel();
+  cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+  sla_topk_route_kernel<<<div_ceil(index_count, static_cast<int64_t>(Threads)),
+                          Threads, 0, stream>>>(
+      topk_indices.data_ptr<int32_t>(),
+      reinterpret_cast<uint32_t *>(route_words.data_ptr<int32_t>()),
+      index_count,
+      topk,
+      route_word_count,
+      num_key_blocks);
+  check_launch("SLA Top-K route packing");
+  const int64_t route_rows = route_words.numel() / route_word_count;
+  const int64_t total_words = route_words.numel();
+  sla_exact_route_kernel<<<div_ceil(total_words, static_cast<int64_t>(Threads)),
+                           Threads, 0, stream>>>(
+      exact_kv_blocks.data_ptr<uint8_t>(),
+      reinterpret_cast<uint32_t *>(route_words.data_ptr<int32_t>()),
+      route_rows,
+      route_word_count,
+      num_key_blocks);
+  check_launch("SLA exact-KV route union");
+  return route_words;
+}
+
+at::Tensor sla_sparse_online_attn(
+    at::Tensor query_int8,
+    at::Tensor key_int8,
+    at::Tensor value,
+    at::Tensor value_int8,
+    at::Tensor value_scale,
+    at::Tensor output,
+    at::Tensor query_scale,
+    at::Tensor key_scale,
+    at::Tensor route_words,
+    at::Tensor sparse_query_blocks,
+    float softmax_scale,
+    int return_stats,
+    int use_w8a8,
+    int key_tile_tokens)
+{
+  CHECK_CUDA(query_int8);
+  CHECK_CUDA(key_int8);
+  CHECK_CUDA(value);
+  CHECK_CUDA(output);
+  CHECK_CUDA(query_scale);
+  CHECK_CUDA(key_scale);
+  CHECK_CUDA(route_words);
+  CHECK_CUDA(sparse_query_blocks);
+  CHECK_LASTDIM_CONTIGUOUS(query_int8);
+  CHECK_LASTDIM_CONTIGUOUS(key_int8);
+  CHECK_LASTDIM_CONTIGUOUS(value);
+  CHECK_LASTDIM_CONTIGUOUS(output);
+  CHECK_CONTIGUOUS(query_scale);
+  CHECK_CONTIGUOUS(key_scale);
+  CHECK_CONTIGUOUS(route_words);
+  CHECK_CONTIGUOUS(sparse_query_blocks);
+  CHECK_DTYPE(query_int8, at::ScalarType::Char);
+  CHECK_DTYPE(key_int8, at::ScalarType::Char);
+  CHECK_DTYPE(query_scale, at::ScalarType::Float);
+  CHECK_DTYPE(key_scale, at::ScalarType::Float);
+  CHECK_DTYPE(route_words, at::ScalarType::Int);
+  CHECK_DTYPE(sparse_query_blocks, at::ScalarType::Byte);
+  TORCH_CHECK(
+      output.scalar_type() == at::ScalarType::Half ||
+          output.scalar_type() == at::ScalarType::BFloat16,
+      "SLA output must be float16 or bfloat16");
+  TORCH_CHECK(value.scalar_type() == output.scalar_type(),
+              "SLA logical V and output dtypes must match");
+  TORCH_CHECK(use_w8a8 == 0 || use_w8a8 == 1,
+              "SLA use_w8a8 must be 0 or 1");
+  TORCH_CHECK(key_tile_tokens == 64 || key_tile_tokens == 128,
+              "SLA key_tile_tokens must be 64 or 128");
+  const int batch_size = query_int8.size(0);
+  const int query_heads = query_int8.size(1);
+  const int key_heads = key_int8.size(1);
+  const int query_length = query_int8.size(2);
+  const int key_length = key_int8.size(2);
+  const int head_dim = query_int8.size(3);
+  const int query_blocks_64 = div_ceil(query_length, kBlockTokens);
+  const int query_blocks_128 = div_ceil(query_length, kSlaQueryBlockTokens);
+  const int key_blocks = div_ceil(key_length, kBlockTokens);
+  const int route_word_count = div_ceil(key_blocks, kRouteWordBits);
+  TORCH_CHECK(
+      query_int8.dim() == 4 && key_int8.dim() == 4 && value.dim() == 4 &&
+          output.dim() == 4,
+      "SLA Q/K/V/O must be four-dimensional");
+  TORCH_CHECK(
+      (head_dim == 64 || head_dim == 128) && key_int8.size(3) == head_dim &&
+          value.size(3) == head_dim,
+      "SLA requires matching head_dim 64 or 128");
+  TORCH_CHECK(
+      key_heads > 0 && query_heads % key_heads == 0,
+      "SLA Query heads must be divisible by KV heads");
+  TORCH_CHECK(output.sizes() == query_int8.sizes(),
+              "SLA output shape is incompatible");
+  TORCH_CHECK(
+      use_w8a8 ||
+          (value.size(0) == batch_size && value.size(1) == key_heads &&
+           value.size(2) == key_length),
+      "SLA FP16/BF16 V shape is incompatible");
+  TORCH_CHECK(
+      query_scale.sizes() == at::IntArrayRef(
+          {batch_size, query_heads, query_blocks_64 * kWarps}) &&
+          key_scale.sizes() ==
+              at::IntArrayRef({batch_size, key_heads, key_blocks}),
+      "SLA Q/K scale shapes are incompatible");
+  TORCH_CHECK(
+      route_words.sizes() == at::IntArrayRef(
+          {batch_size, query_heads, query_blocks_128, route_word_count}) &&
+          sparse_query_blocks.numel() == query_blocks_64,
+      "SLA route policy shapes are incompatible");
+  if (use_w8a8)
+  {
+    CHECK_CUDA(value_int8);
+    CHECK_CUDA(value_scale);
+    CHECK_CONTIGUOUS(value_int8);
+    CHECK_CONTIGUOUS(value_scale);
+    CHECK_DTYPE(value_int8, at::ScalarType::Char);
+    CHECK_DTYPE(value_scale, at::ScalarType::Float);
+    TORCH_CHECK(
+        value_int8.sizes() == at::IntArrayRef(
+            {batch_size, key_heads, head_dim,
+             div_ceil(key_length, kBlockTokens) * kBlockTokens}) &&
+            value_scale.sizes() ==
+                at::IntArrayRef({batch_size, key_heads, head_dim}),
+        "SLA W8A8 V shapes are incompatible");
+  }
+  at::Tensor selected_count = return_stats
+      ? at::zeros({1}, output.options().dtype(at::ScalarType::Long))
+      : at::empty({0}, output.options().dtype(at::ScalarType::Long));
+  dispatch_sla_attention(
+      query_int8, key_int8, value, value_int8, value_scale, output,
+      query_scale, key_scale, route_words, sparse_query_blocks,
+      selected_count, softmax_scale, use_w8a8 != 0, key_tile_tokens);
+  return selected_count;
+}
 
 void quantize_v_int8_varlen_sm75(
     at::Tensor value,

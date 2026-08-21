@@ -142,6 +142,72 @@ class SparseAttentionNodeTest(unittest.TestCase):
             use_w8a8=True,
         )
 
+    def test_sla_schema_matches_semantic_sparse_controls(self):
+        node = attention_nodes.SlaSparseAttentionPatch
+        self.assertEqual(node.TITLE, "Patch SLA Sparse Attention")
+        inputs = node.INPUT_TYPES()["required"]
+        self.assertEqual(
+            tuple(inputs),
+            (
+                "model",
+                "keep_ratio",
+                "prefix_policy",
+                "manual_prefix_tokens",
+                "sparse_reference_image",
+                "sparse_reference_video",
+                "sparse_reference_audio",
+                "dense_prefix_steps",
+                "dense_suffix_steps",
+                "dense_prefix_layers",
+                "dense_suffix_layers",
+            ),
+        )
+        self.assertEqual(inputs["keep_ratio"][1]["default"], 0.15)
+        self.assertEqual(inputs["prefix_policy"][0][0], "auto")
+        self.assertFalse(inputs["sparse_reference_image"][1]["default"])
+        self.assertTrue(inputs["sparse_reference_video"][1]["default"])
+        self.assertFalse(inputs["sparse_reference_audio"][1]["default"])
+        optional = node.INPUT_TYPES()["optional"]
+        self.assertEqual(tuple(optional), ("use_w8a8", "debug_route_density"))
+        self.assertTrue(optional["use_w8a8"][1]["default"])
+
+    def test_sla_node_returns_the_patched_model(self):
+        model = object()
+        patched = object()
+        with mock.patch(
+            "comfyui_turing_utils.nodes.attention.apply_sla_attention_patch",
+            return_value=patched,
+        ) as apply_patch:
+            output = attention_nodes.SlaSparseAttentionPatch().patch(
+                model,
+                0.2,
+                "manual",
+                128,
+                True,
+                False,
+                True,
+                2,
+                1,
+                3,
+                4,
+            )
+        self.assertEqual(output, (patched,))
+        apply_patch.assert_called_once_with(
+            model,
+            keep_ratio=0.2,
+            prefix_policy="manual",
+            manual_prefix_tokens=128,
+            sparse_reference_image=True,
+            sparse_reference_video=False,
+            sparse_reference_audio=True,
+            dense_prefix_steps=2,
+            dense_suffix_steps=1,
+            dense_prefix_layers=3,
+            dense_suffix_layers=4,
+            use_w8a8=True,
+            debug_route_density=False,
+        )
+
     def test_node_returns_the_patched_model(self):
         model = object()
         patched = object()

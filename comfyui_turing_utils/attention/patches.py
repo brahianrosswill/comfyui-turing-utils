@@ -24,10 +24,15 @@ from .sparse import (
     _sparse_dense_layer,
     _sparse_dense_schedule,
     inspect_sol_attention_call,
+    inspect_sla_attention_call,
+    prequantize_turing_sla_attention,
+    prequantize_turing_sla_attention_from_qk,
     prequantize_turing_sol_attention,
     prequantize_turing_sol_attention_from_qk,
     turing_sol_attention_from_prequantized,
     turing_sol_sparse_attention,
+    turing_sla_attention_from_prequantized,
+    turing_sla_sparse_attention,
 )
 from .stable import (
     LOG,
@@ -42,12 +47,14 @@ from .stable import (
     SPARSE_ROUTING_THRESHOLD,
     SPARSE_SKIPPED_RESIDUAL,
     SPARSE_USE_W8A8,
+    SLA_KEEP_RATIO,
     AttentionBackend,
     _BACKENDS,
     _comfy_attention_function,
     _select_attention_backend,
     bundled_available,
     bundled_sparse_available,
+    bundled_sla_available,
     bundled_w8a8_available,
     fused_qk_preprocessing_available,
     is_supported_attention_device,
@@ -59,6 +66,7 @@ from .stable import (
     prequantize_turing_qk,
     preflight_bundled,
     preflight_bundled_sparse,
+    preflight_bundled_sla,
     preflight_bundled_w8a8,
     split_prequantization_available,
     turing_attention_from_prequantized,
@@ -1036,6 +1044,356 @@ def make_sparse_attention_override(
     return attention_override
 
 
+def make_sla_attention_override(
+    device: torch.device,
+    min_sequence_tokens: int = 0,
+    keep_ratio: float = SLA_KEEP_RATIO,
+    prefix_policy: str = SPARSE_PREFIX_POLICY,
+    manual_prefix_tokens: int = 0,
+    sparse_reference_image: bool = SPARSE_REFERENCE_IMAGE,
+    sparse_reference_video: bool = SPARSE_REFERENCE_VIDEO,
+    sparse_reference_audio: bool = SPARSE_REFERENCE_AUDIO,
+    dense_prefix_steps: int = SPARSE_DENSE_PREFIX_STEPS,
+    dense_suffix_steps: int = SPARSE_DENSE_SUFFIX_STEPS,
+    dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
+    dense_suffix_layers: int = SPARSE_DENSE_SUFFIX_LAYERS,
+    debug_route_density: bool = False,
+    use_w8a8: bool = SPARSE_USE_W8A8,
+) -> Callable:
+    min_sequence_tokens = int(min_sequence_tokens)
+    keep_ratio = float(keep_ratio)
+    prefix_policy = str(prefix_policy).strip().lower()
+    manual_prefix_tokens = int(manual_prefix_tokens)
+    sparse_reference_image = bool(sparse_reference_image)
+    sparse_reference_video = bool(sparse_reference_video)
+    sparse_reference_audio = bool(sparse_reference_audio)
+    dense_prefix_steps = int(dense_prefix_steps)
+    dense_suffix_steps = int(dense_suffix_steps)
+    dense_prefix_layers = int(dense_prefix_layers)
+    dense_suffix_layers = int(dense_suffix_layers)
+    debug_route_density = bool(debug_route_density)
+    use_w8a8 = bool(use_w8a8)
+    if min_sequence_tokens < 0:
+        raise ValueError("min_sequence_tokens must be non-negative")
+    if not math.isfinite(keep_ratio) or not 0.0 < keep_ratio <= 1.0:
+        raise ValueError("keep_ratio must be finite and in (0, 1]")
+    if prefix_policy not in {"auto", "none", "manual"}:
+        raise ValueError("prefix_policy must be auto, none, or manual")
+    if manual_prefix_tokens < 0:
+        raise ValueError("manual_prefix_tokens must be non-negative")
+    if min(
+        dense_prefix_steps,
+        dense_suffix_steps,
+        dense_prefix_layers,
+        dense_suffix_layers,
+    ) < 0:
+        raise ValueError("dense step/layer counts must be non-negative")
+    if not is_supported_attention_device(device):
+        raise RuntimeError(
+            "SLA sparse attention requires a CUDA Tensor Core GPU (sm75 or newer)"
+        )
+    if not bundled_sla_available():
+        raise RuntimeError(
+            "The bundled SLA extension is unavailable. Rebuild "
+            "comfyui-turing-utils-kernel 0.29.0 or newer for this GPU."
+        )
+    preflight_bundled_sla(device)
+    if use_w8a8 and not bundled_w8a8_available():
+        raise RuntimeError("SLA W8A8 requires the bundled W8A8 attention ABI")
+
+    schedule_state: dict[str, object] = {}
+    debug_route_keys: set[tuple] = set()
+    dense_override = make_attention_override(
+        "w8a8" if use_w8a8 else "sage", device=device
+    )
+    if use_w8a8 and not is_supported_turing_device(device):
+        preflight_bundled_w8a8(device)
+    dense_prepared_executor = getattr(
+        dense_override, "prepared_attention_executor", None
+    )
+    dense_container = getattr(dense_override, "container_function", None)
+    sparse_capabilities = AttentionBackendCapabilities(
+        supports_semantic_sparse=True,
+    )
+
+    def run_dense_prepared(request: PreparedAttention) -> AttentionExecutionOutcome:
+        if callable(dense_prepared_executor):
+            return dense_prepared_executor(request)
+        return AttentionExecutionOutcome.unsupported(
+            "the selected dense backend does not expose prepared attention"
+        )
+
+    def run_dense_container(
+        q,
+        k,
+        v,
+        heads,
+        *,
+        mask,
+        attn_precision,
+        skip_reshape,
+        skip_output_reshape,
+        **kwargs,
+    ):
+        if callable(dense_container):
+            return dense_container(
+                q,
+                k,
+                v,
+                heads,
+                mask=mask,
+                attn_precision=attn_precision,
+                skip_reshape=skip_reshape,
+                skip_output_reshape=skip_output_reshape,
+                **kwargs,
+            )
+        return dense_override(
+            _default_attention_fallback(),
+            q.take(),
+            k.take(),
+            v.take(),
+            heads,
+            mask=mask,
+            attn_precision=attn_precision,
+            skip_reshape=skip_reshape,
+            skip_output_reshape=skip_output_reshape,
+            **kwargs,
+        )
+
+    def inspect(request_q, request_k, request_v, heads, *, mask,
+                skip_reshape, skip_output_reshape, transformer_options, kwargs):
+        return inspect_sla_attention_call(
+            request_q,
+            request_k,
+            request_v,
+            heads,
+            mask=mask,
+            skip_reshape=skip_reshape,
+            skip_output_reshape=skip_output_reshape,
+            min_sequence_tokens=min_sequence_tokens,
+            prefix_policy=prefix_policy,
+            manual_prefix_tokens=manual_prefix_tokens,
+            sparse_reference_image=sparse_reference_image,
+            sparse_reference_video=sparse_reference_video,
+            sparse_reference_audio=sparse_reference_audio,
+            transformer_options=transformer_options,
+            kwargs=kwargs,
+        )
+
+    def collect_stats(result, sla_call, transformer_options):
+        output, selected, possible = result
+        layer_index, _ = _attention_layer_metadata(transformer_options)
+        debug_key = (
+            schedule_state.get("step"),
+            layer_index,
+            sla_call.attention.query_tokens,
+            sla_call.attention.key_tokens,
+            sla_call.dense_query_ranges,
+            sla_call.exact_kv_ranges,
+        )
+        if debug_key not in debug_route_keys:
+            selected_blocks = int(selected.item())
+            LOG.warning(
+                "[Turing SLA debug] step=%s layer=%s Q=%d K=%d "
+                "selected=%d/%d density=%.4f target_keep_ratio=%.2f "
+                "protected_q=%d",
+                schedule_state.get("step"),
+                layer_index,
+                sla_call.attention.query_tokens,
+                sla_call.attention.key_tokens,
+                selected_blocks,
+                possible,
+                selected_blocks / possible if possible else 0.0,
+                keep_ratio,
+                sum(stop - start for start, stop in sla_call.dense_query_ranges),
+            )
+            debug_route_keys.add(debug_key)
+        return output
+
+    def is_dense(transformer_options) -> bool:
+        return keep_ratio == 1.0 or _sparse_dense_schedule(
+            transformer_options,
+            dense_prefix_steps,
+            dense_suffix_steps,
+            schedule_state,
+        ) or _sparse_dense_layer(
+            transformer_options,
+            dense_prefix_layers,
+            dense_suffix_layers,
+        )
+
+    def prepared_executor(request: PreparedAttention) -> AttentionExecutionOutcome:
+        reason = sparse_capabilities.unsupported_reason(request)
+        if reason is not None:
+            return AttentionExecutionOutcome.unsupported(reason)
+        transformer_options = request.transformer_options
+        if is_dense(transformer_options):
+            return run_dense_prepared(request)
+        query_view, key_view, value_view = request.peek_qkv()
+        sla_call, reason = inspect(
+            query_view,
+            key_view,
+            value_view,
+            request.heads,
+            mask=request.mask,
+            skip_reshape=True,
+            skip_output_reshape=request.skip_output_reshape,
+            transformer_options=transformer_options,
+            kwargs={
+                "enable_gqa": request.heads != request.kv_heads,
+                "low_precision_attention": request.low_precision_attention,
+                "is_causal": request.is_causal,
+            },
+        )
+        if reason is not None:
+            return run_dense_prepared(request)
+        reason = _prepared_call_mismatch(request, sla_call.attention)
+        if reason is not None:
+            return AttentionExecutionOutcome.unsupported(reason)
+        del query_view, key_view, value_view
+        query, key, value = request.consume_qkv()
+        qk = _profiled(
+            "attention.qk_norm_rope_quant",
+            prequantize_turing_qk,
+            query,
+            key,
+            request.qk_transform,
+            kernel="sla",
+            transformer_options=transformer_options,
+        )
+        del query, key
+        quantized = _profiled(
+            "attention.value_route_prepare",
+            prequantize_turing_sla_attention_from_qk,
+            qk,
+            value,
+            sla_call,
+            keep_ratio=keep_ratio,
+            scale=request.scale,
+            use_w8a8=use_w8a8,
+            transformer_options=transformer_options,
+        )
+        del qk, value
+        result = _profiled(
+            "attention.execute",
+            turing_sla_attention_from_prequantized,
+            quantized,
+            return_stats=debug_route_density,
+        )
+        output = (
+            collect_stats(result, sla_call, transformer_options)
+            if debug_route_density
+            else result
+        )
+        return AttentionExecutionOutcome(output)
+
+    prepared_executor.capabilities = sparse_capabilities
+
+    def attention_override(original: Callable, *args, **kwargs):
+        fallback = lambda *fallback_args, **fallback_kwargs: dense_override(
+            original, *fallback_args, **fallback_kwargs
+        )
+        if is_dense(kwargs.get("transformer_options")):
+            return fallback(*args, **kwargs)
+        return turing_sla_sparse_attention(
+            fallback,
+            *args,
+            min_sequence_tokens=min_sequence_tokens,
+            keep_ratio=keep_ratio,
+            prefix_policy=prefix_policy,
+            manual_prefix_tokens=manual_prefix_tokens,
+            sparse_reference_image=sparse_reference_image,
+            sparse_reference_video=sparse_reference_video,
+            sparse_reference_audio=sparse_reference_audio,
+            debug_route_density=debug_route_density,
+            use_w8a8=use_w8a8,
+            **kwargs,
+        )
+
+    if split_prequantization_available():
+        def container_function(
+            q,
+            k,
+            v,
+            heads: int,
+            mask=None,
+            attn_precision=None,
+            skip_reshape: bool = False,
+            skip_output_reshape: bool = False,
+            **kwargs,
+        ):
+            transformer_options = kwargs.get("transformer_options")
+            if is_dense(transformer_options):
+                return run_dense_container(
+                    q,
+                    k,
+                    v,
+                    heads,
+                    mask=mask,
+                    attn_precision=attn_precision,
+                    skip_reshape=skip_reshape,
+                    skip_output_reshape=skip_output_reshape,
+                    **kwargs,
+                )
+            sla_call, reason = inspect(
+                q.peek(),
+                k.peek(),
+                v.peek(),
+                heads,
+                mask=mask,
+                skip_reshape=skip_reshape,
+                skip_output_reshape=skip_output_reshape,
+                transformer_options=transformer_options,
+                kwargs=kwargs,
+            )
+            if reason is not None:
+                return run_dense_container(
+                    q,
+                    k,
+                    v,
+                    heads,
+                    mask=mask,
+                    attn_precision=attn_precision,
+                    skip_reshape=skip_reshape,
+                    skip_output_reshape=skip_output_reshape,
+                    **kwargs,
+                )
+            query = q.take()
+            key = k.take()
+            value = v.take()
+            quantized = prequantize_turing_sla_attention(
+                query,
+                key,
+                value,
+                sla_call,
+                keep_ratio=keep_ratio,
+                scale=kwargs.get("scale"),
+                use_w8a8=use_w8a8,
+                transformer_options=transformer_options,
+            )
+            del query, key, value
+            result = turing_sla_attention_from_prequantized(
+                quantized,
+                return_stats=debug_route_density,
+            )
+            return (
+                collect_stats(result, sla_call, transformer_options)
+                if debug_route_density
+                else result
+            )
+
+        attention_override.container_function = container_function
+
+    attention_override.turing_utils_attention_backend = "sla_sparse_attn"
+    attention_override.turing_utils_attention_implementation = "bundled_sla_sparse"
+    attention_override.turing_utils_dense_implementation = (
+        dense_override.turing_utils_attention_implementation
+    )
+    if fused_qk_preprocessing_available():
+        attention_override.prepared_attention_executor = prepared_executor
+    return attention_override
+
+
 def apply_sparse_attention_patch(
     model,
     min_sequence_tokens: int = 0,
@@ -1123,6 +1481,91 @@ def apply_sparse_attention_patch(
         dense_prefix_layers,
         dense_suffix_layers,
         dense_implementation,
+        "u8xs8_tensorcore" if use_w8a8 else "fp16_tensorcore",
+        debug_route_density,
+    )
+    return patched
+
+
+def apply_sla_attention_patch(
+    model,
+    min_sequence_tokens: int = 0,
+    keep_ratio: float = SLA_KEEP_RATIO,
+    prefix_policy: str = SPARSE_PREFIX_POLICY,
+    manual_prefix_tokens: int = 0,
+    sparse_reference_image: bool = SPARSE_REFERENCE_IMAGE,
+    sparse_reference_video: bool = SPARSE_REFERENCE_VIDEO,
+    sparse_reference_audio: bool = SPARSE_REFERENCE_AUDIO,
+    dense_prefix_steps: int = SPARSE_DENSE_PREFIX_STEPS,
+    dense_suffix_steps: int = SPARSE_DENSE_SUFFIX_STEPS,
+    dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
+    dense_suffix_layers: int = SPARSE_DENSE_SUFFIX_LAYERS,
+    debug_route_density: bool = False,
+    use_w8a8: bool = SPARSE_USE_W8A8,
+):
+    patched = model.clone()
+    layout_status = ensure_attention_layout_provider(patched)
+    override = make_sla_attention_override(
+        patched.load_device,
+        min_sequence_tokens=min_sequence_tokens,
+        keep_ratio=keep_ratio,
+        prefix_policy=prefix_policy,
+        manual_prefix_tokens=manual_prefix_tokens,
+        sparse_reference_image=sparse_reference_image,
+        sparse_reference_video=sparse_reference_video,
+        sparse_reference_audio=sparse_reference_audio,
+        dense_prefix_steps=dense_prefix_steps,
+        dense_suffix_steps=dense_suffix_steps,
+        dense_prefix_layers=dense_prefix_layers,
+        dense_suffix_layers=dense_suffix_layers,
+        debug_route_density=debug_route_density,
+        use_w8a8=use_w8a8,
+    )
+    transformer_options = patched.model_options.setdefault("transformer_options", {})
+    if layout_status.required:
+        transformer_options[ATTENTION_LAYOUT_REQUIREMENT_KEY] = layout_status.model_kind
+        if not layout_status.installed:
+            LOG.warning(
+                "%s SLA attention will stay dense because its runtime layout "
+                "provider could not be installed: %s",
+                layout_status.model_kind,
+                layout_status.reason,
+            )
+    transformer_options["optimized_attention_override"] = override
+    prepared_executor = getattr(override, "prepared_attention_executor", None)
+    if callable(prepared_executor):
+        transformer_options[ATTENTION_EXECUTOR_KEY] = prepared_executor
+        site_status = ensure_prepared_attention_sites(patched, patched.load_device)
+        if site_status.matched and site_status.reason is not None:
+            LOG.info(
+                "%s prepared-attention fusion was not installed: %s",
+                site_status.model_kind,
+                site_status.reason,
+            )
+    else:
+        transformer_options.pop(ATTENTION_EXECUTOR_KEY, None)
+    transformer_options["turing_utils_attention_backend"] = "sla_sparse_attn"
+    transformer_options["turing_utils_attention_implementation"] = (
+        "bundled_sla_sparse"
+    )
+    LOG.info(
+        "SLA sparse attention patch enabled: keep_ratio=%.2f "
+        "topology=128x64 smooth_k=True prefix_policy=%s manual_prefix=%d "
+        "sparse_reference=(image=%s,video=%s,audio=%s) "
+        "dense_prefix_steps=%d dense_suffix_steps=%d "
+        "dense_prefix_layers=%d dense_suffix_layers=%d "
+        "dense_backend=%s pv_backend=%s debug_route_density=%s",
+        keep_ratio,
+        prefix_policy,
+        manual_prefix_tokens,
+        sparse_reference_image,
+        sparse_reference_video,
+        sparse_reference_audio,
+        dense_prefix_steps,
+        dense_suffix_steps,
+        dense_prefix_layers,
+        dense_suffix_layers,
+        override.turing_utils_dense_implementation,
         "u8xs8_tensorcore" if use_w8a8 else "fp16_tensorcore",
         debug_route_density,
     )

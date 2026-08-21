@@ -531,7 +531,7 @@ if _includes_integer_attention_arch():
 
 setup(
     name="comfyui-turing-utils-kernel",
-    version="0.28.1",
+    version="0.29.0",
     packages=find_packages(where=str(ROOT)),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

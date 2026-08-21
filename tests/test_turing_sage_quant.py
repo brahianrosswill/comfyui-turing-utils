@@ -92,13 +92,18 @@ class TuringSageQuantContractTest(unittest.TestCase):
 
         stable = turing_sage.sageattn_compiled(q, k, v)
         w8a8 = turing_sage.w8a8attn_compiled(q, k, v)
+        sla = turing_sage.sla_sparse_sageattn_compiled(
+            q,
+            k,
+            v,
+            dense_query_ranges=((0, 64),),
+            exact_kv_ranges=((128, 151),),
+        )
 
-        self.assertEqual(stable.shape, q.shape)
-        self.assertEqual(stable.dtype, q.dtype)
-        self.assertEqual(stable.device.type, "meta")
-        self.assertEqual(w8a8.shape, q.shape)
-        self.assertEqual(w8a8.dtype, q.dtype)
-        self.assertEqual(w8a8.device.type, "meta")
+        for output in (stable, w8a8, sla):
+            self.assertEqual(output.shape, q.shape)
+            self.assertEqual(output.dtype, q.dtype)
+            self.assertEqual(output.device.type, "meta")
 
     def test_compiled_attention_facade_is_a_fullgraph_leaf(self):
         q = torch.empty((1, 4, 129, 128), dtype=torch.bfloat16, device="meta")
@@ -108,6 +113,26 @@ class TuringSageQuantContractTest(unittest.TestCase):
         compiled = torch.compile(
             lambda query, key, value: turing_sage.sageattn_compiled(
                 query, key, value
+            ),
+            backend="eager",
+            fullgraph=True,
+        )
+        output = compiled(q, k, v)
+        self.assertEqual(output.shape, q.shape)
+        self.assertEqual(output.device.type, "meta")
+
+    def test_compiled_sla_facade_is_a_fullgraph_leaf(self):
+        q = torch.empty((1, 4, 129, 128), dtype=torch.bfloat16, device="meta")
+        k = torch.empty((1, 2, 151, 128), dtype=torch.bfloat16, device="meta")
+        v = torch.empty_like(k)
+
+        compiled = torch.compile(
+            lambda query, key, value: turing_sage.sla_sparse_sageattn_compiled(
+                query,
+                key,
+                value,
+                dense_query_ranges=((0, 64),),
+                exact_kv_ranges=((128, 151),),
             ),
             backend="eager",
             fullgraph=True,
@@ -196,9 +221,12 @@ class TuringSageQuantContractTest(unittest.TestCase):
                 "overlap_blend_available",
                 "overlap_blend_compiled",
                 "prequantize_sageattn",
+                "prequantize_sla_sageattn",
+                "prequantize_sla_sageattn_from_qk",
                 "prequantize_sol_sageattn",
                 "preflight",
                 "preflight_sparse",
+                "preflight_sla",
                 "preflight_w8a8",
                 "run_attention_correctness_gate",
                 "sageattn",
@@ -206,6 +234,10 @@ class TuringSageQuantContractTest(unittest.TestCase):
                 "sageattn_from_prequantized",
                 "sageattn_varlen",
                 "sageattn_varlen_compiled",
+                "sla_available",
+                "sla_sparse_sageattn",
+                "sla_sparse_sageattn_compiled",
+                "sla_sparse_sageattn_from_prequantized",
                 "sol_sparse_sageattn",
                 "sol_sparse_sageattn_compiled",
                 "sol_sparse_sageattn_from_prequantized",

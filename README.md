@@ -3,7 +3,8 @@
 Compatibility and performance extensions that fill gaps in ComfyUI on older
 NVIDIA Turing GPUs. The plugin currently provides ConvRot W8A8/W4A8/W4A4
 support, exact-sm75 BF16 activation storage, bundled Turing Sage/W8A8
-attention, native sm75+ Sol sparse attention, and focused Wan/Bernini utilities.
+attention, native sm75+ Sol and fixed-Top-K SLA sparse attention, and focused
+Wan/Bernini utilities.
 
 ## Requirements
 
@@ -12,9 +13,9 @@ attention, native sm75+ Sol sparse attention, and focused Wan/Bernini utilities.
 - Python 3.10 or newer
 - PyTorch with CUDA and ComfyUI
 - `comfy-kitchen>=0.2.26` for ConvRot model integration
-- the independently installed `comfyui-turing-utils-kernel>=0.28.0` for native
-  Sol on Ampere or newer; exact-sm75 installs also provide the local dense
-  attention and quantized-linear paths
+- the independently installed `comfyui-turing-utils-kernel>=0.29.0` for SLA;
+  native Sol on Ampere or newer requires 0.28.0, while exact-sm75 installs also
+  provide the local dense attention and quantized-linear paths
 
 Grouped-codebook `asym_w4a8_int8` checkpoints require kernel 0.24.0. Existing
 W8A8, W4A4, legacy W4A8, and attention paths keep their earlier minimum.
@@ -103,6 +104,12 @@ only after its CUDA sources or required version change.
   multimodal layout metadata, and exposes integer dense-step safeguards,
   dense first/last-layer protection, the native integer W8A8 PV path by default, and an
   internal automatic short-sequence crossover.
+- `Patch SLA Sparse Attention` implements the MiniMax H3 Turbo-SLA runtime as
+  fixed-budget 128-query by 64-key Top-K routing. It shares Sol's semantic
+  reference protection, dense step/layer scheduling, fused Q/K preprocessing,
+  tensor lifetime, and optional W8A8 PV path, but deliberately does not add
+  Sol's local blocks or skipped-block residual. Use it with the SLA-trained
+  LoRA; `keep_ratio=0.15` matches the published runtime budget.
 - `Patch Turing Attention Kernel Tuning (Experimental)` overrides the logical
   CTA-K schedule and the fused Hadamard/adaptive-anchor quality controls for
   dense W8A8 and Sol. Its defaults are the production policy; explicit values

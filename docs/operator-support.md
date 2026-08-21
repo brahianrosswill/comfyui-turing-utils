@@ -48,6 +48,7 @@ implementation.
 | Attention | `w8a8_attention` | Dense INT8-QK and INT8-PV SM75 attention |
 | Attention | `w8a8_attention_varlen` | Packed variable-length dense W8A8 attention |
 | Attention | `sol_attention` | Native sm75+ online Sol routing with FP16/BF16-PV or INT8-PV |
+| Attention | `sla_attention` | Native sm75+ 128x64 fixed-Top-K SLA routing with FP16/BF16-PV or INT8-PV |
 
 W4A4 and the main W8A8 linear contraction deliberately reuse Comfy Kitchen or
 cuBLAS. The local package supplies the Turing-specific quantization, BF16
@@ -79,6 +80,16 @@ duplicate full W4A4 and W8A8 GEMM implementations.
 FP32 is accepted at the plugin boundary only for ComfyUI's Turing BF16
 fallback case; it is converted to BF16 storage before entering these kernels.
 The kernels do not advertise native FP32 attention.
+
+SLA has the same fixed-shape, unmasked, non-causal, GQA, unequal-Q/K, D64/D128,
+semantic exact-KV, and split-prequantization support as Sol. Its routing policy
+is intentionally different: every 128-token Query block keeps a fixed fraction
+of 64-token K/V blocks, adjacent Q64 execution CTAs share that route, and
+unselected blocks contribute nothing. The retained route is a compressed
+bitset; the centroid score tensor exists only while building Top-K and is
+released before exact attention. Smooth-K's global K subtraction is omitted
+mathematically because it adds the same constant to every candidate score in a
+Query row and therefore cannot change Top-K ordering.
 
 The D64 attention specializations use 16 KiB shared memory and D128 uses 32
 KiB. The long-key 128-token schedule reuses a 64-token shared tile rather than
@@ -112,6 +123,7 @@ sequence length or that an A40 PTX result can choose a Turing launch policy.
 | Production default | Dense W8A8 attention; ConvRot W8A8/W4A8/W4A4 activation paths; BF16 epilogue; normalization fusions | Selected by the loader/adapter after preflight; exact-sm75 tile choices are cached per device and contraction shape |
 | Production alternative | Stable Sage; SDPA FP16 bridge; legacy and grouped-codebook W4A8 | Explicit backend/weight-format choice with deterministic fallback |
 | Production patch | Sol FP16-PV and Sol W8A8 | Enabled only by the independent Sol node so workflow-specific routing and modality controls remain explicit; W8A8 is the node default; newer architectures use a native Sol cubin and architecture-native dense fallback |
+| Production patch | SLA FP16-PV and SLA W8A8 | Independent fixed-Top-K node for SLA-trained weights; shares Sol's safety controls and architecture-native dense fallback without changing SLA route semantics |
 | Compatibility only | Staged codebook decode | Preserves grouped-codebook formats that cannot use the inline g16 decoder |
 
 The resource release gate covers all compiled production and compatibility

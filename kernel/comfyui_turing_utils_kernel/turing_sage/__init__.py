@@ -32,6 +32,23 @@ def sparse_available() -> bool:
     return hasattr(module, "sol_sparse_online_int8_f16_attn")
 
 
+def sla_available() -> bool:
+    if not available():
+        return False
+    try:
+        module = importlib.import_module("comfyui_turing_utils_kernel._sage_qattn_sm75")
+    except (ImportError, OSError):
+        return False
+    return all(
+        hasattr(module, name)
+        for name in (
+            "sla_qk_block_summaries",
+            "sla_build_route_words",
+            "sla_sparse_online_attn",
+        )
+    )
+
+
 def w8a8_available() -> bool:
     # Dense W8A8 is a production backend with its own ABI.  Do not couple its
     # availability to the Sol entry point merely because both
@@ -206,6 +223,47 @@ def sol_sparse_sageattn(*args, **kwargs):
     return implementation(*args, **kwargs)
 
 
+def sla_sparse_sageattn(*args, **kwargs):
+    from .core import sla_sparse_sageattn as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def sla_sparse_sageattn_compiled(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    dense_query_ranges=(),
+    exact_kv_ranges=(),
+    keep_ratio: float = 0.15,
+    use_w8a8: bool = True,
+    sm_scale: float | None = None,
+    key_tile_tokens: int = 0,
+    rotate_qk: bool = True,
+    stabilize_k: bool = True,
+):
+    from .custom_ops import sla_attention
+
+    dense_query_ranges = tuple(dense_query_ranges)
+    exact_kv_ranges = tuple(exact_kv_ranges)
+    return sla_attention(
+        q,
+        k,
+        v,
+        [int(item[0]) for item in dense_query_ranges],
+        [int(item[1]) for item in dense_query_ranges],
+        [int(item[0]) for item in exact_kv_ranges],
+        [int(item[1]) for item in exact_kv_ranges],
+        float(keep_ratio),
+        bool(use_w8a8),
+        float(sm_scale) if sm_scale is not None else -1.0,
+        int(key_tile_tokens),
+        bool(rotate_qk),
+        bool(stabilize_k),
+    )
+
+
 def sol_sparse_sageattn_compiled(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -347,8 +405,26 @@ def prequantize_sol_sageattn_from_qk(*args, **kwargs):
     return implementation(*args, **kwargs)
 
 
+def prequantize_sla_sageattn(*args, **kwargs):
+    from .core import prequantize_sla_sageattn as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def prequantize_sla_sageattn_from_qk(*args, **kwargs):
+    from .core import prequantize_sla_sageattn_from_qk as implementation
+
+    return implementation(*args, **kwargs)
+
+
 def sol_sparse_sageattn_from_prequantized(*args, **kwargs):
     from .core import sol_sparse_sageattn_from_prequantized as implementation
+
+    return implementation(*args, **kwargs)
+
+
+def sla_sparse_sageattn_from_prequantized(*args, **kwargs):
+    from .core import sla_sparse_sageattn_from_prequantized as implementation
 
     return implementation(*args, **kwargs)
 
@@ -389,6 +465,108 @@ def preflight_sparse(device: torch.device) -> None:
                 raise RuntimeError(
                     f"Sol sparse attention BF16 D={head_dim} self-test failed"
                 )
+        torch.cuda.synchronize(device)
+
+
+def preflight_sla(device: torch.device) -> None:
+    if not _integer_attention_device(device):
+        raise RuntimeError(f"SLA sparse attention requires sm75 or newer, got {device}")
+    if not sla_available():
+        raise RuntimeError("the SLA sparse attention extension is not built")
+
+    with torch.inference_mode(), torch.cuda.device(device):
+        for head_dim in (64, 128):
+            q_values = torch.arange(
+                4 * 257 * head_dim, device=device, dtype=torch.float32
+            )
+            kv_values = torch.arange(
+                2 * 319 * head_dim, device=device, dtype=torch.float32
+            )
+            q = (((q_values % 29) - 14) / 16).reshape(
+                1, 4, 257, head_dim
+            ).to(torch.bfloat16)
+            k = ((((kv_values * 3) % 31) - 15) / 16).reshape(
+                1, 2, 319, head_dim
+            ).to(torch.bfloat16)
+            v = ((((kv_values * 5) % 37) - 18) / 16).reshape_as(k).to(
+                torch.bfloat16
+            )
+            output = sla_sparse_sageattn(
+                q,
+                k,
+                v,
+                keep_ratio=1.0,
+                use_w8a8=True,
+            )
+            reference = torch.nn.functional.scaled_dot_product_attention(
+                q.float(), k.float(), v.float(), enable_gqa=True
+            )
+            if (
+                output.dtype != torch.bfloat16
+                or output.shape != q.shape
+                or not torch.isfinite(output).all()
+                or not torch.allclose(output.float(), reference, rtol=0.12, atol=0.09)
+            ):
+                raise RuntimeError(
+                    f"SLA sparse attention BF16 D={head_dim} self-test failed"
+                )
+
+        # Exercise a genuinely sparse route rather than validating only the
+        # all-block boundary above. Decode the retained route bitset into a
+        # small explicit token mask and compare the exact selected-block path
+        # with SDPA. This also gates Q128 route sharing, dense Query blocks,
+        # exact-KV union, GQA, unequal Q/K lengths, and the final partial block.
+        state = prequantize_sla_sageattn(
+            q,
+            k,
+            v,
+            dense_query_ranges=((0, 64),),
+            exact_kv_ranges=((256, 319),),
+            keep_ratio=0.5,
+            use_w8a8=False,
+        )
+        output, selected, _ = sla_sparse_sageattn_from_prequantized(
+            state,
+            return_stats=True,
+        )
+        route_words = state.route_words.to(torch.int64)
+        route_mask = torch.zeros(
+            (q.size(0), q.size(1), q.size(2), k.size(2)),
+            dtype=torch.bool,
+            device=device,
+        )
+        query_blocks_64 = (q.size(2) + 63) // 64
+        key_blocks = (k.size(2) + 63) // 64
+        expected_selected = 0
+        for query_block in range(query_blocks_64):
+            query_start = query_block * 64
+            query_stop = min(query_start + 64, q.size(2))
+            if not bool(state.sparse_query_blocks[query_block].item()):
+                route_mask[:, :, query_start:query_stop, :] = True
+                continue
+            route_row = query_block // 2
+            for key_block in range(key_blocks):
+                word = route_words[:, :, route_row, key_block // 32]
+                block_selected = ((word >> (key_block % 32)) & 1).bool()
+                expected_selected += int(block_selected.sum().item())
+                key_start = key_block * 64
+                key_stop = min(key_start + 64, k.size(2))
+                route_mask[
+                    :, :, query_start:query_stop, key_start:key_stop
+                ] = block_selected[:, :, None, None]
+        reference = torch.nn.functional.scaled_dot_product_attention(
+            q.float(),
+            k.float(),
+            v.float(),
+            attn_mask=route_mask,
+            enable_gqa=True,
+        )
+        if (
+            int(selected.item()) != expected_selected
+            or not torch.isfinite(output).all()
+            or not torch.allclose(output.float(), reference, rtol=0.08, atol=0.06)
+        ):
+            raise RuntimeError("SLA sparse route/mask self-test failed")
         torch.cuda.synchronize(device)
 
 
@@ -500,9 +678,12 @@ __all__ = [
     "overlap_blend_available",
     "overlap_blend_compiled",
     "prequantize_sageattn",
+    "prequantize_sla_sageattn",
+    "prequantize_sla_sageattn_from_qk",
     "prequantize_sol_sageattn",
     "preflight",
     "preflight_sparse",
+    "preflight_sla",
     "preflight_w8a8",
     "run_attention_correctness_gate",
     "sageattn",
@@ -510,6 +691,10 @@ __all__ = [
     "sageattn_from_prequantized",
     "sageattn_varlen",
     "sageattn_varlen_compiled",
+    "sla_available",
+    "sla_sparse_sageattn",
+    "sla_sparse_sageattn_compiled",
+    "sla_sparse_sageattn_from_prequantized",
     "sol_sparse_sageattn",
     "sol_sparse_sageattn_compiled",
     "sol_sparse_sageattn_from_prequantized",

@@ -32,8 +32,10 @@ SPARSE_DENSE_PREFIX_STEPS = 1
 SPARSE_DENSE_SUFFIX_STEPS = 0
 SPARSE_DENSE_PREFIX_LAYERS = 2
 SPARSE_DENSE_SUFFIX_LAYERS = 0
+SLA_KEEP_RATIO = 0.15
 _PREFLIGHTED_DEVICES: set[int] = set()
 _PREFLIGHTED_SPARSE_DEVICES: set[int] = set()
+_PREFLIGHTED_SLA_DEVICES: set[int] = set()
 _PREFLIGHTED_W8A8_DEVICES: set[int] = set()
 _LOGGED_FP32_COMPAT = False
 _LOGGED_TURING_KERNELS: set[tuple] = set()
@@ -322,6 +324,18 @@ def bundled_sparse_available() -> bool:
     return version_tuple >= (0, 23, 0) and turing_sage.sparse_available()
 
 
+def bundled_sla_available() -> bool:
+    try:
+        turing_sage = load_turing_sage()
+    except (ImportError, OSError):
+        return False
+    try:
+        version_tuple = tuple(int(part) for part in kernel_version().split(".")[:3])
+    except ValueError:
+        return False
+    return version_tuple >= (0, 29, 0) and turing_sage.sla_available()
+
+
 def bundled_w8a8_available() -> bool:
     try:
         turing_sage = load_turing_sage()
@@ -375,11 +389,11 @@ def prequantize_turing_qk(
     kernel: str,
     transformer_options=None,
 ):
-    if kernel not in {"sage", "w8a8", "sol"}:
+    if kernel not in {"sage", "w8a8", "sol", "sla"}:
         raise ValueError(f"unsupported fused Q/K target: {kernel}")
     tuning = attention_kernel_tuning(transformer_options)
-    rotate_qk = kernel in {"w8a8", "sol"} and tuning.rotate_qk
-    stabilize_k = kernel in {"w8a8", "sol"} and tuning.stabilize_k
+    rotate_qk = kernel in {"w8a8", "sol", "sla"} and tuning.rotate_qk
+    stabilize_k = kernel in {"w8a8", "sol", "sla"} and tuning.stabilize_k
     return load_turing_sage().prequantize_rms_rope_qk(
         q,
         k,
@@ -518,6 +532,16 @@ def preflight_bundled_sparse(device: torch.device) -> None:
         return
     load_turing_sage().preflight_sparse(device)
     _PREFLIGHTED_SPARSE_DEVICES.add(index)
+
+
+def preflight_bundled_sla(device: torch.device) -> None:
+    if not is_supported_attention_device(device):
+        raise RuntimeError(f"unsupported SLA attention device {device}")
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    if index in _PREFLIGHTED_SLA_DEVICES:
+        return
+    load_turing_sage().preflight_sla(device)
+    _PREFLIGHTED_SLA_DEVICES.add(index)
 
 
 def preflight_bundled_w8a8(device: torch.device) -> None:

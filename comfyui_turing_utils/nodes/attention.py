@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
-from ..attention import apply_attention_kernel_tuning_patch, apply_sparse_attention_patch
+from ..attention import (
+    apply_attention_kernel_tuning_patch,
+    apply_sla_attention_patch,
+    apply_sparse_attention_patch,
+)
 
 
 class AttentionKernelTuningPatch:
@@ -211,6 +215,161 @@ class SolSparseAttentionPatch:
                 prefix_policy=prefix_policy,
                 manual_prefix_tokens=manual_prefix_tokens,
                 skipped_residual=skipped_residual,
+                sparse_reference_image=sparse_reference_image,
+                sparse_reference_video=sparse_reference_video,
+                sparse_reference_audio=sparse_reference_audio,
+                dense_prefix_steps=dense_prefix_steps,
+                dense_suffix_steps=dense_suffix_steps,
+                dense_prefix_layers=dense_prefix_layers,
+                dense_suffix_layers=dense_suffix_layers,
+                use_w8a8=use_w8a8,
+                debug_route_density=debug_route_density,
+            ),
+        )
+
+
+class SlaSparseAttentionPatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "keep_ratio": (
+                    "FLOAT",
+                    {
+                        "default": 0.15,
+                        "min": 0.01,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "round": 0.01,
+                        "tooltip": "Fraction of 64-token K/V blocks retained for every 128-token Query block. 0.15 matches the MiniMax H3 Turbo-SLA training/runtime budget and should be used with an SLA-trained LoRA. 1.0 dispatches directly to the dense backend.",
+                    },
+                ),
+                "prefix_policy": (
+                    ["auto", "none", "manual"],
+                    {
+                        "default": "auto",
+                        "tooltip": "Auto applies the H3 semantic layout and reference switches. None reproduces the unprotected published SLA route. Manual protects only the leading token count.",
+                    },
+                ),
+                "manual_prefix_tokens": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 262144,
+                        "step": 64,
+                        "tooltip": "Leading Query tokens kept dense and leading K/V tokens kept exact for manual policy.",
+                    },
+                ),
+                "sparse_reference_image": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Allow image-reference and keyframe blocks to use SLA Top-K routing. Disabled keeps their Query dense and KV exact.",
+                    },
+                ),
+                "sparse_reference_video": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Allow long reference-video blocks to use SLA Top-K routing.",
+                    },
+                ),
+                "sparse_reference_audio": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Allow reference-audio blocks to use SLA Top-K routing. Disabled protects dialogue conditioning exactly.",
+                    },
+                ),
+                "dense_prefix_steps": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 0,
+                        "max": 1000,
+                        "step": 1,
+                        "tooltip": "Early denoising steps that use the selected dense backend in every layer. Set 0 to reproduce all-step SLA routing.",
+                    },
+                ),
+                "dense_suffix_steps": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 1000,
+                        "step": 1,
+                        "tooltip": "Final denoising steps that use the selected dense backend in every layer.",
+                    },
+                ),
+                "dense_prefix_layers": (
+                    "INT",
+                    {
+                        "default": 2,
+                        "min": 0,
+                        "max": 256,
+                        "step": 1,
+                        "tooltip": "Leading transformer layers kept dense in sparse steps. Prefix plus suffix reaching the model layer count makes the complete patch dense.",
+                    },
+                ),
+                "dense_suffix_layers": (
+                    "INT",
+                    {
+                        "default": 0,
+                        "min": 0,
+                        "max": 256,
+                        "step": 1,
+                        "tooltip": "Trailing transformer layers kept dense in sparse steps.",
+                    },
+                ),
+            },
+            "optional": {
+                "use_w8a8": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": "Use INT8 V and probability Tensor Cores for selected SLA blocks and protected dense steps/layers.",
+                    },
+                ),
+                "debug_route_density": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Log realized SLA route density, including exact reference blocks.",
+                    },
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "patch"
+    CATEGORY = "Turing Utils/patches"
+    TITLE = "Patch SLA Sparse Attention"
+
+    def patch(
+        self,
+        model,
+        keep_ratio: float = 0.15,
+        prefix_policy: str = "auto",
+        manual_prefix_tokens: int = 0,
+        sparse_reference_image: bool = False,
+        sparse_reference_video: bool = True,
+        sparse_reference_audio: bool = False,
+        dense_prefix_steps: int = 1,
+        dense_suffix_steps: int = 0,
+        dense_prefix_layers: int = 2,
+        dense_suffix_layers: int = 0,
+        use_w8a8: bool = True,
+        debug_route_density: bool = False,
+    ):
+        return (
+            apply_sla_attention_patch(
+                model,
+                keep_ratio=keep_ratio,
+                prefix_policy=prefix_policy,
+                manual_prefix_tokens=manual_prefix_tokens,
                 sparse_reference_image=sparse_reference_image,
                 sparse_reference_video=sparse_reference_video,
                 sparse_reference_audio=sparse_reference_audio,

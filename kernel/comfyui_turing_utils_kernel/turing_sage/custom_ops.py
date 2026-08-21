@@ -357,3 +357,60 @@ def _sol_attention_fake(
     stabilize_k,
 ):
     return torch.empty_like(query)
+
+
+@torch.library.custom_op("turing_utils::sla_attention", mutates_args=())
+def sla_attention(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    dense_query_starts: list[int],
+    dense_query_stops: list[int],
+    exact_kv_starts: list[int],
+    exact_kv_stops: list[int],
+    keep_ratio: float,
+    use_w8a8: bool,
+    sm_scale: float,
+    key_tile_tokens: int,
+    rotate_qk: bool,
+    stabilize_k: bool,
+) -> torch.Tensor:
+    from .core import sla_sparse_sageattn
+
+    if len(dense_query_starts) != len(dense_query_stops):
+        raise ValueError("dense Query range starts/stops must have equal length")
+    if len(exact_kv_starts) != len(exact_kv_stops):
+        raise ValueError("exact KV range starts/stops must have equal length")
+    return sla_sparse_sageattn(
+        query,
+        key,
+        value,
+        tensor_layout="HND",
+        sm_scale=sm_scale if sm_scale > 0.0 else None,
+        dense_query_ranges=tuple(zip(dense_query_starts, dense_query_stops)),
+        exact_kv_ranges=tuple(zip(exact_kv_starts, exact_kv_stops)),
+        keep_ratio=keep_ratio,
+        use_w8a8=use_w8a8,
+        key_tile_tokens=key_tile_tokens,
+        rotate_qk=rotate_qk,
+        stabilize_k=stabilize_k,
+    )
+
+
+@sla_attention.register_fake
+def _sla_attention_fake(
+    query,
+    key,
+    value,
+    dense_query_starts,
+    dense_query_stops,
+    exact_kv_starts,
+    exact_kv_stops,
+    keep_ratio,
+    use_w8a8,
+    sm_scale,
+    key_tile_tokens,
+    rotate_qk,
+    stabilize_k,
+):
+    return torch.empty_like(query)

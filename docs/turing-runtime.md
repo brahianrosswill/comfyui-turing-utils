@@ -190,6 +190,7 @@ invisibly to `sage` and are not displayed by the loader.
 | `sage` on Turing | INT8, per-16-token Q-warp scales | disabled | FP16 V tiles with direct FP32 accumulation |
 | `w8a8` on Turing | stable-Sage INT8 score domain | disabled | channel-wise signed INT8 V and unsigned INT8 probabilities, INT32 Tensor Core PV, FP32 online state |
 | `Patch Sol Sparse Attention` | fused 64-token centroid routing; selected tiles reuse stable Sage INT8 QK | input-adaptive `mean + tau * std` threshold | exact FP16 V tiles plus skipped-block V centroids, FP32 online accumulation |
+| `Patch SLA Sparse Attention` | one route shared by adjacent Q64 CTAs (logical Q128 x K64); selected tiles reuse stable Sage INT8 QK | fixed Top-K budget; Smooth-K-invariant ordering | selected exact FP16 V tiles or optional W8A8 PV; no skipped-block residual |
 
 Integer Q/K MMA accumulates into INT32. The stable facade supports FP16 and
 BF16 Q/K/V, HND/NHD, GQA, causal mode, unequal Q/KV lengths, head dimensions
@@ -208,6 +209,15 @@ The sparse backend is installed only by the independent
 `Patch Sol Sparse Attention` node and is never a loader option. Keeping a
 separate node is intentional: its routing, modality, step, layer, and residual
 quality parameters do not belong in the loader.
+
+SLA is likewise installed only by its independent patch node and requires
+kernel 0.29.0. It shares the Sol layout contract, dense schedules, fused Q/K
+preprocessing, GQA and unequal-Q/K handling. It differs at the route itself:
+128-token Query centroids select a fixed Top-K set of 64-token K blocks and the
+two corresponding Q64 execution CTAs consume one compressed bitset. There is no
+local-radius union and no centroid contribution for skipped values. This keeps
+the runtime aligned with SLA-trained weights rather than turning SLA into a
+second Sol profile.
 Dispatch depends only on the attention call: matching
 FP16, BF16, or FP32 Q/K/V; head dimensions 1--128; unmasked non-causal attention;
 and both Q and K meeting the configurable minimum sequence length. HND and

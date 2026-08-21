@@ -1,4 +1,4 @@
-"""Production Sol sparse-attention policy and exact modality protection."""
+"""Production Sol/SLA sparse-attention policy and exact modality protection."""
 
 from __future__ import annotations
 
@@ -45,6 +45,14 @@ class SolAttentionCall:
     residual_subblocks: int
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class SlaAttentionCall:
+    attention: AttentionCall
+    effective_min_sequence: int
+    dense_query_ranges: tuple[tuple[int, int], ...]
+    exact_kv_ranges: tuple[tuple[int, int], ...]
+
+
 def _sparse_dense_baseline(
     reason: str,
     fallback: Callable,
@@ -55,7 +63,7 @@ def _sparse_dense_baseline(
     **kwargs,
 ) -> torch.Tensor:
     if reason not in _LOGGED_SPARSE_DENSE_REASONS:
-        LOG.info("Sol sparse attention uses the selected dense backend for %s", reason)
+        LOG.info("Sparse attention uses the selected dense backend for %s", reason)
         _LOGGED_SPARSE_DENSE_REASONS.add(reason)
     return fallback(q, k, v, heads, **kwargs)
 
@@ -371,6 +379,79 @@ def inspect_sol_attention_call(
     ), None
 
 
+def inspect_sla_attention_call(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    heads: int,
+    *,
+    mask,
+    skip_reshape: bool,
+    skip_output_reshape: bool,
+    min_sequence_tokens: int,
+    prefix_policy: str,
+    manual_prefix_tokens: int,
+    sparse_reference_image: bool,
+    sparse_reference_video: bool,
+    sparse_reference_audio: bool,
+    transformer_options,
+    kwargs: dict,
+) -> tuple[SlaAttentionCall | None, str | None]:
+    call, reason = inspect_turing_attention_call(
+        q,
+        k,
+        v,
+        heads,
+        mask=mask,
+        skip_reshape=skip_reshape,
+        skip_output_reshape=skip_output_reshape,
+        enable_gqa=bool(kwargs.get("enable_gqa", False)),
+        low_precision_attention=kwargs.get("low_precision_attention", True),
+        is_causal=bool(kwargs.get("is_causal", False)),
+        kernel="sol",
+        require_long_sequence=True,
+    )
+    if reason is not None:
+        return None, reason
+    effective_min_sequence = min_sequence_tokens or SPARSE_AUTO_MIN_SEQUENCE
+    if call.query_tokens < effective_min_sequence or call.key_tokens < effective_min_sequence:
+        return None, f"sequences shorter than {effective_min_sequence} tokens"
+    if _required_sparse_layout_missing(
+        transformer_options,
+        call.query_tokens,
+        call.key_tokens,
+    ):
+        return None, "required semantic attention layout metadata is unavailable"
+    dense_query_ranges = _sparse_protected_ranges(
+        prefix_policy,
+        manual_prefix_tokens,
+        transformer_options,
+        call.query_tokens,
+        sparse_reference_image=bool(sparse_reference_image),
+        sparse_reference_video=bool(sparse_reference_video),
+        sparse_reference_audio=bool(sparse_reference_audio),
+        axis="query",
+    )
+    if sum(stop - start for start, stop in dense_query_ranges) >= call.query_tokens:
+        return None, "all Query tokens are protected"
+    exact_kv_ranges = _sparse_protected_ranges(
+        prefix_policy,
+        manual_prefix_tokens,
+        transformer_options,
+        call.key_tokens,
+        sparse_reference_image=bool(sparse_reference_image),
+        sparse_reference_video=bool(sparse_reference_video),
+        sparse_reference_audio=bool(sparse_reference_audio),
+        axis="key",
+    )
+    return SlaAttentionCall(
+        attention=call,
+        effective_min_sequence=effective_min_sequence,
+        dense_query_ranges=dense_query_ranges,
+        exact_kv_ranges=exact_kv_ranges,
+    ), None
+
+
 def prequantize_turing_sol_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -431,12 +512,89 @@ def prequantize_turing_sol_attention_from_qk(
     return PrequantizedAttentionCall(state, call.attention)
 
 
+def prequantize_turing_sla_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    call: SlaAttentionCall,
+    *,
+    keep_ratio: float,
+    scale: float | None,
+    use_w8a8: bool,
+    transformer_options=None,
+) -> PrequantizedAttentionCall:
+    q, k, v = normalize_turing_attention_tensors(q, k, v, call.attention)
+    if call.attention.tensor_layout == "NHD":
+        q = q.transpose(1, 2).contiguous()
+        k = k.transpose(1, 2).contiguous()
+        v = v.transpose(1, 2).contiguous()
+    tuning = attention_kernel_tuning(transformer_options)
+    state = load_turing_sage().prequantize_sla_sageattn(
+        q,
+        k,
+        v,
+        tensor_layout="HND",
+        sm_scale=scale,
+        dense_query_ranges=call.dense_query_ranges,
+        exact_kv_ranges=call.exact_kv_ranges,
+        keep_ratio=keep_ratio,
+        use_w8a8=bool(use_w8a8),
+        key_tile_tokens=tuning.key_tile_tokens,
+        rotate_qk=tuning.rotate_qk,
+        stabilize_k=tuning.stabilize_k,
+    )
+    return PrequantizedAttentionCall(state, call.attention)
+
+
+def prequantize_turing_sla_attention_from_qk(
+    qk,
+    value: torch.Tensor,
+    call: SlaAttentionCall,
+    *,
+    keep_ratio: float,
+    scale: float | None,
+    use_w8a8: bool,
+    transformer_options=None,
+) -> PrequantizedAttentionCall:
+    tuning = attention_kernel_tuning(transformer_options)
+    state = load_turing_sage().prequantize_sla_sageattn_from_qk(
+        qk,
+        value,
+        sm_scale=scale,
+        dense_query_ranges=call.dense_query_ranges,
+        exact_kv_ranges=call.exact_kv_ranges,
+        keep_ratio=keep_ratio,
+        use_w8a8=bool(use_w8a8),
+        key_tile_tokens=tuning.key_tile_tokens,
+    )
+    return PrequantizedAttentionCall(state, call.attention)
+
+
 def turing_sol_attention_from_prequantized(
     quantized: PrequantizedAttentionCall,
     *,
     return_stats: bool,
 ):
     result = load_turing_sage().sol_sparse_sageattn_from_prequantized(
+        quantized.kernel_state,
+        return_stats=return_stats,
+    )
+    if return_stats:
+        output, selected, possible_blocks = result
+    else:
+        output = result
+    if quantized.call.tensor_layout == "NHD":
+        output = output.transpose(1, 2)
+    output = finish_turing_attention_output(output, quantized.call)
+    return (output, selected, possible_blocks) if return_stats else output
+
+
+def turing_sla_attention_from_prequantized(
+    quantized: PrequantizedAttentionCall,
+    *,
+    return_stats: bool,
+):
+    result = load_turing_sage().sla_sparse_sageattn_from_prequantized(
         quantized.kernel_state,
         return_stats=return_stats,
     )
@@ -699,3 +857,112 @@ def turing_sol_sparse_attention(
         call.batch, -1, call.heads * call.head_dim
     )
     return result.to(input_dtype) if input_dtype == torch.float32 else result
+
+
+def turing_sla_sparse_attention(
+    fallback: Callable,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    heads: int,
+    mask=None,
+    attn_precision=None,
+    skip_reshape: bool = False,
+    skip_output_reshape: bool = False,
+    min_sequence_tokens: int = 0,
+    keep_ratio: float = 0.15,
+    prefix_policy: str = SPARSE_PREFIX_POLICY,
+    manual_prefix_tokens: int = 0,
+    sparse_reference_image: bool = SPARSE_REFERENCE_IMAGE,
+    sparse_reference_video: bool = SPARSE_REFERENCE_VIDEO,
+    sparse_reference_audio: bool = SPARSE_REFERENCE_AUDIO,
+    debug_route_density: bool = False,
+    use_w8a8: bool = SPARSE_USE_W8A8,
+    **kwargs,
+) -> torch.Tensor:
+    common = {
+        "mask": mask,
+        "attn_precision": attn_precision,
+        "skip_reshape": skip_reshape,
+        "skip_output_reshape": skip_output_reshape,
+        **kwargs,
+    }
+    sla_call, reason = inspect_sla_attention_call(
+        q,
+        k,
+        v,
+        heads,
+        mask=mask,
+        skip_reshape=skip_reshape,
+        skip_output_reshape=skip_output_reshape,
+        min_sequence_tokens=min_sequence_tokens,
+        prefix_policy=prefix_policy,
+        manual_prefix_tokens=manual_prefix_tokens,
+        sparse_reference_image=bool(sparse_reference_image),
+        sparse_reference_video=bool(sparse_reference_video),
+        sparse_reference_audio=bool(sparse_reference_audio),
+        transformer_options=kwargs.get("transformer_options"),
+        kwargs=kwargs,
+    )
+    if reason is not None:
+        return _sparse_dense_baseline(
+            f"SLA: {reason}", fallback, q, k, v, heads, **common
+        )
+    call = sla_call.attention
+    kernel_key = (
+        "sla",
+        q.device.index,
+        call.input_dtype,
+        call.query_tokens,
+        call.key_tokens,
+        call.heads,
+        call.kv_heads,
+        sla_call.dense_query_ranges,
+        sla_call.exact_kv_ranges,
+        float(keep_ratio),
+        bool(use_w8a8),
+    )
+    if kernel_key not in _LOGGED_SPARSE_KERNELS:
+        LOG.info(
+            "Bundled SLA sparse attention active: dtype=%s Q=%d K=%d "
+            "topology=128x64 keep_ratio=%.2f smooth_k=True "
+            "dense_query_ranges=%s exact_kv_ranges=%s pv=%s",
+            call.input_dtype,
+            call.query_tokens,
+            call.key_tokens,
+            keep_ratio,
+            sla_call.dense_query_ranges,
+            sla_call.exact_kv_ranges,
+            "w8a8" if use_w8a8 else "fp16",
+        )
+        _LOGGED_SPARSE_KERNELS.add(kernel_key)
+    quantized = prequantize_turing_sla_attention(
+        q,
+        k,
+        v,
+        sla_call,
+        keep_ratio=keep_ratio,
+        scale=kwargs.get("scale"),
+        use_w8a8=use_w8a8,
+        transformer_options=kwargs.get("transformer_options"),
+    )
+    result = turing_sla_attention_from_prequantized(
+        quantized,
+        return_stats=debug_route_density,
+    )
+    if not debug_route_density:
+        return result
+    output, selected, possible = result
+    selected_blocks = int(selected.item())
+    LOG.warning(
+        "[Turing SLA debug] Q=%d K=%d selected=%d/%d density=%.4f "
+        "target_keep_ratio=%.2f protected_q=%d",
+        call.query_tokens,
+        call.key_tokens,
+        selected_blocks,
+        possible,
+        selected_blocks / possible if possible else 0.0,
+        keep_ratio,
+        sum(stop - start for start, stop in sla_call.dense_query_ranges),
+    )
+    return output

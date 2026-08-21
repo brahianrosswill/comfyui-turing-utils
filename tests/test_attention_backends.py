@@ -213,6 +213,91 @@ class AttentionBackendsTest(unittest.TestCase):
                     attention_backends.split_prequantization_available(), expected
                 )
 
+    def test_sla_adapter_preprocessor_reuses_fused_qk_and_releases_inputs(self):
+        tensors = [
+            torch.zeros((1, 2, 4096, 128), dtype=torch.bfloat16)
+            for _ in range(3)
+        ]
+        references = [weakref.ref(tensor) for tensor in tensors]
+        q, k, v = (
+            comfy_attention.AttentionTensorContainer(tensor) for tensor in tensors
+        )
+        del tensors
+        attention_call = SimpleNamespace(
+            heads=2,
+            kv_heads=2,
+            head_dim=128,
+            input_dtype=torch.bfloat16,
+            query_tokens=4096,
+            key_tokens=4096,
+            tensor_layout="HND",
+            skip_output_reshape=False,
+        )
+        sla_call = SimpleNamespace(
+            attention=attention_call,
+            dense_query_ranges=(),
+            exact_kv_ranges=(),
+        )
+        spec = attention_backends.QKTransformSpec(
+            attention_backends.RMSNormSpec(
+                torch.ones(128, dtype=torch.bfloat16), 1e-6, "head"
+            ),
+            attention_backends.RMSNormSpec(
+                torch.ones(128, dtype=torch.bfloat16), 1e-6, "head"
+            ),
+            attention_backends.RotaryEmbeddingSpec(None, 0, "none"),
+        )
+
+        def finish(qk, value, inspected, **kwargs):
+            self.assertEqual(qk, "qk")
+            self.assertIs(inspected, sla_call)
+            return "packed-sla"
+
+        def inspect(*args, **kwargs):
+            return sla_call, None
+
+        def quantize(*args, **kwargs):
+            return "qk"
+
+        def execute(packed, *, return_stats):
+            gc.collect()
+            self.assertEqual((packed, return_stats), ("packed-sla", False))
+            self.assertTrue(all(reference() is None for reference in references))
+            return "sla-output"
+
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention.is_supported_attention_device", return_value=True),
+            mock.patch("attention.bundled_available", return_value=True),
+            mock.patch("attention.bundled_sla_available", return_value=True),
+            mock.patch("attention.preflight_bundled"),
+            mock.patch("attention.preflight_bundled_sla"),
+            mock.patch("attention.fused_qk_preprocessing_available", return_value=True),
+            mock.patch("attention.inspect_sla_attention_call", new=inspect),
+            mock.patch("attention.prequantize_turing_qk", new=quantize),
+            mock.patch(
+                "attention.prequantize_turing_sla_attention_from_qk", new=finish
+            ),
+            mock.patch(
+                "attention.turing_sla_attention_from_prequantized", new=execute
+            ),
+        ):
+            override = attention_backends.make_sla_attention_override(
+                torch.device("cuda", 0),
+                dense_prefix_steps=0,
+                dense_prefix_layers=0,
+                use_w8a8=False,
+            )
+            request = attention_backends.PreparedAttention.from_hnd(
+                q, k, v, heads=2, qk_transform=spec, transformer_options={}
+            )
+            outcome = override.prepared_attention_executor(request)
+
+        self.assertEqual(outcome.output, "sla-output")
+        self.assertIsNone(q.tensor)
+        self.assertIsNone(k.tensor)
+        self.assertIsNone(v.tensor)
+
     def test_container_path_releases_inputs_before_output_allocation(self):
         references = []
 
@@ -953,6 +1038,114 @@ class AttentionBackendsTest(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "CUDA Tensor Core GPU"),
         ):
             attention_backends.make_sparse_attention_override(torch.device("cuda", 0))
+
+    def test_sla_override_forwards_fixed_topk_and_semantic_controls(self):
+        q = torch.zeros((1, 2, 4096, 128), dtype=torch.bfloat16)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention.is_supported_attention_device", return_value=True),
+            mock.patch("attention.bundled_available", return_value=True),
+            mock.patch("attention.bundled_sla_available", return_value=True),
+            mock.patch("attention.preflight_bundled"),
+            mock.patch("attention.preflight_bundled_sla") as preflight,
+            mock.patch("attention.turing_sla_sparse_attention", return_value=q) as sparse,
+        ):
+            override = attention_backends.make_sla_attention_override(
+                torch.device("cuda", 0),
+                min_sequence_tokens=2048,
+                keep_ratio=0.15,
+                prefix_policy="manual",
+                manual_prefix_tokens=128,
+                sparse_reference_image=True,
+                sparse_reference_video=False,
+                sparse_reference_audio=True,
+                dense_prefix_steps=0,
+                dense_prefix_layers=0,
+                use_w8a8=False,
+                debug_route_density=True,
+            )
+            output = override(mock.Mock(), q, q, q, 2, skip_reshape=True)
+
+        self.assertIs(output, q)
+        preflight.assert_called_once_with(torch.device("cuda", 0))
+        sparse.assert_called_once()
+        kwargs = sparse.call_args.kwargs
+        self.assertEqual(kwargs["min_sequence_tokens"], 2048)
+        self.assertEqual(kwargs["keep_ratio"], 0.15)
+        self.assertEqual(kwargs["prefix_policy"], "manual")
+        self.assertEqual(kwargs["manual_prefix_tokens"], 128)
+        self.assertTrue(kwargs["sparse_reference_image"])
+        self.assertFalse(kwargs["sparse_reference_video"])
+        self.assertTrue(kwargs["sparse_reference_audio"])
+        self.assertFalse(kwargs["use_w8a8"])
+        self.assertTrue(kwargs["debug_route_density"])
+        self.assertEqual(
+            override.turing_utils_attention_implementation,
+            "bundled_sla_sparse",
+        )
+
+    def test_sla_overlapping_dense_layers_bypass_sparse_kernel(self):
+        q = torch.zeros((1, 2, 4096, 128), dtype=torch.bfloat16)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention.is_supported_attention_device", return_value=True),
+            mock.patch("attention.bundled_sla_available", return_value=True),
+            mock.patch("attention.bundled_w8a8_available", return_value=True),
+            mock.patch("attention.preflight_bundled_sla"),
+            mock.patch("attention.preflight_bundled_w8a8"),
+            mock.patch("attention.turing_w8a8_attention", return_value=q) as dense,
+            mock.patch("attention.turing_sla_sparse_attention", return_value=q) as sparse,
+        ):
+            override = attention_backends.make_sla_attention_override(
+                torch.device("cuda", 0),
+                dense_prefix_layers=26,
+                dense_suffix_layers=25,
+            )
+            for layer_index in range(50):
+                override(
+                    mock.Mock(),
+                    q,
+                    q,
+                    q,
+                    2,
+                    skip_reshape=True,
+                    transformer_options={
+                        "turing_utils_attention_layout": {
+                            "layer_index": layer_index,
+                            "layer_count": 50,
+                        }
+                    },
+                )
+
+        self.assertEqual(dense.call_count, 50)
+        sparse.assert_not_called()
+
+    def test_sla_rejects_invalid_keep_ratio_before_preflight(self):
+        with self.assertRaisesRegex(ValueError, "keep_ratio"):
+            attention_backends.make_sla_attention_override(
+                torch.device("cuda", 0), keep_ratio=0.0
+            )
+
+    def test_full_sla_keep_ratio_dispatches_directly_to_dense_backend(self):
+        q = torch.zeros((1, 2, 4096, 128), dtype=torch.bfloat16)
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=True),
+            mock.patch("attention.is_supported_attention_device", return_value=True),
+            mock.patch("attention.bundled_sla_available", return_value=True),
+            mock.patch("attention.bundled_w8a8_available", return_value=True),
+            mock.patch("attention.preflight_bundled_sla"),
+            mock.patch("attention.preflight_bundled_w8a8"),
+            mock.patch("attention.turing_w8a8_attention", return_value=q) as dense,
+            mock.patch("attention.turing_sla_sparse_attention") as sparse,
+        ):
+            override = attention_backends.make_sla_attention_override(
+                torch.device("cuda", 0), keep_ratio=1.0
+            )
+            output = override(mock.Mock(), q, q, q, 2, skip_reshape=True)
+
+        self.assertIs(output, q)
+        dense.assert_called_once()
+        sparse.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

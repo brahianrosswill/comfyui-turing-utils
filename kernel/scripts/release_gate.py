@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = ROOT / "kernel"
 COMFYUI_ROOT = ROOT.parents[1]
-EXPECTED_VERSION = "0.28.1"
+EXPECTED_VERSION = "0.29.0"
 
 
 def _run(command: list[str], *, cwd: Path = ROOT, env=None) -> None:
@@ -72,8 +72,10 @@ def _static_gate() -> None:
     if "__threadfence_block" in fallback or "__syncthreads" in fallback:
         raise RuntimeError("SM75 synchronous-copy fallback contains a duplicate barrier")
     header = (KERNEL / "csrc/turing/sage/attn_cuda_sm75.h").read_text(encoding="utf-8")
-    if header.count("int key_tile_tokens") != 2:
-        raise RuntimeError("C++/pybind attention ABI does not expose both key-tile arguments")
+    if header.count("int key_tile_tokens") != 3:
+        raise RuntimeError(
+            "C++/pybind attention ABI does not expose all key-tile arguments"
+        )
     setup_source = (KERNEL / "setup.py").read_text(encoding="utf-8")
     for marker in (
         "CUDA_TOOLKIT_VERSION = _cuda_toolkit_version()",
@@ -180,6 +182,8 @@ def _static_gate() -> None:
     for marker in (
         "* sparse_block_count\n        * key_block_count",
         "possible_blocks=possible_blocks",
+        "def _sla_fixed_topk_indices(",
+        "route_words=route_words",
     ):
         if marker not in sparse_core:
             raise RuntimeError(f"missing full-block Sol route statistic: {marker}")
@@ -188,6 +192,13 @@ def _static_gate() -> None:
     )
     if "bundled_turing_sol_sparse_experimental" in sparse_patch:
         raise RuntimeError("the production Sol patch still advertises an experimental ABI")
+    for marker in (
+        "sla_qk_block_summaries",
+        "sla_build_route_words",
+        "sla_sparse_online_attn",
+    ):
+        if marker not in cuda or marker not in header:
+            raise RuntimeError(f"missing production SLA CUDA ABI marker: {marker}")
     print(f"static release gate passed (kernel ABI {EXPECTED_VERSION})")
 
 
@@ -219,6 +230,7 @@ def main() -> None:
                 "--device",
                 args.device,
                 "--sol",
+                "--sla",
             ],
             env=env,
         )

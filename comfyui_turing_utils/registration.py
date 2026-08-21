@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from .adapters.minimax.conditioning import install_combined_minimax_conditioning_support
-from .nodes.attention import AttentionKernelTuningPatch, SolSparseAttentionPatch
+from .nodes.attention import (
+    AttentionKernelTuningPatch,
+    SlaSparseAttentionPatch,
+    SolSparseAttentionPatch,
+)
 from .nodes.bernini import BerniniContextWindowsCore, BerniniInpaintCondition
 from .nodes.loaders import ConvRotCLIPLoader, ConvRotDiffusionModelLoader
 from .nodes.media import ResizeImageIfPresent, VideoMotionContactSheet
@@ -52,6 +56,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsMiniMaxH3LatentUpscale": MiniMaxH3LatentUpscale,
     "TuringUtilsMiniMaxH3BlockCachePatch": MiniMaxH3BlockCachePatch,
     "TuringUtilsSolSparseAttentionPatch": SolSparseAttentionPatch,
+    "TuringUtilsSlaSparseAttentionPatch": SlaSparseAttentionPatch,
     "TuringUtilsAttentionKernelTuningPatch": AttentionKernelTuningPatch,
     "TuringUtilsResizeImageIfPresent": ResizeImageIfPresent,
     "TuringUtilsVideoMotionContactSheet": VideoMotionContactSheet,
@@ -79,6 +84,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsMiniMaxH3LatentUpscale": "MiniMax H3 Latent Upscale",
     "TuringUtilsMiniMaxH3BlockCachePatch": "Patch MiniMax H3 Block Cache (Experimental)",
     "TuringUtilsSolSparseAttentionPatch": "Patch Sol Sparse Attention",
+    "TuringUtilsSlaSparseAttentionPatch": "Patch SLA Sparse Attention",
     "TuringUtilsAttentionKernelTuningPatch": "Patch Turing Attention Kernel Tuning (Experimental)",
     "TuringUtilsResizeImageIfPresent": "Resize Image If Present",
     "TuringUtilsVideoMotionContactSheet": "Video Motion Contact Sheet (Experimental)",

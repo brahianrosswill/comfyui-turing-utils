@@ -1035,6 +1035,54 @@ def validate_sparse(device: torch.device) -> None:
     )
 
 
+def validate_sla(device: torch.device) -> None:
+    from comfyui_turing_utils_kernel.turing_sage import (
+        preflight_sla,
+        prequantize_sla_sageattn,
+        sla_sparse_sageattn,
+    )
+
+    preflight_sla(device)
+    for head_dim in (1, 32, 63, 64, 65, 96, 127, 128):
+        q = torch.randn((1, 4, 129, head_dim), device=device, dtype=torch.bfloat16)
+        k = torch.randn((1, 2, 151, head_dim), device=device, dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        state = prequantize_sla_sageattn(
+            q,
+            k,
+            v,
+            keep_ratio=1.0,
+            use_w8a8=True,
+        )
+        expected_kernel_dim = 64 if head_dim <= 64 else 128
+        if (
+            state.query_int8.size(-1) != expected_kernel_dim
+            or state.key_int8.size(-1) != expected_kernel_dim
+            or state.value_int8.size(2) != expected_kernel_dim
+        ):
+            raise RuntimeError(
+                f"SLA D={head_dim} used the wrong native kernel dimension"
+            )
+        output = sla_sparse_sageattn(
+            q,
+            k,
+            v,
+            keep_ratio=1.0,
+            use_w8a8=True,
+        )
+        reference = torch.nn.functional.scaled_dot_product_attention(
+            q.float(), k.float(), v.float(), enable_gqa=True
+        )
+        _assert_close(
+            f"SLA all-block padded D={head_dim}",
+            output,
+            reference,
+            rtol=0.15,
+            atol=0.12,
+        )
+    print("SLA fixed-Top-K route and D1-128 validation passed")
+
+
 def _elapsed_ms(function, iterations: int) -> float:
     for _ in range(5):
         function()
@@ -1150,6 +1198,11 @@ def main() -> None:
         help="Run the production Sol sparse-attention correctness and benchmark gates",
     )
     parser.add_argument(
+        "--sla",
+        action="store_true",
+        help="Run the production fixed-Top-K SLA correctness gate",
+    )
+    parser.add_argument(
         "--experimental-sparse",
         action="store_true",
         dest="legacy_experimental_sparse",
@@ -1176,6 +1229,8 @@ def main() -> None:
         validate_sol = args.sol or args.legacy_experimental_sparse
         if validate_sol:
             validate_sparse(device)
+        if args.sla:
+            validate_sla(device)
         torch.cuda.synchronize(device)
         print("numerical validation passed")
         if args.benchmark:

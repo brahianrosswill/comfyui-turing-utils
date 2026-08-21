@@ -1,7 +1,7 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's quantized
-runtime. Version 0.28.1 contains legacy packed W4A8 and grouped-codebook W4A8
+runtime. Version 0.29.0 contains legacy packed W4A8 and grouped-codebook W4A8
 Tensor Core GEMMs, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, bundled Sage attention, pure-INT8 W8A8 attention,
@@ -14,6 +14,10 @@ Q-to-K-centroid Tensor Core pass now drives both routing and skipped-block
 online-softmax correction, so no duplicate Q/K centroid scan or full global
 route map is materialized. The local neighborhood is fixed to the official
 +/- one block. Original V means remain dedicated to value approximation.
+It also provides fixed-budget SLA routing: 128-token Query centroids choose a
+Top-K set of 64-token K/V blocks, adjacent Q64 execution CTAs share one compact
+route, and selected blocks use the same FP16-PV or W8A8-PV exact core without a
+Sol-style skipped residual.
 Legacy W4A8 K/N edge dimensions use predicated or tail-padded Tensor Core
 launches; the former full-matrix DP4A compatibility kernel has been removed.
 It contains no model-weight format or model loader.
@@ -22,7 +26,7 @@ Every stable public tensor operator is registered through
 `torch.library.custom_op` with a fake/meta implementation: both W4A8 GEMMs, a
 raw W8A8 contraction used by the grouped-codebook path and regression tests, BF16
 epilogue, ConvRot activation fusions, normalization fusions, fixed and varlen
-Sage, dense W8A8, Sol, and fused Q/K RMSNorm+RoPE+INT8 preprocessing.
+Sage, dense W8A8, Sol, SLA, and fused Q/K RMSNorm+RoPE+INT8 preprocessing.
 The same extension also provides a deterministic FP32 overlap epilogue for
 isolated validation and a streaming FP32 accumulator for the production
 MiniMax H3 shared-core VAE decoder. The streaming path consumes compact

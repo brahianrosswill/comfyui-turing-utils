@@ -72,6 +72,26 @@ class PrequantizedSolAttention:
     route_original_basis: bool
 
 
+@dataclass(frozen=True, slots=True)
+class PrequantizedSlaAttention:
+    query_int8: torch.Tensor
+    query_scale: torch.Tensor
+    key_int8: torch.Tensor
+    key_scale: torch.Tensor
+    value: Optional[torch.Tensor]
+    value_int8: torch.Tensor
+    value_scale: torch.Tensor
+    route_words: torch.Tensor
+    sparse_query_blocks: torch.Tensor
+    output_dtype: torch.dtype
+    sm_scale: float
+    keep_ratio: float
+    possible_blocks: int
+    use_w8a8: bool
+    original_head_dim: int
+    key_tile_tokens: int
+
+
 def _normalize_token_ranges(ranges, sequence_length: int) -> tuple[tuple[int, int], ...]:
     normalized = []
     for item in ranges or ():
@@ -136,6 +156,57 @@ def _sol_block_policy(
         while len(_SOL_POLICY_CACHE) > _SOL_POLICY_CACHE_LIMIT:
             _SOL_POLICY_CACHE.popitem(last=False)
     return policy
+
+
+def _sla_fixed_topk_indices(
+    query_summary: torch.Tensor,
+    key_summary: torch.Tensor,
+    keep_ratio: float,
+) -> torch.Tensor:
+    """Select the fixed SLA K budget for every 128-token Query block."""
+    if query_summary.ndim != 4 or key_summary.ndim != 4:
+        raise ValueError("SLA Q/K summaries must be four-dimensional")
+    if query_summary.size(0) != key_summary.size(0):
+        raise ValueError("SLA Q/K summary batch sizes must match")
+    if query_summary.size(-1) != key_summary.size(-1):
+        raise ValueError("SLA Q/K summary head dimensions must match")
+    query_heads = query_summary.size(1)
+    key_heads = key_summary.size(1)
+    if key_heads <= 0 or query_heads % key_heads:
+        raise ValueError("SLA Query heads must be divisible by KV heads")
+    key_blocks = key_summary.size(2)
+    keep_blocks = min(
+        key_blocks,
+        max(1, int(float(keep_ratio) * key_blocks)),
+    )
+    groups = query_heads // key_heads
+    grouped_query = query_summary.reshape(
+        query_summary.size(0),
+        key_heads,
+        groups,
+        query_summary.size(2),
+        query_summary.size(3),
+    )
+    # Smooth-K subtracts the same global K mean from every candidate block.
+    # That shifts every score in one Query row by one constant, so Top-K is
+    # exactly invariant; omitting the subtraction saves two tensors and a pass.
+    scores = torch.matmul(
+        grouped_query,
+        key_summary.unsqueeze(2).transpose(-1, -2),
+    ).reshape(
+        query_summary.size(0),
+        query_heads,
+        query_summary.size(2),
+        key_blocks,
+    )
+    indices = torch.topk(
+        scores,
+        keep_blocks,
+        dim=-1,
+        largest=True,
+        sorted=False,
+    ).indices.to(torch.int32)
+    return indices.contiguous()
 
 
 def _on_input_device(function):
@@ -909,6 +980,257 @@ def sol_sparse_sageattn_from_prequantized(
             )
     output = output[..., : quantized.original_head_dim]
     return (output, selected, quantized.possible_blocks) if return_stats else output
+
+
+def prequantize_sla_sageattn_from_qk(
+    qk: PrequantizedQK,
+    value: torch.Tensor,
+    *,
+    sm_scale: Optional[float] = None,
+    dense_query_ranges=(),
+    exact_kv_ranges=(),
+    keep_ratio: float = 0.15,
+    use_w8a8: bool = True,
+    key_tile_tokens: int = 0,
+) -> PrequantizedSlaAttention:
+    """Attach V and the SLA 128x64 fixed-Top-K route to preprocessed Q/K."""
+    if qk.tensor_layout != "HND":
+        raise ValueError("prequantized SLA attention requires HND layout")
+    if value.dtype != qk.input_dtype:
+        raise TypeError("preprocessed SLA Q/K and V must have matching dtypes")
+    if value.device != qk.query_int8.device:
+        raise ValueError("preprocessed SLA Q/K and V must share one CUDA device")
+    if value.ndim != 4 or value.stride(-1) != 1:
+        raise ValueError("preprocessed SLA V must have contiguous channels")
+    if (
+        value.size(0) != qk.key_int8.size(0)
+        or value.size(1) != qk.key_int8.size(1)
+        or value.size(2) != qk.key_int8.size(2)
+        or value.size(3) != qk.key_int8.size(3)
+    ):
+        raise ValueError("preprocessed SLA Q/K and V shapes are incompatible")
+    keep_ratio = float(keep_ratio)
+    if not 0.0 < keep_ratio <= 1.0:
+        raise ValueError("keep_ratio must be in (0, 1]")
+    key_tile_tokens = int(key_tile_tokens)
+    if key_tile_tokens not in (0, 64, 128):
+        raise ValueError("key_tile_tokens must be 0 (auto), 64, or 128")
+    if key_tile_tokens == 0:
+        key_tile_tokens = 128 if qk.key_int8.size(2) > 1024 else 64
+
+    sparse_query_blocks, exact_kv_blocks, sparse_block_count = _sol_block_policy(
+        qk.query_int8.device,
+        qk.query_int8.size(2),
+        qk.key_int8.size(2),
+        dense_query_ranges,
+        exact_kv_ranges,
+    )
+    if sparse_block_count == 0:
+        raise ValueError("SLA has no sparse Query blocks; use the dense backend")
+    key_block_count = (qk.key_int8.size(2) + 63) // 64
+    possible_blocks = (
+        qk.query_int8.size(0)
+        * qk.query_int8.size(1)
+        * sparse_block_count
+        * key_block_count
+    )
+    query_summary, key_summary = _qattn.sla_qk_block_summaries(
+        qk.query_int8,
+        qk.key_int8,
+        qk.query_scale,
+        qk.key_scale,
+    )
+    topk_indices = _sla_fixed_topk_indices(
+        query_summary,
+        key_summary,
+        keep_ratio,
+    )
+    del query_summary, key_summary
+    route_words = _qattn.sla_build_route_words(
+        topk_indices,
+        exact_kv_blocks,
+        key_block_count,
+    )
+    del topk_indices, exact_kv_blocks
+
+    if use_w8a8:
+        padded_key_length = ((value.size(2) + 63) // 64) * 64
+        value_int8 = torch.empty(
+            (value.size(0), value.size(1), value.size(3), padded_key_length),
+            dtype=torch.int8,
+            device=value.device,
+        )
+        value_scale = torch.empty(
+            (value.size(0), value.size(1), value.size(3)),
+            dtype=torch.float32,
+            device=value.device,
+        )
+        _qattn.quantize_v_int8_sm75(value, value_int8, value_scale)
+        retained_value = None
+    else:
+        value_int8 = torch.empty(0, dtype=torch.int8, device=value.device)
+        value_scale = torch.empty(0, dtype=torch.float32, device=value.device)
+        retained_value = value.contiguous()
+    scale = (
+        float(sm_scale)
+        if sm_scale is not None
+        else qk.original_head_dim**-0.5
+    )
+    return PrequantizedSlaAttention(
+        query_int8=qk.query_int8,
+        query_scale=qk.query_scale,
+        key_int8=qk.key_int8,
+        key_scale=qk.key_scale,
+        value=retained_value,
+        value_int8=value_int8,
+        value_scale=value_scale,
+        route_words=route_words,
+        sparse_query_blocks=sparse_query_blocks,
+        output_dtype=value.dtype,
+        sm_scale=scale,
+        keep_ratio=keep_ratio,
+        possible_blocks=possible_blocks,
+        use_w8a8=bool(use_w8a8),
+        original_head_dim=qk.original_head_dim,
+        key_tile_tokens=key_tile_tokens,
+    )
+
+
+@_on_input_device
+def prequantize_sla_sageattn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    tensor_layout: str = "HND",
+    sm_scale: Optional[float] = None,
+    dense_query_ranges=(),
+    exact_kv_ranges=(),
+    keep_ratio: float = 0.15,
+    use_w8a8: bool = True,
+    key_tile_tokens: int = 0,
+    rotate_qk: bool = True,
+    stabilize_k: bool = True,
+) -> PrequantizedSlaAttention:
+    if not q.is_cuda:
+        raise ValueError("SLA Q/K/V must be on CUDA")
+    if tensor_layout != "HND":
+        raise ValueError("SLA sparse attention currently requires HND layout")
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("SLA Q/K/V must be float16 or bfloat16")
+    if q.device != k.device or q.device != v.device:
+        raise ValueError("SLA Q/K/V must share one CUDA device")
+    if q.dtype != k.dtype or q.dtype != v.dtype:
+        raise TypeError("SLA Q/K/V must have matching dtypes")
+    _validate_fixed_qkv(q, k, v, tensor_layout)
+    head_dim = q.size(-1)
+    if not 0 < head_dim <= 128:
+        raise ValueError("SLA requires head_dim in [1, 128]")
+    if q.stride(-1) != 1 or k.stride(-1) != 1 or v.stride(-1) != 1:
+        raise ValueError("the last SLA Q/K/V dimension must be contiguous")
+    kernel_head_dim = 64 if head_dim <= 64 else 128
+    if head_dim < kernel_head_dim:
+        padding = kernel_head_dim - head_dim
+        q = torch.nn.functional.pad(q, (0, padding))
+        k = torch.nn.functional.pad(k, (0, padding))
+        v = torch.nn.functional.pad(v, (0, padding))
+    if rotate_qk:
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8_hadamard(
+            q, k, tensor_layout="HND", stabilize_k=bool(stabilize_k)
+        )
+    else:
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8(
+            q, k, tensor_layout="HND", fuse_qk=True
+        )
+    qk = PrequantizedQK(
+        query_int8=q_int8,
+        query_scale=q_scale,
+        key_int8=k_int8,
+        key_scale=k_scale,
+        tensor_layout="HND",
+        input_dtype=v.dtype,
+        original_head_dim=head_dim,
+        route_original_basis=bool(rotate_qk),
+    )
+    return prequantize_sla_sageattn_from_qk(
+        qk,
+        v,
+        sm_scale=sm_scale,
+        dense_query_ranges=dense_query_ranges,
+        exact_kv_ranges=exact_kv_ranges,
+        keep_ratio=keep_ratio,
+        use_w8a8=use_w8a8,
+        key_tile_tokens=key_tile_tokens,
+    )
+
+
+def sla_sparse_sageattn_from_prequantized(
+    quantized: PrequantizedSlaAttention,
+    *,
+    return_stats: bool = False,
+):
+    with torch.cuda.device(quantized.query_int8.device):
+        output = torch.empty(
+            quantized.query_int8.shape,
+            dtype=quantized.output_dtype,
+            device=quantized.query_int8.device,
+        )
+        value = output if quantized.value is None else quantized.value
+        selected = _qattn.sla_sparse_online_attn(
+            quantized.query_int8,
+            quantized.key_int8,
+            value,
+            quantized.value_int8,
+            quantized.value_scale,
+            output,
+            quantized.query_scale,
+            quantized.key_scale,
+            quantized.route_words,
+            quantized.sparse_query_blocks,
+            quantized.sm_scale,
+            int(return_stats),
+            int(quantized.use_w8a8),
+            quantized.key_tile_tokens,
+        )
+    output = output[..., : quantized.original_head_dim]
+    return (output, selected, quantized.possible_blocks) if return_stats else output
+
+
+@_on_input_device
+def sla_sparse_sageattn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    tensor_layout: str = "HND",
+    sm_scale: Optional[float] = None,
+    dense_query_ranges=(),
+    exact_kv_ranges=(),
+    keep_ratio: float = 0.15,
+    return_stats: bool = False,
+    use_w8a8: bool = True,
+    key_tile_tokens: int = 0,
+    rotate_qk: bool = True,
+    stabilize_k: bool = True,
+):
+    quantized = prequantize_sla_sageattn.__wrapped__(
+        q,
+        k,
+        v,
+        tensor_layout=tensor_layout,
+        sm_scale=sm_scale,
+        dense_query_ranges=dense_query_ranges,
+        exact_kv_ranges=exact_kv_ranges,
+        keep_ratio=keep_ratio,
+        use_w8a8=use_w8a8,
+        key_tile_tokens=key_tile_tokens,
+        rotate_qk=rotate_qk,
+        stabilize_k=stabilize_k,
+    )
+    return sla_sparse_sageattn_from_prequantized(
+        quantized,
+        return_stats=return_stats,
+    )
 
 
 @_on_input_device

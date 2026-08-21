@@ -82,6 +82,33 @@ at::Tensor sol_sparse_online_w8a8_prequantized_attn(
                     int is_causal,
                     int route_original_basis);
 
+std::vector<at::Tensor> sla_qk_block_summaries(
+                    at::Tensor query_int8,
+                    at::Tensor key_int8,
+                    at::Tensor query_scale,
+                    at::Tensor key_scale);
+
+at::Tensor sla_build_route_words(
+                    at::Tensor topk_indices,
+                    at::Tensor exact_kv_blocks,
+                    int num_key_blocks);
+
+at::Tensor sla_sparse_online_attn(
+                    at::Tensor query_int8,
+                    at::Tensor key_int8,
+                    at::Tensor value,
+                    at::Tensor value_int8,
+                    at::Tensor value_scale,
+                    at::Tensor output,
+                    at::Tensor query_scale,
+                    at::Tensor key_scale,
+                    at::Tensor route_words,
+                    at::Tensor sparse_query_blocks,
+                    float softmax_scale,
+                    int return_stats,
+                    int use_w8a8,
+                    int key_tile_tokens);
+
 void quantize_v_int8_sm75(at::Tensor value,
                     at::Tensor quantized,
                     at::Tensor scale);
