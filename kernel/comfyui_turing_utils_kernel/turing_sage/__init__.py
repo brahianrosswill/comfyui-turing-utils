@@ -236,7 +236,7 @@ def sla_sparse_sageattn_compiled(
     *,
     dense_query_ranges=(),
     exact_kv_ranges=(),
-    keep_ratio: float = 0.15,
+    sparsity_ratio: float = 0.85,
     use_w8a8: bool = True,
     sm_scale: float | None = None,
     key_tile_tokens: int = 0,
@@ -255,7 +255,7 @@ def sla_sparse_sageattn_compiled(
         [int(item[1]) for item in dense_query_ranges],
         [int(item[0]) for item in exact_kv_ranges],
         [int(item[1]) for item in exact_kv_ranges],
-        float(keep_ratio),
+        float(sparsity_ratio),
         bool(use_w8a8),
         float(sm_scale) if sm_scale is not None else -1.0,
         int(key_tile_tokens),
@@ -495,7 +495,7 @@ def preflight_sla(device: torch.device) -> None:
                 q,
                 k,
                 v,
-                keep_ratio=1.0,
+                sparsity_ratio=0.0,
                 use_w8a8=True,
             )
             reference = torch.nn.functional.scaled_dot_product_attention(
@@ -522,7 +522,7 @@ def preflight_sla(device: torch.device) -> None:
             v,
             dense_query_ranges=((0, 64),),
             exact_kv_ranges=((256, 319),),
-            keep_ratio=0.5,
+            sparsity_ratio=0.5,
             use_w8a8=False,
         )
         output, selected, _ = sla_sparse_sageattn_from_prequantized(

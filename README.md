@@ -13,7 +13,7 @@ Wan/Bernini utilities.
 - Python 3.10 or newer
 - PyTorch with CUDA and ComfyUI
 - `comfy-kitchen>=0.2.26` for ConvRot model integration
-- the independently installed `comfyui-turing-utils-kernel>=0.29.0` for SLA;
+- the independently installed `comfyui-turing-utils-kernel>=0.29.1` for SLA;
   native Sol on Ampere or newer requires 0.28.0, while exact-sm75 installs also
   provide the local dense attention and quantized-linear paths
 
@@ -112,7 +112,7 @@ only after its CUDA sources or required version change.
   reference protection, dense step/layer scheduling, fused Q/K preprocessing,
   tensor lifetime, and optional W8A8 PV path, but deliberately does not add
   Sol's local blocks or skipped-block residual. Use it with the SLA-trained
-  LoRA; `keep_ratio=0.15` matches the published runtime budget.
+  LoRA; `sparsity_ratio=0.85` matches the published runtime hyperparameter.
 - `Patch Turing Attention Kernel Tuning (Experimental)` overrides the logical
   CTA-K schedule and the fused Hadamard/adaptive-anchor quality controls for
   dense W8A8 and Sol. Its defaults are the production policy; explicit values

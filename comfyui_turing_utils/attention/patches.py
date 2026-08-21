@@ -47,7 +47,11 @@ from .stable import (
     SPARSE_ROUTING_THRESHOLD,
     SPARSE_SKIPPED_RESIDUAL,
     SPARSE_USE_W8A8,
-    SLA_KEEP_RATIO,
+    SLA_DENSE_PREFIX_LAYERS,
+    SLA_DENSE_PREFIX_STEPS,
+    SLA_DENSE_SUFFIX_LAYERS,
+    SLA_DENSE_SUFFIX_STEPS,
+    SLA_SPARSITY_RATIO,
     AttentionBackend,
     _BACKENDS,
     _comfy_attention_function,
@@ -1047,21 +1051,21 @@ def make_sparse_attention_override(
 def make_sla_attention_override(
     device: torch.device,
     min_sequence_tokens: int = 0,
-    keep_ratio: float = SLA_KEEP_RATIO,
+    sparsity_ratio: float = SLA_SPARSITY_RATIO,
     prefix_policy: str = SPARSE_PREFIX_POLICY,
     manual_prefix_tokens: int = 0,
     sparse_reference_image: bool = SPARSE_REFERENCE_IMAGE,
     sparse_reference_video: bool = SPARSE_REFERENCE_VIDEO,
     sparse_reference_audio: bool = SPARSE_REFERENCE_AUDIO,
-    dense_prefix_steps: int = SPARSE_DENSE_PREFIX_STEPS,
-    dense_suffix_steps: int = SPARSE_DENSE_SUFFIX_STEPS,
-    dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
-    dense_suffix_layers: int = SPARSE_DENSE_SUFFIX_LAYERS,
+    dense_prefix_steps: int = SLA_DENSE_PREFIX_STEPS,
+    dense_suffix_steps: int = SLA_DENSE_SUFFIX_STEPS,
+    dense_prefix_layers: int = SLA_DENSE_PREFIX_LAYERS,
+    dense_suffix_layers: int = SLA_DENSE_SUFFIX_LAYERS,
     debug_route_density: bool = False,
     use_w8a8: bool = SPARSE_USE_W8A8,
 ) -> Callable:
     min_sequence_tokens = int(min_sequence_tokens)
-    keep_ratio = float(keep_ratio)
+    sparsity_ratio = float(sparsity_ratio)
     prefix_policy = str(prefix_policy).strip().lower()
     manual_prefix_tokens = int(manual_prefix_tokens)
     sparse_reference_image = bool(sparse_reference_image)
@@ -1075,8 +1079,8 @@ def make_sla_attention_override(
     use_w8a8 = bool(use_w8a8)
     if min_sequence_tokens < 0:
         raise ValueError("min_sequence_tokens must be non-negative")
-    if not math.isfinite(keep_ratio) or not 0.0 < keep_ratio <= 1.0:
-        raise ValueError("keep_ratio must be finite and in (0, 1]")
+    if not math.isfinite(sparsity_ratio) or not 0.0 <= sparsity_ratio < 1.0:
+        raise ValueError("sparsity_ratio must be finite and in [0, 1)")
     if prefix_policy not in {"auto", "none", "manual"}:
         raise ValueError("prefix_policy must be auto, none, or manual")
     if manual_prefix_tokens < 0:
@@ -1095,7 +1099,7 @@ def make_sla_attention_override(
     if not bundled_sla_available():
         raise RuntimeError(
             "The bundled SLA extension is unavailable. Rebuild "
-            "comfyui-turing-utils-kernel 0.29.0 or newer for this GPU."
+            "comfyui-turing-utils-kernel 0.29.1 or newer for this GPU."
         )
     preflight_bundled_sla(device)
     if use_w8a8 and not bundled_w8a8_available():
@@ -1195,7 +1199,7 @@ def make_sla_attention_override(
             selected_blocks = int(selected.item())
             LOG.warning(
                 "[Turing SLA debug] step=%s layer=%s Q=%d K=%d "
-                "selected=%d/%d density=%.4f target_keep_ratio=%.2f "
+                "selected=%d/%d density=%.4f target_sparsity=%.2f "
                 "protected_q=%d",
                 schedule_state.get("step"),
                 layer_index,
@@ -1204,14 +1208,14 @@ def make_sla_attention_override(
                 selected_blocks,
                 possible,
                 selected_blocks / possible if possible else 0.0,
-                keep_ratio,
+                sparsity_ratio,
                 sum(stop - start for start, stop in sla_call.dense_query_ranges),
             )
             debug_route_keys.add(debug_key)
         return output
 
     def is_dense(transformer_options) -> bool:
-        return keep_ratio == 1.0 or _sparse_dense_schedule(
+        return sparsity_ratio == 0.0 or _sparse_dense_schedule(
             transformer_options,
             dense_prefix_steps,
             dense_suffix_steps,
@@ -1268,7 +1272,7 @@ def make_sla_attention_override(
             qk,
             value,
             sla_call,
-            keep_ratio=keep_ratio,
+            sparsity_ratio=sparsity_ratio,
             scale=request.scale,
             use_w8a8=use_w8a8,
             transformer_options=transformer_options,
@@ -1299,7 +1303,7 @@ def make_sla_attention_override(
             fallback,
             *args,
             min_sequence_tokens=min_sequence_tokens,
-            keep_ratio=keep_ratio,
+            sparsity_ratio=sparsity_ratio,
             prefix_policy=prefix_policy,
             manual_prefix_tokens=manual_prefix_tokens,
             sparse_reference_image=sparse_reference_image,
@@ -1366,7 +1370,7 @@ def make_sla_attention_override(
                 key,
                 value,
                 sla_call,
-                keep_ratio=keep_ratio,
+                sparsity_ratio=sparsity_ratio,
                 scale=kwargs.get("scale"),
                 use_w8a8=use_w8a8,
                 transformer_options=transformer_options,
@@ -1490,16 +1494,16 @@ def apply_sparse_attention_patch(
 def apply_sla_attention_patch(
     model,
     min_sequence_tokens: int = 0,
-    keep_ratio: float = SLA_KEEP_RATIO,
+    sparsity_ratio: float = SLA_SPARSITY_RATIO,
     prefix_policy: str = SPARSE_PREFIX_POLICY,
     manual_prefix_tokens: int = 0,
     sparse_reference_image: bool = SPARSE_REFERENCE_IMAGE,
     sparse_reference_video: bool = SPARSE_REFERENCE_VIDEO,
     sparse_reference_audio: bool = SPARSE_REFERENCE_AUDIO,
-    dense_prefix_steps: int = SPARSE_DENSE_PREFIX_STEPS,
-    dense_suffix_steps: int = SPARSE_DENSE_SUFFIX_STEPS,
-    dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
-    dense_suffix_layers: int = SPARSE_DENSE_SUFFIX_LAYERS,
+    dense_prefix_steps: int = SLA_DENSE_PREFIX_STEPS,
+    dense_suffix_steps: int = SLA_DENSE_SUFFIX_STEPS,
+    dense_prefix_layers: int = SLA_DENSE_PREFIX_LAYERS,
+    dense_suffix_layers: int = SLA_DENSE_SUFFIX_LAYERS,
     debug_route_density: bool = False,
     use_w8a8: bool = SPARSE_USE_W8A8,
 ):
@@ -1508,7 +1512,7 @@ def apply_sla_attention_patch(
     override = make_sla_attention_override(
         patched.load_device,
         min_sequence_tokens=min_sequence_tokens,
-        keep_ratio=keep_ratio,
+        sparsity_ratio=sparsity_ratio,
         prefix_policy=prefix_policy,
         manual_prefix_tokens=manual_prefix_tokens,
         sparse_reference_image=sparse_reference_image,
@@ -1549,13 +1553,13 @@ def apply_sla_attention_patch(
         "bundled_sla_sparse"
     )
     LOG.info(
-        "SLA sparse attention patch enabled: keep_ratio=%.2f "
+        "SLA sparse attention patch enabled: sparsity_ratio=%.2f "
         "topology=128x64 smooth_k=True prefix_policy=%s manual_prefix=%d "
         "sparse_reference=(image=%s,video=%s,audio=%s) "
         "dense_prefix_steps=%d dense_suffix_steps=%d "
         "dense_prefix_layers=%d dense_suffix_layers=%d "
         "dense_backend=%s pv_backend=%s debug_route_density=%s",
-        keep_ratio,
+        sparsity_ratio,
         prefix_policy,
         manual_prefix_tokens,
         sparse_reference_image,

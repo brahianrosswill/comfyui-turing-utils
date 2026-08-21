@@ -234,15 +234,15 @@ class SlaSparseAttentionPatch:
         return {
             "required": {
                 "model": ("MODEL",),
-                "keep_ratio": (
+                "sparsity_ratio": (
                     "FLOAT",
                     {
-                        "default": 0.15,
-                        "min": 0.01,
-                        "max": 1.0,
+                        "default": 0.85,
+                        "min": 0.0,
+                        "max": 0.99,
                         "step": 0.01,
                         "round": 0.01,
-                        "tooltip": "Fraction of 64-token K/V blocks retained for every 128-token Query block. 0.15 matches the MiniMax H3 Turbo-SLA training/runtime budget and should be used with an SLA-trained LoRA. 1.0 dispatches directly to the dense backend.",
+                        "tooltip": "Fraction of 64-token K/V blocks skipped for every 128-token Query block. 0.85 matches the public MiniMax H3 Turbo-SLA training/runtime hyperparameter and should be used with an SLA-trained LoRA. Zero dispatches directly to the dense backend.",
                     },
                 ),
                 "prefix_policy": (
@@ -286,7 +286,7 @@ class SlaSparseAttentionPatch:
                 "dense_prefix_steps": (
                     "INT",
                     {
-                        "default": 1,
+                        "default": 0,
                         "min": 0,
                         "max": 1000,
                         "step": 1,
@@ -306,7 +306,7 @@ class SlaSparseAttentionPatch:
                 "dense_prefix_layers": (
                     "INT",
                     {
-                        "default": 2,
+                        "default": 0,
                         "min": 0,
                         "max": 256,
                         "step": 1,
@@ -351,15 +351,15 @@ class SlaSparseAttentionPatch:
     def patch(
         self,
         model,
-        keep_ratio: float = 0.15,
+        sparsity_ratio: float = 0.85,
         prefix_policy: str = "auto",
         manual_prefix_tokens: int = 0,
         sparse_reference_image: bool = False,
         sparse_reference_video: bool = True,
         sparse_reference_audio: bool = False,
-        dense_prefix_steps: int = 1,
+        dense_prefix_steps: int = 0,
         dense_suffix_steps: int = 0,
-        dense_prefix_layers: int = 2,
+        dense_prefix_layers: int = 0,
         dense_suffix_layers: int = 0,
         use_w8a8: bool = True,
         debug_route_density: bool = False,
@@ -367,7 +367,7 @@ class SlaSparseAttentionPatch:
         return (
             apply_sla_attention_patch(
                 model,
-                keep_ratio=keep_ratio,
+                sparsity_ratio=sparsity_ratio,
                 prefix_policy=prefix_policy,
                 manual_prefix_tokens=manual_prefix_tokens,
                 sparse_reference_image=sparse_reference_image,

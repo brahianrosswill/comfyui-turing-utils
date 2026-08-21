@@ -150,7 +150,7 @@ class SparseAttentionNodeTest(unittest.TestCase):
             tuple(inputs),
             (
                 "model",
-                "keep_ratio",
+                "sparsity_ratio",
                 "prefix_policy",
                 "manual_prefix_tokens",
                 "sparse_reference_image",
@@ -162,7 +162,11 @@ class SparseAttentionNodeTest(unittest.TestCase):
                 "dense_suffix_layers",
             ),
         )
-        self.assertEqual(inputs["keep_ratio"][1]["default"], 0.15)
+        self.assertEqual(inputs["sparsity_ratio"][1]["default"], 0.85)
+        self.assertEqual(inputs["dense_prefix_steps"][1]["default"], 0)
+        self.assertEqual(inputs["dense_suffix_steps"][1]["default"], 0)
+        self.assertEqual(inputs["dense_prefix_layers"][1]["default"], 0)
+        self.assertEqual(inputs["dense_suffix_layers"][1]["default"], 0)
         self.assertEqual(inputs["prefix_policy"][0][0], "auto")
         self.assertFalse(inputs["sparse_reference_image"][1]["default"])
         self.assertTrue(inputs["sparse_reference_video"][1]["default"])
@@ -180,7 +184,7 @@ class SparseAttentionNodeTest(unittest.TestCase):
         ) as apply_patch:
             output = attention_nodes.SlaSparseAttentionPatch().patch(
                 model,
-                0.2,
+                0.8,
                 "manual",
                 128,
                 True,
@@ -194,7 +198,7 @@ class SparseAttentionNodeTest(unittest.TestCase):
         self.assertEqual(output, (patched,))
         apply_patch.assert_called_once_with(
             model,
-            keep_ratio=0.2,
+            sparsity_ratio=0.8,
             prefix_policy="manual",
             manual_prefix_tokens=128,
             sparse_reference_image=True,

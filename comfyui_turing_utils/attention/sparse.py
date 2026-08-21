@@ -518,7 +518,7 @@ def prequantize_turing_sla_attention(
     v: torch.Tensor,
     call: SlaAttentionCall,
     *,
-    keep_ratio: float,
+    sparsity_ratio: float,
     scale: float | None,
     use_w8a8: bool,
     transformer_options=None,
@@ -537,7 +537,7 @@ def prequantize_turing_sla_attention(
         sm_scale=scale,
         dense_query_ranges=call.dense_query_ranges,
         exact_kv_ranges=call.exact_kv_ranges,
-        keep_ratio=keep_ratio,
+        sparsity_ratio=sparsity_ratio,
         use_w8a8=bool(use_w8a8),
         key_tile_tokens=tuning.key_tile_tokens,
         rotate_qk=tuning.rotate_qk,
@@ -551,7 +551,7 @@ def prequantize_turing_sla_attention_from_qk(
     value: torch.Tensor,
     call: SlaAttentionCall,
     *,
-    keep_ratio: float,
+    sparsity_ratio: float,
     scale: float | None,
     use_w8a8: bool,
     transformer_options=None,
@@ -563,7 +563,7 @@ def prequantize_turing_sla_attention_from_qk(
         sm_scale=scale,
         dense_query_ranges=call.dense_query_ranges,
         exact_kv_ranges=call.exact_kv_ranges,
-        keep_ratio=keep_ratio,
+        sparsity_ratio=sparsity_ratio,
         use_w8a8=bool(use_w8a8),
         key_tile_tokens=tuning.key_tile_tokens,
     )
@@ -870,7 +870,7 @@ def turing_sla_sparse_attention(
     skip_reshape: bool = False,
     skip_output_reshape: bool = False,
     min_sequence_tokens: int = 0,
-    keep_ratio: float = 0.15,
+    sparsity_ratio: float = 0.85,
     prefix_policy: str = SPARSE_PREFIX_POLICY,
     manual_prefix_tokens: int = 0,
     sparse_reference_image: bool = SPARSE_REFERENCE_IMAGE,
@@ -919,18 +919,18 @@ def turing_sla_sparse_attention(
         call.kv_heads,
         sla_call.dense_query_ranges,
         sla_call.exact_kv_ranges,
-        float(keep_ratio),
+        float(sparsity_ratio),
         bool(use_w8a8),
     )
     if kernel_key not in _LOGGED_SPARSE_KERNELS:
         LOG.info(
             "Bundled SLA sparse attention active: dtype=%s Q=%d K=%d "
-            "topology=128x64 keep_ratio=%.2f smooth_k=True "
+            "topology=128x64 sparsity_ratio=%.2f smooth_k=True "
             "dense_query_ranges=%s exact_kv_ranges=%s pv=%s",
             call.input_dtype,
             call.query_tokens,
             call.key_tokens,
-            keep_ratio,
+            sparsity_ratio,
             sla_call.dense_query_ranges,
             sla_call.exact_kv_ranges,
             "w8a8" if use_w8a8 else "fp16",
@@ -941,7 +941,7 @@ def turing_sla_sparse_attention(
         k,
         v,
         sla_call,
-        keep_ratio=keep_ratio,
+        sparsity_ratio=sparsity_ratio,
         scale=kwargs.get("scale"),
         use_w8a8=use_w8a8,
         transformer_options=kwargs.get("transformer_options"),
@@ -956,13 +956,13 @@ def turing_sla_sparse_attention(
     selected_blocks = int(selected.item())
     LOG.warning(
         "[Turing SLA debug] Q=%d K=%d selected=%d/%d density=%.4f "
-        "target_keep_ratio=%.2f protected_q=%d",
+        "target_sparsity=%.2f protected_q=%d",
         call.query_tokens,
         call.key_tokens,
         selected_blocks,
         possible,
         selected_blocks / possible if possible else 0.0,
-        keep_ratio,
+        sparsity_ratio,
         sum(stop - start for start, stop in sla_call.dense_query_ranges),
     )
     return output

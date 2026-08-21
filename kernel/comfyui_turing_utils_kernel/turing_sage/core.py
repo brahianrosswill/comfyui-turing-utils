@@ -85,7 +85,7 @@ class PrequantizedSlaAttention:
     sparse_query_blocks: torch.Tensor
     output_dtype: torch.dtype
     sm_scale: float
-    keep_ratio: float
+    sparsity_ratio: float
     possible_blocks: int
     use_w8a8: bool
     original_head_dim: int
@@ -161,7 +161,7 @@ def _sol_block_policy(
 def _sla_fixed_topk_indices(
     query_summary: torch.Tensor,
     key_summary: torch.Tensor,
-    keep_ratio: float,
+    sparsity_ratio: float,
 ) -> torch.Tensor:
     """Select the fixed SLA K budget for every 128-token Query block."""
     if query_summary.ndim != 4 or key_summary.ndim != 4:
@@ -177,7 +177,7 @@ def _sla_fixed_topk_indices(
     key_blocks = key_summary.size(2)
     keep_blocks = min(
         key_blocks,
-        max(1, int(float(keep_ratio) * key_blocks)),
+        max(1, int((1.0 - float(sparsity_ratio)) * key_blocks)),
     )
     groups = query_heads // key_heads
     grouped_query = query_summary.reshape(
@@ -989,7 +989,7 @@ def prequantize_sla_sageattn_from_qk(
     sm_scale: Optional[float] = None,
     dense_query_ranges=(),
     exact_kv_ranges=(),
-    keep_ratio: float = 0.15,
+    sparsity_ratio: float = 0.85,
     use_w8a8: bool = True,
     key_tile_tokens: int = 0,
 ) -> PrequantizedSlaAttention:
@@ -1009,9 +1009,9 @@ def prequantize_sla_sageattn_from_qk(
         or value.size(3) != qk.key_int8.size(3)
     ):
         raise ValueError("preprocessed SLA Q/K and V shapes are incompatible")
-    keep_ratio = float(keep_ratio)
-    if not 0.0 < keep_ratio <= 1.0:
-        raise ValueError("keep_ratio must be in (0, 1]")
+    sparsity_ratio = float(sparsity_ratio)
+    if not 0.0 <= sparsity_ratio < 1.0:
+        raise ValueError("sparsity_ratio must be in [0, 1)")
     key_tile_tokens = int(key_tile_tokens)
     if key_tile_tokens not in (0, 64, 128):
         raise ValueError("key_tile_tokens must be 0 (auto), 64, or 128")
@@ -1043,7 +1043,7 @@ def prequantize_sla_sageattn_from_qk(
     topk_indices = _sla_fixed_topk_indices(
         query_summary,
         key_summary,
-        keep_ratio,
+        sparsity_ratio,
     )
     del query_summary, key_summary
     route_words = _qattn.sla_build_route_words(
@@ -1088,7 +1088,7 @@ def prequantize_sla_sageattn_from_qk(
         sparse_query_blocks=sparse_query_blocks,
         output_dtype=value.dtype,
         sm_scale=scale,
-        keep_ratio=keep_ratio,
+        sparsity_ratio=sparsity_ratio,
         possible_blocks=possible_blocks,
         use_w8a8=bool(use_w8a8),
         original_head_dim=qk.original_head_dim,
@@ -1106,7 +1106,7 @@ def prequantize_sla_sageattn(
     sm_scale: Optional[float] = None,
     dense_query_ranges=(),
     exact_kv_ranges=(),
-    keep_ratio: float = 0.15,
+    sparsity_ratio: float = 0.85,
     use_w8a8: bool = True,
     key_tile_tokens: int = 0,
     rotate_qk: bool = True,
@@ -1158,7 +1158,7 @@ def prequantize_sla_sageattn(
         sm_scale=sm_scale,
         dense_query_ranges=dense_query_ranges,
         exact_kv_ranges=exact_kv_ranges,
-        keep_ratio=keep_ratio,
+        sparsity_ratio=sparsity_ratio,
         use_w8a8=use_w8a8,
         key_tile_tokens=key_tile_tokens,
     )
@@ -1206,7 +1206,7 @@ def sla_sparse_sageattn(
     sm_scale: Optional[float] = None,
     dense_query_ranges=(),
     exact_kv_ranges=(),
-    keep_ratio: float = 0.15,
+    sparsity_ratio: float = 0.85,
     return_stats: bool = False,
     use_w8a8: bool = True,
     key_tile_tokens: int = 0,
@@ -1221,7 +1221,7 @@ def sla_sparse_sageattn(
         sm_scale=sm_scale,
         dense_query_ranges=dense_query_ranges,
         exact_kv_ranges=exact_kv_ranges,
-        keep_ratio=keep_ratio,
+        sparsity_ratio=sparsity_ratio,
         use_w8a8=use_w8a8,
         key_tile_tokens=key_tile_tokens,
         rotate_qk=rotate_qk,

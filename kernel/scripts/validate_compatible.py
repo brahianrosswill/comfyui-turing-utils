@@ -1051,7 +1051,7 @@ def validate_sla(device: torch.device) -> None:
             q,
             k,
             v,
-            keep_ratio=1.0,
+            sparsity_ratio=0.0,
             use_w8a8=True,
         )
         expected_kernel_dim = 64 if head_dim <= 64 else 128
@@ -1067,7 +1067,7 @@ def validate_sla(device: torch.device) -> None:
             q,
             k,
             v,
-            keep_ratio=1.0,
+            sparsity_ratio=0.0,
             use_w8a8=True,
         )
         reference = torch.nn.functional.scaled_dot_product_attention(

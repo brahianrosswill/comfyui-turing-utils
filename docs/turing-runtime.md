@@ -211,13 +211,17 @@ separate node is intentional: its routing, modality, step, layer, and residual
 quality parameters do not belong in the loader.
 
 SLA is likewise installed only by its independent patch node and requires
-kernel 0.29.0. It shares the Sol layout contract, dense schedules, fused Q/K
+kernel 0.29.1. It shares the Sol layout contract, dense schedules, fused Q/K
 preprocessing, GQA and unequal-Q/K handling. It differs at the route itself:
 128-token Query centroids select a fixed Top-K set of 64-token K blocks and the
 two corresponding Q64 execution CTAs consume one compressed bitset. There is no
 local-radius union and no centroid contribution for skipped values. This keeps
 the runtime aligned with SLA-trained weights rather than turning SLA into a
 second Sol profile.
+The official-style SLA defaults apply the 85% sparse route to every denoising
+step and transformer layer: all four dense prefix/suffix step/layer counts are
+zero. Dense scheduling remains available only as an explicit compatibility or
+quality safeguard.
 Dispatch depends only on the attention call: matching
 FP16, BF16, or FP32 Q/K/V; head dimensions 1--128; unmasked non-causal attention;
 and both Q and K meeting the configurable minimum sequence length. HND and

@@ -1053,7 +1053,7 @@ class AttentionBackendsTest(unittest.TestCase):
             override = attention_backends.make_sla_attention_override(
                 torch.device("cuda", 0),
                 min_sequence_tokens=2048,
-                keep_ratio=0.15,
+                sparsity_ratio=0.85,
                 prefix_policy="manual",
                 manual_prefix_tokens=128,
                 sparse_reference_image=True,
@@ -1071,7 +1071,7 @@ class AttentionBackendsTest(unittest.TestCase):
         sparse.assert_called_once()
         kwargs = sparse.call_args.kwargs
         self.assertEqual(kwargs["min_sequence_tokens"], 2048)
-        self.assertEqual(kwargs["keep_ratio"], 0.15)
+        self.assertEqual(kwargs["sparsity_ratio"], 0.85)
         self.assertEqual(kwargs["prefix_policy"], "manual")
         self.assertEqual(kwargs["manual_prefix_tokens"], 128)
         self.assertTrue(kwargs["sparse_reference_image"])
@@ -1120,13 +1120,13 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertEqual(dense.call_count, 50)
         sparse.assert_not_called()
 
-    def test_sla_rejects_invalid_keep_ratio_before_preflight(self):
-        with self.assertRaisesRegex(ValueError, "keep_ratio"):
+    def test_sla_rejects_invalid_sparsity_before_preflight(self):
+        with self.assertRaisesRegex(ValueError, "sparsity_ratio"):
             attention_backends.make_sla_attention_override(
-                torch.device("cuda", 0), keep_ratio=0.0
+                torch.device("cuda", 0), sparsity_ratio=1.0
             )
 
-    def test_full_sla_keep_ratio_dispatches_directly_to_dense_backend(self):
+    def test_zero_sla_sparsity_dispatches_directly_to_dense_backend(self):
         q = torch.zeros((1, 2, 4096, 128), dtype=torch.bfloat16)
         with (
             mock.patch("attention.is_supported_turing_device", return_value=True),
@@ -1139,7 +1139,7 @@ class AttentionBackendsTest(unittest.TestCase):
             mock.patch("attention.turing_sla_sparse_attention") as sparse,
         ):
             override = attention_backends.make_sla_attention_override(
-                torch.device("cuda", 0), keep_ratio=1.0
+                torch.device("cuda", 0), sparsity_ratio=0.0
             )
             output = override(mock.Mock(), q, q, q, 2, skip_reshape=True)
 

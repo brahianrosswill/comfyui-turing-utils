@@ -32,7 +32,11 @@ SPARSE_DENSE_PREFIX_STEPS = 1
 SPARSE_DENSE_SUFFIX_STEPS = 0
 SPARSE_DENSE_PREFIX_LAYERS = 2
 SPARSE_DENSE_SUFFIX_LAYERS = 0
-SLA_KEEP_RATIO = 0.15
+SLA_SPARSITY_RATIO = 0.85
+SLA_DENSE_PREFIX_STEPS = 0
+SLA_DENSE_SUFFIX_STEPS = 0
+SLA_DENSE_PREFIX_LAYERS = 0
+SLA_DENSE_SUFFIX_LAYERS = 0
 _PREFLIGHTED_DEVICES: set[int] = set()
 _PREFLIGHTED_SPARSE_DEVICES: set[int] = set()
 _PREFLIGHTED_SLA_DEVICES: set[int] = set()
@@ -333,7 +337,7 @@ def bundled_sla_available() -> bool:
         version_tuple = tuple(int(part) for part in kernel_version().split(".")[:3])
     except ValueError:
         return False
-    return version_tuple >= (0, 29, 0) and turing_sage.sla_available()
+    return version_tuple >= (0, 29, 1) and turing_sage.sla_available()
 
 
 def bundled_w8a8_available() -> bool:
