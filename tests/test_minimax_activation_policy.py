@@ -98,7 +98,7 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
         self.assertTrue(qkv.streamed)
         self.assertEqual(qkv.chunk_rows, 16_384)
         self.assertTrue(mlp.streamed)
-        self.assertEqual(mlp.chunk_rows, 32_768)
+        self.assertEqual(mlp.chunk_rows, 16_384)
         self.assertLess(qkv.streamed_peak_bytes, qkv.full_peak_bytes / 2)
         self.assertLess(mlp.streamed_peak_bytes, mlp.full_peak_bytes / 2)
 
@@ -114,7 +114,7 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
             mlp = self._decision(135_000, "mlp")
 
         self.assertEqual(qkv.chunk_rows, 16_384)
-        self.assertEqual(mlp.chunk_rows, 32_768)
+        self.assertEqual(mlp.chunk_rows, 16_384)
         self.assertLess(qkv.streamed_peak_bytes, 4.5 * _GIB)
         self.assertLess(mlp.streamed_peak_bytes, 3.9 * _GIB)
 
@@ -484,9 +484,88 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
                 runtime_plan=plan,
             )
 
-        self.assertEqual(decision.head_group, 18)
+        self.assertEqual(decision.head_group, 14)
+        self.assertEqual(decision.saturation_group, 14)
         self.assertEqual(released, 0)
         vbar.free_memory.assert_not_called()
+
+    def test_saturated_head_group_does_not_grow_with_extra_working_memory(self):
+        with mock.patch.object(
+            activation_policy,
+            "_runtime_memory",
+            return_value=(int(6.25 * _GIB), 4 * _GIB, 12 * _GIB),
+        ):
+            decision = activation_policy.decide_attention_heads(
+                _FakeActivation(127_275),
+                heads=56,
+                head_dim=128,
+                compact_qk=True,
+                quantized_input=True,
+                quantized_value=True,
+            )
+
+        self.assertEqual(decision.saturation_group, 14)
+        self.assertEqual(decision.head_group, 14)
+        self.assertLess(decision.estimated_peak_bytes, 4 * _GIB)
+
+    def test_balanced_saturation_sizes_use_four_equal_groups(self):
+        self.assertEqual(
+            activation_policy.balanced_saturation_size(
+                56,
+                alignment=2,
+                minimum=8,
+            ),
+            14,
+        )
+        self.assertEqual(
+            activation_policy.balanced_saturation_size(
+                14_336,
+                alignment=256,
+                minimum=1_024,
+            ),
+            3_584,
+        )
+
+    def test_dynamic_model_residency_disables_full_input_cache(self):
+        patcher = SimpleNamespace(
+            load_device=torch.device("cuda", 0),
+            is_dynamic=lambda: True,
+        )
+        base = SimpleNamespace(current_patcher=patcher)
+        with mock.patch.object(
+            activation_policy,
+            "_runtime_memory",
+            return_value=(int(6.25 * _GIB), 4 * _GIB, 12 * _GIB),
+        ):
+            decision = activation_policy.decide_attention_heads(
+                _FakeActivation(127_275),
+                heads=56,
+                head_dim=128,
+                compact_qk=True,
+                quantized_input=True,
+                quantized_value=True,
+                base_model=base,
+            )
+
+        self.assertEqual(decision.head_group, 14)
+        self.assertFalse(decision.cache_quantized_input)
+
+    def test_short_attention_grid_raises_the_saturation_group(self):
+        capabilities = SimpleNamespace(multiprocessor_count=46)
+        with mock.patch.object(
+            activation_policy,
+            "device_capabilities",
+            return_value=capabilities,
+        ):
+            group = activation_policy._attention_saturation_group(
+                torch.device("cuda", 0),
+                rows=151,
+                heads=56,
+                head_dim=128,
+                legal_groups=list(range(56, 1, -2)),
+            )
+
+        self.assertEqual(group, 56)
 
     def test_dynamic_vram_headroom_reclaims_only_the_selected_tier_deficit(self):
         vbar = SimpleNamespace(free_memory=mock.Mock(return_value=384 * 1024**2))
@@ -680,6 +759,21 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
         self.assertTrue(channel_decision.sharded)
         self.assertEqual(channel_decision.chunk_channels, 256)
         self.assertEqual(channel_decision.chunk_rows, 2_048)
+
+    def test_ffn_channel_sharding_stops_at_balanced_saturation_width(self):
+        with mock.patch.object(
+            activation_policy,
+            "_runtime_memory",
+            return_value=(int(3.95 * _GIB), 4 * _GIB, 12 * _GIB),
+        ):
+            decision = activation_policy.decide_ffn_channels(
+                _FakeActivation(135_000),
+                expanded_size=14_336,
+                chunk_rows=16_384,
+            )
+
+        self.assertTrue(decision.sharded)
+        self.assertEqual(decision.chunk_channels, 3_584)
 
     def test_explicit_modes_and_chunk_override_remain_available(self):
         with (

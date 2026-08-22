@@ -35,6 +35,7 @@ class DeviceCapabilities:
     name: str
     compute_capability: tuple[int, int] | None
     total_memory: int
+    multiprocessor_count: int
     shared_memory_per_block: int
     optin_shared_memory_per_block: int
     shared_memory_per_multiprocessor: int
@@ -67,7 +68,7 @@ def device_capabilities(device: torch.device | str) -> DeviceCapabilities:
     device = torch.device(device)
     if device.type != "cuda" or not torch.cuda.is_available():
         return DeviceCapabilities(
-            device, None, "", None, 0, 0, 0, 0, False, False, False
+            device, None, "", None, 0, 0, 0, 0, 0, False, False, False
         )
 
     index = device.index if device.index is not None else torch.cuda.current_device()
@@ -102,6 +103,11 @@ def device_capabilities(device: torch.device | str) -> DeviceCapabilities:
         name,
         capability,
         _property_int(properties, "total_memory", "totalGlobalMem"),
+        _property_int(
+            properties,
+            "multi_processor_count",
+            "multiProcessorCount",
+        ),
         shared,
         max(optin, shared),
         _property_int(

@@ -14,10 +14,17 @@ import os
 
 import torch
 
+from ...hardware import device_capabilities
+
 
 LOG = logging.getLogger("comfyui-turing-utils")
 _MIB = 1024**2
 _VBAR_PAGE_BYTES = 32 * _MIB
+_ATTENTION_QUERY_TILE_ROWS = 64
+_ATTENTION_TARGET_WAVES = 4
+_ATTENTION_CTAS_PER_SM = 2
+_MAX_BALANCED_SHARDS = 4
+_MIN_SATURATED_GEMM_WIDTH = 1024
 _LOGGED_DECISIONS: set[tuple] = set()
 
 
@@ -100,6 +107,7 @@ class AttentionDecision:
     rows: int
     heads: int
     head_group: int
+    saturation_group: int
     cache_quantized_input: bool
     available_bytes: int
     estimated_peak_bytes: int
@@ -256,6 +264,19 @@ def _dynamic_vbars(
     ):
         result.append(current_vbar)
     return tuple(result)
+
+
+def _current_model_is_dynamic(base_model, device: torch.device) -> bool:
+    if base_model is None:
+        return False
+    try:
+        patcher = base_model.current_patcher
+        return bool(
+            patcher.is_dynamic()
+            and torch.device(patcher.load_device) == torch.device(device)
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 def _vbar_reclaimable_bytes(vbar) -> int:
@@ -452,6 +473,72 @@ def _align_rows(value: int, alignment: int, minimum: int) -> int:
     return max(value, minimum) if value >= minimum else 0
 
 
+def balanced_saturation_size(
+    total: int,
+    *,
+    alignment: int,
+    minimum: int,
+    max_shards: int = _MAX_BALANCED_SHARDS,
+) -> int:
+    """Return the smallest aligned, balanced shard near the MFU plateau."""
+    total = int(total)
+    alignment = max(int(alignment), 1)
+    target = max(
+        int(minimum),
+        math.ceil(total / max(int(max_shards), 1)),
+    )
+    legal = [
+        size
+        for size in range(alignment, total + 1, alignment)
+        if total % size == 0 and size >= target
+    ]
+    if legal:
+        return min(legal)
+    return min(
+        total,
+        math.ceil(target / alignment) * alignment,
+    )
+
+
+def _attention_saturation_group(
+    device: torch.device,
+    *,
+    rows: int,
+    heads: int,
+    head_dim: int,
+    legal_groups: list[int],
+) -> int:
+    """Find the smallest legal group that already supplies ample GPU work.
+
+    Attention exposes one CTA per 64-query tile and head. Four resident-grid
+    waves are sufficient to make launch width cease being the dominant MFU
+    limiter. QKV projection also keeps at least a 1024-channel output tile,
+    while at most four balanced groups bound repeated launch/anchor overhead.
+    """
+    capabilities = device_capabilities(device)
+    sm_count = max(int(capabilities.multiprocessor_count), 1)
+    query_blocks = max(
+        math.ceil(int(rows) / _ATTENTION_QUERY_TILE_ROWS),
+        1,
+    )
+    grid_heads = math.ceil(
+        sm_count * _ATTENTION_CTAS_PER_SM * _ATTENTION_TARGET_WAVES
+        / query_blocks
+    )
+    gemm_heads = math.ceil(_MIN_SATURATED_GEMM_WIDTH / int(head_dim))
+    pass_heads = math.ceil(int(heads) / _MAX_BALANCED_SHARDS)
+    minimum = max(grid_heads, gemm_heads, pass_heads, 1)
+    balanced = [
+        group
+        for group in legal_groups
+        if group >= minimum and heads % group == 0
+    ]
+    if balanced:
+        return min(balanced)
+    candidates = [group for group in legal_groups if group >= minimum]
+    return min(candidates) if candidates else max(legal_groups)
+
+
 def estimate_attention_lifecycle_peak(
     *,
     rows: int,
@@ -547,7 +634,11 @@ def decide_activation_chunks(
         # fixed-workspace fused fc2 rather than a full INT32 accumulator.
         persistent = rows * hidden_size * element
         per_row = 2 * expanded_size * element + expanded_size + hidden_size * element
-        cap, alignment, minimum = 32768, 256, 2048
+        # At H3's 5,376x14,336 contractions a 16K-row tile already exposes
+        # far more Tensor Core work than the GPU can run concurrently. Larger
+        # tiles increase the transient by about 1.26 GiB per additional 16K
+        # rows without improving steady-state MFU.
+        cap, alignment, minimum = 16384, 256, 2048
     elif operation == "qkv":
         # Streamed projection retains Q/K INT8 and V BF16.  One tile holds the
         # packed BF16 projection plus its quantized input row.  Q/K scales are
@@ -651,7 +742,17 @@ def decide_attention_heads(
     head_dim = int(head_dim)
     mode = _mode()
     if x.device.type != "cuda" or rows <= 0 or heads <= 0:
-        return AttentionDecision(mode, rows, heads, heads, False, 0, 0, 0)
+        return AttentionDecision(
+            mode,
+            rows,
+            heads,
+            heads,
+            heads,
+            False,
+            0,
+            0,
+            0,
+        )
 
     available, reserve, usable = _runtime_memory(x.device, base_model)
     planned_available = _planning_available(
@@ -666,6 +767,7 @@ def decide_attention_heads(
     safety = max(768 * _MIB, int(usable * 0.075))
     weight_scratch = 512 * _MIB
     working = max(planned_available - safety - weight_scratch, 0)
+
     def peak(group: int, cache_input: bool) -> int:
         return estimate_attention_lifecycle_peak(
             rows=rows,
@@ -695,33 +797,59 @@ def decide_attention_heads(
     if override is not None:
         groups = [group for group in groups if group <= override] or [groups[-1]]
 
+    saturation_group = (
+        groups[0]
+        if override is not None
+        else _attention_saturation_group(
+            x.device,
+            rows=rows,
+            heads=heads,
+            head_dim=head_dim,
+            legal_groups=groups,
+        )
+    )
+
     # Head sharding changes only the number of exact passes, whereas evicting
     # hot model pages forces immediate PCIe reloads. Keep a small allocator
     # margin and accept another head pass instead of manufacturing headroom by
     # weight eviction.
     fit_limit = int(working * 0.96)
     full_fits = peak(heads, False) <= fit_limit
+    allow_input_cache = bool(
+        quantized_input and not _current_model_is_dynamic(base_model, x.device)
+    )
     if (mode == "throughput" or full_fits) and override is None:
         head_group = heads
         cache_input = False
     else:
         head_group = groups[-1]
         cache_input = False
+        fitting = []
         for group in groups:
-            if peak(group, quantized_input) <= fit_limit:
-                head_group = group
-                cache_input = quantized_input
-                break
-            if peak(group, False) <= fit_limit:
-                head_group = group
-                cache_input = False
-                break
+            cached_fits = (
+                allow_input_cache and peak(group, True) <= fit_limit
+            )
+            plain_fits = peak(group, False) <= fit_limit
+            if cached_fits or plain_fits:
+                fitting.append((group, cached_fits))
+        saturated = [
+            item for item in fitting if item[0] == saturation_group
+        ]
+        selected = (
+            saturated[0]
+            if saturated
+            else (fitting[0] if fitting else None)
+        )
+        if selected is not None:
+            head_group = selected[0]
+            cache_input = bool(selected[1])
     estimated = peak(head_group, cache_input)
     decision = AttentionDecision(
         mode,
         rows,
         heads,
         head_group,
+        saturation_group,
         cache_input,
         available,
         estimated,
@@ -734,19 +862,21 @@ def decide_attention_heads(
         rows,
         heads,
         head_group,
+        saturation_group,
         cache_input,
         reserve // (256 * _MIB),
     )
     if _should_log(runtime_plan, key):
         LOG.info(
             "MiniMax H3 attention policy: mode=%s tier=%d rows=%d heads=%d "
-            "head_group=%d input_cache=%s available=%.2f GiB "
+            "head_group=%d saturation_group=%d input_cache=%s available=%.2f GiB "
             "reserve=%.2f GiB planned_available=%.2f GiB estimated_peak=%.2f GiB %s",
             mode,
             decision.tier,
             rows,
             heads,
             head_group,
+            saturation_group,
             cache_input,
             available / 1024**3,
             reserve / 1024**3,
@@ -812,7 +942,16 @@ def decide_ffn_channels(
             (budget // max(tile_rows * 5, 1)) // 256 * 256,
             256,
         )
-        requested = automatic if override is None else override
+        saturation_channels = balanced_saturation_size(
+            expanded_size,
+            alignment=256,
+            minimum=_MIN_SATURATED_GEMM_WIDTH,
+        )
+        requested = (
+            min(automatic, saturation_channels)
+            if override is None
+            else override
+        )
         chunk_channels = min(
             expanded_size,
             max((requested // 256) * 256, 256),
@@ -864,6 +1003,7 @@ __all__ = [
     "ActivationDecision",
     "AttentionDecision",
     "FFNChannelDecision",
+    "balanced_saturation_size",
     "decide_activation_chunks",
     "decide_attention_heads",
     "decide_ffn_channels",

@@ -148,6 +148,16 @@ FFN call, the adapter reads ComfyUI's immediately usable memory and the
 - activation low-water marks are scoped to the operation. A low pre-QKV
   reading therefore cannot unnecessarily force the later MLP to stream after
   QKV/attention buffers have retired;
+- once splitting is required, automatic shard sizes stop at the MFU plateau
+  instead of consuming every free byte. Attention requires at least four CTA
+  waves, a 1024-channel QKV projection, and at most four balanced head groups;
+  FFN channel shards use the same four-way balance, while QKV and MLP row
+  tiles cap at 16K. Larger activations offer little additional utilization but
+  displace hot DynamicVRAM weight pages;
+- a dynamically resident DiT does not retain the optional full-sequence INT8
+  input cache during head sharding. Recomputing the inexpensive row
+  quantization preserves roughly one hidden tensor of weight residency and
+  avoids PCIe page churn;
 - the H3 video-VAE overlap accumulator uses the same sm75+ native capability
   gate, so Ampere does not lose that fused decode path.
 
@@ -161,7 +171,7 @@ The policy can be diagnosed or overridden with these environment variables:
 ```text
 COMFYUI_TURING_UTILS_H3_ACTIVATION_MODE=auto|throughput|balanced
 COMFYUI_TURING_UTILS_H3_QKV_CHUNK_ROWS=16384
-COMFYUI_TURING_UTILS_H3_MLP_CHUNK_ROWS=32768
+COMFYUI_TURING_UTILS_H3_MLP_CHUNK_ROWS=16384
 COMFYUI_TURING_UTILS_H3_HEAD_GROUP=14
 COMFYUI_TURING_UTILS_H3_FFN_CHUNK_CHANNELS=2048
 ```
@@ -172,6 +182,9 @@ attention. Kernel 0.30 precomputes the adaptive K anchor from the same nine
 global sequence locations and reuses it while writing every row tile directly
 into the final Q/K storage. Row and head splitting therefore do not discard the
 global anchor, RMSNorm, RoPE, orthogonal rotation, scale blocks, or any K/V row.
+Policy logs report both `head_group` and `saturation_group`; equality means the
+selected group has reached the modeled MFU plateau without growing its working
+set further.
 
 The automatic ladder is: full throughput, row streaming, compact prepared
 Q/K, whole-head grouping, then two-pass FFN-channel grouping. It is selected

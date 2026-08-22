@@ -32,6 +32,7 @@ from ...hardware import is_supported_attention_device
 from ...kernel_api import load_kernel_package
 from ...profiling import CUDA_PHASE_PROFILER
 from .activation_policy import (
+    balanced_saturation_size,
     decide_activation_chunks,
     decide_attention_heads,
     decide_ffn_channels,
@@ -199,8 +200,11 @@ class _MiniMaxActivationProfile:
         rows = int(rows)
         element_size = int(element_size)
         block_heads = 256 // math.gcd(256, self.head_dim)
-        half = max((self.heads // 2) // block_heads * block_heads, block_heads)
-        group = min(half, self.heads)
+        group = balanced_saturation_size(
+            self.heads,
+            alignment=block_heads,
+            minimum=math.ceil(self.heads / 4),
+        )
         attention = estimate_attention_lifecycle_peak(
             rows=rows,
             heads=self.heads,
@@ -229,7 +233,7 @@ class _MiniMaxActivationProfile:
         )
         qkv = qkv_persistent + qkv_tile
 
-        mlp = rows * self.hidden_size * element_size + min(rows, 32_768) * (
+        mlp = rows * self.hidden_size * element_size + min(rows, 16_384) * (
             2 * self.expanded_size * element_size
             + self.expanded_size
             + self.hidden_size * element_size

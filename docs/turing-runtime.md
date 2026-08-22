@@ -195,6 +195,26 @@ Attention, QKV projection, and MLP observe different live-buffer boundaries;
 a low pre-attention reading must not force the later MLP to retain row
 streaming after QKV and attention temporaries have retired.
 
+Automatic splitting is saturation-first rather than capacity-first. For
+attention, the minimum group must expose at least four CTA scheduling waves,
+at least 1024 QKV output channels, and no more than four balanced head passes.
+The smallest legal ConvRot-aligned group meeting those constraints becomes the
+`saturation_group`; a larger fitting group is not selected unless the complete
+unsharded lifecycle fits with its normal safety margin. QKV and MLP row tiles
+cap at 16K, and FFN channel splitting similarly targets no more than four
+balanced, 256-aligned groups. These tile sizes already expose much more Tensor
+Core work than can run concurrently on current supported GPUs, so preserving
+hot model residency takes precedence over enlarging their transient state.
+The packed-sequence memory estimate uses the same 16K MLP tile and balanced
+head group, preventing ComfyUI from pre-evicting weights for an obsolete,
+larger transient estimate.
+
+When the current DiT uses DynamicVRAM, head sharding also omits the optional
+full-sequence quantized-input cache. Row quantization is repeated inside the
+balanced groups, but the smaller working set retains roughly one additional
+hidden tensor of hot weights and avoids a substantially costlier PCIe reload.
+Explicit chunk/head/channel overrides remain available for measurement.
+
 QKV row tiles write directly into their final INT8 Q/K and BF16 V storage.
 Kernel 0.30 accepts a reusable K anchor computed from the same nine positions
 in the complete sequence, so streaming no longer disables adaptive anchoring.

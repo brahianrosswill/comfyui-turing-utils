@@ -21,6 +21,7 @@ class DeviceCapabilitiesTest(unittest.TestCase):
         properties = SimpleNamespace(
             name="NVIDIA GeForce RTX 3070",
             total_memory=16 * 1024**3,
+            multi_processor_count=46,
             shared_memory_per_block=48 * 1024,
             shared_memory_per_block_optin=99 * 1024,
             shared_memory_per_multiprocessor=100 * 1024,
@@ -36,6 +37,7 @@ class DeviceCapabilitiesTest(unittest.TestCase):
         self.assertEqual(result.architecture, "sm86")
         self.assertTrue(result.tensor_core)
         self.assertTrue(result.native_bf16)
+        self.assertEqual(result.multiprocessor_count, 46)
         self.assertEqual(result.optin_shared_memory_per_block, 99 * 1024)
 
     def test_low_end_turing_name_remains_excluded(self):
