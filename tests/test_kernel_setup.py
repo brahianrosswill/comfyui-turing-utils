@@ -85,6 +85,13 @@ class KernelSetupTest(unittest.TestCase):
         )
         flags = extensions[1].kwargs["extra_compile_args"]["nvcc"]
         self.assertEqual(namespace["ARCH_LIST"], "7.5+PTX")
+        self.assertEqual(
+            extensions[1].kwargs["define_macros"],
+            [
+                ("COMFYUI_TURING_UTILS_BUILD_SM75", "1"),
+                ("COMFYUI_TURING_UTILS_BUILD_SM75_PTX", "1"),
+            ],
+        )
         self.assertNotIn("-gencode", flags)
         self.assertNotIn("-DCOMFYUI_TURING_UTILS_EXPERIMENTAL_SAGE_VARIANTS", flags)
         self.assertIn("-std=c++17", flags)
@@ -100,7 +107,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(
             "csrc/turing/sage/overlap_blend.cu", extensions[2].kwargs["sources"]
         )
-        self.assertEqual(setup.call_args.kwargs["version"], "0.30.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.31.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -152,6 +159,15 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(
             "csrc/turing/sage/sol_sparse_cuda_sm75.cu",
             setup.call_args.kwargs["ext_modules"][1].kwargs["sources"],
+        )
+        self.assertEqual(
+            setup.call_args.kwargs["ext_modules"][1].kwargs["define_macros"],
+            [
+                ("COMFYUI_TURING_UTILS_BUILD_SM80", "1"),
+                ("COMFYUI_TURING_UTILS_BUILD_SM86", "1"),
+                ("COMFYUI_TURING_UTILS_BUILD_SM89", "1"),
+                ("COMFYUI_TURING_UTILS_BUILD_SM90", "1"),
+            ],
         )
 
     def test_default_arch_detects_all_unique_visible_gpu_capabilities(self):
@@ -281,7 +297,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.30.0")
+        self.assertEqual(metadata["project"]["version"], "0.31.0")
 
     def test_overlap_epilogue_is_self_contained_and_deterministic_by_design(self):
         source = (

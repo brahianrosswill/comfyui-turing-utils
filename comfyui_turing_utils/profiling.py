@@ -9,6 +9,12 @@ from collections.abc import Callable
 
 import torch
 
+from .kernel_api import (
+    attention_kernel_architectures,
+    attention_runtime_profile_schema,
+    kernel_version,
+)
+
 
 LOG = logging.getLogger("comfyui-turing-utils")
 
@@ -23,6 +29,33 @@ def _profile_call_limit() -> int:
             value,
         )
         return 0
+
+
+def _runtime_profile_metadata() -> dict[str, str | int | bool]:
+    architectures = attention_kernel_architectures()
+    architecture_text = ",".join(architectures) if architectures else "unknown"
+    result: dict[str, str | int | bool] = {
+        "kernel": kernel_version(),
+        "compiled_attention": architecture_text,
+        "profile_schema": attention_runtime_profile_schema(),
+        "device": "unknown",
+        "device_sm": "unknown",
+        "native_arch": "unknown",
+    }
+    try:
+        index = torch.cuda.current_device()
+        major, minor = torch.cuda.get_device_capability(index)
+        device_arch = f"sm{major}{minor}"
+        result["device"] = str(torch.cuda.get_device_name(index))
+        result["device_sm"] = device_arch
+        if architectures:
+            result["native_arch"] = any(
+                architecture.split("+")[0] == device_arch
+                for architecture in architectures
+            )
+    except (AttributeError, RuntimeError):
+        pass
+    return result
 
 
 class CudaPhaseProfiler:
@@ -78,6 +111,17 @@ class CudaPhaseProfiler:
             self.calls,
             total,
             ",".join(f"{shape}:{count}" for shape, count in sorted(self.shapes.items())),
+        )
+        runtime = _runtime_profile_metadata()
+        LOG.warning(
+            "[Turing profile] runtime device=%s device_sm=%s kernel=%s "
+            "compiled_attention=[%s] native_arch=%s profile_schema=%s",
+            runtime["device"],
+            runtime["device_sm"],
+            runtime["kernel"],
+            runtime["compiled_attention"],
+            runtime["native_arch"],
+            runtime["profile_schema"],
         )
         for phase, elapsed in totals.most_common():
             LOG.warning(

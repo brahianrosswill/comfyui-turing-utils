@@ -17,9 +17,13 @@
 #pragma once
 #include "torch_compat.h"
 #include <cuda_runtime.h>
+#include <cstdlib>
 #include <cstdint>
+#include <iomanip>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 
 #if defined(_MSC_VER)
 #define SAGE_FUNC_NAME __FUNCSIG__
@@ -51,6 +55,78 @@ inline void configure_dynamic_shared_memory(
   TORCH_CHECK(error == cudaSuccess,
               kernel_name, " could not opt in to ", requested_bytes,
               " bytes of dynamic shared memory: ", cudaGetErrorString(error));
+}
+
+inline bool attention_kernel_profile_enabled()
+{
+  static const bool enabled = []() {
+    const char *raw = std::getenv("COMFYUI_TURING_UTILS_PROFILE_CALLS");
+    if (raw == nullptr || *raw == '\0')
+      return false;
+    char *end = nullptr;
+    const long calls = std::strtol(raw, &end, 10);
+    return end != raw && calls > 0;
+  }();
+  return enabled;
+}
+
+template <typename Kernel>
+inline void report_cuda_kernel_profile(
+    Kernel kernel,
+    const char *operation,
+    const std::string &schedule,
+    int block_threads,
+    size_t dynamic_shared_bytes,
+    int grid_x,
+    int grid_y,
+    int grid_z)
+{
+  int device = 0;
+  cudaDeviceProp properties{};
+  cudaFuncAttributes attributes{};
+  int active_blocks = 0;
+  const cudaError_t device_error = cudaGetDevice(&device);
+  const cudaError_t properties_error = device_error == cudaSuccess
+      ? cudaGetDeviceProperties(&properties, device)
+      : device_error;
+  const cudaError_t attributes_error = cudaFuncGetAttributes(&attributes, kernel);
+  const cudaError_t occupancy_error = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &active_blocks, kernel, block_threads, dynamic_shared_bytes);
+  if (properties_error != cudaSuccess || attributes_error != cudaSuccess ||
+      occupancy_error != cudaSuccess)
+  {
+    std::clog << "[Turing kernel profile] op=" << operation
+              << " query_failed device=" << cudaGetErrorString(properties_error)
+              << " attributes=" << cudaGetErrorString(attributes_error)
+              << " occupancy=" << cudaGetErrorString(occupancy_error)
+              << std::endl;
+    // Diagnostic queries must not poison the subsequent launch check.
+    cudaGetLastError();
+    return;
+  }
+
+  const int active_warps = active_blocks * block_threads / 32;
+  const int maximum_warps = properties.maxThreadsPerMultiProcessor / 32;
+  const double occupancy = maximum_warps > 0
+      ? 100.0 * static_cast<double>(active_warps) /
+            static_cast<double>(maximum_warps)
+      : 0.0;
+  std::clog << "[Turing kernel profile] op=" << operation
+            << " device=" << properties.name
+            << " device_sm=sm" << properties.major << properties.minor
+            << " binary_sm=sm" << attributes.binaryVersion
+            << " ptx_compute=compute_" << attributes.ptxVersion
+            << " schedule={" << schedule << "}"
+            << " grid=" << grid_x << "x" << grid_y << "x" << grid_z
+            << " block_threads=" << block_threads
+            << " registers_per_thread=" << attributes.numRegs
+            << " static_shared=" << attributes.sharedSizeBytes
+            << " dynamic_shared=" << dynamic_shared_bytes
+            << " local_bytes=" << attributes.localSizeBytes
+            << " active_ctas_per_sm=" << active_blocks
+            << " active_warps_per_sm=" << active_warps
+            << " occupancy=" << std::fixed << std::setprecision(1)
+            << occupancy << "%" << std::endl;
 }
 
 #define DISPATCH_HEAD_DIM(head_dim, HEAD_DIM, ...)              \

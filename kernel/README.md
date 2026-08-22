@@ -1,7 +1,7 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's quantized
-runtime. Version 0.30.0 contains legacy packed W4A8 and grouped-codebook W4A8
+runtime. Version 0.31.0 contains legacy packed W4A8 and grouped-codebook W4A8
 Tensor Core GEMMs, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, bundled Sage attention, pure-INT8 W8A8 attention,
@@ -21,6 +21,13 @@ Sol-style skipped residual.
 Legacy W4A8 K/N edge dimensions use predicated or tail-padded Tensor Core
 launches; the former full-matrix DP4A compatibility kernel has been removed.
 It contains no model-weight format or model loader.
+
+When bounded attention profiling is enabled, the extension also reports its
+embedded CUDA architecture set and the resources of the kernel specialization
+that CUDA actually selected: binary/PTX architecture, CTA geometry, registers,
+static/dynamic shared memory, local memory, active CTAs/warps per SM, and
+occupancy. These are diagnostic-only queries and are absent from the normal
+sampling path.
 
 Every stable public tensor operator is registered through
 `torch.library.custom_op` with a fake/meta implementation: both W4A8 GEMMs, a

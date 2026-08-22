@@ -18,8 +18,50 @@
 #include <torch/extension.h>
 #include "attn_cuda_sm75.h"
 
+namespace {
+
+pybind11::list compiled_cuda_architectures()
+{
+  pybind11::list architectures;
+#if defined(COMFYUI_TURING_UTILS_BUILD_SM75_PTX)
+  architectures.append("sm75+ptx");
+#elif defined(COMFYUI_TURING_UTILS_BUILD_SM75)
+  architectures.append("sm75");
+#endif
+#if defined(COMFYUI_TURING_UTILS_BUILD_SM80_PTX)
+  architectures.append("sm80+ptx");
+#elif defined(COMFYUI_TURING_UTILS_BUILD_SM80)
+  architectures.append("sm80");
+#endif
+#if defined(COMFYUI_TURING_UTILS_BUILD_SM86_PTX)
+  architectures.append("sm86+ptx");
+#elif defined(COMFYUI_TURING_UTILS_BUILD_SM86)
+  architectures.append("sm86");
+#endif
+#if defined(COMFYUI_TURING_UTILS_BUILD_SM89_PTX)
+  architectures.append("sm89+ptx");
+#elif defined(COMFYUI_TURING_UTILS_BUILD_SM89)
+  architectures.append("sm89");
+#endif
+#if defined(COMFYUI_TURING_UTILS_BUILD_SM90_PTX)
+  architectures.append("sm90+ptx");
+#elif defined(COMFYUI_TURING_UTILS_BUILD_SM90)
+  architectures.append("sm90");
+#endif
+#if defined(COMFYUI_TURING_UTILS_BUILD_SM90A_PTX)
+  architectures.append("sm90a+ptx");
+#elif defined(COMFYUI_TURING_UTILS_BUILD_SM90A)
+  architectures.append("sm90a");
+#endif
+  return architectures;
+}
+
+} // namespace
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+  m.attr("cuda_architectures") = compiled_cuda_architectures();
+  m.attr("runtime_profile_schema") = 1;
   m.def("qk_int8_sv_f16_accum_f32_attn", &qk_int8_sv_f16_accum_f32_attn, "QK int8 sv f16 accum f32 attn per warp");
   m.def("qk_int8_sv_f16_varlen_accum_f32_attn", &qk_int8_sv_f16_varlen_accum_f32_attn, "Varlen QK int8 sv f16 accum f32 attn per warp");
   m.def("sol_sparse_online_int8_f16_attn", &sol_sparse_online_int8_f16_attn, "Sol online-routed sparse attention with INT8 QK and FP16/BF16 V for sm75+");

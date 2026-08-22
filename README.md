@@ -263,7 +263,13 @@ uses about 10.6 KiB.
 
 Internal CUDA phase timing is disabled by default and allocates no events. For
 a bounded diagnostic run, set `COMFYUI_TURING_UTILS_PROFILE_CALLS` to the
-number of attention calls to collect before one report is emitted.
+number of attention calls to collect before one report is emitted. Kernel 0.31
+also embeds the wheel's exact CUDA architecture set and, while this profiler is
+enabled, reports the specialization CUDA selected for dense/Sol attention.
+`compiled_attention=[sm75,sm86] native_arch=True` proves that the wheel contains
+an exact cubin for the active device. The native report additionally includes
+`binary_sm`, `ptx_compute`, registers, shared/local memory, active CTAs and
+occupancy; the historical `_sm75` extension filename remains only an ABI name.
 
 Sol's `use_w8a8` switch is enabled by default. Selected exact blocks and
 protected dense steps/layers use the

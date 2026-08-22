@@ -342,6 +342,17 @@ Optional phase timing is process-local and disabled unless
 `COMFYUI_TURING_UTILS_PROFILE_CALLS` is a positive integer. The disabled path
 creates no CUDA events and performs no synchronization.
 
+Kernel 0.31 makes architecture validation part of the same bounded report. The
+Python summary publishes the architectures embedded by the wheel build and
+whether the active device has an exact entry. The CUDA launch report queries
+the specialization selected for the real attention call and prints
+`binary_sm`, `ptx_compute`, registers per thread, static/dynamic shared memory,
+local memory, active CTAs/warps per SM, and occupancy. This distinguishes an
+exact sm86 cubin from a stale sm75-only/PTX install and exposes resource-limited
+long-sequence schedules without changing the mathematical path. These resource
+queries run once per selected specialization and only while the profiler is
+enabled.
+
 The node keeps the measured 4096-token crossover internally; shorter calls use
 stable Sage. `routing_threshold=1.0` matches the official mean-plus-one-standard-
 deviation policy. Lower values preserve more exact blocks. The local safeguard

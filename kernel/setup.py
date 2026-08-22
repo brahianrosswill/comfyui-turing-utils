@@ -375,6 +375,29 @@ ARCH_LIST = _arch_list()
 # wheel for a different architecture than setup.py advertises.
 os.environ["TORCH_CUDA_ARCH_LIST"] = ARCH_LIST
 print(f"comfyui-turing-utils-kernel: CUDA architectures {ARCH_LIST}")
+
+
+def _architecture_macros() -> list[tuple[str, str]]:
+    """Embed the exact wheel architecture set in every native extension."""
+    macros: list[tuple[str, str]] = []
+    for raw in ARCH_LIST.split(";"):
+        arch = raw.strip()
+        base = arch.split("+")[0]
+        match = re.match(r"^(\d+)\.(\d+)(a?)$", base)
+        if not match:
+            continue
+        suffix = "A" if match.group(3) else ""
+        name = (
+            "COMFYUI_TURING_UTILS_BUILD_SM"
+            f"{match.group(1)}{match.group(2)}{suffix}"
+        )
+        macros.append((name, "1"))
+        if "+PTX" in arch.upper():
+            macros.append((f"{name}_PTX", "1"))
+    return macros
+
+
+ARCHITECTURE_MACROS = _architecture_macros()
 CUTLASS_INCLUDE_DIR = _cutlass_include_dir()
 CCCL_INCLUDE_DIRS = _windows_cccl_include_dirs()
 
@@ -471,6 +494,7 @@ core_ext = CUDAExtension(
         "csrc/turing/segmented_rms_adaln.cu",
         "csrc/turing/w4a8.cu",
     ],
+    define_macros=ARCHITECTURE_MACROS,
     include_dirs=[
         str((ROOT / "csrc").resolve()),
         str(CUTLASS_INCLUDE_DIR.resolve()),
@@ -511,6 +535,7 @@ if _includes_integer_attention_arch():
                     "csrc/turing/sage/sol_sparse_cuda_sm75.cu",
                     "csrc/turing/sage/quant_v_int8_cuda_sm75.cu",
                 ],
+                define_macros=ARCHITECTURE_MACROS,
                 include_dirs=sage_include_dirs,
                 extra_compile_args={"cxx": CXX_FLAGS, "nvcc": attention_nvcc_flags},
             ),
@@ -522,6 +547,7 @@ if _includes_integer_attention_arch():
                     "csrc/turing/sage/qk_preprocess.cu",
                     "csrc/turing/sage/overlap_blend.cu",
                 ],
+                define_macros=ARCHITECTURE_MACROS,
                 include_dirs=sage_include_dirs,
                 extra_compile_args={"cxx": CXX_FLAGS, "nvcc": attention_nvcc_flags},
             ),
@@ -531,7 +557,7 @@ if _includes_integer_attention_arch():
 
 setup(
     name="comfyui-turing-utils-kernel",
-    version="0.30.0",
+    version="0.31.0",
     packages=find_packages(where=str(ROOT)),
     ext_modules=ext_modules,
     cmdclass={"build_ext": BuildExtension},

@@ -45,8 +45,38 @@ def kernel_version(default: str = "0.0.0") -> str:
     return str(getattr(package, "__version__", default))
 
 
+def attention_kernel_architectures() -> tuple[str, ...]:
+    """Return architectures embedded in the installed attention extension.
+
+    Kernel 0.31 and newer publish this metadata from the native module.  An
+    empty tuple deliberately means that an older or stale extension cannot
+    prove which cubins it contains.
+    """
+    try:
+        extension = load_kernel_extension("_sage_qattn_sm75")
+    except (ImportError, OSError):
+        return ()
+    raw = getattr(extension, "cuda_architectures", ())
+    if isinstance(raw, str):
+        raw = (raw,)
+    if not isinstance(raw, (tuple, list)):
+        return ()
+    return tuple(str(architecture) for architecture in raw if architecture)
+
+
+def attention_runtime_profile_schema() -> int:
+    try:
+        extension = load_kernel_extension("_sage_qattn_sm75")
+    except (ImportError, OSError):
+        return 0
+    value = getattr(extension, "runtime_profile_schema", 0)
+    return int(value) if isinstance(value, int) else 0
+
+
 __all__ = [
     "KERNEL_PACKAGE",
+    "attention_kernel_architectures",
+    "attention_runtime_profile_schema",
     "kernel_extension_has_symbol",
     "kernel_version",
     "load_kernel_extension",

@@ -31,6 +31,7 @@
 #include <cmath>
 #include <cstdint>
 #include <algorithm>
+#include <mutex>
 #include <type_traits>
 
 namespace {
@@ -1503,6 +1504,36 @@ void launch_sparse_threshold_attention(
                               Varlen, ResidualSubblocks, KeyStages>;
   configure_dynamic_shared_memory(
       attention_kernel, G::kAttentionSharedBytes, "Sol sparse attention");
+  if (attention_kernel_profile_enabled())
+  {
+    static std::once_flag profile_once;
+    std::call_once(profile_once, [=]() {
+      std::ostringstream schedule;
+      schedule << "head_dim=" << HeadDim
+               << ",dtype="
+               << (std::is_same<T, half>::value ? "fp16" : "bf16")
+               << ",w8a8=" << (UseW8A8 ? 1 : 0)
+               << ",dense=" << (ForceDense ? 1 : 0)
+               << ",causal=" << (IsCausal ? 1 : 0)
+               << ",varlen=" << (Varlen ? 1 : 0)
+               << ",residual_subblocks=" << ResidualSubblocks
+               << ",key_stages=" << KeyStages
+               << ",query_tokens=" << query_length
+               << ",key_tokens=" << key_length
+               << ",query_blocks=" << num_query_blocks
+               << ",heads=" << num_query_heads
+               << ",kv_heads=" << num_kv_heads;
+      report_cuda_kernel_profile(
+          attention_kernel,
+          "sol_w8a8_attention",
+          schedule.str(),
+          WARP_SIZE * kWarps,
+          G::kAttentionSharedBytes,
+          attention_grid.x,
+          attention_grid.y,
+          attention_grid.z);
+    });
+  }
   attention_kernel<<<
       attention_grid,
       attention_block,
