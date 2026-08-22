@@ -233,7 +233,7 @@ def _should_log(
 
 def _memory_diagnostics(device: torch.device) -> tuple[int, int, int, int]:
     """Best-effort allocator and DynamicVRAM pressure counters."""
-    allocated = reserved = raw_free = reclaimable = 0
+    allocated = reserved = raw_free = aimdo_usage = 0
     try:
         allocated = int(torch.cuda.memory_allocated(device))
         reserved = int(torch.cuda.memory_reserved(device))
@@ -242,22 +242,25 @@ def _memory_diagnostics(device: torch.device) -> tuple[int, int, int, int]:
         pass
     try:
         import comfy.memory_management as memory_management
-        import comfy_aimdo.model_vbar as model_vbar
+        import comfy_aimdo.control as aimdo_control
 
         if memory_management.aimdo_enabled:
-            reclaimable = int(model_vbar.vbars_analyze(device.index))
+            # Unlike vbars_analyze(), this is a read-only counter. The analyze
+            # API intentionally reports every currently pinned page as a
+            # warning and must not be called from normal policy telemetry.
+            aimdo_usage = int(aimdo_control.get_total_vram_usage())
     except (ImportError, AttributeError, RuntimeError, TypeError):
         pass
-    return allocated, reserved, raw_free, reclaimable
+    return allocated, reserved, raw_free, aimdo_usage
 
 
 def _log_memory_diagnostics(device: torch.device) -> str:
-    allocated, reserved, raw_free, reclaimable = _memory_diagnostics(device)
+    allocated, reserved, raw_free, aimdo_usage = _memory_diagnostics(device)
     return (
         f"torch_active={allocated / 1024**3:.2f} GiB "
         f"torch_reserved={reserved / 1024**3:.2f} GiB "
         f"cuda_free={raw_free / 1024**3:.2f} GiB "
-        f"dynamic_reclaimable={reclaimable / 1024**3:.2f} GiB"
+        f"aimdo_usage={aimdo_usage / 1024**3:.2f} GiB"
     )
 
 

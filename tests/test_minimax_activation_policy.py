@@ -302,6 +302,44 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
         self.assertEqual(second, 0)
         vbar.free_memory.assert_called_once()
 
+    def test_memory_telemetry_uses_quiet_aimdo_counter(self):
+        comfy = ModuleType("comfy")
+        comfy.__path__ = []
+        memory_management = ModuleType("comfy.memory_management")
+        memory_management.aimdo_enabled = True
+        comfy.memory_management = memory_management
+        comfy_aimdo = ModuleType("comfy_aimdo")
+        comfy_aimdo.__path__ = []
+        control = ModuleType("comfy_aimdo.control")
+        control.get_total_vram_usage = mock.Mock(return_value=1234)
+        comfy_aimdo.control = control
+        noisy_vbar = ModuleType("comfy_aimdo.model_vbar")
+        noisy_vbar.vbars_analyze = mock.Mock(
+            side_effect=AssertionError("diagnostic analysis must stay off hot path")
+        )
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "comfy": comfy,
+                    "comfy.memory_management": memory_management,
+                    "comfy_aimdo": comfy_aimdo,
+                    "comfy_aimdo.control": control,
+                    "comfy_aimdo.model_vbar": noisy_vbar,
+                },
+            ),
+            mock.patch.object(torch.cuda, "memory_allocated", return_value=1),
+            mock.patch.object(torch.cuda, "memory_reserved", return_value=2),
+            mock.patch.object(torch.cuda, "mem_get_info", return_value=(3, 4)),
+        ):
+            counters = activation_policy._memory_diagnostics(
+                torch.device("cuda", 0)
+            )
+
+        self.assertEqual(counters, (1, 2, 3, 1234))
+        control.get_total_vram_usage.assert_called_once_with()
+        noisy_vbar.vbars_analyze.assert_not_called()
+
     def test_attention_head_override_uses_largest_legal_group(self):
         with (
             mock.patch.object(
