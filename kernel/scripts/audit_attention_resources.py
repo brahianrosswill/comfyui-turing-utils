@@ -110,16 +110,14 @@ def main() -> None:
         raise RuntimeError(f"the current Python core extension is not built: suffix={suffix}")
     output = _resource_output(qattn)
     records: list[tuple[int, dict[str, int]]] = []
-    lines = output.splitlines()
-    for index, line in enumerate(lines):
-        if "sparse_attention_kernel" not in line or index + 1 >= len(lines):
+    qattn_sm75_records = _sm75_records(output)
+    for line, metrics in qattn_sm75_records:
+        if "sparse_attention_kernel" not in line:
             continue
         dimension = re.search(r"sparse_attention_kernelILi(64|128)E", line)
         if dimension is None:
             raise RuntimeError(f"cannot identify attention head dimension: {line}")
-        metrics = _metrics(lines[index + 1])
-        if metrics:
-            records.append((int(dimension.group(1)), metrics))
+        records.append((int(dimension.group(1)), metrics))
     dimensions = {64: [], 128: []}
     for dimension, metrics in records:
         dimensions[dimension].append(metrics)
@@ -132,11 +130,8 @@ def main() -> None:
         _validate_no_spill(f"D{dimension} attention", metrics)
 
     varlen_value_records = []
-    for index, line in enumerate(lines):
-        if "quantize_varlen_value_kernel" not in line or index + 1 >= len(lines):
-            continue
-        metrics = _metrics(lines[index + 1])
-        if metrics:
+    for line, metrics in qattn_sm75_records:
+        if "quantize_varlen_value_kernel" in line:
             varlen_value_records.append(metrics)
     if len(varlen_value_records) != 2:
         raise RuntimeError(
@@ -161,14 +156,10 @@ def main() -> None:
     )
 
     preprocessing_output = _resource_output(fused)
-    preprocessing_lines = preprocessing_output.splitlines()
     preprocessing_records: list[dict[str, int]] = []
     preprocessing_dimensions = {64: [], 128: []}
-    for index, line in enumerate(preprocessing_lines):
-        if "qk_preprocess" not in line or index + 1 >= len(preprocessing_lines):
-            continue
-        metrics = _metrics(preprocessing_lines[index + 1])
-        if not metrics:
+    for line, metrics in _sm75_records(preprocessing_output):
+        if "qk_preprocess" not in line:
             continue
         preprocessing_records.append(metrics)
         if "quantize_qk_kernel" in line:
@@ -213,6 +204,12 @@ def main() -> None:
         ("BF16 epilogue", "dequantize_int8_bf16", 4, 64),
         ("ConvRot row-buffer", "bf16_rowbuffer_convrot_quantize_kernel", 18, 64),
         ("ConvRot staged reduction", "swiglu_rotate_amax_kernel", 4, 64),
+        (
+            "scaled SwiGLU shard quantizer",
+            "swiglu_rotate_scaled_quantize_kernel",
+            2,
+            64,
+        ),
         ("ConvRot staged INT8 output", "quantize_from_partials_kernel", 2, 64),
         ("ConvRot staged INT4 output", "quantize_int4_from_partials_kernel", 2, 64),
         ("segmented RMSNorm+AdaLN", "segmented_rms_adaln_kernel", 3, 96),

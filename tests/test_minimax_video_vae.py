@@ -344,7 +344,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         with (
             mock.patch.object(video_vae, "TILE_SIZE", 4),
             mock.patch.object(video_vae, "TILE_OVERLAP", 2),
-            mock.patch.object(video_vae, "is_supported_turing_device", return_value=True),
+            mock.patch.object(video_vae, "is_supported_tensor_core_device", return_value=True),
             mock.patch.object(video_vae, "load_turing_sage", return_value=unavailable),
             torch.inference_mode(),
         ):
@@ -360,7 +360,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         with (
             mock.patch.object(video_vae, "TILE_SIZE", 4),
             mock.patch.object(video_vae, "TILE_OVERLAP", 2),
-            mock.patch.object(video_vae, "is_supported_turing_device", return_value=True),
+            mock.patch.object(video_vae, "is_supported_tensor_core_device", return_value=True),
             mock.patch.object(video_vae, "load_turing_sage", return_value=available),
             torch.inference_mode(),
         ):
@@ -382,7 +382,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             vae_ratio=2,
         )
         with (
-            mock.patch.object(video_vae, "is_supported_turing_device", return_value=False),
+            mock.patch.object(video_vae, "is_supported_tensor_core_device", return_value=False),
             mock.patch.object(video_vae, "load_turing_sage") as load_kernel,
             mock.patch.object(video_vae, "_SharedWindowLayout") as layout_type,
             mock.patch.object(video_vae.h3_vae, "create_token_ids", return_value=torch.zeros(1, 1, 3)),

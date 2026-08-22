@@ -134,6 +134,32 @@ __device__ __forceinline__ float fht_store_absmax(
     return fmaxf(fmaxf(fabsf(y0), fabsf(y1)), fmaxf(fabsf(y2), fabsf(y3)));
 }
 
+template <int S, typename InputType>
+__device__ __forceinline__ void fht_store_scaled_int8(
+    const float *__restrict__ src,
+    int8_t *__restrict__ output,
+    int lane,
+    float scale) {
+    const int base = (lane % S) + (lane / S) * (4 * S);
+    const float x0 = src[base];
+    const float x1 = src[base + S];
+    const float x2 = src[base + 2 * S];
+    const float x3 = src[base + 3 * S];
+    const float values[4] = {
+        0.5f * (x0 + x1 + x2 - x3),
+        0.5f * (x0 + x1 - x2 + x3),
+        0.5f * (x0 - x1 + x2 + x3),
+        0.5f * (-x0 + x1 + x2 + x3),
+    };
+#pragma unroll
+    for (int index = 0; index < 4; ++index) {
+        const InputType rounded = from_float<InputType>(values[index]);
+        float quantized = nearbyintf(quant_div_to_float(rounded, scale));
+        quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
+        output[base + index * S] = static_cast<int8_t>(quantized);
+    }
+}
+
 template <typename InputType>
 __device__ __forceinline__ float load_swiglu(
     const InputType *__restrict__ input, int64_t row_offset, int col, int k) {
@@ -207,6 +233,47 @@ __global__ void swiglu_rotate_amax_kernel(
         if (lane == 0 && active) {
             partial_absmax[static_cast<int64_t>(row) * groups + group] = value;
         }
+    }
+}
+
+template <typename InputType>
+__global__ void swiglu_rotate_scaled_quantize_kernel(
+    const InputType *__restrict__ input,
+    const float *__restrict__ scales,
+    int8_t *__restrict__ output,
+    int k) {
+    extern __shared__ float smem[];
+    const int sub = threadIdx.x / kGroupThreads;
+    const int lane = threadIdx.x % kGroupThreads;
+    const int group = static_cast<int>(blockIdx.y) * kGroupsPerBlock + sub;
+    const int row = static_cast<int>(blockIdx.x);
+    const int groups = k / kConvRotGroup;
+    const bool active = group < groups;
+    const int group_col = group * kConvRotGroup;
+    const int base = lane * 4;
+    const int col = group_col + base;
+    const int64_t input_row = static_cast<int64_t>(row) * (2 * k);
+    const int64_t output_row = static_cast<int64_t>(row) * k;
+    float *buf0 = smem + sub * (2 * kConvRotGroup);
+    float *buf1 = buf0 + kConvRotGroup;
+
+    const float x0 = active ? load_swiglu(input, input_row, col, k) : 0.0f;
+    const float x1 = active ? load_swiglu(input, input_row, col + 1, k) : 0.0f;
+    const float x2 = active ? load_swiglu(input, input_row, col + 2, k) : 0.0f;
+    const float x3 = active ? load_swiglu(input, input_row, col + 3, k) : 0.0f;
+    buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
+    buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
+    buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
+    buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+    __syncthreads();
+
+    fht_stage<4>(buf1, buf0, lane);
+    __syncthreads();
+    fht_stage<16>(buf0, buf1, lane);
+    __syncthreads();
+    if (active) {
+        fht_store_scaled_int8<64, InputType>(
+            buf1, output + output_row + group_col, lane, scales[row]);
     }
 }
 
@@ -519,6 +586,38 @@ void turing_swiglu_int8_convrot_quantize(Tensor input,
     } else {
         throw std::runtime_error("SwiGLU staged ConvRot requires float16 or bfloat16 input");
     }
+}
+
+void turing_swiglu_int8_convrot_quantize_scaled(Tensor input,
+                                                 Tensor scales,
+                                                 Tensor output) {
+    const int rows = input.size(0);
+    const int k = output.size(1);
+    const int group_blocks = ceilDiv(k / kConvRotGroup, kGroupsPerBlock);
+    const dim3 grid(
+        static_cast<unsigned int>(rows),
+        static_cast<unsigned int>(group_blocks));
+    constexpr size_t smem_bytes =
+        kGroupsPerBlock * 2 * kConvRotGroup * sizeof(float);
+    if (input.scalar_type() == Tensor::BF16) {
+        swiglu_rotate_scaled_quantize_kernel<nv_bfloat16>
+            <<<grid, kRotateThreads, smem_bytes, getCurrentCUDAStream()>>>(
+                static_cast<const nv_bfloat16 *>(input.ptr),
+                static_cast<const float *>(scales.ptr),
+                static_cast<int8_t *>(output.ptr),
+                k);
+    } else if (input.scalar_type() == Tensor::FP16) {
+        swiglu_rotate_scaled_quantize_kernel<half>
+            <<<grid, kRotateThreads, smem_bytes, getCurrentCUDAStream()>>>(
+                static_cast<const half *>(input.ptr),
+                static_cast<const float *>(scales.ptr),
+                static_cast<int8_t *>(output.ptr),
+                k);
+    } else {
+        throw std::runtime_error(
+            "scaled SwiGLU ConvRot requires float16 or bfloat16 input");
+    }
+    checkCUDA(cudaGetLastError());
 }
 
 void turing_swiglu_int4_convrot_quantize(Tensor input,

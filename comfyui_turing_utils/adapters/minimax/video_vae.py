@@ -30,7 +30,7 @@ from ...attention.protocol import (
     RMSNormSpec,
     RotaryEmbeddingSpec,
 )
-from ...hardware import is_supported_turing_device
+from ...hardware import is_supported_tensor_core_device
 from ...kernel_api import load_turing_sage
 
 
@@ -715,7 +715,7 @@ class _SharedSpatialPlan:
         self._overlap_batch_maps = {}
         self._overlap_backend_logged = False
         self.overlap_accumulate = None
-        if is_supported_turing_device(device):
+        if is_supported_tensor_core_device(device):
             try:
                 turing_sage = load_turing_sage()
                 if turing_sage.overlap_accumulate_available():

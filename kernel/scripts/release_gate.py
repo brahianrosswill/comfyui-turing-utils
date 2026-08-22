@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = ROOT / "kernel"
 COMFYUI_ROOT = ROOT.parents[1]
-EXPECTED_VERSION = "0.29.1"
+EXPECTED_VERSION = "0.30.0"
 
 
 def _run(command: list[str], *, cwd: Path = ROOT, env=None) -> None:
@@ -163,11 +163,32 @@ def _static_gate() -> None:
             overlap_source,
             "overlap_accumulate_kernel",
         ),
+        (
+            KERNEL / "csrc/turing/sage/fused.h",
+            fused_header,
+            "at::Tensor anchor_values",
+        ),
     ):
         if marker not in source:
             raise RuntimeError(
                 f"missing fused preprocessing/overlap ABI marker in {path}"
             )
+    core_api = (KERNEL / "csrc/kernel_api.h").read_text(encoding="utf-8")
+    core_binding = (KERNEL / "csrc/bindings.cpp").read_text(encoding="utf-8")
+    for path, source, marker in (
+        (
+            KERNEL / "csrc/kernel_api.h",
+            core_api,
+            "turing_swiglu_int8_convrot_quantize_scaled",
+        ),
+        (
+            KERNEL / "csrc/bindings.cpp",
+            core_binding,
+            'm.def("turing_swiglu_int8_convrot_quantize_scaled"',
+        ),
+    ):
+        if marker not in source:
+            raise RuntimeError(f"missing activation-streaming ABI marker in {path}")
     sparse_policy = (ROOT / "comfyui_turing_utils/attention/sparse.py").read_text(
         encoding="utf-8"
     )

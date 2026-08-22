@@ -99,7 +99,8 @@ void quant_qk_rms_rope_int8_cuda(
                 int tensor_layout,
                 int norm_scope,
                 bool split_half,
-                bool rotate);
+                bool rotate,
+                bool detect_anchor);
 
 void quant_per_warp_int8_varlen_cuda(
                 at::Tensor input,

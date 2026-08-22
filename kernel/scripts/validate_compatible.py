@@ -63,6 +63,86 @@ def validate_convrot(device: torch.device) -> None:
                 atol=5.0e-8,
             )
 
+    # FFN channel streaming must reproduce the full SwiGLU quantizer exactly.
+    # ConvRot is independent in aligned 256-channel blocks; the only global
+    # statistic is one per-row scale, recovered by the first pass below.
+    rows, hidden, chunk, output_columns = 17, 1024, 256, 512
+    generator = torch.Generator(device=device).manual_seed(4277)
+    expanded = torch.randn(
+        (rows, hidden * 2),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    full_q, full_scale = (
+        comfyui_turing_utils_kernel.turing_bf16_int8_convrot_quantize(
+            expanded, 256, swiglu=True
+        )
+    )
+    whole_scale = None
+    shards = []
+    for start in range(0, hidden, chunk):
+        stop = start + chunk
+        shard = torch.cat(
+            (expanded[:, start:stop], expanded[:, hidden + start : hidden + stop]),
+            dim=1,
+        )
+        _, local_scale = (
+            comfyui_turing_utils_kernel.turing_bf16_int8_convrot_quantize(
+                shard, 256, swiglu=True
+            )
+        )
+        whole_scale = (
+            local_scale
+            if whole_scale is None
+            else torch.maximum(whole_scale, local_scale)
+        )
+        shards.append(shard)
+    if not torch.equal(whole_scale, full_scale):
+        raise RuntimeError("FFN channel shards changed the whole-row INT8 scale")
+
+    quantized_shards = [
+        comfyui_turing_utils_kernel.turing_swiglu_int8_convrot_quantize_scaled(
+            shard, whole_scale, 256
+        )
+        for shard in shards
+    ]
+    if not torch.equal(torch.cat(quantized_shards, dim=1), full_q):
+        raise RuntimeError("FFN channel shards changed SwiGLU ConvRot INT8 values")
+
+    weight = torch.randint(
+        -127,
+        128,
+        (output_columns, hidden),
+        generator=generator,
+        device=device,
+        dtype=torch.int8,
+    )
+    weight_scale = torch.rand(
+        (output_columns,), generator=generator, device=device
+    ) * 0.02
+    full_accumulator = torch._int_mm(full_q, weight.t().contiguous())
+    split_accumulator = None
+    for index, start in enumerate(range(0, hidden, chunk)):
+        stop = start + chunk
+        partial = torch._int_mm(
+            quantized_shards[index], weight[:, start:stop].t().contiguous()
+        )
+        if split_accumulator is None:
+            split_accumulator = partial
+        else:
+            split_accumulator.add_(partial)
+    if not torch.equal(split_accumulator, full_accumulator):
+        raise RuntimeError("FFN channel shards changed the INT32 dot product")
+    full_output = comfyui_turing_utils_kernel.turing_dequantize_int8_bf16(
+        full_accumulator, full_scale, weight_scale
+    )
+    split_output = comfyui_turing_utils_kernel.turing_dequantize_int8_bf16(
+        split_accumulator, whole_scale, weight_scale
+    )
+    if not torch.equal(split_output, full_output):
+        raise RuntimeError("FFN channel shards changed the BF16 epilogue")
+
     zero = torch.zeros((2, 512), device=device, dtype=torch.bfloat16)
     for implementation in (
         lambda: comfyui_turing_utils_kernel.turing_swiglu_int4_convrot_quantize(zero, 256),
@@ -287,7 +367,10 @@ def _reference_qk_preprocessing(
 
 
 def validate_qk_preprocessing(device: torch.device) -> None:
-    from comfyui_turing_utils_kernel.turing_sage.core import prequantize_rms_rope_qk
+    from comfyui_turing_utils_kernel.turing_sage.core import (
+        precompute_rms_rope_k_anchor,
+        prequantize_rms_rope_qk,
+    )
     from comfyui_turing_utils_kernel.turing_sage.quant import (
         per_warp_int8,
         per_warp_int8_hadamard,
@@ -418,6 +501,75 @@ def validate_qk_preprocessing(device: torch.device) -> None:
                         expected,
                         rtol=0.015,
                         atol=0.0011,
+                    )
+
+            sample_indices = torch.tensor(
+                [index * (sequence - 1) // 8 for index in range(9)],
+                dtype=torch.long,
+                device=device,
+            )
+            anchor = precompute_rms_rope_k_anchor(
+                key.index_select(2, sample_indices),
+                key_norm,
+                freqs.index_select(1, sample_indices),
+                epsilon=1.0e-6,
+                rot_dim=rot_dim,
+                norm_scope=norm_scope,
+                split_half=split_half,
+            )
+            streamed_buffers = (
+                torch.empty_like(query, dtype=torch.int8),
+                torch.empty_like(rotated.query_scale),
+                torch.empty_like(key, dtype=torch.int8),
+                torch.empty_like(rotated.key_scale),
+            )
+            for start in range(0, sequence, 128):
+                stop = min(start + 128, sequence)
+                rows = stop - start
+                prequantize_rms_rope_qk(
+                    query[:, :, start:stop],
+                    key[:, :, start:stop],
+                    query_norm,
+                    key_norm,
+                    freqs[:, start:stop],
+                    epsilon=1.0e-6,
+                    rot_dim=rot_dim,
+                    norm_scope=norm_scope,
+                    split_half=split_half,
+                    rotate_qk=True,
+                    stabilize_k=True,
+                    k_anchor=anchor,
+                    qk_output=(
+                        streamed_buffers[0][:, :, start:stop],
+                        streamed_buffers[1][
+                            :,
+                            :,
+                            (start // 64) * 4 : (start // 64) * 4
+                            + ((rows + 63) // 64) * 4,
+                        ],
+                        streamed_buffers[2][:, :, start:stop],
+                        streamed_buffers[3][
+                            :,
+                            :,
+                            start // 64 : start // 64
+                            + (rows + 63) // 64,
+                        ],
+                    ),
+                )
+            for name, expected, actual in zip(
+                ("query", "query scale", "key", "key scale"),
+                (
+                    rotated.query_int8,
+                    rotated.query_scale,
+                    rotated.key_int8,
+                    rotated.key_scale,
+                ),
+                streamed_buffers,
+            ):
+                if not torch.equal(expected, actual):
+                    raise RuntimeError(
+                        f"streamed fused {name} differs from full preprocessing: "
+                        f"{dtype=} {head_dim=} {norm_scope=}"
                     )
 
 

@@ -509,6 +509,39 @@ std::tuple<at::Tensor, at::Tensor> turing_swiglu_int8_convrot_quantize(
     return {output, scales};
 }
 
+at::Tensor turing_swiglu_int8_convrot_quantize_scaled(
+    at::Tensor input, at::Tensor scales, int64_t group_size) {
+    input = input.contiguous();
+    scales = scales.reshape({-1}).to(at::kFloat).contiguous();
+    check_cuda_2d(input, "input");
+    check_half_like(input, "input");
+    TORCH_CHECK(group_size == 256,
+                "scaled SwiGLU ConvRot only supports group_size=256");
+    TORCH_CHECK(input.size(1) % 2 == 0,
+                "scaled SwiGLU input width must be even");
+    const int64_t rows = input.size(0);
+    const int64_t hidden = input.size(1) / 2;
+    TORCH_CHECK(rows > 0 && hidden > 0 && hidden % group_size == 0,
+                "scaled SwiGLU width must be positive and divisible by 256");
+    TORCH_CHECK(scales.is_cuda() && scales.device() == input.device() &&
+                    scales.numel() == rows,
+                "scaled SwiGLU requires one FP32 scale per input row");
+    TORCH_CHECK(rows <= std::numeric_limits<int>::max() &&
+                    hidden <= std::numeric_limits<int>::max(),
+                "scaled SwiGLU dimensions exceed the CUDA kernel range");
+    const at::cuda::CUDAGuard device_guard(input.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major > 7 ||
+                    (properties->major == 7 && properties->minor >= 5),
+                "scaled SwiGLU ConvRot requires sm75 or newer");
+    at::Tensor output = at::empty(
+        {rows, hidden}, input.options().dtype(at::kChar));
+    TorchOpContext ctx;
+    comfyui_turing_utils::kernels::turing_swiglu_int8_convrot_quantize_scaled(
+        from_torch(input), from_torch(scales), from_torch(output));
+    return output;
+}
+
 std::tuple<at::Tensor, at::Tensor> turing_swiglu_int4_convrot_quantize(
     at::Tensor input, int64_t group_size) {
     input = input.contiguous();
@@ -886,6 +919,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("turing_swiglu_int8_convrot_quantize",
           &turing_swiglu_int8_convrot_quantize,
           pybind11::arg("input"),
+          pybind11::arg("group_size") = 256);
+    m.def("turing_swiglu_int8_convrot_quantize_scaled",
+          &turing_swiglu_int8_convrot_quantize_scaled,
+          pybind11::arg("input"),
+          pybind11::arg("scales"),
           pybind11::arg("group_size") = 256);
     m.def("turing_swiglu_int4_convrot_quantize",
           &turing_swiglu_int4_convrot_quantize,

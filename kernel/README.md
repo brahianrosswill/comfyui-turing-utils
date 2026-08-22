@@ -1,7 +1,7 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's quantized
-runtime. Version 0.29.1 contains legacy packed W4A8 and grouped-codebook W4A8
+runtime. Version 0.30.0 contains legacy packed W4A8 and grouped-codebook W4A8
 Tensor Core GEMMs, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, bundled Sage attention, pure-INT8 W8A8 attention,
@@ -78,11 +78,11 @@ Override detection with `COMFYUI_TURING_UTILS_ARCH_LIST` to cross-compile the
 portable core extension for Ampere (`8.0;8.6`), Ada (`8.9`), Hopper
 (`9.0`/`9.0a`), or a combined wheel. Attention extensions are built for every
 requested architecture at sm75 or newer. Stable dense Sage remains an
-exact-sm75 runtime choice; native Ampere+ Sol delegates protected dense work to
-Comfy Kitchen W8A8 or the installed SageAttention backend. The historical
-`_sm75` extension suffix is retained as an ABI name. `7.5+PTX` remains useful
-for compatibility validation, while an `8.6` build enables native A40
-async-copy and INT8 MMA instructions.
+exact-sm75 runtime choice; dense W8A8, Sol, and SLA share the bundled sm75+
+prepared-attention path, including protected dense work. The historical `_sm75`
+extension suffix is retained as an ABI name. `7.5+PTX` remains useful for
+compatibility validation, while an `8.6` build enables native Ampere async-copy
+and INT8 MMA instructions.
 
 ```bash
 COMFYUI_TURING_UTILS_ARCH_LIST="7.5;8.0;8.6;8.9;9.0" \
@@ -180,6 +180,7 @@ print("Fused Q/K preprocessing:", comfyui_turing_utils_kernel.turing_sage.fused_
 print("Turing W4A8:", callable(comfyui_turing_utils_kernel.turing_w4a8_linear))
 print("Turing codebook W4A8:", callable(comfyui_turing_utils_kernel.turing_codebook_w4a8_linear))
 print("Turing SwiGLU:", callable(comfyui_turing_utils_kernel.turing_swiglu_int8_convrot_quantize))
+print("Scaled SwiGLU shard:", callable(comfyui_turing_utils_kernel.turing_swiglu_int8_convrot_quantize_scaled))
 print("Turing norm:", callable(comfyui_turing_utils_kernel.turing_segmented_rms_adaln))
 PY
 ```

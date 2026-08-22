@@ -117,7 +117,8 @@ class FusionDispatchTest(unittest.TestCase):
         offload = (None, None, None)
 
         with (
-            mock.patch("comfyui_turing_utils.quantization.dispatch.is_supported_turing_device", return_value=True),
+            mock.patch("comfyui_turing_utils.hardware.is_supported_attention_device", return_value=True),
+            mock.patch("comfyui_turing_utils.quantization.dispatch.is_supported_tensor_core_device", return_value=True),
             mock.patch(
                 "comfy.ops.cast_bias_weight",
                 return_value=(weight, None, offload),
@@ -148,7 +149,8 @@ class FusionDispatchTest(unittest.TestCase):
                 output = torch.empty((2, 4), dtype=torch.bfloat16)
                 offload = (None, None, None)
                 with (
-                    mock.patch("comfyui_turing_utils.quantization.dispatch.is_supported_turing_device", return_value=True),
+                    mock.patch("comfyui_turing_utils.hardware.is_supported_attention_device", return_value=True),
+                    mock.patch("comfyui_turing_utils.quantization.dispatch.is_supported_tensor_core_device", return_value=True),
                     mock.patch(
                         "comfy.ops.cast_bias_weight",
                         return_value=(weight, None, offload),
@@ -170,7 +172,8 @@ class FusionDispatchTest(unittest.TestCase):
         output = torch.empty((2, 4), dtype=torch.bfloat16)
         offload = (None, None, None)
         with (
-            mock.patch("comfyui_turing_utils.quantization.dispatch.is_supported_turing_device", return_value=True),
+            mock.patch("comfyui_turing_utils.hardware.is_supported_attention_device", return_value=True),
+            mock.patch("comfyui_turing_utils.quantization.dispatch.is_supported_tensor_core_device", return_value=True),
             mock.patch(
                 "comfy.ops.cast_bias_weight", return_value=(weight, None, offload)
             ),
@@ -191,8 +194,9 @@ class FusionDispatchTest(unittest.TestCase):
         output = torch.empty((2, 8), dtype=torch.bfloat16)
         offload = (None, None, None)
         with (
+            mock.patch("comfyui_turing_utils.hardware.is_supported_attention_device", return_value=True),
             mock.patch(
-                "comfyui_turing_utils.quantization.dispatch.is_supported_turing_device",
+                "comfyui_turing_utils.quantization.dispatch.is_supported_tensor_core_device",
                 return_value=True,
             ),
             mock.patch(
@@ -264,6 +268,7 @@ class FusionDispatchTest(unittest.TestCase):
         offload = (None, None, None)
 
         with (
+            mock.patch("comfyui_turing_utils.hardware.is_supported_attention_device", return_value=True),
             mock.patch(
                 "comfy.ops.cast_bias_weight",
                 return_value=(dense, None, offload),

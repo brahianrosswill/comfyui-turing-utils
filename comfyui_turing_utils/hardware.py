@@ -32,8 +32,13 @@ def is_supported_turing_device(device: torch.device) -> bool:
     return not any(model in name for model in _TURING_WITHOUT_TENSOR_CORES)
 
 
-def is_supported_attention_device(device: torch.device) -> bool:
-    """Return whether bundled integer attention can target ``device``."""
+def is_supported_tensor_core_device(device: torch.device) -> bool:
+    """Return whether the shared low-precision CUDA kernels target ``device``.
+
+    The runtime contract is capability based: exact sm75 devices must have
+    Tensor Cores, while sm80 and newer devices use the same operator APIs with
+    architecture-specific cubins selected by CUDA.
+    """
     if is_supported_turing_device(device):
         return True
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -42,4 +47,13 @@ def is_supported_attention_device(device: torch.device) -> bool:
     return torch.cuda.get_device_capability(index) >= (8, 0)
 
 
-__all__ = ["is_supported_attention_device", "is_supported_turing_device"]
+def is_supported_attention_device(device: torch.device) -> bool:
+    """Compatibility alias for the original public predicate."""
+    return is_supported_tensor_core_device(device)
+
+
+__all__ = [
+    "is_supported_attention_device",
+    "is_supported_tensor_core_device",
+    "is_supported_turing_device",
+]

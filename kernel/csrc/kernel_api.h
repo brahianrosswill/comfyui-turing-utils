@@ -44,6 +44,10 @@ void turing_swiglu_int8_convrot_quantize(Tensor input,
                                           Tensor output,
                                           Tensor scales);
 
+void turing_swiglu_int8_convrot_quantize_scaled(Tensor input,
+                                                 Tensor scales,
+                                                 Tensor output);
+
 void turing_swiglu_int4_convrot_quantize(Tensor input,
                                           Tensor rotated,
                                           Tensor partial_absmax,

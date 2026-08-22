@@ -1,7 +1,8 @@
-"""MiniMax H3 memory planning and Turing block fusions."""
+"""MiniMax H3 memory planning and capability-based CUDA fusions."""
 
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import logging
 import math
@@ -19,9 +20,21 @@ from ...attention.protocol import (
     RotaryEmbeddingSpec,
     prepared_attention_executor,
 )
-from ...attention.stable import fused_qk_preprocessing_available
+from ...attention.stable import (
+    fused_qk_preprocessing_available,
+    precompute_turing_k_anchor,
+    prequantize_turing_qk,
+    reusable_k_anchor_available,
+)
+from ...attention.tuning import attention_kernel_tuning
+from ...hardware import is_supported_attention_device
 from ...kernel_api import load_kernel_package
 from ...profiling import CUDA_PHASE_PROFILER
+from .activation_policy import (
+    decide_activation_chunks,
+    decide_attention_heads,
+    decide_ffn_channels,
+)
 from .layout import (
     ATTENTION_LAYOUT_KEY,
     RUNTIME_CONTEXT_ATTR,
@@ -33,13 +46,19 @@ from .layout import (
     publish_minimax_attention_layout,
 )
 from ...quantization.fusions import (
+    convrot_linear_input_act_from_weight,
+    convrot_w8_output_slice,
+    convrot_w8_plain_tensors,
     convrot_weight_kind,
+    fused_convrot_linear_input_act,
     is_turing_convrot_linear,
     segmented_rms_adaln,
-    turing_linear_input_act,
 )
 from ...quantization.dispatch import (
-    is_supported_turing_device,
+    int8_linear_from_quantized,
+    quantize_convrot_int8_activation,
+    quantize_convrot_swiglu_activation,
+    quantize_convrot_swiglu_with_scale,
     turing_codebook_w4a8_workspace_bytes,
     turing_int8_workspace_bytes,
 )
@@ -65,6 +84,7 @@ _MEMORY_CONTEXT_ATTR = RUNTIME_CONTEXT_ATTR
 _MEMORY_ADAPTER_ATTR = "_turing_utils_minimax_memory_adapter"
 _OUTER_SAMPLE_WRAPPER_KEY = RUNTIME_OUTER_WRAPPER_KEY
 _ATTENTION_LAYOUT_KEY = ATTENTION_LAYOUT_KEY
+_STREAMED_QKV_EXECUTOR_ATTR = "turing_utils_streamed_qkv_executor"
 
 
 class _MiniMaxMemoryShape(list):
@@ -387,7 +407,7 @@ class _RuntimeDispatchAudit:
 
         log = LOG.warning if self.counts[phase]["fallback"] else LOG.info
         log(
-            "MiniMax Turing runtime dispatch: phase=%s fused=%d fallback=%d "
+            "MiniMax fused runtime dispatch: phase=%s fused=%d fallback=%d "
             "dtypes=[%s] shapes=[%s] reasons=[%s]",
             phase,
             self.counts[phase]["fused"],
@@ -421,7 +441,7 @@ def _audit_fc2(blocks: Sequence[torch.nn.Module]) -> int:
     ]
     eligible = sum(kind != "other" for kind in kinds)
     LOG.info(
-        "MiniMax Turing fc2 dispatch: blocks=%d eligible=%d formats=[%s]",
+        "MiniMax fused fc2 dispatch: blocks=%d eligible=%d formats=[%s]",
         len(linears),
         eligible,
         _format_counts(kinds),
@@ -439,6 +459,740 @@ def _compatible_attention_forward(attention_type: type[torch.nn.Module]) -> bool
     return parameters == ("self", *_ATTENTION_FORWARD_PARAMETERS)
 
 
+def _qk_transform(attention, x, rope_freqs) -> QKTransformSpec:
+    import comfy.model_management
+
+    query_norm = comfy.model_management.cast_to(
+        attention.q_norm.weight, device=x.device, dtype=x.dtype
+    )
+    key_norm = comfy.model_management.cast_to(
+        attention.k_norm.weight, device=x.device, dtype=x.dtype
+    )
+    rot_dim = int(rope_freqs.shape[-3] * 2) if rope_freqs is not None else 0
+    return QKTransformSpec(
+        query_norm=RMSNormSpec(
+            query_norm, float(attention.q_norm.eps), "head"
+        ),
+        key_norm=RMSNormSpec(
+            key_norm, float(attention.k_norm.eps), "head"
+        ),
+        rotary=RotaryEmbeddingSpec(
+            rope_freqs,
+            rot_dim,
+            "split_half" if rope_freqs is not None else "none",
+        ),
+    )
+
+
+def _linear_with_cast_weight(linear, x, weight, bias):
+    pre_quant_scale = getattr(linear, "pre_quant_scale", None)
+    if pre_quant_scale is not None:
+        import comfy.model_management
+
+        x = x * comfy.model_management.cast_to_device(
+            pre_quant_scale, x.device, x.dtype
+        )
+    function = getattr(linear, "_forward", None)
+    return (
+        function(x, weight, bias)
+        if callable(function)
+        else torch.nn.functional.linear(x, weight, bias)
+    )
+
+
+def _slice_qk_transform(
+    transform: QKTransformSpec,
+    start: int,
+    stop: int,
+    full_rows: int,
+) -> QKTransformSpec:
+    freqs = transform.freqs
+    if torch.is_tensor(freqs) and freqs.ndim >= 2 and freqs.shape[1] == full_rows:
+        rotary = dataclasses.replace(transform.rotary, freqs=freqs[:, start:stop])
+        return dataclasses.replace(transform, rotary=rotary)
+    return transform
+
+
+def _sample_qk_transform(
+    transform: QKTransformSpec,
+    indices: torch.Tensor,
+    full_rows: int,
+) -> QKTransformSpec:
+    freqs = transform.freqs
+    if torch.is_tensor(freqs) and freqs.ndim >= 2 and freqs.shape[1] == full_rows:
+        rotary = dataclasses.replace(
+            transform.rotary,
+            freqs=freqs.index_select(1, indices),
+        )
+        return dataclasses.replace(transform, rotary=rotary)
+    return transform
+
+
+def _global_k_anchor(
+    attention,
+    x: torch.Tensor,
+    weight,
+    bias,
+    transform: QKTransformSpec,
+    inner: int,
+    heads: int,
+    head_dim: int,
+):
+    sequence = int(x.shape[0])
+    sample_rows = [index * (sequence - 1) // 8 for index in range(9)]
+    sample_indices = torch.tensor(
+        sample_rows, dtype=torch.long, device=x.device
+    )
+    sampled = x.index_select(0, sample_indices)
+    projected = _linear_with_cast_weight(
+        attention.qkv_proj, sampled, weight, bias
+    )
+    key = projected[:, inner : 2 * inner]
+    key = key.view(9, heads, head_dim).transpose(0, 1).unsqueeze(0)
+    sample_transform = _sample_qk_transform(
+        transform, sample_indices, sequence
+    )
+    anchor_indices, anchor_values = precompute_turing_k_anchor(
+        key, sample_transform
+    )
+    lookup = sample_indices.to(dtype=torch.int32)
+    selected = anchor_indices.clamp_min(0).to(dtype=torch.long)
+    anchor_indices = torch.where(
+        anchor_indices >= 0,
+        lookup[selected],
+        anchor_indices,
+    )
+    return anchor_indices, anchor_values
+
+
+def _qkv_input_tile(linear, x: torch.Tensor) -> torch.Tensor:
+    pre_quant_scale = getattr(linear, "pre_quant_scale", None)
+    if pre_quant_scale is None:
+        return x
+    import comfy.model_management
+
+    scale = comfy.model_management.cast_to_device(
+        pre_quant_scale, x.device, x.dtype
+    )
+    return x * scale
+
+
+def _quantize_qkv_rows(linear, x: torch.Tensor):
+    return quantize_convrot_int8_activation(
+        _qkv_input_tile(linear, x), 256
+    )
+
+
+def _cache_quantized_qkv_input(linear, x: torch.Tensor, chunk_rows: int):
+    qactivation = torch.empty_like(x, dtype=torch.int8)
+    activation_scale = torch.empty(
+        (x.shape[0],), dtype=torch.float32, device=x.device
+    )
+    for start in range(0, x.shape[0], chunk_rows):
+        stop = min(start + chunk_rows, x.shape[0])
+        tile, scale = _quantize_qkv_rows(linear, x[start:stop])
+        qactivation[start:stop].copy_(tile)
+        activation_scale[start:stop].copy_(scale.reshape(-1))
+        del tile, scale
+    return qactivation, activation_scale
+
+
+def _w8_qkv_component(
+    qactivation: torch.Tensor,
+    activation_scale: torch.Tensor,
+    qweight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    *,
+    component: int,
+    head_start: int,
+    head_stop: int,
+    heads: int,
+    head_dim: int,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    inner = heads * head_dim
+    start = component * inner + head_start * head_dim
+    stop = component * inner + head_stop * head_dim
+    return convrot_w8_output_slice(
+        qactivation,
+        activation_scale,
+        qweight,
+        weight_scale,
+        bias,
+        start,
+        stop,
+        output_dtype,
+    )
+
+
+def _head_group_k_anchor(
+    attention,
+    x: torch.Tensor,
+    transform: QKTransformSpec,
+    qweight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    head_start: int,
+    head_stop: int,
+    quantized_input,
+):
+    sequence = int(x.shape[0])
+    sample_rows = [index * (sequence - 1) // 8 for index in range(9)]
+    sample_indices = torch.tensor(
+        sample_rows, dtype=torch.long, device=x.device
+    )
+    if quantized_input is None:
+        qactivation, activation_scale = _quantize_qkv_rows(
+            attention.qkv_proj, x.index_select(0, sample_indices)
+        )
+    else:
+        cached_activation, cached_scale = quantized_input
+        qactivation = cached_activation.index_select(0, sample_indices)
+        activation_scale = cached_scale.index_select(0, sample_indices)
+    key = _w8_qkv_component(
+        qactivation,
+        activation_scale,
+        qweight,
+        weight_scale,
+        bias,
+        component=1,
+        head_start=head_start,
+        head_stop=head_stop,
+        heads=int(attention.heads),
+        head_dim=int(attention.head_dim),
+        output_dtype=x.dtype,
+    )
+    group = head_stop - head_start
+    key = key.view(9, group, attention.head_dim).transpose(0, 1).unsqueeze(0)
+    sample_transform = _sample_qk_transform(
+        transform, sample_indices, sequence
+    )
+    anchor_indices, anchor_values = precompute_turing_k_anchor(
+        key, sample_transform
+    )
+    lookup = sample_indices.to(dtype=torch.int32)
+    selected = anchor_indices.clamp_min(0).to(dtype=torch.long)
+    anchor_indices = torch.where(
+        anchor_indices >= 0,
+        lookup[selected],
+        anchor_indices,
+    )
+    return anchor_indices, anchor_values
+
+
+def _stream_qkv_head_group(
+    attention,
+    x: torch.Tensor,
+    transform: QKTransformSpec,
+    transformer_options: dict,
+    qweight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    head_start: int,
+    head_stop: int,
+    chunk_rows: int,
+    quantized_input,
+):
+    """Project one full-sequence head group into compact Q/K/V storage."""
+    sequence = int(x.shape[0])
+    group = head_stop - head_start
+    head_dim = int(attention.head_dim)
+    q_int8 = torch.empty(
+        (1, group, sequence, head_dim), dtype=torch.int8, device=x.device
+    )
+    k_int8 = torch.empty_like(q_int8)
+    q_scale = torch.empty(
+        (1, group, ((sequence + 63) // 64) * 4),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    k_scale = torch.empty(
+        (1, group, (sequence + 63) // 64),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    value = torch.empty(
+        (1, group, sequence, head_dim), dtype=x.dtype, device=x.device
+    )
+    tuning = attention_kernel_tuning(transformer_options)
+    k_anchor = (
+        _head_group_k_anchor(
+            attention,
+            x,
+            transform,
+            qweight,
+            weight_scale,
+            bias,
+            head_start,
+            head_stop,
+            quantized_input,
+        )
+        if tuning.rotate_qk and tuning.stabilize_k
+        else None
+    )
+    qk_type = None
+    route_original_basis = False
+    for start in range(0, sequence, chunk_rows):
+        stop = min(start + chunk_rows, sequence)
+        if quantized_input is None:
+            qactivation, activation_scale = _quantize_qkv_rows(
+                attention.qkv_proj, x[start:stop]
+            )
+        else:
+            cached_activation, cached_scale = quantized_input
+            qactivation = cached_activation[start:stop]
+            activation_scale = cached_scale[start:stop]
+        query = _w8_qkv_component(
+            qactivation,
+            activation_scale,
+            qweight,
+            weight_scale,
+            bias,
+            component=0,
+            head_start=head_start,
+            head_stop=head_stop,
+            heads=int(attention.heads),
+            head_dim=head_dim,
+            output_dtype=x.dtype,
+        )
+        key = _w8_qkv_component(
+            qactivation,
+            activation_scale,
+            qweight,
+            weight_scale,
+            bias,
+            component=1,
+            head_start=head_start,
+            head_stop=head_stop,
+            heads=int(attention.heads),
+            head_dim=head_dim,
+            output_dtype=x.dtype,
+        )
+        rows = stop - start
+        query = query.view(rows, group, head_dim).transpose(0, 1).unsqueeze(0)
+        key = key.view(rows, group, head_dim).transpose(0, 1).unsqueeze(0)
+        tile_transform = _slice_qk_transform(
+            transform, start, stop, sequence
+        )
+        q_scale_start = (start // 64) * 4
+        k_scale_start = start // 64
+        tile_q_scale = q_scale[
+            :,
+            :,
+            q_scale_start : q_scale_start + ((rows + 63) // 64) * 4,
+        ]
+        tile_k_scale = k_scale[
+            :,
+            :,
+            k_scale_start : k_scale_start + (rows + 63) // 64,
+        ]
+        tile_qk = prequantize_turing_qk(
+            query,
+            key,
+            tile_transform,
+            kernel="sol",
+            transformer_options=transformer_options,
+            k_anchor=k_anchor,
+            qk_output=(
+                q_int8[:, :, start:stop],
+                tile_q_scale,
+                k_int8[:, :, start:stop],
+                tile_k_scale,
+            ),
+        )
+        value_tile = _w8_qkv_component(
+            qactivation,
+            activation_scale,
+            qweight,
+            weight_scale,
+            bias,
+            component=2,
+            head_start=head_start,
+            head_stop=head_stop,
+            heads=int(attention.heads),
+            head_dim=head_dim,
+            output_dtype=x.dtype,
+        )
+        value[:, :, start:stop].copy_(
+            value_tile.view(rows, group, head_dim).transpose(0, 1).unsqueeze(0)
+        )
+        qk_type = type(tile_qk)
+        route_original_basis = bool(tile_qk.route_original_basis)
+        del query, key, value_tile, tile_qk
+        if quantized_input is None:
+            del qactivation, activation_scale
+
+    if qk_type is None:
+        raise RuntimeError("head-sharded H3 QKV projection produced no tiles")
+    qk = qk_type(
+        query_int8=q_int8,
+        query_scale=q_scale,
+        key_int8=k_int8,
+        key_scale=k_scale,
+        tensor_layout="HND",
+        input_dtype=x.dtype,
+        original_head_dim=head_dim,
+        route_original_basis=route_original_basis,
+    )
+    return qk, value
+
+
+def _project_qkv_head_group(
+    attention,
+    x: torch.Tensor,
+    qweight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    head_start: int,
+    head_stop: int,
+    chunk_rows: int,
+    quantized_input,
+):
+    sequence = int(x.shape[0])
+    group = head_stop - head_start
+    head_dim = int(attention.head_dim)
+    outputs = [
+        torch.empty(
+            (sequence, group, head_dim), dtype=x.dtype, device=x.device
+        )
+        for _ in range(3)
+    ]
+    for start in range(0, sequence, chunk_rows):
+        stop = min(start + chunk_rows, sequence)
+        if quantized_input is None:
+            qactivation, activation_scale = _quantize_qkv_rows(
+                attention.qkv_proj, x[start:stop]
+            )
+        else:
+            cached_activation, cached_scale = quantized_input
+            qactivation = cached_activation[start:stop]
+            activation_scale = cached_scale[start:stop]
+        rows = stop - start
+        for component, destination in enumerate(outputs):
+            tile = _w8_qkv_component(
+                qactivation,
+                activation_scale,
+                qweight,
+                weight_scale,
+                bias,
+                component=component,
+                head_start=head_start,
+                head_stop=head_stop,
+                heads=int(attention.heads),
+                head_dim=head_dim,
+                output_dtype=x.dtype,
+            )
+            destination[start:stop].copy_(tile.view(rows, group, head_dim))
+            del tile
+        if quantized_input is None:
+            del qactivation, activation_scale
+    return tuple(outputs)
+
+
+def _apply_minimax_qk_transform(attention, query, key, rope_freqs):
+    import comfy.model_management
+    import comfy.quant_ops
+
+    sequence, group, head_dim = query.shape
+    if rope_freqs is not None:
+        query = query.view(1, sequence, group, head_dim)
+        key = key.view(1, sequence, group, head_dim)
+        query_weight = comfy.model_management.cast_to(
+            attention.q_norm.weight, device=query.device
+        )
+        key_weight = comfy.model_management.cast_to(
+            attention.k_norm.weight, device=key.device
+        )
+        rot_dim = rope_freqs.shape[-3] * 2
+        if comfy.model_management.in_training:
+            query, key = comfy.quant_ops.ck.rms_rope_split_half(
+                query,
+                key,
+                rope_freqs,
+                query_weight,
+                key_weight,
+                epsilon=attention.q_norm.eps,
+                rot_dim=rot_dim,
+            )
+        else:
+            comfy.quant_ops.ck.rms_rope_split_half_(
+                query,
+                key,
+                rope_freqs,
+                query_weight,
+                key_weight,
+                epsilon=attention.q_norm.eps,
+                rot_dim=rot_dim,
+            )
+        return query[0], key[0]
+    return attention.q_norm(query), attention.k_norm(key)
+
+
+def _head_sharded_attention(
+    attention,
+    x: torch.Tensor,
+    rope_freqs,
+    transform: QKTransformSpec,
+    transformer_options: dict,
+    attention_container,
+    executor,
+    head_group: int,
+    cache_quantized_input: bool,
+):
+    import comfy.ops
+    from comfy.ldm.modules.attention import optimized_attention
+
+    comfy.ops.run_every_op()
+    weight, bias, offload_stream = comfy.ops.cast_bias_weight(
+        attention.qkv_proj,
+        x,
+        offloadable=True,
+        compute_dtype=x.dtype,
+        want_requant=True,
+    )
+    try:
+        plain = convrot_w8_plain_tensors(weight)
+        if plain is None:
+            return None
+        qweight, weight_scale = plain
+        quantized_input = (
+            _cache_quantized_qkv_input(attention.qkv_proj, x, 16_384)
+            if cache_quantized_input
+            else None
+        )
+        sequence = int(x.shape[0])
+        heads = int(attention.heads)
+        head_dim = int(attention.head_dim)
+        output = torch.empty(
+            (sequence, heads * head_dim), dtype=x.dtype, device=x.device
+        )
+        streamed_executor = (
+            getattr(executor, _STREAMED_QKV_EXECUTOR_ATTR, None)
+            if executor is not None
+            else None
+        )
+        compact = callable(streamed_executor) and reusable_k_anchor_available()
+        for head_start in range(0, heads, head_group):
+            head_stop = min(head_start + head_group, heads)
+            group = head_stop - head_start
+            if compact:
+                qk, value = _stream_qkv_head_group(
+                    attention,
+                    x,
+                    transform,
+                    transformer_options,
+                    qweight,
+                    weight_scale,
+                    bias,
+                    head_start,
+                    head_stop,
+                    16_384,
+                    quantized_input,
+                )
+                outcome = streamed_executor(
+                    qk,
+                    value,
+                    heads=group,
+                    qk_transform=transform,
+                    transformer_options=transformer_options,
+                )
+                del qk, value
+                if not outcome.supported:
+                    return None
+                group_output = outcome.output.squeeze(0)
+            else:
+                query, key, value = _project_qkv_head_group(
+                    attention,
+                    x,
+                    qweight,
+                    weight_scale,
+                    bias,
+                    head_start,
+                    head_stop,
+                    16_384,
+                    quantized_input,
+                )
+                query, key = _apply_minimax_qk_transform(
+                    attention, query, key, rope_freqs
+                )
+                group_output = optimized_attention(
+                    attention_container(query.transpose(0, 1).unsqueeze(0)),
+                    attention_container(key.transpose(0, 1).unsqueeze(0)),
+                    attention_container(value.transpose(0, 1).unsqueeze(0)),
+                    group,
+                    mask=None,
+                    skip_reshape=True,
+                    transformer_options=transformer_options,
+                ).squeeze(0)
+                del query, key, value
+            output[
+                :, head_start * head_dim : head_stop * head_dim
+            ].copy_(group_output)
+            del group_output
+        return output
+    finally:
+        comfy.ops.uncast_bias_weight(
+            attention.qkv_proj, weight, bias, offload_stream
+        )
+
+
+def _stream_qkv_projection(
+    attention,
+    x: torch.Tensor,
+    transform: QKTransformSpec,
+    transformer_options: dict,
+    chunk_rows: int,
+):
+    """Project H3 QKV by rows while retaining only Q/K INT8 and V BF16."""
+    import comfy.ops
+
+    sequence = int(x.shape[0])
+    heads = int(attention.heads)
+    head_dim = int(attention.head_dim)
+    inner = heads * head_dim
+    q_int8 = torch.empty(
+        (1, heads, sequence, head_dim), dtype=torch.int8, device=x.device
+    )
+    k_int8 = torch.empty_like(q_int8)
+    q_scale = torch.empty(
+        (1, heads, ((sequence + 63) // 64) * 4),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    k_scale = torch.empty(
+        (1, heads, (sequence + 63) // 64),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    value = torch.empty(
+        (1, heads, sequence, head_dim), dtype=x.dtype, device=x.device
+    )
+
+    comfy.ops.run_every_op()
+    original_w8 = convrot_weight_kind(attention.qkv_proj.weight) == "w8a8"
+    weight, bias, offload_stream = comfy.ops.cast_bias_weight(
+        attention.qkv_proj,
+        x,
+        offloadable=True,
+        compute_dtype=x.dtype,
+        want_requant=original_w8,
+    )
+    qk_type = None
+    route_original_basis = False
+    try:
+        plain = convrot_w8_plain_tensors(weight) if original_w8 else None
+        tuning = attention_kernel_tuning(transformer_options)
+        if tuning.rotate_qk and tuning.stabilize_k:
+            if plain is not None:
+                qweight, weight_scale = plain
+                k_anchor = _head_group_k_anchor(
+                    attention,
+                    x,
+                    transform,
+                    qweight,
+                    weight_scale,
+                    bias,
+                    0,
+                    heads,
+                    None,
+                )
+            else:
+                k_anchor = _global_k_anchor(
+                    attention,
+                    x,
+                    weight,
+                    bias,
+                    transform,
+                    inner,
+                    heads,
+                    head_dim,
+                )
+        else:
+            k_anchor = None
+        for start in range(0, sequence, chunk_rows):
+            stop = min(start + chunk_rows, sequence)
+            if plain is None:
+                projected = _linear_with_cast_weight(
+                    attention.qkv_proj, x[start:stop], weight, bias
+                )
+            else:
+                qactivation, activation_scale = _quantize_qkv_rows(
+                    attention.qkv_proj, x[start:stop]
+                )
+                projected = convrot_w8_output_slice(
+                    qactivation,
+                    activation_scale,
+                    qweight,
+                    weight_scale,
+                    bias,
+                    0,
+                    3 * inner,
+                    x.dtype,
+                )
+                del qactivation, activation_scale
+            query, key, value_tile = projected.split(inner, dim=-1)
+            tile_rows = stop - start
+            query = query.view(tile_rows, heads, head_dim).transpose(0, 1).unsqueeze(0)
+            key = key.view(tile_rows, heads, head_dim).transpose(0, 1).unsqueeze(0)
+            value_tile = (
+                value_tile.view(tile_rows, heads, head_dim)
+                .transpose(0, 1)
+                .unsqueeze(0)
+            )
+            tile_transform = _slice_qk_transform(
+                transform, start, stop, sequence
+            )
+            q_scale_start = (start // 64) * 4
+            k_scale_start = start // 64
+            tile_q_scale = q_scale[
+                :,
+                :,
+                q_scale_start : q_scale_start + ((tile_rows + 63) // 64) * 4,
+            ]
+            tile_k_scale = k_scale[
+                :,
+                :,
+                k_scale_start : k_scale_start + (tile_rows + 63) // 64,
+            ]
+            tile_qk = prequantize_turing_qk(
+                query,
+                key,
+                tile_transform,
+                kernel="sol",
+                transformer_options=transformer_options,
+                k_anchor=k_anchor,
+                qk_output=(
+                    q_int8[:, :, start:stop],
+                    tile_q_scale,
+                    k_int8[:, :, start:stop],
+                    tile_k_scale,
+                ),
+            )
+            value[:, :, start:stop].copy_(value_tile)
+            qk_type = type(tile_qk)
+            route_original_basis = bool(tile_qk.route_original_basis)
+            del projected, query, key, value_tile, tile_qk
+    finally:
+        comfy.ops.uncast_bias_weight(
+            attention.qkv_proj, weight, bias, offload_stream
+        )
+
+    if qk_type is None:
+        raise RuntimeError("streamed H3 QKV projection produced no tiles")
+    qk = qk_type(
+        query_int8=q_int8,
+        query_scale=q_scale,
+        key_int8=k_int8,
+        key_scale=k_scale,
+        tensor_layout="HND",
+        input_dtype=x.dtype,
+        original_head_dim=head_dim,
+        route_original_basis=route_original_basis,
+    )
+    return qk, value
+
+
 def _make_attention_forward(attention, attention_container, original=None):
     original = OriginalMethod.capture(
         attention.forward if original is None else original,
@@ -448,8 +1202,7 @@ def _make_attention_forward(attention, attention_container, original=None):
     def forward(self, x, rope_freqs=None, transformer_options={}):
         executor = prepared_attention_executor(transformer_options)
         if (
-            executor is None
-            or x.ndim != 2
+            x.ndim != 2
             or x.shape[0] < 64
             or x.dtype not in (torch.float16, torch.bfloat16)
             or self.head_dim not in (64, 128)
@@ -468,9 +1221,97 @@ def _make_attention_forward(attention, attention_container, original=None):
                 transformer_options=transformer_options,
             )
 
-        import comfy.model_management
-
         profiling = CUDA_PHASE_PROFILER.enabled
+        transform = _qk_transform(self, x, rope_freqs)
+        streamed_executor = (
+            getattr(executor, _STREAMED_QKV_EXECUTOR_ATTR, None)
+            if executor is not None
+            else None
+        )
+        # Row streaming relies on the v0.30 direct-output ABI even when
+        # K-anchor stabilization is disabled. Older kernels keep the complete
+        # projection path instead of failing after committing partial output.
+        stream_abi_available = reusable_k_anchor_available()
+        qkv_is_w8 = convrot_weight_kind(self.qkv_proj.weight) == "w8a8"
+        if qkv_is_w8:
+            head_decision = decide_attention_heads(
+                x,
+                heads=int(self.heads),
+                head_dim=int(self.head_dim),
+                compact_qk=bool(
+                    callable(streamed_executor) and stream_abi_available
+                ),
+                quantized_input=True,
+            )
+            if head_decision.sharded:
+                output = _head_sharded_attention(
+                    self,
+                    x,
+                    rope_freqs,
+                    transform,
+                    transformer_options,
+                    attention_container,
+                    executor,
+                    head_decision.head_group,
+                    head_decision.cache_quantized_input,
+                )
+                if output is not None:
+                    if profiling:
+                        output = CUDA_PHASE_PROFILER.call(
+                            "minimax.out_projection", self.out_proj, output
+                        )
+                        CUDA_PHASE_PROFILER.complete_attention(
+                            (1, self.heads, x.shape[0], self.head_dim)
+                        )
+                        return output
+                    return self.out_proj(output)
+
+        if executor is None:
+            return original(
+                self,
+                x,
+                rope_freqs=rope_freqs,
+                transformer_options=transformer_options,
+            )
+        if callable(streamed_executor) and stream_abi_available:
+            decision = decide_activation_chunks(
+                x,
+                operation="qkv",
+                hidden_size=int(x.shape[-1]),
+                expanded_size=int(self.heads * self.head_dim),
+            )
+            if decision.streamed:
+                qk, value = _stream_qkv_projection(
+                    self,
+                    x,
+                    transform,
+                    transformer_options,
+                    decision.chunk_rows,
+                )
+                outcome = streamed_executor(
+                    qk,
+                    value,
+                    heads=self.heads,
+                    qk_transform=transform,
+                    transformer_options=transformer_options,
+                )
+                del qk, value
+                if not outcome.supported:
+                    raise RuntimeError(
+                        "streamed H3 QKV executor rejected a committed projection: "
+                        f"{outcome.reason}"
+                    )
+                output = outcome.output.squeeze(0)
+                if profiling:
+                    output = CUDA_PHASE_PROFILER.call(
+                        "minimax.out_projection", self.out_proj, output
+                    )
+                    CUDA_PHASE_PROFILER.complete_attention(
+                        (1, self.heads, x.shape[0], self.head_dim)
+                    )
+                    return output
+                return self.out_proj(output)
+
         if profiling:
             qkv = CUDA_PHASE_PROFILER.call(
                 "minimax.qkv_projection", self.qkv_proj, x
@@ -483,26 +1324,6 @@ def _make_attention_forward(attention, attention_container, original=None):
         query = query.view(sequence, self.heads, self.head_dim)
         key = key.view(sequence, self.heads, self.head_dim)
         value = value.view(sequence, self.heads, self.head_dim)
-        query_norm = comfy.model_management.cast_to(
-            self.q_norm.weight, device=x.device, dtype=query.dtype
-        )
-        key_norm = comfy.model_management.cast_to(
-            self.k_norm.weight, device=x.device, dtype=key.dtype
-        )
-        rot_dim = int(rope_freqs.shape[-3] * 2) if rope_freqs is not None else 0
-        transform = QKTransformSpec(
-            query_norm=RMSNormSpec(
-                query_norm, float(self.q_norm.eps), "head"
-            ),
-            key_norm=RMSNormSpec(
-                key_norm, float(self.k_norm.eps), "head"
-            ),
-            rotary=RotaryEmbeddingSpec(
-                rope_freqs,
-                rot_dim,
-                "split_half" if rope_freqs is not None else "none",
-            ),
-        )
         del qkv
         outcome = execute_projected_attention(
             query.transpose(0, 1).unsqueeze(0),
@@ -558,8 +1379,8 @@ def install_minimax_attention_sites(model, device: torch.device) -> AttentionSit
     ]
     if not candidates:
         return AttentionSiteStatus(None, 0, "not_minimax_h3")
-    if not is_supported_turing_device(device):
-        return AttentionSiteStatus("minimax_h3", 0, "not_supported_turing")
+    if not is_supported_attention_device(device):
+        return AttentionSiteStatus("minimax_h3", 0, "not_supported_tensor_core")
     if not callable(getattr(model, "add_object_patch", None)):
         return AttentionSiteStatus("minimax_h3", 0, "model_patcher_api_unavailable")
     if not fused_qk_preprocessing_available():
@@ -603,6 +1424,244 @@ def _block_fusion_blocker(
     return None
 
 
+def _stream_mlp(mlp: torch.nn.Module, x: torch.Tensor, chunk_rows: int):
+    """Evaluate an H3 SwiGLU MLP in row tiles with one weight cast per layer."""
+    import comfy.ops
+
+    comfy.ops.run_every_op()
+    fc1_weight, fc1_bias, fc1_stream = comfy.ops.cast_bias_weight(
+        mlp.fc1,
+        x,
+        offloadable=True,
+        compute_dtype=x.dtype,
+        want_requant=False,
+    )
+    fc2_weight = fc2_bias = fc2_stream = None
+    try:
+        fc2_weight, fc2_bias, fc2_stream = comfy.ops.cast_bias_weight(
+            mlp.fc2,
+            x,
+            offloadable=True,
+            compute_dtype=x.dtype,
+            want_requant=True,
+        )
+        output_features = int(getattr(mlp.fc2, "out_features", x.shape[-1]))
+        output = torch.empty(
+            (x.shape[0], output_features), dtype=x.dtype, device=x.device
+        )
+        for start in range(0, x.shape[0], chunk_rows):
+            stop = min(start + chunk_rows, x.shape[0])
+            expanded = _linear_with_cast_weight(
+                mlp.fc1, x[start:stop], fc1_weight, fc1_bias
+            )
+            tile = convrot_linear_input_act_from_weight(
+                fc2_weight, fc2_bias, expanded, "swiglu"
+            )
+            output[start:stop].copy_(tile)
+            del expanded, tile
+        return output
+    finally:
+        if fc2_weight is not None:
+            comfy.ops.uncast_bias_weight(
+                mlp.fc2, fc2_weight, fc2_bias, fc2_stream
+            )
+        comfy.ops.uncast_bias_weight(
+            mlp.fc1, fc1_weight, fc1_bias, fc1_stream
+        )
+
+
+def _ffn_expanded_shard(
+    mlp,
+    qactivation: torch.Tensor,
+    activation_scale: torch.Tensor,
+    qweight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    expanded_size: int,
+    start: int,
+    stop: int,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Project one aligned gate/up interval without a full fc1 output."""
+    width = stop - start
+    expanded = torch.empty(
+        (qactivation.shape[0], 2 * width),
+        dtype=output_dtype,
+        device=qactivation.device,
+    )
+    gate = convrot_w8_output_slice(
+        qactivation,
+        activation_scale,
+        qweight,
+        weight_scale,
+        bias,
+        start,
+        stop,
+        output_dtype,
+    )
+    expanded[:, :width].copy_(gate)
+    del gate
+    up = convrot_w8_output_slice(
+        qactivation,
+        activation_scale,
+        qweight,
+        weight_scale,
+        bias,
+        expanded_size + start,
+        expanded_size + stop,
+        output_dtype,
+    )
+    expanded[:, width:].copy_(up)
+    del up
+    return expanded
+
+
+def _stream_mlp_channels(
+    mlp: torch.nn.Module,
+    x: torch.Tensor,
+    *,
+    chunk_rows: int,
+    chunk_channels: int,
+):
+    """Exact two-pass H3 FFN evaluation over ConvRot-aligned channels.
+
+    The first pass finds the same whole-row activation scale as the unsharded
+    fused SwiGLU quantizer.  The second pass recomputes each aligned interval,
+    uses that common scale, and writes directly into the final compact A8 row.
+    The unchanged fused fc2 consumes that row once, so no shard boundary enters
+    the contraction or its BF16 epilogue.
+    """
+    import comfy.ops
+
+    if chunk_channels <= 0 or chunk_channels % 256:
+        return None
+    if getattr(mlp.fc2, "pre_quant_scale", None) is not None:
+        # This is not used by MiniMax H3 today.  Falling back avoids changing
+        # the ordering of a future SmoothQuant-style pre-scale.
+        return None
+
+    comfy.ops.run_every_op()
+    fc1_weight, fc1_bias, fc1_stream = comfy.ops.cast_bias_weight(
+        mlp.fc1,
+        x,
+        offloadable=True,
+        compute_dtype=x.dtype,
+        want_requant=True,
+    )
+    fc2_weight = fc2_bias = fc2_stream = None
+    try:
+        fc2_weight, fc2_bias, fc2_stream = comfy.ops.cast_bias_weight(
+            mlp.fc2,
+            x,
+            offloadable=True,
+            compute_dtype=x.dtype,
+            want_requant=True,
+        )
+        fc1_plain = convrot_w8_plain_tensors(fc1_weight)
+        fc2_plain = convrot_w8_plain_tensors(fc2_weight)
+        if fc1_plain is None or fc2_plain is None or fc2_bias is not None:
+            return None
+        fc1_qweight, fc1_weight_scale = fc1_plain
+        fc2_qweight, fc2_weight_scale = fc2_plain
+        expanded_size = int(getattr(mlp.fc2, "in_features", 0))
+        if (
+            expanded_size <= 0
+            or expanded_size % 256
+            or fc1_qweight.shape[0] != 2 * expanded_size
+            or fc2_qweight.shape[1] != expanded_size
+        ):
+            return None
+
+        output_features = int(fc2_qweight.shape[0])
+        output = torch.empty(
+            (x.shape[0], output_features), dtype=x.dtype, device=x.device
+        )
+        for row_start in range(0, x.shape[0], chunk_rows):
+            row_stop = min(row_start + chunk_rows, x.shape[0])
+            qactivation, input_scale = _quantize_qkv_rows(
+                mlp.fc1, x[row_start:row_stop]
+            )
+
+            whole_row_scale = None
+            for start in range(0, expanded_size, chunk_channels):
+                stop = min(start + chunk_channels, expanded_size)
+                expanded = _ffn_expanded_shard(
+                    mlp,
+                    qactivation,
+                    input_scale,
+                    fc1_qweight,
+                    fc1_weight_scale,
+                    fc1_bias,
+                    expanded_size,
+                    start,
+                    stop,
+                    x.dtype,
+                )
+                local_quantized, local_scale = (
+                    quantize_convrot_swiglu_activation(expanded, 256)
+                )
+                del expanded, local_quantized
+                if whole_row_scale is None:
+                    whole_row_scale = local_scale
+                else:
+                    torch.maximum(
+                        whole_row_scale, local_scale, out=whole_row_scale
+                    )
+                    del local_scale
+
+            activated = torch.empty(
+                (row_stop - row_start, expanded_size),
+                dtype=torch.int8,
+                device=x.device,
+            )
+            for start in range(0, expanded_size, chunk_channels):
+                stop = min(start + chunk_channels, expanded_size)
+                expanded = _ffn_expanded_shard(
+                    mlp,
+                    qactivation,
+                    input_scale,
+                    fc1_qweight,
+                    fc1_weight_scale,
+                    fc1_bias,
+                    expanded_size,
+                    start,
+                    stop,
+                    x.dtype,
+                )
+                quantized = quantize_convrot_swiglu_with_scale(
+                    expanded, whole_row_scale, 256
+                )
+                del expanded
+                activated[:, start:stop].copy_(quantized)
+                del quantized
+
+            tile = int8_linear_from_quantized(
+                activated,
+                whole_row_scale,
+                fc2_qweight,
+                fc2_weight_scale,
+                bias=None,
+                out_dtype=x.dtype,
+            )
+            output[row_start:row_stop].copy_(tile)
+            del (
+                activated,
+                input_scale,
+                qactivation,
+                tile,
+                whole_row_scale,
+            )
+        return output
+    finally:
+        if fc2_weight is not None:
+            comfy.ops.uncast_bias_weight(
+                mlp.fc2, fc2_weight, fc2_bias, fc2_stream
+            )
+        comfy.ops.uncast_bias_weight(
+            mlp.fc1, fc1_weight, fc1_bias, fc1_stream
+        )
+
+
 def _make_mlp_forward(mlp: torch.nn.Module, audit: _RuntimeDispatchAudit):
     original = OriginalMethod.capture(mlp.forward, mlp)
 
@@ -612,10 +1671,37 @@ def _make_mlp_forward(mlp: torch.nn.Module, audit: _RuntimeDispatchAudit):
             blocker = f"dtype={x.dtype}"
         elif not is_turing_convrot_linear(self.fc2):
             blocker = "fc2_not_turing_convrot"
+        elif not is_supported_attention_device(x.device):
+            blocker = f"device={x.device}"
         audit.record("mlp", blocker is None, x, blocker)
         if blocker is not None:
             return original(self, x)
-        return turing_linear_input_act(self.fc2, self.fc1(x), "swiglu")
+        expanded_size = int(getattr(self.fc2, "in_features", 0))
+        decision = decide_activation_chunks(
+            x,
+            operation="mlp",
+            hidden_size=int(x.shape[-1]),
+            expanded_size=expanded_size,
+        )
+        channel_decision = decide_ffn_channels(
+            x,
+            expanded_size=expanded_size,
+            chunk_rows=decision.chunk_rows,
+        )
+        if channel_decision.sharded:
+            output = _stream_mlp_channels(
+                self,
+                x,
+                chunk_rows=channel_decision.chunk_rows,
+                chunk_channels=channel_decision.chunk_channels,
+            )
+            if output is not None:
+                return output
+        if decision.streamed:
+            return _stream_mlp(self, x, decision.chunk_rows)
+        return fused_convrot_linear_input_act(
+            self.fc2, self.fc1(x), "swiglu"
+        )
 
     return weak_method(forward, mlp)
 
@@ -682,17 +1768,17 @@ def _make_block_forward(
 
 def apply_minimax_adapter(model, device: torch.device) -> int:
     """Install MiniMax-only forward substitutions through the ModelPatcher."""
-    if not is_supported_turing_device(device):
+    if not is_supported_attention_device(device):
         return 0
     if not hasattr(model, "add_object_patch"):
-        raise RuntimeError("MiniMax Turing integration requires a ComfyUI ModelPatcher")
+        raise RuntimeError("MiniMax CUDA integration requires a ComfyUI ModelPatcher")
 
     try:
         from comfy.ldm.minimax.model import DiTBlock, _mod_gate
     except ImportError:
         return 0
     if not _compatible_block_forward(DiTBlock):
-        LOG.warning("MiniMax Turing fusions are disabled because the DiTBlock forward contract changed")
+        LOG.warning("MiniMax CUDA fusions are disabled because the DiTBlock forward contract changed")
         return 0
 
     root = getattr(model, "model", model)
@@ -754,14 +1840,14 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
             block_fusions += 1
 
     if block_fusions:
-        LOG.info("Enabled MiniMax segmented RMSNorm+AdaLN on %d Turing blocks", block_fusions)
+        LOG.info("Enabled MiniMax segmented RMSNorm+AdaLN on %d CUDA blocks", block_fusions)
     if mlp_fusions:
-        LOG.info("Enabled MiniMax fused ConvRot SwiGLU on %d Turing MLP layers", mlp_fusions)
+        LOG.info("Enabled MiniMax fused/streamed ConvRot SwiGLU on %d MLP layers", mlp_fusions)
     if attention_fusions:
         LOG.info(
             "Enabled MiniMax fused Q/K RMSNorm+RoPE+INT8 preprocessing on %d attention layers",
             attention_fusions,
         )
     if eligible_fc2 and mlp_fusions != eligible_fc2:
-        raise RuntimeError("MiniMax Turing fc2 adapter did not patch every eligible layer")
+        raise RuntimeError("MiniMax fused fc2 adapter did not patch every eligible layer")
     return max(block_fusions, mlp_fusions, attention_fusions)

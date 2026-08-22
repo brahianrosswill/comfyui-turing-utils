@@ -181,7 +181,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
                 original_block_forward = root.block.forward
                 original_mlp_forward = root.block.mlp.forward
                 with (
-                    mock.patch("comfyui_turing_utils.adapters.minimax.acceleration.is_supported_turing_device", return_value=True),
+                    mock.patch("comfyui_turing_utils.adapters.minimax.acceleration.is_supported_attention_device", return_value=True),
                     mock.patch.object(minimax_model, "DiTBlock", FakeBlock),
                     mock.patch.dict(
                         sys.modules,
@@ -211,7 +211,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
         root.block = ChangedBlock()
         patcher = FakePatcher(root)
         with (
-            mock.patch("comfyui_turing_utils.adapters.minimax.acceleration.is_supported_turing_device", return_value=True),
+            mock.patch("comfyui_turing_utils.adapters.minimax.acceleration.is_supported_attention_device", return_value=True),
             mock.patch.object(minimax_model, "DiTBlock", ChangedBlock),
             self.assertLogs("comfyui-turing-utils", level="WARNING"),
         ):
@@ -261,7 +261,15 @@ class MiniMaxAdapterTest(unittest.TestCase):
 
         with (
             mock.patch(
-                "comfyui_turing_utils.adapters.minimax.acceleration.turing_linear_input_act",
+                "comfyui_turing_utils.adapters.minimax.acceleration.is_supported_attention_device",
+                return_value=True,
+            ),
+            mock.patch(
+                "comfyui_turing_utils.adapters.minimax.acceleration.decide_activation_chunks",
+                return_value=SimpleNamespace(streamed=False),
+            ),
+            mock.patch(
+                "comfyui_turing_utils.adapters.minimax.acceleration.fused_convrot_linear_input_act",
                 return_value=sentinel,
             ) as fused,
             self.assertLogs("comfyui-turing-utils", level="INFO") as captured,

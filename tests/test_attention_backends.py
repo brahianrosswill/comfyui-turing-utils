@@ -781,11 +781,12 @@ class AttentionBackendsTest(unittest.TestCase):
             "bundled_turing_w8a8",
         )
 
-    def test_explicit_w8a8_uses_kitchen_on_non_turing_device(self):
+    def test_explicit_w8a8_uses_kitchen_on_unsupported_device(self):
         kitchen = mock.Mock(return_value="kitchen")
         kitchen.container_function = mock.Mock(return_value="container")
         with (
             mock.patch("attention.is_supported_turing_device", return_value=False),
+            mock.patch("attention.is_supported_attention_device", return_value=False),
             mock.patch(
                 "comfy.ldm.modules.attention.get_attention_function",
                 side_effect=lambda name, default: (
@@ -808,6 +809,27 @@ class AttentionBackendsTest(unittest.TestCase):
             "kitchen",
         )
         self.assertTrue(all(container.tensor is None for container in containers))
+
+    def test_explicit_w8a8_uses_same_bundled_path_on_ampere(self):
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=False),
+            mock.patch("attention.is_supported_attention_device", return_value=True),
+            mock.patch("attention.bundled_available", return_value=True),
+            mock.patch("attention.bundled_w8a8_available", return_value=True),
+            mock.patch("attention.preflight_bundled_w8a8") as preflight,
+        ):
+            override = attention_backends.make_attention_override(
+                "w8a8", device=torch.device("cuda", 0)
+            )
+
+        preflight.assert_called_once_with(torch.device("cuda", 0))
+        self.assertEqual(
+            override.turing_utils_attention_implementation,
+            "bundled_turing_w8a8",
+        )
+        self.assertTrue(
+            callable(getattr(override, "prepared_attention_executor", None))
+        )
 
     def test_legacy_sage_alias_uses_external_sage_on_non_turing_device(self):
         sage = mock.Mock(return_value="sage")
@@ -964,21 +986,15 @@ class AttentionBackendsTest(unittest.TestCase):
         sparse.assert_called_once()
         self.assertTrue(sparse.call_args.kwargs["use_w8a8"])
 
-    def test_sparse_ampere_uses_bundled_sol_and_kitchen_dense_backend(self):
-        kitchen = mock.Mock(return_value="dense")
+    def test_sparse_ampere_uses_bundled_sol_and_shared_dense_backend(self):
         with (
             mock.patch("attention.is_supported_turing_device", return_value=False),
             mock.patch("attention.is_supported_attention_device", return_value=True),
+            mock.patch("attention.bundled_available", return_value=True),
             mock.patch("attention.bundled_sparse_available", return_value=True),
             mock.patch("attention.bundled_w8a8_available", return_value=True),
             mock.patch("attention.preflight_bundled_sparse") as sparse_preflight,
             mock.patch("attention.preflight_bundled_w8a8") as w8a8_preflight,
-            mock.patch(
-                "comfy.ldm.modules.attention.get_attention_function",
-                side_effect=lambda name, default: (
-                    kitchen if name == "comfy_kitchen_int8" else default
-                ),
-            ),
         ):
             override = attention_backends.make_sparse_attention_override(
                 torch.device("cuda", 0), use_w8a8=True
@@ -992,7 +1008,7 @@ class AttentionBackendsTest(unittest.TestCase):
         )
         self.assertEqual(
             override.turing_utils_dense_implementation,
-            "comfy:comfy_kitchen_int8",
+            "bundled_turing_w8a8",
         )
 
     def test_overlapping_dense_layer_ranges_bypass_sol_for_every_layer(self):

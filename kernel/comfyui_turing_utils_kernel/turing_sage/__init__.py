@@ -381,6 +381,12 @@ def prequantize_rms_rope_qk(*args, **kwargs):
     return implementation(*args, **kwargs)
 
 
+def precompute_rms_rope_k_anchor(*args, **kwargs):
+    from .core import precompute_rms_rope_k_anchor as implementation
+
+    return implementation(*args, **kwargs)
+
+
 def prequantize_sageattn_from_qk(*args, **kwargs):
     from .core import prequantize_sageattn_from_qk as implementation
 
@@ -677,6 +683,8 @@ __all__ = [
     "overlap_accumulate_compiled",
     "overlap_blend_available",
     "overlap_blend_compiled",
+    "precompute_rms_rope_k_anchor",
+    "prequantize_rms_rope_qk",
     "prequantize_sageattn",
     "prequantize_sla_sageattn",
     "prequantize_sla_sageattn_from_qk",

@@ -99,9 +99,11 @@ def inspect_turing_attention_call(
         raise ValueError(f"unsupported Turing attention kernel: {kernel}")
     if not isinstance(q, torch.Tensor) or not isinstance(k, torch.Tensor) or not isinstance(v, torch.Tensor):
         return None, "Q/K/V are not tensors"
+    # W8A8 and Sol share the bundled sm75+ integer core.  Architecture-specific
+    # MMA/copy variants are selected by the compiled cubin, not by Python.
     device_supported = (
         is_supported_attention_device(q.device)
-        if kernel == "sol"
+        if kernel in {"sol", "w8a8"}
         else is_supported_turing_device(q.device)
     )
     if not device_supported:
@@ -385,6 +387,36 @@ def fused_qk_preprocessing_available() -> bool:
         return False
 
 
+def reusable_k_anchor_available() -> bool:
+    try:
+        version_tuple = tuple(int(part) for part in kernel_version().split(".")[:3])
+        return (
+            version_tuple >= (0, 30, 0)
+            and fused_qk_preprocessing_available()
+            and callable(
+                getattr(load_turing_sage(), "precompute_rms_rope_k_anchor", None)
+            )
+        )
+    except (ImportError, OSError, ValueError, AttributeError):
+        return False
+
+
+def precompute_turing_k_anchor(
+    key: torch.Tensor,
+    spec: QKTransformSpec,
+):
+    return load_turing_sage().precompute_rms_rope_k_anchor(
+        key,
+        spec.key_norm_weight,
+        spec.freqs,
+        epsilon=spec.epsilon,
+        rot_dim=spec.rot_dim,
+        tensor_layout="HND",
+        norm_scope=spec.norm_scope,
+        split_half=spec.split_half,
+    )
+
+
 def prequantize_turing_qk(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -392,6 +424,8 @@ def prequantize_turing_qk(
     *,
     kernel: str,
     transformer_options=None,
+    k_anchor=None,
+    qk_output=None,
 ):
     if kernel not in {"sage", "w8a8", "sol", "sla"}:
         raise ValueError(f"unsupported fused Q/K target: {kernel}")
@@ -411,6 +445,8 @@ def prequantize_turing_qk(
         split_half=spec.split_half,
         rotate_qk=rotate_qk,
         stabilize_k=stabilize_k,
+        k_anchor=k_anchor,
+        qk_output=qk_output,
     )
 
 

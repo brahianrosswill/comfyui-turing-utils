@@ -192,6 +192,59 @@ def _make_dense_prepared_executor(kernel: str) -> Callable:
         )
 
     executor.capabilities = capabilities
+    if kernel == "w8a8":
+        def streamed_qkv_executor(
+            qk,
+            value: torch.Tensor,
+            *,
+            heads: int,
+            qk_transform,
+            transformer_options,
+        ) -> AttentionExecutionOutcome:
+            del qk_transform
+            if not torch.is_tensor(value) or value.ndim != 4 or value.shape[2] < 64:
+                return AttentionExecutionOutcome.unsupported(
+                    "streamed QKV requires HND W8A8 with at least 64 tokens"
+                )
+            prototype = value[:, :, :1, :].expand(
+                value.shape[0], value.shape[1], value.shape[2], value.shape[3]
+            )
+            call, reason = inspect_turing_attention_call(
+                prototype,
+                prototype,
+                prototype,
+                heads,
+                mask=None,
+                skip_reshape=True,
+                skip_output_reshape=False,
+                enable_gqa=False,
+                low_precision_attention=True,
+                is_causal=False,
+                kernel="w8a8",
+                require_long_sequence=True,
+            )
+            if reason is not None:
+                return AttentionExecutionOutcome.unsupported(reason)
+            quantized = _profiled(
+                "attention.value_prepare",
+                prequantize_turing_attention_from_qk,
+                qk,
+                value,
+                call,
+                kernel="w8a8",
+                scale=None,
+                transformer_options=transformer_options,
+            )
+            return AttentionExecutionOutcome(
+                _profiled(
+                    "attention.execute",
+                    turing_attention_from_prequantized,
+                    quantized,
+                    kernel="w8a8",
+                )
+            )
+
+        executor.turing_utils_streamed_qkv_executor = streamed_qkv_executor
     return executor
 
 
@@ -277,8 +330,10 @@ def _uses_bundled_turing_attention(option: str, device: torch.device | None) -> 
     option = normalize_attention_backend(option)
     return bool(
         device is not None
-        and is_supported_turing_device(device)
-        and option in {"sage", "w8a8"}
+        and (
+            (option == "w8a8" and is_supported_attention_device(device))
+            or (option == "sage" and is_supported_turing_device(device))
+        )
     )
 
 
@@ -584,12 +639,21 @@ def make_sparse_attention_override(
     dense_override = make_attention_override(
         "w8a8" if use_w8a8 else "sage", device=device
     )
-    if use_w8a8 and not is_supported_turing_device(device):
-        preflight_bundled_w8a8(device)
     dense_prepared_executor = getattr(
         dense_override, "prepared_attention_executor", None
     )
     dense_container = getattr(dense_override, "container_function", None)
+    if use_w8a8 and not callable(dense_prepared_executor):
+        # The bundled force-dense W8A8 core has native sm75+ cubins.  Keep the
+        # same prepared path on every supported generation instead of falling
+        # back to a full floating Q/K/V materialization on newer GPUs.
+        dense_prepared_executor = _make_dense_prepared_executor("w8a8")
+        dense_container = _make_dense_container_function("w8a8")
+    dense_streamed_qkv_executor = getattr(
+        dense_prepared_executor,
+        "turing_utils_streamed_qkv_executor",
+        None,
+    )
     sparse_capabilities = AttentionBackendCapabilities(
         supports_semantic_sparse=True,
     )
@@ -858,7 +922,117 @@ def make_sparse_attention_override(
         record_route_stats(selected, possible, sol_call, debug_key, debug_context)
         return AttentionExecutionOutcome(output)
 
+    def streamed_qkv_executor(
+        qk,
+        value: torch.Tensor,
+        *,
+        heads: int,
+        qk_transform,
+        transformer_options,
+    ) -> AttentionExecutionOutcome:
+        """Finish attention from row-streamed Q/K INT8 and retained V BF16."""
+        if (
+            not use_w8a8
+            or not torch.is_tensor(value)
+            or value.ndim != 4
+            or value.shape[2] < 64
+        ):
+            return AttentionExecutionOutcome.unsupported(
+                "streamed QKV requires HND W8A8 with at least 64 tokens"
+            )
+        prototype = value[:, :, :1, :].expand(
+            value.shape[0], value.shape[1], value.shape[2], value.shape[3]
+        )
+
+        def dense_result() -> AttentionExecutionOutcome:
+            if not callable(dense_streamed_qkv_executor):
+                return AttentionExecutionOutcome.unsupported(
+                    "the selected dense backend cannot consume streamed QKV"
+                )
+            return dense_streamed_qkv_executor(
+                qk,
+                value,
+                heads=heads,
+                qk_transform=qk_transform,
+                transformer_options=transformer_options,
+            )
+
+        if _sparse_dense_schedule(
+            transformer_options,
+            dense_prefix_steps,
+            dense_suffix_steps,
+            schedule_state,
+        ) or _sparse_dense_layer(
+            transformer_options,
+            dense_prefix_layers,
+            dense_suffix_layers,
+        ):
+            return dense_result()
+
+        sol_call, reason = inspect_sol_attention_call(
+            prototype,
+            prototype,
+            prototype,
+            heads,
+            mask=None,
+            skip_reshape=True,
+            skip_output_reshape=False,
+            min_sequence_tokens=min_sequence_tokens,
+            prefix_policy=prefix_policy,
+            manual_prefix_tokens=manual_prefix_tokens,
+            skipped_residual=skipped_residual,
+            sparse_reference_image=sparse_reference_image,
+            sparse_reference_video=sparse_reference_video,
+            sparse_reference_audio=sparse_reference_audio,
+            transformer_options=transformer_options,
+            kwargs={
+                "enable_gqa": False,
+                "low_precision_attention": True,
+                "is_causal": False,
+            },
+        )
+        if reason is not None:
+            return dense_result()
+        quantized = _profiled(
+            "attention.value_route_prepare",
+            prequantize_turing_sol_attention_from_qk,
+            qk,
+            value,
+            sol_call,
+            routing_threshold=routing_threshold,
+            scale=None,
+            use_w8a8=True,
+            transformer_options=transformer_options,
+        )
+        debug_key = (
+            sol_call.attention.input_dtype,
+            sol_call.attention.query_tokens,
+            sol_call.attention.key_tokens,
+            sol_call.dense_query_ranges,
+            sol_call.exact_kv_ranges,
+            routing_threshold,
+            sol_call.residual_subblocks,
+            True,
+        )
+        debug_context = route_debug_context(transformer_options, debug_key)
+        collect_stats = debug_context["collect"]
+        result = _profiled(
+            "attention.execute",
+            turing_sol_attention_from_prequantized,
+            quantized,
+            return_stats=collect_stats,
+        )
+        if not collect_stats:
+            return AttentionExecutionOutcome(result)
+        output, selected, possible = result
+        record_route_stats(selected, possible, sol_call, debug_key, debug_context)
+        return AttentionExecutionOutcome(output)
+
     prepared_executor.capabilities = sparse_capabilities
+    if use_w8a8:
+        prepared_executor.turing_utils_streamed_qkv_executor = (
+            streamed_qkv_executor
+        )
 
     def attention_override(original: Callable, *args, **kwargs):
         fallback = lambda *fallback_args, **fallback_kwargs: dense_override(
@@ -1110,12 +1284,15 @@ def make_sla_attention_override(
     dense_override = make_attention_override(
         "w8a8" if use_w8a8 else "sage", device=device
     )
-    if use_w8a8 and not is_supported_turing_device(device):
-        preflight_bundled_w8a8(device)
     dense_prepared_executor = getattr(
         dense_override, "prepared_attention_executor", None
     )
     dense_container = getattr(dense_override, "container_function", None)
+    dense_streamed_qkv_executor = getattr(
+        dense_prepared_executor,
+        "turing_utils_streamed_qkv_executor",
+        None,
+    )
     sparse_capabilities = AttentionBackendCapabilities(
         supports_semantic_sparse=True,
     )
@@ -1292,6 +1469,84 @@ def make_sla_attention_override(
         return AttentionExecutionOutcome(output)
 
     prepared_executor.capabilities = sparse_capabilities
+    if use_w8a8:
+        def streamed_qkv_executor(
+            qk,
+            value: torch.Tensor,
+            *,
+            heads: int,
+            qk_transform,
+            transformer_options,
+        ) -> AttentionExecutionOutcome:
+            """Finish SLA from the shared row-streamed H3 QKV representation."""
+            if (
+                not torch.is_tensor(value)
+                or value.ndim != 4
+                or value.shape[2] < 64
+            ):
+                return AttentionExecutionOutcome.unsupported(
+                    "streamed QKV requires HND W8A8 with at least 64 tokens"
+                )
+            if is_dense(transformer_options):
+                if not callable(dense_streamed_qkv_executor):
+                    return AttentionExecutionOutcome.unsupported(
+                        "the selected dense backend cannot consume streamed QKV"
+                    )
+                return dense_streamed_qkv_executor(
+                    qk,
+                    value,
+                    heads=heads,
+                    qk_transform=qk_transform,
+                    transformer_options=transformer_options,
+                )
+
+            prototype = value[:, :, :1, :].expand(
+                value.shape[0], value.shape[1], value.shape[2], value.shape[3]
+            )
+            sla_call, reason = inspect(
+                prototype,
+                prototype,
+                prototype,
+                heads,
+                mask=None,
+                skip_reshape=True,
+                skip_output_reshape=False,
+                transformer_options=transformer_options,
+                kwargs={
+                    "enable_gqa": False,
+                    "low_precision_attention": True,
+                    "is_causal": False,
+                },
+            )
+            if reason is not None:
+                return AttentionExecutionOutcome.unsupported(reason)
+            quantized = _profiled(
+                "attention.value_route_prepare",
+                prequantize_turing_sla_attention_from_qk,
+                qk,
+                value,
+                sla_call,
+                sparsity_ratio=sparsity_ratio,
+                scale=None,
+                use_w8a8=True,
+                transformer_options=transformer_options,
+            )
+            result = _profiled(
+                "attention.execute",
+                turing_sla_attention_from_prequantized,
+                quantized,
+                return_stats=debug_route_density,
+            )
+            output = (
+                collect_stats(result, sla_call, transformer_options)
+                if debug_route_density
+                else result
+            )
+            return AttentionExecutionOutcome(output)
+
+        prepared_executor.turing_utils_streamed_qkv_executor = (
+            streamed_qkv_executor
+        )
 
     def attention_override(original: Callable, *args, **kwargs):
         fallback = lambda *fallback_args, **fallback_kwargs: dense_override(

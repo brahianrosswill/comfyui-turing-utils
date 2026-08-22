@@ -42,8 +42,62 @@ def is_turing_convrot_linear(linear: torch.nn.Module) -> bool:
     return convrot_weight_kind(getattr(linear, "weight", None)) is not None
 
 
-def turing_linear_input_act(linear: torch.nn.Module, x: torch.Tensor, input_act: str):
-    """Fold an activation into any supported Turing ConvRot input quantizer."""
+def convrot_w8_plain_tensors(
+    weight: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Return W8 ConvRot storage without materializing a BF16 weight."""
+    if convrot_weight_kind(weight) != "w8a8":
+        return None
+    import comfy.quant_ops
+
+    return comfy.quant_ops.TensorWiseINT8Layout.get_plain_tensors(weight)
+
+
+def convrot_w8_output_slice(
+    qactivation: torch.Tensor,
+    activation_scale: torch.Tensor,
+    qweight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None,
+    start: int,
+    stop: int,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Evaluate a contiguous W8 output-channel interval."""
+    from .dispatch import int8_linear_from_quantized
+
+    start, stop = int(start), int(stop)
+    if start < 0 or stop <= start or stop > qweight.shape[0]:
+        raise ValueError("W8 output slice is outside the weight")
+    sliced_scale = (
+        weight_scale
+        if weight_scale.numel() == 1
+        else weight_scale.reshape(-1)[start:stop]
+    )
+    sliced_bias = None if bias is None else bias[start:stop]
+    return int8_linear_from_quantized(
+        qactivation,
+        activation_scale,
+        qweight[start:stop],
+        sliced_scale,
+        bias=sliced_bias,
+        out_dtype=output_dtype,
+    )
+
+
+def convrot_linear_input_act_from_weight(
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    x: torch.Tensor,
+    input_act: str,
+) -> torch.Tensor:
+    """Run a fused ConvRot activation against an already-cast weight.
+
+    Keeping the cast outside this helper lets activation streaming reuse one
+    Dynamic-VRAM transfer for every row tile.  The quantized-linear dispatcher
+    owns architecture-specific CUDA selection; the mathematical path is shared
+    by every supported Tensor Core generation.
+    """
     import comfy.model_management
     import comfy.ops
     import comfy.quant_ops
@@ -52,13 +106,72 @@ def turing_linear_input_act(linear: torch.nn.Module, x: torch.Tensor, input_act:
         codebook_w4a8_linear,
         convrot_w4a4_linear,
         int8_linear,
-        is_supported_turing_device,
     )
+
+    kind = convrot_weight_kind(weight)
+    if kind is None or comfy.model_management.in_training:
+        activated = comfy.ops.INPUT_ACT_EAGER[input_act](x)
+        return torch.nn.functional.linear(activated, weight, bias)
+    if kind == "w8a8":
+        qdata, scale = comfy.quant_ops.TensorWiseINT8Layout.get_plain_tensors(weight)
+        return int8_linear(
+            x,
+            qdata,
+            scale,
+            bias=bias,
+            out_dtype=x.dtype,
+            convrot=True,
+            convrot_groupsize=weight._params.convrot_groupsize,
+            input_act=input_act,
+        )
+    if kind == "codebook_w4a8":
+        qdata, s_rel, s_channel, correction, codebook = (
+            comfy.quant_ops.AsymW4A8Int8Layout.get_plain_tensors(weight)
+        )
+        params = weight._params
+        return codebook_w4a8_linear(
+            x,
+            qdata,
+            s_rel,
+            s_channel,
+            codebook=codebook,
+            correction=correction,
+            bias=bias,
+            group_size=params.group_size,
+            convrot_groupsize=params.convrot_groupsize,
+            out_dtype=x.dtype,
+            input_act=input_act,
+        )
+
+    qdata, scale = comfy.quant_ops.TensorCoreConvRotW4A4Layout.get_plain_tensors(weight)
+    params = weight._params
+    return convrot_w4a4_linear(
+        x,
+        qdata,
+        scale,
+        bias=bias,
+        convrot_groupsize=params.convrot_groupsize,
+        quant_group_size=params.quant_group_size,
+        linear_dtype=params.linear_dtype,
+        input_act=input_act,
+    )
+
+
+def fused_convrot_linear_input_act(
+    linear: torch.nn.Module,
+    x: torch.Tensor,
+    input_act: str,
+) -> torch.Tensor:
+    """Fold an activation into a ConvRot quantizer on any sm75+ GPU."""
+    import comfy.model_management
+    import comfy.ops
+
+    from ..hardware import is_supported_attention_device
 
     if (
         x.dtype != torch.bfloat16
         or comfy.model_management.in_training
-        or not is_supported_turing_device(x.device)
+        or not is_supported_attention_device(x.device)
         or not is_turing_convrot_linear(linear)
     ):
         return comfy.ops.linear_input_act(linear, x, input_act)
@@ -71,55 +184,15 @@ def turing_linear_input_act(linear: torch.nn.Module, x: torch.Tensor, input_act:
         want_requant=True,
     )
     try:
-        kind = convrot_weight_kind(weight)
-        if kind is None:
-            activated = comfy.ops.INPUT_ACT_EAGER[input_act](x)
-            return torch.nn.functional.linear(activated, weight, bias)
-        if kind == "w8a8":
-            qdata, scale = comfy.quant_ops.TensorWiseINT8Layout.get_plain_tensors(weight)
-            return int8_linear(
-                x,
-                qdata,
-                scale,
-                bias=bias,
-                out_dtype=x.dtype,
-                convrot=True,
-                convrot_groupsize=weight._params.convrot_groupsize,
-                input_act=input_act,
-            )
-        if kind == "codebook_w4a8":
-            qdata, s_rel, s_channel, correction, codebook = (
-                comfy.quant_ops.AsymW4A8Int8Layout.get_plain_tensors(weight)
-            )
-            params = weight._params
-            return codebook_w4a8_linear(
-                x,
-                qdata,
-                s_rel,
-                s_channel,
-                codebook=codebook,
-                correction=correction,
-                bias=bias,
-                group_size=params.group_size,
-                convrot_groupsize=params.convrot_groupsize,
-                out_dtype=x.dtype,
-                input_act=input_act,
-            )
-
-        qdata, scale = comfy.quant_ops.TensorCoreConvRotW4A4Layout.get_plain_tensors(weight)
-        params = weight._params
-        return convrot_w4a4_linear(
-            x,
-            qdata,
-            scale,
-            bias=bias,
-            convrot_groupsize=params.convrot_groupsize,
-            quant_group_size=params.quant_group_size,
-            linear_dtype=params.linear_dtype,
-            input_act=input_act,
+        return convrot_linear_input_act_from_weight(
+            weight, bias, x, input_act
         )
     finally:
         comfy.ops.uncast_bias_weight(linear, weight, bias, offload_stream)
+
+
+# Compatibility name retained for existing imports and external workflows.
+turing_linear_input_act = fused_convrot_linear_input_act
 
 
 def _normalized_segments(
@@ -191,7 +264,7 @@ def segmented_rms_adaln(
             )
         except (ImportError, OSError, AttributeError) as exc:
             raise RuntimeError(
-                "Turing RMSNorm+AdaLN fusion requires an updated comfyui-turing-utils-kernel; reinstall the kernel package"
+                "RMSNorm+AdaLN fusion requires an updated comfyui-turing-utils-kernel; reinstall the kernel package"
             ) from exc
         return turing_segmented_rms_adaln(x, weight, scale, shift, table, float(norm.eps))
     finally:

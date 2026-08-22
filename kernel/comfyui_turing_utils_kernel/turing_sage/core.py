@@ -233,6 +233,10 @@ def prequantize_rms_rope_qk(
     split_half: bool = False,
     rotate_qk: bool = False,
     stabilize_k: bool = False,
+    k_anchor: tuple[torch.Tensor, torch.Tensor] | None = None,
+    qk_output: tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ] | None = None,
 ) -> PrequantizedQK:
     """Prepare normalized/rotated Q/K without materializing BF16 intermediates."""
     if not q.is_cuda or not k.is_cuda:
@@ -261,22 +265,78 @@ def prequantize_rms_rope_qk(
         freqs = torch.empty(0, device=q.device, dtype=q.dtype)
     else:
         freqs = freqs.to(device=q.device, dtype=q.dtype)
-    from .custom_ops import qk_rms_rope_int8
+    if qk_output is not None:
+        if stabilize_k and k_anchor is None:
+            raise ValueError(
+                "direct Q/K output with stabilization requires a precomputed anchor"
+            )
+        from .custom_ops import qk_rms_rope_int8_out
 
-    q_int8, q_scale, k_int8, k_scale = qk_rms_rope_int8(
-        q,
-        k,
-        q_norm,
-        k_norm,
-        freqs,
-        epsilon=float(epsilon),
-        rot_dim=int(rot_dim),
-        tensor_layout=tensor_layout,
-        norm_scope=norm_scope,
-        split_half=bool(split_half),
-        rotate_qk=bool(rotate_qk),
-        stabilize_k=bool(stabilize_k),
-    )
+        empty_indices = torch.empty(0, dtype=torch.int32, device=q.device)
+        empty_values = torch.empty(0, dtype=torch.float32, device=q.device)
+        anchor_indices, anchor_values = k_anchor or (
+            empty_indices,
+            empty_values,
+        )
+        qk_rms_rope_int8_out(
+            q,
+            k,
+            q_norm,
+            k_norm,
+            freqs,
+            anchor_indices,
+            anchor_values,
+            qk_output[0],
+            qk_output[1],
+            qk_output[2],
+            qk_output[3],
+            epsilon=float(epsilon),
+            rot_dim=int(rot_dim),
+            tensor_layout=tensor_layout,
+            norm_scope=norm_scope,
+            split_half=bool(split_half),
+            rotate_qk=bool(rotate_qk),
+            stabilize_k=bool(stabilize_k),
+        )
+        q_int8, q_scale, k_int8, k_scale = qk_output
+    elif k_anchor is None:
+        from .custom_ops import qk_rms_rope_int8
+
+        q_int8, q_scale, k_int8, k_scale = qk_rms_rope_int8(
+            q,
+            k,
+            q_norm,
+            k_norm,
+            freqs,
+            epsilon=float(epsilon),
+            rot_dim=int(rot_dim),
+            tensor_layout=tensor_layout,
+            norm_scope=norm_scope,
+            split_half=bool(split_half),
+            rotate_qk=bool(rotate_qk),
+            stabilize_k=bool(stabilize_k),
+        )
+    else:
+        if not rotate_qk or not stabilize_k:
+            raise ValueError(
+                "precomputed K anchor requires rotated K stabilization"
+            )
+        from .custom_ops import qk_rms_rope_int8_anchored
+
+        q_int8, q_scale, k_int8, k_scale = qk_rms_rope_int8_anchored(
+            q,
+            k,
+            q_norm,
+            k_norm,
+            freqs,
+            k_anchor[0],
+            k_anchor[1],
+            epsilon=float(epsilon),
+            rot_dim=int(rot_dim),
+            tensor_layout=tensor_layout,
+            norm_scope=norm_scope,
+            split_half=bool(split_half),
+        )
     return PrequantizedQK(
         query_int8=q_int8,
         query_scale=q_scale,
@@ -286,6 +346,44 @@ def prequantize_rms_rope_qk(
         input_dtype=q.dtype,
         original_head_dim=head_dim,
         route_original_basis=bool(rotate_qk),
+    )
+
+
+@_on_input_device
+def precompute_rms_rope_k_anchor(
+    k: torch.Tensor,
+    k_norm: torch.Tensor,
+    freqs: torch.Tensor | None,
+    *,
+    epsilon: float,
+    rot_dim: int,
+    tensor_layout: str = "HND",
+    norm_scope: str = "head",
+    split_half: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select the adaptive K anchor from the supplied nine global samples."""
+    if not k.is_cuda or k.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("K anchor preprocessing requires CUDA FP16 or BF16 input")
+    if k.ndim != 4 or k.stride(-1) != 1:
+        raise ValueError("K anchor preprocessing requires contiguous-head 4D input")
+    if k.shape[-1] not in (64, 128):
+        raise ValueError("K anchor preprocessing requires head_dim 64 or 128")
+    k_norm = k_norm.to(device=k.device, dtype=k.dtype).contiguous()
+    if freqs is None:
+        freqs = torch.empty(0, device=k.device, dtype=k.dtype)
+    else:
+        freqs = freqs.to(device=k.device, dtype=k.dtype)
+    from .custom_ops import qk_rms_rope_anchor
+
+    return qk_rms_rope_anchor(
+        k,
+        k_norm,
+        freqs,
+        epsilon=float(epsilon),
+        rot_dim=int(rot_dim),
+        tensor_layout=tensor_layout,
+        norm_scope=norm_scope,
+        split_half=bool(split_half),
     )
 
 

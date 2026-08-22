@@ -134,6 +134,199 @@ def _qk_rms_rope_int8_fake(
     )
 
 
+@torch.library.custom_op("turing_utils::qk_rms_rope_anchor", mutates_args=())
+def qk_rms_rope_anchor(
+    key: torch.Tensor,
+    key_norm: torch.Tensor,
+    freqs: torch.Tensor,
+    epsilon: float,
+    rot_dim: int,
+    tensor_layout: str,
+    norm_scope: str,
+    split_half: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from .quant import rms_rope_per_warp_int8
+
+    result = rms_rope_per_warp_int8(
+        key,
+        key,
+        key_norm,
+        key_norm,
+        freqs if freqs.numel() else None,
+        epsilon=epsilon,
+        rot_dim=rot_dim,
+        tensor_layout=tensor_layout,
+        norm_scope=norm_scope,
+        split_half=split_half,
+        rotate_qk=True,
+        stabilize_k=True,
+        return_anchor=True,
+    )
+    return result[4], result[5]
+
+
+@qk_rms_rope_anchor.register_fake
+def _qk_rms_rope_anchor_fake(
+    key,
+    key_norm,
+    freqs,
+    epsilon,
+    rot_dim,
+    tensor_layout,
+    norm_scope,
+    split_half,
+):
+    if tensor_layout == "HND":
+        batch, heads, _, head_dim = key.shape
+    elif tensor_layout == "NHD":
+        batch, _, heads, head_dim = key.shape
+    else:
+        raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+    return (
+        torch.empty((batch, heads), dtype=torch.int32, device=key.device),
+        torch.empty(
+            (batch, heads, head_dim), dtype=torch.float32, device=key.device
+        ),
+    )
+
+
+@torch.library.custom_op(
+    "turing_utils::qk_rms_rope_int8_anchored", mutates_args=()
+)
+def qk_rms_rope_int8_anchored(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    query_norm: torch.Tensor,
+    key_norm: torch.Tensor,
+    freqs: torch.Tensor,
+    anchor_indices: torch.Tensor,
+    anchor_values: torch.Tensor,
+    epsilon: float,
+    rot_dim: int,
+    tensor_layout: str,
+    norm_scope: str,
+    split_half: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from .quant import rms_rope_per_warp_int8
+
+    return rms_rope_per_warp_int8(
+        query,
+        key,
+        query_norm,
+        key_norm,
+        freqs if freqs.numel() else None,
+        epsilon=epsilon,
+        rot_dim=rot_dim,
+        tensor_layout=tensor_layout,
+        norm_scope=norm_scope,
+        split_half=split_half,
+        rotate_qk=True,
+        stabilize_k=True,
+        anchor_indices=anchor_indices,
+        anchor_values=anchor_values,
+    )
+
+
+@qk_rms_rope_int8_anchored.register_fake
+def _qk_rms_rope_int8_anchored_fake(
+    query,
+    key,
+    query_norm,
+    key_norm,
+    freqs,
+    anchor_indices,
+    anchor_values,
+    epsilon,
+    rot_dim,
+    tensor_layout,
+    norm_scope,
+    split_half,
+):
+    return _qk_rms_rope_int8_fake(
+        query,
+        key,
+        query_norm,
+        key_norm,
+        freqs,
+        epsilon,
+        rot_dim,
+        tensor_layout,
+        norm_scope,
+        split_half,
+        True,
+        True,
+    )
+
+
+@torch.library.custom_op(
+    "turing_utils::qk_rms_rope_int8_out",
+    mutates_args=("query_output", "query_scale", "key_output", "key_scale"),
+)
+def qk_rms_rope_int8_out(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    query_norm: torch.Tensor,
+    key_norm: torch.Tensor,
+    freqs: torch.Tensor,
+    anchor_indices: torch.Tensor,
+    anchor_values: torch.Tensor,
+    query_output: torch.Tensor,
+    query_scale: torch.Tensor,
+    key_output: torch.Tensor,
+    key_scale: torch.Tensor,
+    epsilon: float,
+    rot_dim: int,
+    tensor_layout: str,
+    norm_scope: str,
+    split_half: bool,
+    rotate_qk: bool,
+    stabilize_k: bool,
+) -> None:
+    from .quant import rms_rope_per_warp_int8
+
+    rms_rope_per_warp_int8(
+        query,
+        key,
+        query_norm,
+        key_norm,
+        freqs if freqs.numel() else None,
+        epsilon=epsilon,
+        rot_dim=rot_dim,
+        tensor_layout=tensor_layout,
+        norm_scope=norm_scope,
+        split_half=split_half,
+        rotate_qk=rotate_qk,
+        stabilize_k=stabilize_k,
+        anchor_indices=anchor_indices if anchor_indices.numel() else None,
+        anchor_values=anchor_values if anchor_values.numel() else None,
+        output_buffers=(query_output, query_scale, key_output, key_scale),
+    )
+
+
+@qk_rms_rope_int8_out.register_fake
+def _qk_rms_rope_int8_out_fake(
+    query,
+    key,
+    query_norm,
+    key_norm,
+    freqs,
+    anchor_indices,
+    anchor_values,
+    query_output,
+    query_scale,
+    key_output,
+    key_scale,
+    epsilon,
+    rot_dim,
+    tensor_layout,
+    norm_scope,
+    split_half,
+    rotate_qk,
+    stabilize_k,
+):
+    return None
+
+
 @torch.library.custom_op("turing_utils::sage_attention", mutates_args=())
 def sage_attention(
     query: torch.Tensor,

@@ -19,8 +19,9 @@ The plugin and kernel package remain independently installable. A Python-only
 plugin update does not rebuild CUDA. Sparse attention remains an explicit patch.
 Kernel builds target all unique visible supported CUDA architectures unless a
 cross-compilation list is supplied explicitly.
-The loader defaults to bundled W8A8 on supported Turing GPUs and Comfy Kitchen
-INT8 attention on newer architectures; Sage and SDPA remain explicit choices.
+The loader defaults to bundled W8A8 on sm75 and newer Tensor Core GPUs; Sage
+and SDPA remain explicit choices. Native cubins provide compile-time device
+specialization without a separate Python model path.
 If Kitchen rejects a shape or an incompatible installed binary at runtime, the
 single-owner container path safely delegates that call to ComfyUI's prior
 attention backend instead of leaving Q/K/V partially consumed.
@@ -32,20 +33,21 @@ implementation.
 
 | Family | `turing_utils::` operator | Purpose |
 |---|---|---|
-| Linear | `w4a8_linear` | Packed INT4 weights with INT8 activations on SM75 Tensor Cores; BF16 output |
-| Linear | `codebook_w4a8_linear` | Grouped-codebook INT4 storage with E4M3 group scales, inline packed-to-shared decode for long sequences, bounded staged fallback, SM75 INT8 Tensor Core contraction, and BF16 output |
-| Linear | `int8_linear` | Raw prequantized SM75 W8A8 contraction used by the grouped-codebook path and backend regression gates |
+| Linear | `w4a8_linear` | Packed INT4 weights with INT8 activations on sm75+ Tensor Cores; BF16 output |
+| Linear | `codebook_w4a8_linear` | Grouped-codebook INT4 storage with E4M3 group scales, inline packed-to-shared decode for long sequences, bounded staged fallback, sm75+ INT8 Tensor Core contraction, and BF16 output |
+| Linear | `int8_linear` | Raw prequantized sm75+ W8A8 contraction used by the grouped-codebook path and backend regression gates |
 | Epilogue | `dequantize_int8_bf16` | INT32 GEMM workspace to packed BF16 output |
 | Activation quantization | `swiglu_int8_convrot_quantize`, `swiglu_int4_convrot_quantize` | Fused SwiGLU and ConvRot activation quantization |
 | Activation quantization | `gelu_int8_convrot_quantize`, `gelu_int4_convrot_quantize` | Fused tanh-GELU and ConvRot activation quantization |
 | Activation quantization | `bf16_int8_convrot_quantize`, `bf16_int4_convrot_quantize` | BF16 row-buffer ConvRot quantization, optionally with SwiGLU |
+| Activation quantization | `swiglu_int8_convrot_quantize_scaled` | Quantize one aligned FFN channel interval with a precomputed whole-row scale |
 | Activation quantization | `bf16_gelu_int8_convrot_quantize`, `bf16_gelu_int4_convrot_quantize` | BF16 row-buffer GELU and ConvRot quantization |
 | Normalization | `segmented_rms_adaln` | RMSNorm plus segmented AdaLN modulation |
 | Normalization | `layer_norm_adaln` | LayerNorm plus AdaLN modulation |
 | Attention preprocessing | `qk_rms_rope_int8` | Fused RMSNorm, RoPE and production Q/K INT8 quantization |
 | Attention | `sage_attention` | Stable dense INT8-QK, FP16/BF16-PV SM75 attention |
 | Attention | `sage_attention_varlen` | Packed variable-length stable Sage attention |
-| Attention | `w8a8_attention` | Dense INT8-QK and INT8-PV SM75 attention |
+| Attention | `w8a8_attention` | Dense INT8-QK and INT8-PV sm75+ attention |
 | Attention | `w8a8_attention_varlen` | Packed variable-length dense W8A8 attention |
 | Attention | `sol_attention` | Native sm75+ online Sol routing with FP16/BF16-PV or INT8-PV |
 | Attention | `sla_attention` | Native sm75+ 128x64 fixed-Top-K SLA routing with FP16/BF16-PV or INT8-PV |
@@ -75,7 +77,7 @@ duplicate full W4A4 and W8A8 GEMM implementations.
 | Q/K Hadamard rotation | no | optional, default on | optional, default on | optional, default on |
 | Adaptive K anchor | no | optional, default on | optional, default on | optional, default on |
 | Exact modal KV ranges | n/a | n/a | yes | yes |
-| Bundled architecture | exact sm75 | exact sm75 | sm75 / Ampere / Ada / Hopper | sm75 / Ampere / Ada / Hopper |
+| Bundled architecture | exact sm75 | sm75 / Ampere / Ada / Hopper | sm75 / Ampere / Ada / Hopper | sm75 / Ampere / Ada / Hopper |
 
 FP32 is accepted at the plugin boundary only for ComfyUI's Turing BF16
 fallback case; it is converted to BF16 storage before entering these kernels.
@@ -100,15 +102,87 @@ real SM75 profile.
 
 | Format | Weight storage | Activation | Contraction owner | Local Turing additions |
 |---|---|---|---|---|
-| W8A8 | INT8 | INT8 | Kitchen/cuBLAS | ConvRot quantization, fused SwiGLU/GELU, BF16 epilogue, workspace policy |
-| W4A4 | packed INT4 | INT4 | Kitchen | Turing BF16 input/output compatibility and fused activation quantization |
-| Legacy W4A8 | signed packed INT4 | INT8 | local exact-SM75 kernel | packed-weight shared-tile expansion, INT8 Tensor Core MMA, BF16 output |
-| Grouped-codebook W4A8 | 4-bit codebook indices + E4M3 g16 scales + FP32 channel scales | INT8 | local exact-SM75 kernel | register decode directly into the shared W8A8 tile for long sequences, bounded staged fallback, BF16 output; covers the symmetric `asym_w4a8_int8` MiniMax-H3 files |
+| W8A8 | INT8 | INT8 | Kitchen/cuBLAS | sm75+ ConvRot quantization, fused SwiGLU/GELU, BF16 epilogue, workspace policy |
+| W4A4 | packed INT4 | INT4 | Kitchen | sm75+ BF16 input/output compatibility and fused activation quantization |
+| Legacy W4A8 | signed packed INT4 | INT8 | local sm75+ kernel | packed-weight shared-tile expansion, INT8 Tensor Core MMA, BF16 output |
+| Grouped-codebook W4A8 | 4-bit codebook indices + E4M3 g16 scales + FP32 channel scales | INT8 | local sm75+ kernel | register decode directly into the shared W8A8 tile for long sequences, bounded staged fallback, BF16 output; covers the symmetric `asym_w4a8_int8` MiniMax-H3 files |
 
 ConvRot group size 256 is the optimized H3 path. Unsupported layouts, group
 sizes, devices, or dtypes are rejected or delegated to Kitchen according to the
 format contract; dense checkpoint weights are never silently quantized at
 runtime.
+
+## MiniMax H3 activation scheduling
+
+H3 QKV and FFN activation policy is based on current allocatable VRAM, not the
+GPU marketing generation. It combines ComfyUI's live free/reclaimable value
+with the hard `--reserve-vram` ceiling and leaves explicit allocator, output,
+and per-layer weight headroom. The same decision function runs on every
+supported Tensor Core GPU.
+
+For the 15-second portrait workflow, the target sequence is 44,541 rows at
+480x864 and 111,630 rows after the 2.5x-area latent upscale to 768x1376. Before
+reference rows, the relevant operator-local BF16/INT8 estimates are:
+
+| Target stage | Full QKV | Streamed QKV | Full FFN | Streamed FFN |
+|---|---:|---:|---:|---:|
+| 0.4 MP / 44,541 rows | 3.57 GiB | not selected | 3.87 GiB | not selected |
+| 1.06 MP / 111,630 rows | 8.94 GiB | 3.86 GiB at 16,384 rows/tile | 9.69 GiB | 3.63 GiB at 32,768 rows/tile |
+
+These are incremental operator buffers, not total process VRAM. Packed text,
+keyframes, image/video/audio references add rows, while the model, current
+hidden/residual, CUDA allocator, and compositor consume the rest. Because the
+policy measures memory again inside each layer, those live allocations reduce
+the selected tile automatically. Long or multiple reference videos can still
+raise the irreducible INT8-Q/K plus BF16-V floor; cap reference duration or
+resolution when the log reports a minimum tile near the budget.
+
+The streamed FFN casts each weight once and processes all row tiles before
+uncasting. Streamed QKV similarly casts the projection once, emits 64-row-
+aligned INT8 Q/K scale blocks, and retains BF16 V. Bundled dense W8A8, Sol-W8A8,
+and SLA-W8A8 consume this state directly, so the memory reduction does not
+materialize a second full floating Q/K pair.
+
+If the compact attention state is still over budget, the policy selects the
+largest fitting whole-head group whose start and end feature offsets are both
+divisible by the ConvRot-256 block. The group width need not divide the total
+head count; a smaller aligned tail is valid. Each group contains the full
+Query/Key/Value sequence;
+there is no token-window approximation and no repeated global attention work.
+The adapter calls the workflow-selected backend for every group, so an explicit
+SDPA selection stays SDPA. Kernel 0.30's reusable global K-anchor and direct
+Q/K output ABI keep row-streamed W8A8/Sol preprocessing equivalent to the full
+sequence contract.
+
+If even the minimum FFN row tile is constrained, W8 ConvRot fc1/fc2 can split
+the 14,336-wide intermediate on aligned 256-channel boundaries. The first pass
+computes the maximum of the per-interval scales, exactly recovering the full
+row scale. The second pass quantizes every interval with that common scale and
+writes it by offset into the final compact INT8 row. The original fused fc2
+then performs one complete contraction and BF16 epilogue. This is the last
+automatic tier because it recomputes fc1 intervals;
+normal 12 GiB runs prefer the materially faster row-only path.
+
+The resulting order is not a GPU-generation table:
+
+| Ladder | Selected when | Preserved contract |
+|---|---|---|
+| L0 full | full activation has headroom | original throughput path |
+| L1 rows | transient projection/FFN activation is too large | exact per-row linear and quantization math |
+| L2 compact Q/K | prepared W8A8/Sol/SLA is active | global sequence anchor, INT8 Q/K and BF16/INT8 V |
+| L3 heads | complete attention state is too large | full non-causal sequence and selected backend per head |
+| L4 FFN channels | minimum practical row tile is still constrained | common scale, direct A8 offsets, unchanged fused fc2 |
+
+Every decision uses current reclaimable memory after ComfyUI's
+`--reserve-vram` ceiling. Native cubins specialize instructions for sm75,
+sm86, and later architectures, while Python uses this one ladder for all of
+them. The ladder has no Triton dependency; on Windows, a missing optional
+Kitchen fixed-workspace entry point falls through to the bundled CUTLASS W8
+contraction rather than a sequence-sized INT32 workspace.
+
+The H3 video-VAE overlap accumulator follows the same sm75+ capability contract.
+Legacy `turing` and `_sm75` names are retained only as public/package ABI; CUDA
+selects the architecture-specific cubin and instruction sequence internally.
 
 ## Production classification
 
@@ -120,10 +194,10 @@ sequence length or that an A40 PTX result can choose a Turing launch policy.
 
 | Tier | Operator families | Runtime policy |
 |---|---|---|
-| Production default | Dense W8A8 attention; ConvRot W8A8/W4A8/W4A4 activation paths; BF16 epilogue; normalization fusions | Selected by the loader/adapter after preflight; exact-sm75 tile choices are cached per device and contraction shape |
+| Production default | Dense W8A8 attention; ConvRot W8A8/W4A8/W4A4 activation paths; BF16 epilogue; normalization fusions | Selected by the loader/adapter after preflight; tile choices are cached per device and contraction shape while the native cubin supplies architecture specialization |
 | Production alternative | Stable Sage; SDPA FP16 bridge; legacy and grouped-codebook W4A8 | Explicit backend/weight-format choice with deterministic fallback |
-| Production patch | Sol FP16-PV and Sol W8A8 | Enabled only by the independent Sol node so workflow-specific routing and modality controls remain explicit; W8A8 is the node default; newer architectures use a native Sol cubin and architecture-native dense fallback |
-| Production patch | SLA FP16-PV and SLA W8A8 | Independent fixed-Top-K node for SLA-trained weights; shares Sol's safety controls and architecture-native dense fallback without changing SLA route semantics |
+| Production patch | Sol FP16-PV and Sol W8A8 | Enabled only by the independent Sol node so workflow-specific routing and modality controls remain explicit; W8A8 is the node default; sm75+ uses the same prepared sparse and bundled dense interfaces with a native cubin for the installed architecture |
+| Production patch | SLA FP16-PV and SLA W8A8 | Independent fixed-Top-K node for SLA-trained weights; shares Sol's safety controls and the same bundled sm75+ dense path without changing SLA route semantics |
 | Compatibility only | Staged codebook decode | Preserves grouped-codebook formats that cannot use the inline g16 decoder |
 
 The resource release gate covers all compiled production and compatibility

@@ -634,11 +634,12 @@ void quant_qk_rms_rope_int8_cuda(
     at::Tensor query_rrms, at::Tensor key_rrms, at::Tensor anchor_indices,
     at::Tensor anchor_values, float epsilon, int rot_dim,
     int query_block_size, int query_warp_block_size, int key_block_size,
-    int tensor_layout, int norm_scope, bool split_half, bool rotate) {
+    int tensor_layout, int norm_scope, bool split_half, bool rotate,
+    bool detect_anchor) {
   CHECK_CUDA(query); CHECK_CUDA(key); CHECK_CUDA(query_output); CHECK_CUDA(key_output);
   CHECK_CUDA(query_scale); CHECK_CUDA(key_scale); CHECK_CUDA(query_norm); CHECK_CUDA(key_norm);
   CHECK_DIMS(query, 4); CHECK_DIMS(key, 4); CHECK_LASTDIM_CONTIGUOUS(query); CHECK_LASTDIM_CONTIGUOUS(key);
-  CHECK_CONTIGUOUS(query_output); CHECK_CONTIGUOUS(key_output); CHECK_CONTIGUOUS(query_scale); CHECK_CONTIGUOUS(key_scale);
+  CHECK_LASTDIM_CONTIGUOUS(query_output); CHECK_LASTDIM_CONTIGUOUS(key_output);
   CHECK_DTYPE(query_output, at::ScalarType::Char); CHECK_DTYPE(key_output, at::ScalarType::Char);
   CHECK_DTYPE(query_scale, at::ScalarType::Float); CHECK_DTYPE(key_scale, at::ScalarType::Float);
   TORCH_CHECK(query.scalar_type() == key.scalar_type(), "Q/K dtypes must match");
@@ -697,6 +698,8 @@ void quant_qk_rms_rope_int8_cuda(
     TORCH_CHECK(query_rrms.numel() == query.size(0) * query_length && key_rrms.numel() == key.size(0) * key_length, "row RRMS scratch shapes are incompatible");
   }
   const bool stabilize = anchor_indices.numel() != 0;
+  TORCH_CHECK(!detect_anchor || stabilize,
+              "anchor detection requires anchor output tensors");
   if (stabilize) {
     CHECK_CUDA(anchor_indices); CHECK_CUDA(anchor_values); CHECK_DTYPE(anchor_indices, at::ScalarType::Int); CHECK_DTYPE(anchor_values, at::ScalarType::Float);
     TORCH_CHECK(anchor_indices.sizes() == at::IntArrayRef({key.size(0), key_heads}), "anchor index shape is incompatible");
@@ -706,12 +709,14 @@ void quant_qk_rms_rope_int8_cuda(
 #define LAUNCH_VARIANT(SPLIT, ROTATE, STABILIZE) \
       do { \
         if constexpr (STABILIZE) { \
-          detect_anchor_kernel<scalar_t, HEAD_DIM, SPLIT><<<dim3(key_heads, key.size(0)), kAnchorThreads, 0, c10::cuda::getCurrentCUDAStream()>>>( \
-              reinterpret_cast<const scalar_t *>(key.data_ptr()), reinterpret_cast<const scalar_t *>(key_norm.data_ptr()), \
-              reinterpret_cast<const scalar_t *>(freqs.data_ptr()), global_norm ? key_rrms.data_ptr<float>() : nullptr, \
-              anchor_indices.data_ptr<int>(), anchor_values.data_ptr<float>(), key.size(0), key_heads, key_length, rot_dim, \
-              key.stride(0), k_stride_head, k_stride_sequence, freq_stride_batch, freq_stride_sequence, freq_stride_pair, \
-              freq_stride_row, freq_stride_col, freq_batches, freq_sequence, epsilon, global_norm); \
+          if (detect_anchor) { \
+            detect_anchor_kernel<scalar_t, HEAD_DIM, SPLIT><<<dim3(key_heads, key.size(0)), kAnchorThreads, 0, c10::cuda::getCurrentCUDAStream()>>>( \
+                reinterpret_cast<const scalar_t *>(key.data_ptr()), reinterpret_cast<const scalar_t *>(key_norm.data_ptr()), \
+                reinterpret_cast<const scalar_t *>(freqs.data_ptr()), global_norm ? key_rrms.data_ptr<float>() : nullptr, \
+                anchor_indices.data_ptr<int>(), anchor_values.data_ptr<float>(), key.size(0), key_heads, key_length, rot_dim, \
+                key.stride(0), k_stride_head, k_stride_sequence, freq_stride_batch, freq_stride_sequence, freq_stride_pair, \
+                freq_stride_row, freq_stride_col, freq_batches, freq_sequence, epsilon, global_norm); \
+          } \
         } \
         const int tasks = query_heads * query_scale_length + key_heads * key_scale_length; \
         quantize_qk_kernel<scalar_t, HEAD_DIM, SPLIT, ROTATE, STABILIZE><<<dim3(tasks, query.size(0)), kThreads, 0, c10::cuda::getCurrentCUDAStream()>>>( \

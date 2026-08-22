@@ -186,6 +186,39 @@ def _turing_swiglu_int8_convrot_quantize_fake(x, group_size=256):
     )
 
 
+@torch.library.custom_op(
+    "turing_utils::swiglu_int8_convrot_quantize_scaled", mutates_args=()
+)
+def turing_swiglu_int8_convrot_quantize_scaled(
+    x: torch.Tensor,
+    scales: torch.Tensor,
+    group_size: int = 256,
+) -> torch.Tensor:
+    """Quantize a SwiGLU+ConvRot shard with precomputed whole-row scales."""
+    if x.device.type != "cuda":
+        raise RuntimeError("scaled Turing SwiGLU ConvRot requires CUDA tensors")
+    if torch.cuda.get_device_capability(x.device) < (7, 5):
+        raise RuntimeError("scaled Turing SwiGLU ConvRot requires sm75 or newer")
+    if x.dtype not in (torch.float16, torch.bfloat16) or x.ndim != 2:
+        raise TypeError("scaled SwiGLU ConvRot input must be 2D float16 or bfloat16")
+    if scales.dtype != torch.float32 or scales.numel() != x.shape[0]:
+        raise TypeError("scaled SwiGLU ConvRot requires one FP32 scale per row")
+    return _C.turing_swiglu_int8_convrot_quantize_scaled(
+        x.contiguous(), scales.contiguous(), group_size
+    )
+
+
+@turing_swiglu_int8_convrot_quantize_scaled.register_fake
+def _turing_swiglu_int8_convrot_quantize_scaled_fake(
+    x, scales, group_size=256
+):
+    return torch.empty(
+        (x.size(0), x.size(1) // 2),
+        dtype=torch.int8,
+        device=x.device,
+    )
+
+
 @torch.library.custom_op("turing_utils::swiglu_int4_convrot_quantize", mutates_args=())
 def turing_swiglu_int4_convrot_quantize(
     x: torch.Tensor,

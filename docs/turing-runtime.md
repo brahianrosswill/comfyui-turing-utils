@@ -143,10 +143,13 @@ profiled in projection, Q/K/V preparation, model patching, or VRAM movement;
 it is not explained by a slower bundled stable-Sage CUDA main loop.
 
 For W8A8 GEMM, Kitchen's fused Turing kernel remains first choice. The no-bias
-contraction fallback uses cuBLAS INT8 plus the bundled vectorized BF16
+small-contraction fallback uses cuBLAS INT8 plus the bundled vectorized BF16
 epilogue. Once a full MxN INT32 accumulator would reach 64 MiB, dispatch tries
-the fixed-workspace fused path even for contraction/square layers. If Kitchen
-cannot serve that shape, it falls back without narrowing the accepted input.
+the fixed-workspace fused path even for contraction/square layers. If a
+Windows Kitchen build does not export that optional entry point, the bundled
+CUTLASS contraction writes BF16 directly instead of materializing the global
+INT32 matrix; this fallback has no Triton dependency and does not narrow the
+accepted aligned H3 shapes.
 
 Wan projections, block normalization, attention dispatch, and feed-forward
 execution stay on ComfyUI's native path; current ComfyUI folds tanh-GELU through
@@ -165,6 +168,33 @@ and BF16 packed hidden state. W8A8 planning checks every distinct output width
 and reserves the largest live INT32 accumulator; it does not assume that the
 widest layer owns the largest workspace after fixed-workspace dispatch.
 
+H3 activation execution follows the same live-memory accounting. It first
+retains the unmodified full path, then reduces only transient state in this
+order: row-streamed QKV/FFN, prepared compact Q/K, whole-head attention groups,
+and finally aligned FFN intermediate groups. This is a resource ladder rather
+than a Turing/Ampere branch. ComfyUI's current free/reclaimable bytes and
+`--reserve-vram` ceiling select the highest-throughput fitting rung at every
+operator call.
+
+QKV row tiles write directly into their final INT8 Q/K and BF16 V storage.
+Kernel 0.30 accepts a reusable K anchor computed from the same nine positions
+in the complete sequence, so streaming no longer disables adaptive anchoring.
+If attention must be split further, only whole heads are grouped; every group
+still contains every token and calls the workflow-selected backend. Legal group
+widths are common boundaries of the model head layout and ConvRot's 256-value
+blocks. This preserves non-causal global attention and does not repeat any Q/K
+pair within a head.
+
+The last FFN rung is restricted to W8 ConvRot fc1/fc2. Each 256-aligned channel
+interval is projected twice: the first pass reduces its local maximum into the
+same whole-row activation scale used by the complete 14,336-channel tensor;
+the second quantizes with that common scale and writes directly into its offset
+in the complete compressed INT8 activation. The original fused fc2 then runs
+once, including its normal BF16 epilogue. The A8 row is smaller than an INT32
+output accumulator for H3, so this removes full fc1/SwiGLU intermediates
+without changing the contraction, but costs extra fc1 work and is selected only
+after row streaming cannot satisfy the budget or when explicitly diagnosed.
+
 Wan/Bernini reference shapes are padded per stream before aggregation. The
 outer sampling wrapper also supplies the real sampler batch, so repeated
 context conditions are represented during initial model loading as well as in
@@ -179,16 +209,16 @@ Turing optimization. The reproducible comparison is available through
 ## Attention matrix
 
 The loader exposes exactly `w8a8`, `sage`, and `sdpa`, with W8A8 selected by
-default. On exact sm75, W8A8 and Sage use the bundled implementations. On other
-GPUs, W8A8 delegates to Comfy Kitchen and Sage delegates to ComfyUI's registered
-SageAttention function. `auto` is no longer accepted. Legacy serialized
+default. W8A8 uses the bundled implementation on sm75 and newer GPUs. Sage is
+bundled on exact sm75 and delegates to ComfyUI's registered SageAttention
+function elsewhere. `auto` is no longer accepted. Legacy serialized
 `sage_attn`, `sage_`, `sage_hybrid`, and `turing_sage` values normalize
 invisibly to `sage` and are not displayed by the loader.
 
 | Option | Q/K path | Smoothing | PV path |
 |---|---|---|---|
 | `sage` on Turing | INT8, per-16-token Q-warp scales | disabled | FP16 V tiles with direct FP32 accumulation |
-| `w8a8` on Turing | stable-Sage INT8 score domain | disabled | channel-wise signed INT8 V and unsigned INT8 probabilities, INT32 Tensor Core PV, FP32 online state |
+| `w8a8` on sm75+ | stable-Sage INT8 score domain | optional adaptive K anchor | channel-wise signed INT8 V and unsigned INT8 probabilities, INT32 Tensor Core PV, FP32 online state |
 | `Patch Sol Sparse Attention` | fused 64-token centroid routing; selected tiles reuse stable Sage INT8 QK | input-adaptive `mean + tau * std` threshold | exact FP16 V tiles plus skipped-block V centroids, FP32 online accumulation |
 | `Patch SLA Sparse Attention` | one route shared by adjacent Q64 CTAs (logical Q128 x K64); selected tiles reuse stable Sage INT8 QK | fixed Top-K budget; Smooth-K-invariant ordering | selected exact FP16 V tiles or optional W8A8 PV; no skipped-block residual |
 
@@ -231,7 +261,7 @@ sampling-step checks. A model adapter may publish semantic layer and topology
 metadata; unknown models remain fully generic.
 
 The bundled `w8a8` backend and Sol's `use_w8a8` option require kernel 0.23.0.
-They are specialized for exact sm75 and head dimensions 1--128. Dense W8A8
+They support sm75 and newer native cubins and head dimensions 1--128. Dense W8A8
 supports fixed HND/NHD and native packed-varlen inputs, GQA, unequal Q/K
 lengths, and an upper-left causal diagonal; arbitrary masks remain unsupported.
 Sol remains fixed-shape, unmasked, and non-causal. The W8A8 path
@@ -241,8 +271,8 @@ native D128 uses 32 KiB. V is quantized once per call into a channel-major,
 softmax probabilities are packed to unsigned INT8; PV uses SM75 U8xS8 Tensor
 Core MMA and the output remains FP32 until normalization and dtype writeback.
 The route-free dense specialization omits centroid summaries and route state.
-Short calls can lose to stable Sage because the extra V scan is not amortized,
-so exact-sm75 users should still compare W8A8 and Sage for short sequences.
+Short calls can lose to stable Sage because the extra V scan is not amortized;
+H3's long packed sequences are the intended W8A8 workload.
 
 For packed varlen, Q/K/output and cumulative sequence metadata remain compact;
 the implementation does not pad every sequence to the batch maximum or launch
@@ -441,15 +471,14 @@ instantiations exclude them. Their complete checkpoint and reproduction steps
 are documented in
 [`kernel/experiments/turing_sage_variants`](../kernel/experiments/turing_sage_variants/README.md).
 
-On non-Turing GPUs the selected dense backend is deterministic: W8A8 uses
-Comfy Kitchen, Sage uses the registered SageAttention function, and SDPA uses
+On sm75 and newer GPUs, W8A8 uses the same bundled prepared-attention path and
+the loaded cubin supplies the architecture specialization. Sage remains exact-
+sm75 and uses the registered SageAttention function elsewhere; SDPA uses
 ComfyUI's PyTorch implementation. Flash Attention is not a loader option. An
 all-FP32 call that cannot enter external Sage uses ComfyUI's PyTorch attention
-implementation deterministically. Sol is the exception to the former
-"non-Turing means no local attention" rule: kernel 0.28.0 can compile its
-integer routing/exact core natively for Ampere, Ada, and Hopper, while every
-protected dense step or layer still delegates to those architecture-native
-dense backends.
+implementation deterministically. Sol and SLA share bundled W8A8 for protected
+dense steps/layers, so Q/K preprocessing and activation-streaming ownership do
+not fork at the Turing/Ampere boundary.
 
 The loader log reports `w8a8 via bundled_turing_w8a8` or
 `sage via bundled_turing_sage` for local SM75 implementations. Sol logs the

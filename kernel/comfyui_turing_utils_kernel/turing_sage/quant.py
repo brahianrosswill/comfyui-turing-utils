@@ -17,6 +17,12 @@ def rms_rope_per_warp_int8(
     split_half: bool,
     rotate_qk: bool,
     stabilize_k: bool,
+    anchor_indices: torch.Tensor | None = None,
+    anchor_values: torch.Tensor | None = None,
+    return_anchor: bool = False,
+    output_buffers: tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+    ] | None = None,
 ):
     """Fuse Q/K normalization and RoPE into the production INT8 contract."""
     if tensor_layout == "HND":
@@ -34,18 +40,34 @@ def rms_rope_per_warp_int8(
     if norm_scope not in {"head", "row"}:
         raise ValueError("norm_scope must be head or row")
 
-    q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
-    k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
-    q_scale = torch.empty(
-        (batch, q_heads, ((q_tokens + 63) // 64) * 4),
-        dtype=torch.float32,
-        device=q.device,
-    )
-    k_scale = torch.empty(
-        (batch, k_heads, (k_tokens + 63) // 64),
-        dtype=torch.float32,
-        device=k.device,
-    )
+    q_scale_shape = (batch, q_heads, ((q_tokens + 63) // 64) * 4)
+    k_scale_shape = (batch, k_heads, (k_tokens + 63) // 64)
+    if output_buffers is None:
+        q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
+        k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
+        q_scale = torch.empty(
+            q_scale_shape, dtype=torch.float32, device=q.device
+        )
+        k_scale = torch.empty(
+            k_scale_shape, dtype=torch.float32, device=k.device
+        )
+    else:
+        q_int8, q_scale, k_int8, k_scale = output_buffers
+        expected = (
+            (q_int8, q.shape, torch.int8),
+            (q_scale, q_scale_shape, torch.float32),
+            (k_int8, k.shape, torch.int8),
+            (k_scale, k_scale_shape, torch.float32),
+        )
+        if any(
+            tensor.shape != shape
+            or tensor.dtype != dtype
+            or tensor.device != q.device
+            for tensor, shape, dtype in expected
+        ):
+            raise ValueError(
+                "Q/K preprocessing output buffer has an incompatible shape, dtype, or device"
+            )
     if norm_scope == "row":
         q_rrms = torch.empty((batch, q_tokens), dtype=torch.float32, device=q.device)
         k_rrms = torch.empty((batch, k_tokens), dtype=torch.float32, device=k.device)
@@ -54,12 +76,36 @@ def rms_rope_per_warp_int8(
         q_rrms = torch.empty(0, dtype=torch.float32, device=q.device)
         k_rrms = torch.empty(0, dtype=torch.float32, device=k.device)
         norm_scope_id = 0
+    detect_anchor = bool(
+        stabilize_k
+        and rotate_qk
+        and anchor_indices is None
+        and anchor_values is None
+    )
     if stabilize_k and rotate_qk:
-        anchor_indices = torch.empty((batch, k_heads), dtype=torch.int32, device=k.device)
-        anchor_values = torch.empty(
-            (batch, k_heads, head_dim), dtype=torch.float32, device=k.device
-        )
+        if (anchor_indices is None) != (anchor_values is None):
+            raise ValueError("precomputed K anchor requires indices and values")
+        if anchor_indices is None:
+            anchor_indices = torch.empty(
+                (batch, k_heads), dtype=torch.int32, device=k.device
+            )
+            anchor_values = torch.empty(
+                (batch, k_heads, head_dim), dtype=torch.float32, device=k.device
+            )
+        elif (
+            anchor_indices.shape != (batch, k_heads)
+            or anchor_indices.dtype != torch.int32
+            or anchor_indices.device != k.device
+            or anchor_values.shape != (batch, k_heads, head_dim)
+            or anchor_values.dtype != torch.float32
+            or anchor_values.device != k.device
+        ):
+            raise ValueError("precomputed K anchor has an incompatible shape, dtype, or device")
+        anchor_indices = anchor_indices.contiguous()
+        anchor_values = anchor_values.contiguous()
     else:
+        if anchor_indices is not None or anchor_values is not None:
+            raise ValueError("precomputed K anchor requires rotated K stabilization")
         anchor_indices = torch.empty(0, dtype=torch.int32, device=k.device)
         anchor_values = torch.empty(0, dtype=torch.float32, device=k.device)
     if freqs is None:
@@ -88,7 +134,10 @@ def rms_rope_per_warp_int8(
         norm_scope_id,
         bool(split_half),
         bool(rotate_qk),
+        detect_anchor,
     )
+    if return_anchor:
+        return q_int8, q_scale, k_int8, k_scale, anchor_indices, anchor_values
     return q_int8, q_scale, k_int8, k_scale
 
 

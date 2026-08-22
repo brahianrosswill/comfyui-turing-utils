@@ -8,11 +8,17 @@ from importlib.metadata import PackageNotFoundError, version
 
 import torch
 
-from .attention import bundled_available, normalize_attention_backend, preflight_bundled
+from .attention import (
+    bundled_available,
+    bundled_w8a8_available,
+    normalize_attention_backend,
+    preflight_bundled,
+    preflight_bundled_w8a8,
+)
+from .hardware import is_supported_tensor_core_device, is_supported_turing_device
 from .kernel_api import load_kernel_package
 from .quantization.dispatch import (
     backend_available,
-    is_supported_turing_device,
     preflight_kitchen,
     preflight_codebook_w4a8,
     preflight_w4a8,
@@ -103,17 +109,20 @@ def prepare_turing_runtime(
     device: torch.device,
     attention_backend: str | None = None,
 ) -> None:
-    """Register and validate the self-contained sm75 runtime for one loader."""
-    if not is_supported_turing_device(device):
+    """Register and validate the shared sm75+ runtime for one loader."""
+    if not is_supported_tensor_core_device(device):
         return
 
     if attention_backend is not None:
         attention_backend = normalize_attention_backend(attention_backend)
     codebook_w4a8 = bool(getattr(summary, "codebook_w4a8", 0))
-    bundled_attention = attention_backend in {"w8a8", "sage"}
+    bundled_w8a8 = attention_backend == "w8a8"
+    bundled_sage = (
+        attention_backend == "sage" and is_supported_turing_device(device)
+    )
     needs_kernel = bool(
         summary.w4a4 or summary.w4a8 or codebook_w4a8 or summary.w8a8
-    ) or bundled_attention
+    ) or bundled_w8a8 or bundled_sage
     if needs_kernel:
         _check_kernel_contract()
     if codebook_w4a8:
@@ -126,23 +135,27 @@ def prepare_turing_runtime(
         cuda_status = comfy_kitchen.list_backends().get("cuda", {})
         if not cuda_status.get("available") or cuda_status.get("disabled"):
             reason = cuda_status.get("unavailable_reason") or "disabled"
-            raise RuntimeError(f"Kitchen CUDA backend is unavailable on Turing: {reason}")
+            raise RuntimeError(f"Kitchen CUDA backend is unavailable: {reason}")
         capabilities = set(cuda_status.get("capabilities", ()))
         if (summary.w4a4 or summary.w4a8) and "convrot_w4a4_linear" not in capabilities:
-            raise RuntimeError("Kitchen ConvRot W4 support is unavailable on Turing")
+            raise RuntimeError("Kitchen ConvRot W4 support is unavailable")
         if codebook_w4a8 and "w4a8_int8_linear" not in capabilities:
-            raise RuntimeError("Kitchen grouped-codebook W4A8 support is unavailable on Turing")
+            raise RuntimeError("Kitchen grouped-codebook W4A8 support is unavailable")
         if summary.w8a8 and "int8_linear" not in capabilities:
-            raise RuntimeError("Kitchen W8A8 support is unavailable on Turing")
+            raise RuntimeError("Kitchen W8A8 support is unavailable")
         if not register_backend() or not backend_available():
-            raise RuntimeError("the bundled Turing ConvRot backend could not be registered")
+            raise RuntimeError("the bundled ConvRot backend could not be registered")
         preflight_kitchen(device, bool(summary.w4a4), bool(summary.w8a8))
         if summary.w4a8:
             preflight_w4a8(device)
         if codebook_w4a8:
             preflight_codebook_w4a8(device)
 
-    if bundled_attention:
+    if bundled_w8a8:
+        if not bundled_w8a8_available():
+            raise RuntimeError("the bundled sm75+ W8A8 attention extension is unavailable")
+        preflight_bundled_w8a8(device)
+    elif bundled_sage:
         if not bundled_available():
             raise RuntimeError("the bundled Turing Sage extensions are unavailable")
         preflight_bundled(device)

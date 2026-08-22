@@ -216,6 +216,14 @@ class KernelCustomOpContractTest(unittest.TestCase):
             self.assertEqual(quantized.shape, shape)
             self.assertEqual(scale.shape, (3, 1))
 
+        scaled = kernel.turing_swiglu_int8_convrot_quantize_scaled(
+            x,
+            torch.empty((3,), dtype=torch.float32, device="meta"),
+        )
+        self.assertEqual(scaled.shape, (3, 256))
+        self.assertEqual(scaled.dtype, torch.int8)
+        self.assertEqual(scaled.device.type, "meta")
+
     def test_linear_epilogue_and_norm_fake_contracts(self):
         activation = torch.empty((7, 128), dtype=torch.int8, device="meta")
         weight = torch.empty((64, 64), dtype=torch.int8, device="meta")

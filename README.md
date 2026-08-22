@@ -1,10 +1,9 @@
 # ComfyUI Turing Utils
 
-Compatibility and performance extensions that fill gaps in ComfyUI on older
-NVIDIA Turing GPUs. The plugin currently provides ConvRot W8A8/W4A8/W4A4
-support, exact-sm75 BF16 activation storage, bundled Turing Sage/W8A8
-attention, native sm75+ Sol and fixed-Top-K SLA sparse attention, and focused
-Wan/Bernini utilities.
+Compatibility and performance extensions for CUDA Tensor Core GPUs. The plugin
+currently provides ConvRot W8A8/W4A8/W4A4 support, exact-sm75 BF16 activation
+storage, bundled sm75+ W8A8 attention, exact-sm75 Sage, native sm75+ Sol and
+fixed-Top-K SLA sparse attention, and focused Wan/Bernini utilities.
 
 ## Requirements
 
@@ -14,8 +13,8 @@ Wan/Bernini utilities.
 - PyTorch with CUDA and ComfyUI
 - `comfy-kitchen>=0.2.26` for ConvRot model integration
 - the independently installed `comfyui-turing-utils-kernel>=0.29.1` for SLA;
-  native Sol on Ampere or newer requires 0.28.0, while exact-sm75 installs also
-  provide the local dense attention and quantized-linear paths
+  native sm75+ W8A8/Sol requires a cubin (or PTX) for the target GPU, while
+  exact-sm75 installs additionally provide bundled Sage and BF16 compatibility
 
 Grouped-codebook `asym_w4a8_int8` checkpoints require kernel 0.24.0. Existing
 W8A8, W4A4, legacy W4A8, and attention paths keep their earlier minimum.
@@ -118,6 +117,67 @@ only after its CUDA sources or required version change.
   dense W8A8 and Sol. Its defaults are the production policy; explicit values
   are intended for target-card profiling and do not affect stable Sage.
 
+## MiniMax H3 automatic activation memory
+
+The H3 adapter uses one capability-based path on Turing, Ampere, Ada, Hopper,
+and newer Tensor Core GPUs. CUDA selects the cubin compiled for the installed
+card; Python does not maintain a per-generation H3 algorithm. At each QKV or
+FFN call, the adapter reads ComfyUI's live free/reclaimable memory and the
+`--reserve-vram` ceiling:
+
+- if the complete activation fits with safety headroom, it keeps the normal
+  full-row path for maximum throughput;
+- otherwise QKV projection is streamed by rows while retaining only INT8 Q/K
+  and BF16 V, and the SwiGLU FFN is streamed into its final hidden output;
+- if that compact state still does not fit, attention is evaluated in legal
+  whole-head groups. Every group still attends over the complete sequence and
+  keeps the selected backend (including explicit SDPA); ConvRot groups are
+  split only on their 256-value boundary;
+- at the extreme FFN floor, the intermediate width is split on the same
+  256-value boundary. A first pass obtains the original whole-row scale, a
+  second pass writes directly into the final compressed INT8 activation, and
+  the original fused fc2 performs the complete contraction once;
+- each layer's weights are cast/transferred once and reused by every row tile,
+  so activation savings do not multiply Dynamic VRAM traffic.
+- the H3 video-VAE overlap accumulator uses the same sm75+ native capability
+  gate, so Ampere does not lose that fused decode path.
+
+No workflow socket or node changes are required. For a 16 GiB display card
+that must leave 4 GiB to Windows and the compositor, launch ComfyUI with
+`--reserve-vram 4`. The default `auto` mode then treats 12 GiB as a hard
+inference ceiling even while the desktop is temporarily idle.
+
+The policy can be diagnosed or overridden with these environment variables:
+
+```text
+COMFYUI_TURING_UTILS_H3_ACTIVATION_MODE=auto|throughput|balanced
+COMFYUI_TURING_UTILS_H3_QKV_CHUNK_ROWS=16384
+COMFYUI_TURING_UTILS_H3_MLP_CHUNK_ROWS=32768
+COMFYUI_TURING_UTILS_H3_HEAD_GROUP=14
+COMFYUI_TURING_UTILS_H3_FFN_CHUNK_CHANNELS=2048
+```
+
+Overrides are diagnostic controls; `auto` is the production default. QKV
+streaming is available through bundled W8A8, Sol-W8A8, and SLA-W8A8 prepared
+attention. Kernel 0.30 precomputes the adaptive K anchor from the same nine
+global sequence locations and reuses it while writing every row tile directly
+into the final Q/K storage. Row and head splitting therefore do not discard the
+global anchor, RMSNorm, RoPE, orthogonal rotation, scale blocks, or any K/V row.
+
+The automatic ladder is: full throughput, row streaming, compact prepared
+Q/K, whole-head grouping, then two-pass FFN-channel grouping. It is selected
+independently for each live operator, so a 12 GiB budget normally stops at row
+streaming while a much tighter run can descend further. The final hidden output
+and the chosen attention backend's irreducible state still have to fit; `auto`
+cannot make an arbitrarily reference-heavy 15-second workflow fit 6 GiB.
+None of these rungs requires Triton. If a Windows Kitchen build lacks its
+optional fixed-workspace W8 entry point, large aligned contractions use the
+bundled CUTLASS BF16-output kernel instead of allocating a full INT32 matrix.
+
+Some Python symbols and extension filenames still contain `turing`/`sm75` for
+backward ABI compatibility. They do not select a separate H3 implementation;
+device-specific MMA/copy instructions are compile-time CUDA specializations.
+
 ## Turing behavior
 
 When a model declares BF16 inference support but ComfyUI would otherwise fall
@@ -144,8 +204,10 @@ unequal sequence lengths, HND/NHD layouts, and head dimensions up to 128. FP32
 callers use BF16 boundary storage and receive FP32 output. On non-Turing GPUs,
 the explicit `sage` choice uses ComfyUI's registered SageAttention backend.
 
-The default `w8a8` attention backend uses the bundled exact-sm75 kernel on
-supported Turing GPUs and Comfy Kitchen INT8 attention on newer architectures.
+The default `w8a8` attention backend uses the same bundled prepared-attention
+path on sm75 and newer Tensor Core GPUs. Native builds select compile-time
+architecture specializations; sm80+ uses asynchronous shared-memory copies and
+the matching INT8 MMA implementation without Triton.
 The bundled kernel retains stable Sage's INT8 Q/K score domain,
 quantizes V channel-wise to signed INT8, packs online-softmax probabilities to
 unsigned INT8, and evaluates both QK and PV with Turing Tensor Cores. It
@@ -166,13 +228,11 @@ architecture-native dense backend. Automatic semantic protection requires separa
 metadata for unequal sequences; ambiguous single-sequence metadata falls back
 instead of applying the wrong ranges.
 
-The bundled Sol core is native on sm75, Ampere, Ada, and Hopper when those
-architectures are included in the kernel build. Exact-sm75 protected dense
-steps/layers use bundled Sage or W8A8. On newer GPUs they delegate to the
-installed SageAttention or Comfy Kitchen W8A8 backend, so Sol does not replace
-an architecture-specific dense implementation with the Turing schedule. The
-extension filenames retain their historical `_sm75` suffix as a Python ABI
-name; it no longer describes the only cubin that can be built.
+The bundled Sol core and its protected dense W8A8 path are native on sm75,
+Ampere, Ada, and Hopper when those architectures are included in the kernel
+build. Explicit Sage remains exact-sm75 and uses installed SageAttention on
+newer GPUs. The extension filenames retain their historical `_sm75` suffix as
+a Python ABI name; it no longer describes the only cubin that can be built.
 
 Online Sol routing on Ampere or newer requires kernel package 0.28.0.
 Adapter-protected Query blocks run through the
