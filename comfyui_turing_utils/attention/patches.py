@@ -8,12 +8,9 @@ from collections.abc import Callable
 import torch
 
 from ..profiling import CUDA_PHASE_PROFILER
-from .layout import (
-    ATTENTION_LAYOUT_REQUIREMENT_KEY,
-    attention_semantic_layout,
-    ensure_attention_layout_provider,
-)
+from .layout import attention_semantic_layout
 from .integration import ensure_prepared_attention_sites
+from .orchestration import install_sparse_attention_override
 from .protocol import (
     ATTENTION_EXECUTOR_KEY,
     AttentionBackendCapabilities,
@@ -1670,10 +1667,8 @@ def apply_sparse_attention_patch(
     debug_route_density: bool = False,
     use_w8a8: bool = SPARSE_USE_W8A8,
 ):
-    patched = model.clone()
-    layout_status = ensure_attention_layout_provider(patched)
     override = make_sparse_attention_override(
-        patched.load_device,
+        model.load_device,
         min_sequence_tokens=min_sequence_tokens,
         routing_threshold=routing_threshold,
         prefix_policy=prefix_policy,
@@ -1689,33 +1684,14 @@ def apply_sparse_attention_patch(
         debug_route_density=debug_route_density,
         use_w8a8=use_w8a8,
     )
-    transformer_options = patched.model_options.setdefault("transformer_options", {})
-    if layout_status.required:
-        transformer_options[ATTENTION_LAYOUT_REQUIREMENT_KEY] = layout_status.model_kind
-        if not layout_status.installed:
-            LOG.warning(
-                "%s sparse attention will stay dense because its runtime "
-                "layout provider could not be installed: %s",
-                layout_status.model_kind,
-                layout_status.reason,
-            )
-    transformer_options["optimized_attention_override"] = override
-    prepared_executor = getattr(override, "prepared_attention_executor", None)
-    if callable(prepared_executor):
-        transformer_options[ATTENTION_EXECUTOR_KEY] = prepared_executor
-        site_status = ensure_prepared_attention_sites(patched, patched.load_device)
-        if site_status.matched and site_status.reason is not None:
-            LOG.info(
-                "%s prepared-attention fusion was not installed: %s",
-                site_status.model_kind,
-                site_status.reason,
-            )
-    else:
-        transformer_options.pop(ATTENTION_EXECUTOR_KEY, None)
-    transformer_options["turing_utils_attention_backend"] = "sol_sparse_attn"
-    transformer_options["turing_utils_attention_implementation"] = (
-        "bundled_sol_sparse"
+    patched = install_sparse_attention_override(
+        model,
+        override,
+        strategy="Sol sparse",
+        backend="sol_sparse_attn",
+        implementation="bundled_sol_sparse",
     )
+    patched = patched.model
     dense_implementation = getattr(
         override,
         "turing_utils_dense_implementation",
@@ -1762,10 +1738,8 @@ def apply_sla_attention_patch(
     debug_route_density: bool = False,
     use_w8a8: bool = SPARSE_USE_W8A8,
 ):
-    patched = model.clone()
-    layout_status = ensure_attention_layout_provider(patched)
     override = make_sla_attention_override(
-        patched.load_device,
+        model.load_device,
         min_sequence_tokens=min_sequence_tokens,
         sparsity_ratio=sparsity_ratio,
         prefix_policy=prefix_policy,
@@ -1780,33 +1754,14 @@ def apply_sla_attention_patch(
         debug_route_density=debug_route_density,
         use_w8a8=use_w8a8,
     )
-    transformer_options = patched.model_options.setdefault("transformer_options", {})
-    if layout_status.required:
-        transformer_options[ATTENTION_LAYOUT_REQUIREMENT_KEY] = layout_status.model_kind
-        if not layout_status.installed:
-            LOG.warning(
-                "%s SLA attention will stay dense because its runtime layout "
-                "provider could not be installed: %s",
-                layout_status.model_kind,
-                layout_status.reason,
-            )
-    transformer_options["optimized_attention_override"] = override
-    prepared_executor = getattr(override, "prepared_attention_executor", None)
-    if callable(prepared_executor):
-        transformer_options[ATTENTION_EXECUTOR_KEY] = prepared_executor
-        site_status = ensure_prepared_attention_sites(patched, patched.load_device)
-        if site_status.matched and site_status.reason is not None:
-            LOG.info(
-                "%s prepared-attention fusion was not installed: %s",
-                site_status.model_kind,
-                site_status.reason,
-            )
-    else:
-        transformer_options.pop(ATTENTION_EXECUTOR_KEY, None)
-    transformer_options["turing_utils_attention_backend"] = "sla_sparse_attn"
-    transformer_options["turing_utils_attention_implementation"] = (
-        "bundled_sla_sparse"
+    patched = install_sparse_attention_override(
+        model,
+        override,
+        strategy="SLA",
+        backend="sla_sparse_attn",
+        implementation="bundled_sla_sparse",
     )
+    patched = patched.model
     LOG.info(
         "SLA sparse attention patch enabled: sparsity_ratio=%.2f "
         "topology=128x64 smooth_k=True prefix_policy=%s manual_prefix=%d "

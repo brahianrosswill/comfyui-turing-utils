@@ -8,7 +8,7 @@ import torch
 import comfy.sd
 
 from ..attention import attention_backend_choices
-from ..quantization import convrot as service
+from ..loading import convrot as service
 
 
 class ConvRotDiffusionModelLoader:
@@ -17,7 +17,7 @@ class ConvRotDiffusionModelLoader:
         return {
             "required": {
                 "unet_name": (
-                    service._convrot_model_names(service.DIFFUSION_FOLDER_NAME),
+                    service.convrot_model_names(service.DIFFUSION_FOLDER_NAME),
                     {
                         "tooltip": (
                             "ConvRot DiT file from ComfyUI/models/diffusion_models. "
@@ -64,7 +64,7 @@ class ConvRotDiffusionModelLoader:
         force_int8_gemm: bool = False,
         patch_attention: str = "w8a8",
     ):
-        model_path = service._resolve_convrot_model_path(
+        model_path = service.resolve_convrot_model_path(
             service.DIFFUSION_FOLDER_NAME, unet_name
         )
         return (
@@ -79,7 +79,7 @@ class ConvRotDiffusionModelLoader:
 class ConvRotCLIPLoader:
     @classmethod
     def INPUT_TYPES(cls):
-        official_inputs = service._official_clip_loader_inputs()
+        official_inputs = service.official_clip_loader_inputs()
         official_required = official_inputs["required"]
         if "clip_name" not in official_required or "type" not in official_required:
             raise RuntimeError(
@@ -121,7 +121,7 @@ class ConvRotCLIPLoader:
         force_int8_gemm: bool = False,
         device: str = "default",
     ):
-        clip_types = service._official_clip_types()
+        clip_types = service.official_clip_types()
         if type not in clip_types:
             raise ValueError(f"Unsupported ConvRot CLIP type {type!r}; expected one of {clip_types}")
         if device not in {"default", "cpu"}:
@@ -134,7 +134,7 @@ class ConvRotCLIPLoader:
         if device == "cpu":
             model_options["load_device"] = model_options["offload_device"] = torch.device("cpu")
 
-        model_path = service._resolve_convrot_model_path(
+        model_path = service.resolve_convrot_model_path(
             service.CLIP_FOLDER_NAME, clip_name
         )
         clip = service.load_convrot_clip(

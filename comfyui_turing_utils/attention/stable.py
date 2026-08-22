@@ -8,7 +8,8 @@ from collections.abc import Callable
 
 import torch
 
-from ..kernel_api import kernel_version, load_turing_sage
+from ..kernel_api import load_turing_sage
+from ..runtime.capabilities import kernel_capabilities
 from ..hardware import (
     is_supported_attention_device as _is_supported_attention_device,
     is_supported_turing_device,
@@ -310,48 +311,19 @@ def _select_attention_backend(option: str) -> tuple[AttentionBackend, Callable]:
 
 
 def bundled_available() -> bool:
-    try:
-        turing_sage = load_turing_sage()
-    except (ImportError, OSError):
-        return False
-    return bool(turing_sage.available())
+    return kernel_capabilities().supports("stable_sage").supported
 
 
 def bundled_sparse_available() -> bool:
-    try:
-        turing_sage = load_turing_sage()
-    except (ImportError, OSError):
-        return False
-    version = kernel_version()
-    try:
-        version_tuple = tuple(int(part) for part in version.split(".")[:3])
-    except ValueError:
-        return False
-    return version_tuple >= (0, 23, 0) and turing_sage.sparse_available()
+    return kernel_capabilities().supports("sol").supported
 
 
 def bundled_sla_available() -> bool:
-    try:
-        turing_sage = load_turing_sage()
-    except (ImportError, OSError):
-        return False
-    try:
-        version_tuple = tuple(int(part) for part in kernel_version().split(".")[:3])
-    except ValueError:
-        return False
-    return version_tuple >= (0, 29, 1) and turing_sage.sla_available()
+    return kernel_capabilities().supports("sla").supported
 
 
 def bundled_w8a8_available() -> bool:
-    try:
-        turing_sage = load_turing_sage()
-    except (ImportError, OSError):
-        return False
-    try:
-        version_tuple = tuple(int(part) for part in kernel_version().split(".")[:3])
-    except ValueError:
-        return False
-    return version_tuple >= (0, 23, 0) and turing_sage.w8a8_available()
+    return kernel_capabilities().supports("dense_w8a8").supported
 
 
 def _sageattn(*args, **kwargs):
@@ -369,36 +341,15 @@ def _sol_sparse_sageattn(*args, **kwargs):
 
 
 def split_prequantization_available() -> bool:
-    try:
-        version_tuple = tuple(int(part) for part in kernel_version().split(".")[:3])
-        return version_tuple >= (0, 20, 0) and load_turing_sage().split_prequantization_available()
-    except (ImportError, OSError, ValueError, AttributeError):
-        return False
+    return kernel_capabilities().supports("split_prequantization").supported
 
 
 def fused_qk_preprocessing_available() -> bool:
-    try:
-        version_tuple = tuple(int(part) for part in kernel_version().split(".")[:3])
-        return (
-            version_tuple >= (0, 22, 0)
-            and load_turing_sage().fused_qk_preprocessing_available()
-        )
-    except (ImportError, OSError, ValueError, AttributeError):
-        return False
+    return kernel_capabilities().supports("fused_qk").supported
 
 
 def reusable_k_anchor_available() -> bool:
-    try:
-        version_tuple = tuple(int(part) for part in kernel_version().split(".")[:3])
-        return (
-            version_tuple >= (0, 30, 0)
-            and fused_qk_preprocessing_available()
-            and callable(
-                getattr(load_turing_sage(), "precompute_rms_rope_k_anchor", None)
-            )
-        )
-    except (ImportError, OSError, ValueError, AttributeError):
-        return False
+    return kernel_capabilities().supports("reusable_k_anchor").supported
 
 
 def precompute_turing_k_anchor(

@@ -266,7 +266,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
             ),
             mock.patch(
                 "comfyui_turing_utils.adapters.minimax.acceleration.decide_activation_chunks",
-                return_value=SimpleNamespace(streamed=False),
+                return_value=SimpleNamespace(streamed=False, chunk_rows=0),
             ),
             mock.patch(
                 "comfyui_turing_utils.adapters.minimax.acceleration.fused_convrot_linear_input_act",

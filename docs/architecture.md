@@ -15,9 +15,11 @@ comfyui-turing-utils/
 ├── attention.py                 # sole legacy Python compatibility facade
 ├── comfyui_turing_utils/
 │   ├── attention/               # dense/sparse backends, layout and patches
-│   ├── quantization/            # ConvRot loading, dispatch and fusions
+│   ├── quantization/            # ConvRot formats, dispatch and fusions
+│   ├── loading/                 # ComfyUI model/CLIP construction orchestration
 │   ├── adapters/                # MiniMax, Wan and Bernini integration
 │   ├── nodes/                   # thin ComfyUI schemas
+│   ├── runtime/                 # device/kernel capability resolution and diagnostics
 │   ├── hardware.py
 │   ├── kernel_api.py            # independent-kernel boundary
 │   ├── precision.py
@@ -43,9 +45,11 @@ genuinely new responsibility.
 ```text
 ComfyUI registration and nodes
         ↓
-attention / quantization services   ←   model adapters
-        ↓                                    ↓
-        └──────── kernel_api / hardware ─────┘
+loading orchestration ─────────────→ model adapters
+        ↓                              ↓
+attention / quantization services ←────┘
+        ↓
+runtime capabilities / hardware / kernel_api
                          ↓
           comfyui-turing-utils-kernel
 ```
@@ -62,19 +66,24 @@ built-in adapters without importing ComfyUI node definitions.
 | `attention/sparse.py` | production Sol policy, exact modality protection, and W8A8/FP16 PV dispatch |
 | `attention/protocol.py` | versioned tensor ownership, transform, capability, and execution contract |
 | `attention/integration.py` | model-neutral projected-QKV handoff and attention-site registry |
+| `attention/orchestration.py` | shared sparse ModelPatcher/layout/executor installation mechanics |
 | `attention/layout.py` | versioned Query/KV modality topology contract and provider registry |
 | `attention/patches.py` | attention overrides and loader-independent ModelPatcher installation |
 | `attention/tuning.py` | explicit experimental launch/quantization policy metadata |
-| `quantization/convrot.py` | ConvRot metadata parsing and model/CLIP loading services |
+| `quantization/convrot.py` | ConvRot metadata parsing and loaded-module format inspection |
 | `quantization/dispatch.py` | W8A8/W4A8/W4A4 activation quantization and GEMM dispatch |
 | `quantization/fusions.py` | model-independent fused activation and normalization operations |
-| `adapters/minimax/` | H3 layout publication, VRAM planning, and block fusions |
+| `loading/convrot.py` | filesystem discovery, Comfy model construction, runtime preparation, and adapter installation |
+| `runtime/capabilities.py` | immutable device facts plus independently versioned kernel feature probes |
+| `adapters/memory.py` | common quantized workspace scan and BaseModel memory-hook installation |
+| `adapters/minimax/` | H3 layout publication, reference services, VAE pipelines, VRAM planning, and block fusions |
 | `adapters/wan.py` | Wan/Bernini packed-context planning and supported self-attention preprocessing |
 | `adapters/wan_layout.py` | loader-independent Wan/Bernini self-attention sequence semantics |
 | `adapters/bernini.py` | Bernini context-window and absolute-RoPE integration |
 | `nodes/` | thin ComfyUI schemas and calls into the implementation packages |
 
-`hardware.py` owns architecture predicates. `kernel_api.py` is the only module
+`hardware.py` owns architecture facts. `runtime/capabilities.py` combines those
+facts with operator-level ABI probes without launching CUDA. `kernel_api.py` is the only module
 allowed to import the independently installed kernel package. `registration.py`
 is the only node mapping table.
 

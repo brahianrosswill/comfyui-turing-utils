@@ -6,9 +6,9 @@ import comfy.model_management
 
 from ..adapters.minimax.video_vae import (
     decode_video,
-    encode_video,
     require_h3_video_vae,
 )
+from ..adapters.minimax.video_vae_encode import encode_video
 
 
 class MiniMaxH3VideoVAEDecode:

@@ -194,7 +194,7 @@ MiniMax-specific integration is isolated
 under `comfyui_turing_utils/adapters/minimax/`, including packed-sequence VRAM
 planning for text, keyframes, and multimodal references. Wan/Bernini integration
 is isolated under `comfyui_turing_utils/adapters/`; it adds batch-aware,
-per-reference-padded VRAM planning and, for supported Turing attention calls,
+per-reference-padded VRAM planning and, for supported Tensor Core attention calls,
 the same single-owner Q/K/V lifetime and fused RMSNorm+RoPE+INT8 preprocessing
 used by H3. This includes explicitly selected Sol calls; Sol remains opt-in.
 Generic dtype, attention, and fused operators remain model-independent.
@@ -313,6 +313,8 @@ python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark
 python kernel/scripts/validate_compatible.py --device cuda:0 --benchmark --sol
 python kernel/scripts/release_gate.py --build --device cuda:0
 python kernel/scripts/benchmark_backends.py --device cuda:0 --suite all
+python kernel/scripts/diagnose_runtime.py --device cuda:0
+python kernel/scripts/benchmark_arch_matrix.py --devices 0,1 --suite all
 ```
 
 Compatible A40 runs validate numerical behavior and allocation shapes but do
@@ -320,6 +322,14 @@ not replace final exact-sm75 occupancy and end-to-end testing.
 For native A40 validation, build with
 `COMFYUI_TURING_UTILS_ARCH_LIST="8.6"`; this emits sm86 cubins and enables the
 Ampere async-copy and INT8 MMA specializations rather than JITing compute_75.
+
+`diagnose_runtime.py` reports hardware shared-memory limits, installed kernel
+ABI features, and live allocator state as JSON. `benchmark_arch_matrix.py`
+runs identical arguments serially on multiple local GPUs and writes one JSON
+artifact, so a 2080 Ti and 3070 build can be compared without mixing warmups,
+shapes, or backend scope. Capability checks inspect the compiled extension's
+real symbols as well as its Python version, so a stale editable-build binary
+is reported and safely excluded from scheduling instead of failing mid-run.
 
 ## License
 

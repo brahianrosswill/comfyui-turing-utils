@@ -301,7 +301,7 @@ def _sparse_dense_layer(
     )
 
 
-def inspect_sol_attention_call(
+def _inspect_sparse_attention_call(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -313,13 +313,17 @@ def inspect_sol_attention_call(
     min_sequence_tokens: int,
     prefix_policy: str,
     manual_prefix_tokens: int,
-    skipped_residual: str,
     sparse_reference_image: bool,
     sparse_reference_video: bool,
     sparse_reference_audio: bool,
     transformer_options,
     kwargs: dict,
-) -> tuple[SolAttentionCall | None, str | None]:
+    reject_fully_protected_query: bool,
+) -> tuple[
+    tuple[AttentionCall, int, tuple[tuple[int, int], ...], tuple[tuple[int, int], ...]]
+    | None,
+    str | None,
+]:
     call, reason = inspect_turing_attention_call(
         q,
         k,
@@ -345,11 +349,6 @@ def inspect_sol_attention_call(
         call.key_tokens,
     ):
         return None, "required semantic attention layout metadata is unavailable"
-    residual_subblocks = {"1x64": 1, "2x32": 2}.get(
-        str(skipped_residual).strip().lower()
-    )
-    if residual_subblocks is None:
-        raise ValueError("skipped_residual must be 1x64 or 2x32")
     dense_query_ranges = _sparse_protected_ranges(
         prefix_policy,
         manual_prefix_tokens,
@@ -360,6 +359,12 @@ def inspect_sol_attention_call(
         sparse_reference_audio=bool(sparse_reference_audio),
         axis="query",
     )
+    if (
+        reject_fully_protected_query
+        and sum(stop - start for start, stop in dense_query_ranges)
+        >= call.query_tokens
+    ):
+        return None, "all Query tokens are protected"
     exact_kv_ranges = _sparse_protected_ranges(
         prefix_policy,
         manual_prefix_tokens,
@@ -370,6 +375,54 @@ def inspect_sol_attention_call(
         sparse_reference_audio=bool(sparse_reference_audio),
         axis="key",
     )
+    return (call, effective_min_sequence, dense_query_ranges, exact_kv_ranges), None
+
+
+def inspect_sol_attention_call(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    heads: int,
+    *,
+    mask,
+    skip_reshape: bool,
+    skip_output_reshape: bool,
+    min_sequence_tokens: int,
+    prefix_policy: str,
+    manual_prefix_tokens: int,
+    skipped_residual: str,
+    sparse_reference_image: bool,
+    sparse_reference_video: bool,
+    sparse_reference_audio: bool,
+    transformer_options,
+    kwargs: dict,
+) -> tuple[SolAttentionCall | None, str | None]:
+    common, reason = _inspect_sparse_attention_call(
+        q,
+        k,
+        v,
+        heads,
+        mask=mask,
+        skip_reshape=skip_reshape,
+        skip_output_reshape=skip_output_reshape,
+        min_sequence_tokens=min_sequence_tokens,
+        prefix_policy=prefix_policy,
+        manual_prefix_tokens=manual_prefix_tokens,
+        sparse_reference_image=sparse_reference_image,
+        sparse_reference_video=sparse_reference_video,
+        sparse_reference_audio=sparse_reference_audio,
+        transformer_options=transformer_options,
+        kwargs=kwargs,
+        reject_fully_protected_query=False,
+    )
+    if reason is not None:
+        return None, reason
+    residual_subblocks = {"1x64": 1, "2x32": 2}.get(
+        str(skipped_residual).strip().lower()
+    )
+    if residual_subblocks is None:
+        raise ValueError("skipped_residual must be 1x64 or 2x32")
+    call, effective_min_sequence, dense_query_ranges, exact_kv_ranges = common
     return SolAttentionCall(
         attention=call,
         effective_min_sequence=effective_min_sequence,
@@ -397,7 +450,7 @@ def inspect_sla_attention_call(
     transformer_options,
     kwargs: dict,
 ) -> tuple[SlaAttentionCall | None, str | None]:
-    call, reason = inspect_turing_attention_call(
+    common, reason = _inspect_sparse_attention_call(
         q,
         k,
         v,
@@ -405,45 +458,19 @@ def inspect_sla_attention_call(
         mask=mask,
         skip_reshape=skip_reshape,
         skip_output_reshape=skip_output_reshape,
-        enable_gqa=bool(kwargs.get("enable_gqa", False)),
-        low_precision_attention=kwargs.get("low_precision_attention", True),
-        is_causal=bool(kwargs.get("is_causal", False)),
-        kernel="sol",
-        require_long_sequence=True,
+        min_sequence_tokens=min_sequence_tokens,
+        prefix_policy=prefix_policy,
+        manual_prefix_tokens=manual_prefix_tokens,
+        sparse_reference_image=sparse_reference_image,
+        sparse_reference_video=sparse_reference_video,
+        sparse_reference_audio=sparse_reference_audio,
+        transformer_options=transformer_options,
+        kwargs=kwargs,
+        reject_fully_protected_query=True,
     )
     if reason is not None:
         return None, reason
-    effective_min_sequence = min_sequence_tokens or SPARSE_AUTO_MIN_SEQUENCE
-    if call.query_tokens < effective_min_sequence or call.key_tokens < effective_min_sequence:
-        return None, f"sequences shorter than {effective_min_sequence} tokens"
-    if _required_sparse_layout_missing(
-        transformer_options,
-        call.query_tokens,
-        call.key_tokens,
-    ):
-        return None, "required semantic attention layout metadata is unavailable"
-    dense_query_ranges = _sparse_protected_ranges(
-        prefix_policy,
-        manual_prefix_tokens,
-        transformer_options,
-        call.query_tokens,
-        sparse_reference_image=bool(sparse_reference_image),
-        sparse_reference_video=bool(sparse_reference_video),
-        sparse_reference_audio=bool(sparse_reference_audio),
-        axis="query",
-    )
-    if sum(stop - start for start, stop in dense_query_ranges) >= call.query_tokens:
-        return None, "all Query tokens are protected"
-    exact_kv_ranges = _sparse_protected_ranges(
-        prefix_policy,
-        manual_prefix_tokens,
-        transformer_options,
-        call.key_tokens,
-        sparse_reference_image=bool(sparse_reference_image),
-        sparse_reference_video=bool(sparse_reference_video),
-        sparse_reference_audio=bool(sparse_reference_audio),
-        axis="key",
-    )
+    call, effective_min_sequence, dense_query_ranges, exact_kv_ranges = common
     return SlaAttentionCall(
         attention=call,
         effective_min_sequence=effective_min_sequence,

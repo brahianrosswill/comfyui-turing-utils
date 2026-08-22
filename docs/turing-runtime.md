@@ -1,13 +1,14 @@
-# Turing runtime flow
+# Capability-based CUDA runtime flow
 
-The Turing path is a generic runtime capability. Model adapters only connect
+The historical Turing path is now a generic runtime capability. Model adapters only connect
 MiniMax or Wan/Bernini block structure to those capabilities.
 
 ```text
 checkpoint metadata
   -> quantization summary
-  -> prepare exact-sm75 runtime and run kernel self-tests
-  -> replace an unsupported-FP16 model's sm75 FP32 fallback with BF16
+  -> resolve hardware facts and the compiled operator ABI
+  -> preflight only the selected supported kernels
+  -> on exact sm75, replace an unsupported-FP16 model's FP32 fallback with BF16
   -> ComfyUI constructs the ModelPatcher
   -> when BF16 was selected, normalize ConvRot logical dtype without copying packed data
   -> install optional model adapter object patches
@@ -23,15 +24,17 @@ not skip attention or quantized-kernel preflight.
 
 | Module | Scope |
 |---|---|
-| `comfyui_turing_utils/precision.py` | BF16 selection, Kitchen contract, exact-sm75 preflight |
+| `comfyui_turing_utils/precision.py` | BF16 selection and the exact-sm75 precision compatibility rule |
+| `comfyui_turing_utils/runtime/` | device facts, real compiled-symbol capability resolution, and diagnostics |
+| `comfyui_turing_utils/loading/` | ConvRot discovery, Comfy construction, preflight, and adapter installation |
 | `comfyui_turing_utils/attention/` | prepared-attention protocol, stable Sage, sparse policies, semantic layout, and patches |
 | `comfyui_turing_utils/nodes/attention.py` | model-independent production Sol patch UI and explicit kernel tuning |
-| `comfyui_turing_utils/quantization/` | exact-sm75 W8/W4 dispatch, ConvRot loading, and generic fusions |
+| `comfyui_turing_utils/quantization/` | sm75+ W8/W4 format inspection, dispatch, and generic fusions |
 | `comfyui_turing_utils/adapters/minimax/` | MiniMax layout, packed-sequence planning, and fusions |
 | `comfyui_turing_utils/adapters/wan.py` | Wan/Bernini context-aware planning and Q/K preprocessing hooks |
 | `comfyui_turing_utils/adapters/wan_layout.py` | Wan/Bernini semantic attention-layout provider |
 | `comfyui_turing_utils/kernel_api.py` | sole lazy boundary to the independently installed kernel package |
-| `kernel/csrc/turing` | separately installed Turing kernels, including bundled Sage |
+| `kernel/csrc/turing` | historical source path for separately installed sm75+ kernels and exact-sm75 Sage |
 
 ## Linear matrix
 

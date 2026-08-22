@@ -13,6 +13,7 @@ from collections.abc import Sequence
 import torch
 
 from ..methods import OriginalMethod, weak_method
+from ..memory import install_memory_hooks, scan_quantized_workspaces
 from ...attention.integration import AttentionSiteStatus, execute_projected_attention
 from ...attention.protocol import (
     QKTransformSpec,
@@ -59,7 +60,7 @@ from ...quantization.dispatch import (
     quantize_convrot_int8_activation,
     quantize_convrot_swiglu_activation,
     quantize_convrot_swiglu_with_scale,
-    turing_codebook_w4a8_workspace_bytes,
+    convrot_swiglu_channel_sharding_available,
     turing_int8_workspace_bytes,
 )
 
@@ -321,52 +322,27 @@ _make_outer_sample_wrapper = make_minimax_runtime_context_wrapper
 def _linear_workspace_requirements(
     root: torch.nn.Module,
 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    outputs = set()
-    fixed_workspaces = set()
-    for module in root.modules():
-        weight = getattr(module, "weight", None)
-        kind = convrot_weight_kind(weight)
-        if kind == "w8a8" and getattr(weight, "ndim", 0) == 2:
-            outputs.add(int(weight.shape[0]))
-        elif kind == "codebook_w4a8" and getattr(weight, "ndim", 0) == 2:
-            fixed_workspaces.add(
-                turing_codebook_w4a8_workspace_bytes(
-                    int(weight.shape[1]),
-                    int(weight.shape[0]),
-                )
-            )
-    return tuple(sorted(outputs)), tuple(sorted(fixed_workspaces))
+    profile = scan_quantized_workspaces(root, convrot_weight_kind)
+    return profile.w8_output_channels, profile.fixed_workspaces
 
 
 def _install_memory_planning(model, base_model, diffusion_model) -> bool:
-    if getattr(base_model, _MEMORY_ADAPTER_ATTR, False):
-        return False
-    if not all(
-        callable(getattr(base_model, name, None))
-        for name in (
-            "extra_conds",
-            "extra_conds_shapes",
-            "memory_required",
-            "get_dtype_inference",
-        )
-    ) or not hasattr(model, "add_wrapper_with_key"):
-        return False
-
-    base_model.extra_conds = _make_extra_conds(base_model, diffusion_model)
-    base_model.extra_conds_shapes = _make_extra_conds_shapes(
-        base_model, diffusion_model
-    )
-    factors = tuple(getattr(base_model, "memory_usage_factor_conds", ()))
-    if _MEMORY_SHAPE_KEY not in factors:
-        base_model.memory_usage_factor_conds = (*factors, _MEMORY_SHAPE_KEY)
     outputs, fixed_workspaces = _linear_workspace_requirements(base_model)
-    base_model.memory_required = _make_memory_required(
+    installed = install_memory_hooks(
         base_model,
-        outputs,
-        fixed_workspaces,
+        marker=_MEMORY_ADAPTER_ATTR,
+        condition_key=_MEMORY_SHAPE_KEY,
+        extra_conds=_make_extra_conds(base_model, diffusion_model),
+        extra_conds_shapes=_make_extra_conds_shapes(base_model, diffusion_model),
+        memory_required=_make_memory_required(
+            base_model,
+            outputs,
+            fixed_workspaces,
+        ),
+        required_methods=("get_dtype_inference",),
     )
-
-    setattr(base_model, _MEMORY_ADAPTER_ATTR, True)
+    if not installed:
+        return False
     LOG.info(
         "Enabled MiniMax packed-sequence VRAM planning: W8 outputs=[%s] fixed_workspaces=[%s MiB]",
         ",".join(map(str, outputs)) or "none",
@@ -1683,20 +1659,21 @@ def _make_mlp_forward(mlp: torch.nn.Module, audit: _RuntimeDispatchAudit):
             hidden_size=int(x.shape[-1]),
             expanded_size=expanded_size,
         )
-        channel_decision = decide_ffn_channels(
-            x,
-            expanded_size=expanded_size,
-            chunk_rows=decision.chunk_rows,
-        )
-        if channel_decision.sharded:
-            output = _stream_mlp_channels(
-                self,
+        if convrot_swiglu_channel_sharding_available():
+            channel_decision = decide_ffn_channels(
                 x,
-                chunk_rows=channel_decision.chunk_rows,
-                chunk_channels=channel_decision.chunk_channels,
+                expanded_size=expanded_size,
+                chunk_rows=decision.chunk_rows,
             )
-            if output is not None:
-                return output
+            if channel_decision.sharded:
+                output = _stream_mlp_channels(
+                    self,
+                    x,
+                    chunk_rows=channel_decision.chunk_rows,
+                    chunk_channels=channel_decision.chunk_channels,
+                )
+                if output is not None:
+                    return output
         if decision.streamed:
             return _stream_mlp(self, x, decision.chunk_rows)
         return fused_convrot_linear_input_act(

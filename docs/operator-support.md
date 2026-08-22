@@ -53,7 +53,7 @@ implementation.
 | Attention | `sla_attention` | Native sm75+ 128x64 fixed-Top-K SLA routing with FP16/BF16-PV or INT8-PV |
 
 W4A4 and the main W8A8 linear contraction deliberately reuse Comfy Kitchen or
-cuBLAS. The local package supplies the Turing-specific quantization, BF16
+cuBLAS. The local package supplies sm75+-capable quantization, BF16
 epilogue, activation fusions, dispatch, and W4A8 contraction. It does not carry
 duplicate full W4A4 and W8A8 GEMM implementations.
 
@@ -95,8 +95,9 @@ Query row and therefore cannot change Top-K ordering.
 
 The D64 attention specializations use 16 KiB shared memory and D128 uses 32
 KiB. The long-key 128-token schedule reuses a 64-token shared tile rather than
-doubling the CTA allocation. Exact occupancy and throughput still require a
-real SM75 profile.
+doubling the CTA allocation. Exact occupancy and throughput require a profile
+on every accepted native architecture; one GPU's result is never reused as
+another GPU's launch policy.
 
 ## Quantized linear support
 
@@ -232,13 +233,13 @@ the final choice is based on measured latency on the target device.
 | fc2/out_proj gate + residual epilogue | not implemented | high-value H3 adapter work, but requires a contraction-owned epilogue rather than another post-GEMM kernel |
 | Head/layer/step-specific Sol policy | not implemented | useful only behind calibration and visual/audio gates; do not replace the stable global policy without H3 data |
 | Route reuse and hysteresis | not implemented | potentially useful, but must justify route-state memory and avoid cross-prompt state leakage |
-| Kitchen versus bundled SM75 A/B | directionally tested on A40 | final backend policy still requires exact-SM75 profiling |
+| Kitchen versus bundled native A/B | directionally tested on A40 | final policy requires matched sm75 and sm86 runs with native cubins |
 | H3 trajectory block cache | experimental node | profile-driven standard, 4-step, and 8-step policies reuse one exact residual; sampler branches are isolated, skipped weights are omitted from Dynamic VRAM prefetch, and storage honors ComfyUI's GPU reserve/pinned-memory lifecycle; it remains opt-in because block skipping is inherently approximate |
 | Spectrum-style transformer skipping | not integrated | replay memory and audio workflow cost conflict with the Turing/dynamic-VRAM target |
 
 The next production-oriented order is: gated fc2/out-projection epilogues,
 calibration tooling for head/layer/step Sol
-budgets, then real-Turing backend A/B. The first two target tensor traffic in
+budgets, then matched native sm75/sm86 backend A/B. The first two target tensor traffic in
 the MLP/projection-heavy part of H3 and therefore have a higher whole-model
 ceiling than another dense attention variant.
 
@@ -247,8 +248,8 @@ because that binary requires a newer CUDA driver. The repeatable benchmark
 reports this as an unavailable comparison instead of substituting a different
 kernel. Bundled Sage was compared against external Sage and the historical
 pre-refactor bundled image; the stable main loop stayed within about 0.1% of
-the historical image. Exact-sm75 Kitchen/bundled A/B therefore remains an
-explicit release-machine task, not an inferred result.
+the historical image. Matched native sm75/sm86 Kitchen/bundled A/B therefore
+remains an explicit release-machine task, not an inferred result.
 
 `kernel/scripts/benchmark_backends.py` is the repeatable backend regression
 gate. It reports prequantized and end-to-end scopes separately for H3 QKV/fc1/
@@ -257,6 +258,7 @@ is compatible, bundled/external attention implementations, and SDPA. Its
 preprocess suite separately measures A8/A4 ConvRot quantization, fused
 SwiGLU/tanh-GELU input activation, RMSNorm/LayerNorm+AdaLN, and the BF16
 epilogue, so Python/eager regressions cannot be misreported as GEMM or attention
-regressions. On a newer GPU, build with
-`COMFYUI_TURING_UTILS_ARCH_LIST="7.5+PTX"` before using its numbers as a Turing
-direction check.
+regressions. Build with `COMFYUI_TURING_UTILS_ARCH_LIST` set to every target
+architecture before using the numbers for release decisions.
+`benchmark_arch_matrix.py` runs identical arguments serially on all listed
+devices and stores one JSON comparison artifact.

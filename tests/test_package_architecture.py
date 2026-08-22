@@ -45,6 +45,44 @@ class PackageArchitectureTest(unittest.TestCase):
         self.assertNotIn("adapters.minimax", source)
         self.assertIn("ensure_attention_layout_provider", source)
 
+    def test_convrot_quantization_does_not_orchestrate_model_loading(self):
+        path = ROOT / "comfyui_turing_utils" / "quantization" / "convrot.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        imported = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.append(node.module or "")
+        self.assertFalse(any("adapters" in name for name in imported))
+        self.assertFalse(any("attention" in name for name in imported))
+        self.assertFalse(any(name == "folder_paths" for name in imported))
+        self.assertTrue((ROOT / "comfyui_turing_utils" / "loading" / "convrot.py").is_file())
+
+    def test_h3_services_are_separate_from_node_schemas(self):
+        node_source = (
+            ROOT / "comfyui_turing_utils" / "nodes" / "minimax_references.py"
+        ).read_text(encoding="utf-8")
+        service_source = (
+            ROOT
+            / "comfyui_turing_utils"
+            / "adapters"
+            / "minimax"
+            / "references.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("torchaudio", node_source)
+        self.assertNotIn("@dataclass", node_source)
+        self.assertNotIn("comfy_api", service_source)
+        self.assertTrue(
+            (
+                ROOT
+                / "comfyui_turing_utils"
+                / "adapters"
+                / "minimax"
+                / "video_vae_encode.py"
+            ).is_file()
+        )
+
     def test_builtin_model_adapters_are_registered_once(self):
         from comfyui_turing_utils.adapters.registry import registered_model_adapters
 

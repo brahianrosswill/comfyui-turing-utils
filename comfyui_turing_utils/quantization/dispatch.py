@@ -7,7 +7,11 @@ import sys
 
 import torch
 
-from ..hardware import is_supported_tensor_core_device, is_supported_turing_device
+from ..hardware import (
+    device_capabilities,
+    is_supported_tensor_core_device,
+    is_supported_turing_device,
+)
 from ..kernel_api import load_kernel_extension, load_kernel_package
 
 
@@ -58,6 +62,11 @@ def _kernel_available(name: str = "turing_w4a8_linear") -> bool:
     except (ImportError, OSError):
         return False
     return hasattr(extension, name)
+
+
+def convrot_swiglu_channel_sharding_available() -> bool:
+    """Return whether exact two-pass channel streaming is in the real ABI."""
+    return _kernel_available("turing_swiglu_int8_convrot_quantize_scaled")
 
 
 def _kernel_op(name: str):
@@ -294,14 +303,22 @@ def _convrot_int8_shared_memory_bytes(rows: int, hidden_size: int) -> int:
     return (hidden_size + groups_in_flight * 2 * 256) * 4
 
 
-def _convrot_int8_bf16_rowbuffer_fits(hidden_size: int) -> bool:
+def _convrot_int8_bf16_rowbuffer_fits(
+    hidden_size: int,
+    device: torch.device | str | None = None,
+) -> bool:
+    shared_memory_limit = TURING_OPTIN_SHARED_MEMORY_LIMIT
+    if device is not None:
+        detected_limit = device_capabilities(device).optin_shared_memory_per_block
+        if detected_limit:
+            shared_memory_limit = detected_limit
     for block_threads in (1024, 768, 512):
         groups_in_flight = block_threads // 64
         dynamic_bytes = hidden_size * 2 + groups_in_flight * 2 * 256 * 4
         # ptxas reserves three additional aligned words around the static
         # warp-reduction arrays (80/112/144 bytes for 512/768/1024 threads).
         static_bytes = (block_threads // 32 + 4) * 4
-        if dynamic_bytes + static_bytes <= TURING_OPTIN_SHARED_MEMORY_LIMIT:
+        if dynamic_bytes + static_bytes <= shared_memory_limit:
             return True
     return False
 
@@ -334,7 +351,9 @@ def _quantize_turing_int8_activation(
         raise ValueError(f"unsupported fused INT8 activation: {input_act!r}")
     hidden_size = x2d.shape[1] // 2 if input_act == "swiglu" else x2d.shape[1]
     if input_act == "gelu_tanh":
-        if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(hidden_size):
+        if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(
+            hidden_size, x2d.device
+        ):
             try:
                 turing_bf16_gelu_int8_convrot_quantize = _kernel_op(
                     "turing_bf16_gelu_int8_convrot_quantize"
@@ -360,7 +379,9 @@ def _quantize_turing_int8_activation(
                 x2d, group_size, input_act="swiglu"
             )
         return kitchen_cuda.quantize_int8_rowwise_convrot64(x2d, group_size)
-    if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(hidden_size):
+    if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(
+        hidden_size, x2d.device
+    ):
         try:
             turing_bf16_int8_convrot_quantize = _kernel_op(
                 "turing_bf16_int8_convrot_quantize"
@@ -431,6 +452,11 @@ def quantize_convrot_swiglu_with_scale(
     scale: torch.Tensor,
     group_size: int = 256,
 ) -> torch.Tensor:
+    if not convrot_swiglu_channel_sharding_available():
+        raise RuntimeError(
+            "exact FFN channel sharding requires an updated "
+            "comfyui-turing-utils-kernel; reinstall the kernel package"
+        )
     operation = _kernel_op(
         "turing_swiglu_int8_convrot_quantize_scaled"
     )
@@ -450,7 +476,9 @@ def _quantize_turing_int4_activation(
         raise ValueError(f"unsupported fused INT4 activation: {input_act!r}")
     if input_act == "gelu_tanh":
         hidden_size = x2d.shape[1]
-        if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(hidden_size):
+        if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(
+            hidden_size, x2d.device
+        ):
             try:
                 turing_bf16_gelu_int4_convrot_quantize = _kernel_op(
                     "turing_bf16_gelu_int4_convrot_quantize"
@@ -473,7 +501,9 @@ def _quantize_turing_int4_activation(
         hidden_size = x2d.shape[1] // 2
         if x2d.shape[1] % 2 != 0:
             raise ValueError("SwiGLU input width must be even")
-        if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(hidden_size):
+        if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(
+            hidden_size, x2d.device
+        ):
             try:
                 turing_bf16_int4_convrot_quantize = _kernel_op(
                     "turing_bf16_int4_convrot_quantize"
@@ -501,7 +531,9 @@ def _quantize_turing_int4_activation(
     )
     if requested_shared < KITCHEN_DEFAULT_SHARED_MEMORY_LIMIT:
         return kitchen_cuda.quantize_int4_rowwise_convrot64(x2d, group_size)
-    if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(x2d.shape[1]):
+    if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(
+        x2d.shape[1], x2d.device
+    ):
         try:
             turing_bf16_int4_convrot_quantize = _kernel_op(
                 "turing_bf16_int4_convrot_quantize"

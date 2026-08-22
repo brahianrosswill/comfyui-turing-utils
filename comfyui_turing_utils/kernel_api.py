@@ -23,6 +23,20 @@ def load_turing_sage() -> ModuleType:
     return importlib.import_module(f"{KERNEL_PACKAGE}.turing_sage")
 
 
+def kernel_extension_has_symbol(name: str, extension: str = "_C") -> bool:
+    """Check the compiled ABI instead of trusting a Python wrapper or version.
+
+    Editable installs can temporarily pair newer Python sources with an older
+    extension binary.  Feature selection must therefore inspect the extension
+    that will execute the operation.
+    """
+    try:
+        module = load_kernel_extension(extension)
+    except (ImportError, OSError):
+        return False
+    return callable(getattr(module, name, None))
+
+
 def kernel_version(default: str = "0.0.0") -> str:
     try:
         package = load_kernel_package()
@@ -33,6 +47,7 @@ def kernel_version(default: str = "0.0.0") -> str:
 
 __all__ = [
     "KERNEL_PACKAGE",
+    "kernel_extension_has_symbol",
     "kernel_version",
     "load_kernel_extension",
     "load_kernel_package",

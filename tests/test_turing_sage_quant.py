@@ -220,6 +220,8 @@ class TuringSageQuantContractTest(unittest.TestCase):
                 "overlap_accumulate_compiled",
                 "overlap_blend_available",
                 "overlap_blend_compiled",
+                "precompute_rms_rope_k_anchor",
+                "prequantize_rms_rope_qk",
                 "prequantize_sageattn",
                 "prequantize_sla_sageattn",
                 "prequantize_sla_sageattn_from_qk",

@@ -10,6 +10,7 @@ from collections import Counter
 import torch
 
 from .methods import OriginalMethod, weak_method
+from .memory import install_memory_hooks, scan_quantized_workspaces
 from ..attention.integration import AttentionSiteStatus, execute_projected_attention
 from ..attention.protocol import (
     QKTransformSpec,
@@ -18,10 +19,9 @@ from ..attention.protocol import (
     prepared_attention_executor,
 )
 from ..attention.stable import fused_qk_preprocessing_available
+from ..hardware import is_supported_attention_device
 from ..profiling import CUDA_PHASE_PROFILER
 from ..quantization.dispatch import (
-    is_supported_turing_device,
-    turing_codebook_w4a8_workspace_bytes,
     turing_int8_workspace_bytes,
 )
 
@@ -156,8 +156,8 @@ def install_wan_attention_sites(model, device: torch.device) -> AttentionSiteSta
     diffusion_model = getattr(base_model, "diffusion_model", None)
     if not isinstance(diffusion_model, WanModel):
         return AttentionSiteStatus(None, 0, "not_wan")
-    if not is_supported_turing_device(device):
-        return AttentionSiteStatus("wan", 0, "not_supported_turing")
+    if not is_supported_attention_device(device):
+        return AttentionSiteStatus("wan", 0, "not_supported_tensor_core")
     if not callable(getattr(model, "add_object_patch", None)):
         return AttentionSiteStatus("wan", 0, "model_patcher_api_unavailable")
     if not fused_qk_preprocessing_available():
@@ -399,30 +399,17 @@ def _convrot_planning_kind(weight) -> str | None:
 def _quantized_wan_summary(
     diffusion_model,
 ) -> tuple[Counter, tuple[int, ...], tuple[int, ...]]:
-    formats = Counter()
-    w8_outputs = set()
-    fixed_workspaces = set()
-    for module in diffusion_model.modules():
-        weight = getattr(module, "weight", None)
-        kind = _convrot_planning_kind(weight)
-        if kind is None:
-            continue
-        formats[kind] += 1
-        if kind == "w8a8" and getattr(weight, "ndim", 0) == 2:
-            w8_outputs.add(int(weight.shape[0]))
-        elif kind == "codebook_w4a8" and getattr(weight, "ndim", 0) == 2:
-            fixed_workspaces.add(
-                turing_codebook_w4a8_workspace_bytes(
-                    int(weight.shape[1]),
-                    int(weight.shape[0]),
-                )
-            )
-    return formats, tuple(sorted(w8_outputs)), tuple(sorted(fixed_workspaces))
+    profile = scan_quantized_workspaces(diffusion_model, _convrot_planning_kind)
+    return (
+        Counter(dict(profile.formats)),
+        profile.w8_output_channels,
+        profile.fixed_workspaces,
+    )
 
 
 def apply_wan_adapter(model, device: torch.device) -> int:
     """Install Wan-specific planning without imposing input-size restrictions."""
-    if not is_supported_turing_device(device):
+    if not is_supported_attention_device(device):
         return 0
 
     try:
@@ -442,15 +429,21 @@ def apply_wan_adapter(model, device: torch.device) -> int:
     )
 
     patch_size = tuple(int(value) for value in diffusion_model.patch_size)
-    base_model.extra_conds = _make_extra_conds(base_model, patch_size)
-    base_model.extra_conds_shapes = _make_extra_conds_shapes(base_model, patch_size)
-    factors = tuple(getattr(base_model, "memory_usage_factor_conds", ()))
-    if _CONTEXT_SHAPE_KEY not in factors:
-        base_model.memory_usage_factor_conds = (*factors, _CONTEXT_SHAPE_KEY)
-    base_model.memory_required = _make_memory_required(
-        base_model, patch_size, w8_output_channels, fixed_workspaces
+    installed = install_memory_hooks(
+        base_model,
+        marker="_turing_utils_wan_adapter",
+        condition_key=_CONTEXT_SHAPE_KEY,
+        extra_conds=_make_extra_conds(base_model, patch_size),
+        extra_conds_shapes=_make_extra_conds_shapes(base_model, patch_size),
+        memory_required=_make_memory_required(
+            base_model,
+            patch_size,
+            w8_output_channels,
+            fixed_workspaces,
+        ),
     )
-    base_model._turing_utils_wan_adapter = True
+    if not installed:
+        return 0
 
     attention_fusions = install_wan_attention_sites(model, device).installed
 
@@ -464,7 +457,7 @@ def apply_wan_adapter(model, device: torch.device) -> int:
         )
 
     LOG.info(
-        "Enabled Wan Turing adapter: formats=[%s], context-aware VRAM planning, "
+        "Enabled Wan tensor-core adapter: formats=[%s], context-aware VRAM planning, "
         "w8_outputs=[%s], fixed_workspaces=[%s MiB], fused_qk_attention=%d",
         ",".join(f"{kind}:{count}" for kind, count in sorted(formats.items())),
         ",".join(map(str, w8_output_channels)) or "none",

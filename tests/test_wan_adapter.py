@@ -55,7 +55,7 @@ class WanMemoryPlanningTest(unittest.TestCase):
             mock.patch.object(wan_model, "WanSelfAttention", FakeSelfAttention),
             mock.patch.object(
                 wan_adapter,
-                "is_supported_turing_device",
+                "is_supported_attention_device",
                 return_value=True,
             ),
             mock.patch.object(
@@ -245,7 +245,7 @@ class WanMemoryPlanningTest(unittest.TestCase):
         patcher = SimpleNamespace(model=base)
         context = [torch.empty(1, 16, 3, 8, 8)]
         with (
-            mock.patch("comfyui_turing_utils.adapters.wan.is_supported_turing_device", return_value=True),
+            mock.patch("comfyui_turing_utils.adapters.wan.is_supported_attention_device", return_value=True),
             mock.patch(
                 "comfyui_turing_utils.adapters.wan._quantized_wan_summary",
                 return_value=(Counter({"w8a8": 2}), (4096,), ()),

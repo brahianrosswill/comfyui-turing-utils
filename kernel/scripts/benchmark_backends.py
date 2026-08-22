@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""Compare bundled SM75 kernels with Kitchen and other available backends.
+"""Compare bundled kernels with Kitchen and other available backends.
 
 The report deliberately separates prequantized contraction time from the
 end-to-end path.  Mixing those scopes was the source of several misleading
 historical comparisons: a fast GEMM can still lose after activation rotation,
 quantization, weight decode, output conversion, or an avoidable workspace.
 
-An Ampere GPU running the bundled compute_75 image is useful for regression
-screening only.  Kitchen and PyTorch use native Ampere kernels there, while the
-bundled package uses its SM75 schedule.  Backend selection and final acceptance
-therefore still require an exact-sm75 run.
+Each device loads the matching cubin from a multi-architecture build. Some
+portable ConvRot CUTLASS operators retain their SM75-compatible schedule on
+newer GPUs, while attention selects newer instruction paths at compile time;
+always compare both end-to-end and contraction-only scopes.
 """
 
 from __future__ import annotations
@@ -877,7 +877,7 @@ def benchmark_preprocessing(
 
             measurements = [
                 Measurement(
-                    "bundled SM75",
+                    "bundled native",
                     "end-to-end",
                     _elapsed_ms(bundled, warmup, repeats),
                 )
@@ -900,7 +900,7 @@ def benchmark_preprocessing(
                     for threads in (512, 768, 1024):
                         _append_optional(
                             measurements,
-                            f"bundled SM75 forced {threads} threads",
+                            f"bundled forced {threads} threads",
                             "geometry",
                             lambda threads=threads: core.turing_bf16_int8_convrot_quantize(
                                 x, 256, True, threads
@@ -933,7 +933,7 @@ def benchmark_preprocessing(
 
             int4_measurements = [
                 Measurement(
-                    "bundled SM75",
+                    "bundled native",
                     "end-to-end",
                     _elapsed_ms(bundled_int4, warmup, repeats),
                 )
@@ -1126,8 +1126,8 @@ def main() -> None:
     )
     if capability != (7, 5):
         print(
-            "WARNING: this is a directional comparison. Bundled kernels use "
-            "their compute_75 schedule while other backends may use native GPU features."
+            "NOTE: native cubin selected; portable linear schedules and "
+            "architecture-specialized attention are reported separately."
         )
     with torch.inference_mode(), torch.cuda.device(device):
         if args.suite == "quality":

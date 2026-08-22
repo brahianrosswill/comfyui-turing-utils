@@ -16,6 +16,7 @@ sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from comfyui_turing_utils.adapters.minimax import video_vae  # noqa: E402
+from comfyui_turing_utils.adapters.minimax import video_vae_encode  # noqa: E402
 from comfyui_turing_utils.attention.protocol import (  # noqa: E402
     ATTENTION_EXECUTOR_KEY,
     AttentionExecutionOutcome,
@@ -64,7 +65,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         x = torch.randn(1, 3, 2, 8, 8)
         with torch.inference_mode():
             expected = quant_conv(encoder(x.clone()))
-            actual = video_vae._encode_moments(
+            actual = video_vae_encode._encode_moments(
                 model,
                 x.clone(),
                 prefetch_dynamic_vbars=True,
@@ -101,13 +102,13 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             ) as pop_queue,
             torch.inference_mode(),
         ):
-            video_vae._encode_moments(
+            video_vae_encode._encode_moments(
                 model,
                 value,
                 prefetch_dynamic_vbars=True,
             )
 
-        stages = video_vae._encoder_prefetch_stages(model)
+        stages = video_vae_encode._encoder_prefetch_stages(model)
         make_queue.assert_called_once_with(
             stages,
             value.device,
@@ -140,7 +141,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         )
         pixels = torch.arange(80, dtype=torch.float32).view(1, 1, 1, 8, 10)
         progress = mock.Mock()
-        actual = video_vae._tiled_encode(
+        actual = video_vae_encode._tiled_encode(
             model,
             pixels,
             4,
@@ -910,15 +911,15 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         )
         progress = mock.Mock()
         with (
-            mock.patch.object(video_vae, "require_h3_video_vae", return_value=model),
+            mock.patch.object(video_vae_encode, "require_h3_video_vae", return_value=model),
             mock.patch.object(
-                video_vae, "_select_tiles_per_batch", return_value=(1, 0)
+                video_vae_encode, "_select_tiles_per_batch", return_value=(1, 0)
             ),
-            mock.patch.object(video_vae, "_encode_clip", return_value=moments),
-            mock.patch.object(video_vae, "_TileProgress", return_value=progress),
-            mock.patch.object(video_vae.comfy.model_management, "load_models_gpu"),
+            mock.patch.object(video_vae_encode, "_encode_clip", return_value=moments),
+            mock.patch.object(video_vae_encode, "_TileProgress", return_value=progress),
+            mock.patch.object(video_vae_encode.comfy.model_management, "load_models_gpu"),
         ):
-            actual = video_vae.encode_video(vae, pixels)
+            actual = video_vae_encode.encode_video(vae, pixels)
         self.assertEqual(actual.dtype, torch.float16)
         torch.testing.assert_close(actual, torch.full_like(actual, 0.5))
         progress.finish.assert_called_once_with()
@@ -1035,7 +1036,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             spacial_compression_encode=lambda: 16,
         )
         pixels = torch.zeros(2, 5, 34, 50, 3)
-        actual = video_vae._prepare_encode_pixels(vae, pixels)
+        actual = video_vae_encode._prepare_encode_pixels(vae, pixels)
         self.assertEqual(actual.shape, (2, 3, 5, 32, 48))
 
     def test_auto_tile_batch_respects_memory_limit(self):
@@ -1113,8 +1114,8 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 device=clip.device,
             )
 
-        with mock.patch.object(video_vae, "_encode_clip", side_effect=fake_encode):
-            output = video_vae._encode_temporal_buffered(
+        with mock.patch.object(video_vae_encode, "_encode_clip", side_effect=fake_encode):
+            output = video_vae_encode._encode_temporal_buffered(
                 model,
                 pixels,
                 lambda value: value,
@@ -1153,8 +1154,8 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                 device=clip.device,
             )
 
-        with mock.patch.object(video_vae, "_encode_clip", side_effect=fake_encode):
-            video_vae._encode_temporal_buffered(
+        with mock.patch.object(video_vae_encode, "_encode_clip", side_effect=fake_encode):
+            video_vae_encode._encode_temporal_buffered(
                 model,
                 pixels,
                 process_input,
