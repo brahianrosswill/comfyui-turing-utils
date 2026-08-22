@@ -122,7 +122,7 @@ only after its CUDA sources or required version change.
 The H3 adapter uses one capability-based path on Turing, Ampere, Ada, Hopper,
 and newer Tensor Core GPUs. CUDA selects the cubin compiled for the installed
 card; Python does not maintain a per-generation H3 algorithm. At each QKV or
-FFN call, the adapter reads ComfyUI's live free/reclaimable memory and the
+FFN call, the adapter reads ComfyUI's immediately usable memory and the
 `--reserve-vram` ceiling:
 
 - if the complete activation fits with safety headroom, it keeps the normal
@@ -138,12 +138,16 @@ FFN call, the adapter reads ComfyUI's live free/reclaimable memory and the
   second pass writes directly into the final compressed INT8 activation, and
   the original fused fc2 performs the complete contraction once;
 - each layer's weights are cast/transferred once and reused by every row tile,
-  so activation savings do not multiply Dynamic VRAM traffic.
-- under AIMDO DynamicVRAM, resident VBAR pages are inspected through their
-  resident/pinned flags. Only resident, unpinned pages count as reclaimable;
-  inactive-model pages are released before current diffusion weights when a
-  faster activation tier needs headroom. This avoids both pessimistic head
-  sharding and the noisy `vbars_analyze` diagnostic path.
+  so activation savings do not multiply Dynamic VRAM traffic;
+- under AIMDO DynamicVRAM, immediately usable memory selects the execution
+  tier. Resident model pages never promote a faster tier: evicting hot DiT
+  weights only to reload them on the next layer costs more than an exact head
+  shard. Resident, unpinned pages from inactive models remain an emergency
+  reserve for an already-selected tier, without using the noisy
+  `vbars_analyze` diagnostic path;
+- activation low-water marks are scoped to the operation. A low pre-QKV
+  reading therefore cannot unnecessarily force the later MLP to stream after
+  QKV/attention buffers have retired;
 - the H3 video-VAE overlap accumulator uses the same sm75+ native capability
   gate, so Ampere does not lose that fused decode path.
 

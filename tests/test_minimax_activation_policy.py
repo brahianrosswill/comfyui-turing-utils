@@ -239,6 +239,55 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
         self.assertTrue(first.streamed)
         self.assertEqual(later.chunk_rows, first.chunk_rows)
 
+    def test_sampler_plan_keeps_independent_operation_low_water_marks(self):
+        plan = activation_policy.ActivationRuntimePlan()
+        with mock.patch.object(
+            activation_policy,
+            "_runtime_memory",
+            side_effect=(
+                (int(5.75 * _GIB), 4 * _GIB, 12 * _GIB),
+                (int(9.90 * _GIB), 4 * _GIB, 12 * _GIB),
+                (int(9.90 * _GIB), 4 * _GIB, 12 * _GIB),
+            ),
+        ):
+            qkv = activation_policy.decide_activation_chunks(
+                _FakeActivation(60_186),
+                operation="qkv",
+                hidden_size=5376,
+                expanded_size=7168,
+                heads=56,
+                runtime_plan=plan,
+            )
+            mlp = activation_policy.decide_activation_chunks(
+                _FakeActivation(60_186),
+                operation="mlp",
+                hidden_size=5376,
+                expanded_size=14_336,
+                runtime_plan=plan,
+            )
+            ffn = activation_policy.decide_ffn_channels(
+                _FakeActivation(60_186),
+                expanded_size=14_336,
+                chunk_rows=mlp.chunk_rows,
+                runtime_plan=plan,
+            )
+
+        self.assertEqual(qkv.chunk_rows, 16_384)
+        self.assertFalse(mlp.streamed)
+        self.assertFalse(ffn.sharded)
+        self.assertEqual(
+            plan.available_floors[
+                ("cuda", 0, 60_186, "qkv")
+            ],
+            int(5.75 * _GIB),
+        )
+        self.assertEqual(
+            plan.available_floors[
+                ("cuda", 0, 60_186, "mlp")
+            ],
+            int(9.90 * _GIB),
+        )
+
     def test_attention_peak_includes_w8a8_value_and_summary_lifecycle(self):
         with mock.patch.object(
             activation_policy,
@@ -291,14 +340,20 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
                 "comfy.model_management": model_management,
             },
         ):
-            reclaimable = activation_policy._dynamic_vram_reclaimable(
+            inactive_reclaimable = activation_policy._dynamic_vram_reclaimable(
                 base, torch.device("cuda", 0)
             )
+            all_reclaimable = activation_policy._dynamic_vram_reclaimable(
+                base,
+                torch.device("cuda", 0),
+                include_current=True,
+            )
 
-        self.assertEqual(reclaimable, 2 * 32 * 1024**2)
+        self.assertEqual(inactive_reclaimable, 0)
+        self.assertEqual(all_reclaimable, 2 * 32 * 1024**2)
         vbar.get_residency.assert_called_once_with()
 
-    def test_runtime_budget_includes_reclaimable_vbar_pages_but_keeps_ceiling(self):
+    def test_runtime_budget_does_not_promote_with_reclaimable_vbar_pages(self):
         comfy = ModuleType("comfy")
         comfy.__path__ = []
         model_management = ModuleType("comfy.model_management")
@@ -325,7 +380,7 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
                 torch.device("cuda", 0), object()
             )
 
-        self.assertEqual(available, 9 * _GIB)
+        self.assertEqual(available, 5 * _GIB)
         self.assertEqual(reserve, 4 * _GIB)
         self.assertEqual(usable, 12 * _GIB)
 
@@ -363,13 +418,19 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
                 "comfy.model_management": model_management,
             },
         ):
-            vbars = activation_policy._dynamic_vbars(
+            inactive_vbars = activation_policy._dynamic_vbars(
                 base, torch.device("cuda", 0)
             )
+            all_vbars = activation_policy._dynamic_vbars(
+                base,
+                torch.device("cuda", 0),
+                include_current=True,
+            )
 
-        self.assertEqual(vbars, (inactive_vbar, current_vbar))
+        self.assertEqual(inactive_vbars, (inactive_vbar,))
+        self.assertEqual(all_vbars, (inactive_vbar, current_vbar))
 
-    def test_reclaimable_budget_restores_full_high_resolution_head_group(self):
+    def test_high_resolution_head_group_keeps_allocator_margin(self):
         with mock.patch.object(
             activation_policy,
             "_runtime_memory",
@@ -385,8 +446,47 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
                 base_model=object(),
             )
 
-        self.assertEqual(decision.head_group, 56)
-        self.assertFalse(decision.sharded)
+        self.assertLess(decision.head_group, 56)
+        self.assertTrue(decision.sharded)
+
+    def test_observed_high_resolution_budget_shards_without_reclaim(self):
+        vbar = SimpleNamespace(
+            free_memory=mock.Mock(return_value=896 * 1024**2)
+        )
+        plan = activation_policy.ActivationRuntimePlan()
+        with (
+            mock.patch.object(
+                activation_policy,
+                "_runtime_memory",
+                return_value=(int(5.25 * _GIB), 4 * _GIB, 12 * _GIB),
+            ),
+            mock.patch.object(
+                activation_policy,
+                "_dynamic_vbars",
+                return_value=(vbar,),
+            ),
+        ):
+            decision = activation_policy.decide_attention_heads(
+                _FakeActivation(127_275),
+                heads=56,
+                head_dim=128,
+                compact_qk=True,
+                quantized_input=True,
+                quantized_value=True,
+                runtime_plan=plan,
+            )
+            released = activation_policy.ensure_dynamic_vram_headroom(
+                object(),
+                torch.device("cuda", 0),
+                rows=127_275,
+                operation="attention_heads",
+                estimated_peak_bytes=decision.estimated_peak_bytes,
+                runtime_plan=plan,
+            )
+
+        self.assertEqual(decision.head_group, 18)
+        self.assertEqual(released, 0)
+        vbar.free_memory.assert_not_called()
 
     def test_dynamic_vram_headroom_reclaims_only_the_selected_tier_deficit(self):
         vbar = SimpleNamespace(free_memory=mock.Mock(return_value=384 * 1024**2))
@@ -396,10 +496,17 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
         )
         base = SimpleNamespace(current_patcher=patcher)
         plan = activation_policy.ActivationRuntimePlan()
-        with mock.patch.object(
-            activation_policy,
-            "_runtime_memory",
-            return_value=(2 * _GIB, 0, 6 * _GIB),
+        with (
+            mock.patch.object(
+                activation_policy,
+                "_runtime_memory",
+                return_value=(2 * _GIB, 0, 6 * _GIB),
+            ),
+            mock.patch.object(
+                activation_policy,
+                "_dynamic_vbars",
+                return_value=(vbar,),
+            ),
         ):
             first = activation_policy.ensure_dynamic_vram_headroom(
                 base,
@@ -421,6 +528,46 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
         self.assertEqual(first, 384 * 1024**2)
         self.assertEqual(second, 0)
         vbar.free_memory.assert_called_once()
+
+    def test_headroom_never_evicts_the_current_diffusion_vbar(self):
+        current_vbar = SimpleNamespace(
+            free_memory=mock.Mock(return_value=512 * 1024**2)
+        )
+        current = SimpleNamespace(
+            load_device=torch.device("cuda", 0),
+            is_dynamic=lambda: True,
+            _vbar_get=lambda: current_vbar,
+        )
+        base = SimpleNamespace(current_patcher=current)
+        comfy = ModuleType("comfy")
+        comfy.__path__ = []
+        model_management = ModuleType("comfy.model_management")
+        model_management.loaded_models = mock.Mock(return_value=[current])
+        comfy.model_management = model_management
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "comfy": comfy,
+                    "comfy.model_management": model_management,
+                },
+            ),
+            mock.patch.object(
+                activation_policy,
+                "_runtime_memory",
+                return_value=(2 * _GIB, 0, 6 * _GIB),
+            ),
+        ):
+            released = activation_policy.ensure_dynamic_vram_headroom(
+                base,
+                torch.device("cuda", 0),
+                rows=127_275,
+                operation="attention_heads",
+                estimated_peak_bytes=2 * _GIB,
+            )
+
+        self.assertEqual(released, 0)
+        current_vbar.free_memory.assert_not_called()
 
     def test_memory_telemetry_uses_quiet_aimdo_counter(self):
         comfy = ModuleType("comfy")

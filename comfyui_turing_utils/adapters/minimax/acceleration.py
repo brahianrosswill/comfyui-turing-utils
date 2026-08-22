@@ -1371,6 +1371,10 @@ def _make_attention_forward(
                     return self.out_proj(output)
 
             if base_model is not None:
+                # Automatic tiers already fit immediately usable memory, so
+                # this is normally a no-op. It remains useful for an explicit
+                # throughput override, and may evict only inactive-model
+                # VBARs; the current diffusion weights are never targeted.
                 ensure_dynamic_vram_headroom(
                     base_model,
                     x.device,

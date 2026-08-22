@@ -175,17 +175,25 @@ H3 activation execution follows the same live-memory accounting. It first
 retains the unmodified full path, then reduces only transient state in this
 order: row-streamed QKV/FFN, prepared compact Q/K, whole-head attention groups,
 and finally aligned FFN intermediate groups. This is a resource ladder rather
-than a Turing/Ampere branch. ComfyUI's current free/reclaimable bytes and
+than a Turing/Ampere branch. ComfyUI's immediately usable bytes and
 `--reserve-vram` ceiling select the highest-throughput fitting rung at every
-operator call.
+operator call; inactive-model residency is reserved for emergency headroom,
+not tier promotion.
 
-DynamicVRAM budgeting distinguishes physical CUDA free memory from evictable
-model residency. The adapter reads each VBAR's resident/pinned bitmap and adds
-only resident, unpinned 32 MiB pages to the effective budget, capped by the
-same `--reserve-vram` usable ceiling. When the selected tier needs those pages,
-inactive model VBARs are released before the current diffusion VBAR. This is a
-quiet replacement for `vbars_analyze`: pinned weights never inflate the budget
-and normal runs do not emit one warning per pinned page.
+DynamicVRAM budgeting distinguishes immediately usable memory from evictable
+model residency. Evictable pages do not promote a faster execution tier:
+releasing current DiT weights to reduce exact head sharding causes those pages
+to be loaded again by the next layer and loses more time than it saves.
+Resident, unpinned pages from inactive model VBARs are therefore only an
+emergency reserve for a tier already selected from immediately usable memory;
+the current diffusion VBAR is never explicitly reclaimed by this policy. This
+uses the quiet residency bitmap instead of `vbars_analyze`, so normal runs do
+not emit one warning per pinned page.
+
+The sampler low-water mark is keyed by operation as well as sequence shape.
+Attention, QKV projection, and MLP observe different live-buffer boundaries;
+a low pre-attention reading must not force the later MLP to retain row
+streaming after QKV and attention temporaries have retired.
 
 QKV row tiles write directly into their final INT8 Q/K and BF16 V storage.
 Kernel 0.30 accepts a reusable K anchor computed from the same nine positions

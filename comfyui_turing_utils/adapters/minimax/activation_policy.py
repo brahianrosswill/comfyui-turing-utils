@@ -28,12 +28,15 @@ class ActivationRuntimePlan:
     CUDA free memory moves up and down while DynamicVRAM maps weights and while
     PyTorch retires temporary buffers.  Treating every observation as a fresh
     budget allowed a later layer to promote itself back to the full path.  The
-    per-row-count low-water mark makes automatic decisions monotonic for the
-    lifetime of a sampler without leaking state between queued executions.
+    per-operation, per-row-count low-water mark makes automatic decisions
+    monotonic for the lifetime of a sampler without leaking state between
+    queued executions. Attention, QKV, and MLP have different live-buffer
+    boundaries, so sharing one floor between them would unnecessarily force
+    the later MLP onto its streamed path.
     """
 
-    available_floors: dict[tuple[str, int | None, int], int] = dataclasses.field(
-        default_factory=dict
+    available_floors: dict[tuple[str, int | None, int, str], int] = (
+        dataclasses.field(default_factory=dict)
     )
     reclaim_requests: dict[tuple[str, int | None, int, str], int] = (
         dataclasses.field(default_factory=dict)
@@ -44,9 +47,10 @@ class ActivationRuntimePlan:
         self,
         device: torch.device,
         rows: int,
+        operation: str,
         available_bytes: int,
     ) -> int:
-        key = (device.type, device.index, int(rows))
+        key = (device.type, device.index, int(rows), str(operation))
         previous = self.available_floors.get(key)
         floor = int(available_bytes) if previous is None else min(
             previous, int(available_bytes)
@@ -190,8 +194,19 @@ def _override_ffn_channels() -> int | None:
         return None
 
 
-def _dynamic_vbars(base_model, device: torch.device) -> tuple[object, ...]:
-    """Return unique DynamicVRAM VBARs, preferring inactive models first."""
+def _dynamic_vbars(
+    base_model,
+    device: torch.device,
+    *,
+    include_current: bool = False,
+) -> tuple[object, ...]:
+    """Return unique inactive DynamicVRAM VBARs on ``device``.
+
+    Evicting the current diffusion VBAR between transformer operations causes
+    the same weight pages to be transferred back immediately. The current
+    VBAR can still be included for read-only diagnostics, but normal headroom
+    requests deliberately target inactive models only.
+    """
     if base_model is None:
         return ()
     device = torch.device(device)
@@ -234,7 +249,11 @@ def _dynamic_vbars(base_model, device: torch.device) -> tuple[object, ...]:
             continue
         seen.add(id(vbar))
         result.append(vbar)
-    if current_vbar is not None and current_vbar_id not in seen:
+    if (
+        include_current
+        and current_vbar is not None
+        and current_vbar_id not in seen
+    ):
         result.append(current_vbar)
     return tuple(result)
 
@@ -253,10 +272,19 @@ def _vbar_reclaimable_bytes(vbar) -> int:
     return max(min(reclaimable, loaded_size), 0)
 
 
-def _dynamic_vram_reclaimable(base_model, device: torch.device) -> int:
+def _dynamic_vram_reclaimable(
+    base_model,
+    device: torch.device,
+    *,
+    include_current: bool = False,
+) -> int:
     return sum(
         _vbar_reclaimable_bytes(vbar)
-        for vbar in _dynamic_vbars(base_model, device)
+        for vbar in _dynamic_vbars(
+            base_model,
+            device,
+            include_current=include_current,
+        )
     )
 
 
@@ -264,11 +292,13 @@ def _runtime_memory(
     device: torch.device,
     base_model=None,
 ) -> tuple[int, int, int]:
-    """Return effective remaining bytes, total reserve, and usable ceiling.
+    """Return immediately usable bytes, total reserve, and usable ceiling.
 
-    DynamicVRAM resident pages are not ordinary free CUDA memory, but unpinned
-    pages can be evicted before an activation allocation.  Count only those
-    pages; pinned weights remain unavailable.
+    Evictable model pages are intentionally excluded. Counting them here made
+    the policy select a larger attention tier and then evict hot weights to
+    realize that hypothetical budget, trading exact head sharding for PCIe
+    reload churn. Reclaimable inactive pages remain an emergency reserve for
+    ``ensure_dynamic_vram_headroom`` only.
     """
     import comfy.model_management as model_management
 
@@ -277,11 +307,10 @@ def _runtime_memory(
     usable = max(total - reserve, 0)
     allocated = int(torch.cuda.memory_allocated(device))
     free = int(model_management.get_free_memory(device))
-    reclaimable = _dynamic_vram_reclaimable(base_model, device)
     # get_free_memory includes unused PyTorch cache.  The second bound is what
     # makes --reserve-vram a hard ceiling even when the display is temporarily
     # idle and nvidia-smi reports the memory as free.
-    return max(min(free + reclaimable, usable - allocated), 0), reserve, usable
+    return max(min(free, usable - allocated), 0), reserve, usable
 
 
 def _planning_available(
@@ -290,10 +319,16 @@ def _planning_available(
     rows: int,
     available: int,
     mode: str,
+    operation: str,
 ) -> int:
     if runtime_plan is None or mode == "throughput":
         return available
-    return runtime_plan.observe_available(device, rows, available)
+    return runtime_plan.observe_available(
+        device,
+        rows,
+        operation,
+        available,
+    )
 
 
 def _should_log(
@@ -344,7 +379,10 @@ def _log_memory_diagnostics(device: torch.device, base_model=None) -> str:
     )
     if base_model is not None:
         reclaimable = _dynamic_vram_reclaimable(base_model, device)
-        result += f" dynamic_reclaimable={reclaimable / 1024**3:.2f} GiB"
+        result += (
+            " inactive_reclaimable="
+            f"{reclaimable / 1024**3:.2f} GiB"
+        )
     return result
 
 
@@ -485,7 +523,12 @@ def decide_activation_chunks(
 
     available, reserve, usable = _runtime_memory(x.device, base_model)
     planned_available = _planning_available(
-        runtime_plan, x.device, rows, available, mode
+        runtime_plan,
+        x.device,
+        rows,
+        available,
+        mode,
+        operation,
     )
     element = int(x.element_size())
     hidden_size = int(hidden_size)
@@ -612,7 +655,12 @@ def decide_attention_heads(
 
     available, reserve, usable = _runtime_memory(x.device, base_model)
     planned_available = _planning_available(
-        runtime_plan, x.device, rows, available, mode
+        runtime_plan,
+        x.device,
+        rows,
+        available,
+        mode,
+        "attention",
     )
     element = int(x.element_size())
     safety = max(768 * _MIB, int(usable * 0.075))
@@ -647,11 +695,11 @@ def decide_attention_heads(
     if override is not None:
         groups = [group for group in groups if group <= override] or [groups[-1]]
 
-    # ``working`` already excludes both the general safety allowance and one
-    # streamed weight workspace.  A second percentage haircut pushed H3 D128
-    # just below the legal full-head boundary on a 12 GiB usable budget and
-    # doubled the number of exact attention passes.
-    fit_limit = working
+    # Head sharding changes only the number of exact passes, whereas evicting
+    # hot model pages forces immediate PCIe reloads. Keep a small allocator
+    # margin and accept another head pass instead of manufacturing headroom by
+    # weight eviction.
+    fit_limit = int(working * 0.96)
     full_fits = peak(heads, False) <= fit_limit
     if (mode == "throughput" or full_fits) and override is None:
         head_group = heads
@@ -727,7 +775,12 @@ def decide_ffn_channels(
         )
     available, reserve, usable = _runtime_memory(x.device, base_model)
     planned_available = _planning_available(
-        runtime_plan, x.device, rows, available, mode
+        runtime_plan,
+        x.device,
+        rows,
+        available,
+        mode,
+        "mlp",
     )
     safety = max(768 * _MIB, int(usable * 0.075))
     working = max(planned_available - safety - 512 * _MIB, 0)
