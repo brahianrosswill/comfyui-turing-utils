@@ -53,6 +53,75 @@ class CudaPhaseProfilerTest(unittest.TestCase):
         self.assertTrue(result["native_arch"])
         self.assertEqual(result["profile_schema"], 1)
 
+    def test_dynamic_vram_profile_defers_sync_until_sampler_boundary(self):
+        profiler = CudaPhaseProfiler(1)
+        start = mock.Mock()
+        end = mock.Mock()
+        start.elapsed_time.return_value = 2.5
+        profiler.defer_to_sampler_boundary()
+
+        with (
+            mock.patch.object(
+                profiling.torch.cuda,
+                "Event",
+                side_effect=(start, end),
+            ),
+            mock.patch.object(
+                profiling,
+                "_runtime_profile_metadata",
+                return_value={
+                    "kernel": "0.31.0",
+                    "compiled_attention": "sm86",
+                    "profile_schema": 1,
+                    "device": "RTX 3070",
+                    "device_sm": "sm86",
+                    "native_arch": True,
+                },
+            ),
+        ):
+            self.assertEqual(profiler.call("phase", lambda: "output"), "output")
+            profiler.complete_attention((1, 56, 60186, 128))
+
+            end.synchronize.assert_not_called()
+            self.assertTrue(profiler.pending_report)
+            self.assertFalse(profiler.enabled)
+            self.assertTrue(profiler.report_after_synchronize())
+
+        start.elapsed_time.assert_called_once_with(end)
+        self.assertFalse(profiler.pending_report)
+        self.assertTrue(profiler.reported)
+
+    def test_non_dynamic_profile_keeps_bounded_synchronization(self):
+        profiler = CudaPhaseProfiler(1)
+        start = mock.Mock()
+        end = mock.Mock()
+        start.elapsed_time.return_value = 1.0
+
+        with (
+            mock.patch.object(
+                profiling.torch.cuda,
+                "Event",
+                side_effect=(start, end),
+            ),
+            mock.patch.object(
+                profiling,
+                "_runtime_profile_metadata",
+                return_value={
+                    "kernel": "0.31.0",
+                    "compiled_attention": "sm86",
+                    "profile_schema": 1,
+                    "device": "RTX 3070",
+                    "device_sm": "sm86",
+                    "native_arch": True,
+                },
+            ),
+        ):
+            profiler.call("phase", lambda: None)
+            profiler.complete_attention((1, 56, 60186, 128))
+
+        end.synchronize.assert_called_once_with()
+        self.assertTrue(profiler.reported)
+
 
 if __name__ == "__main__":
     unittest.main()

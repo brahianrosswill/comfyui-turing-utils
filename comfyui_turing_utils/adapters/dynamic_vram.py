@@ -6,6 +6,8 @@ import logging
 
 import torch
 
+from ..profiling import CUDA_PHASE_PROFILER
+
 
 LOG = logging.getLogger("comfyui-turing-utils")
 DYNAMIC_VRAM_FENCE_WRAPPER_KEY = "turing_utils_dynamic_vram_sample_fence"
@@ -30,6 +32,11 @@ def make_dynamic_vram_sample_fence(device: torch.device):
             return executor(*args, **kwargs)
         finally:
             torch.cuda.synchronize(device)
+            try:
+                CUDA_PHASE_PROFILER.report_after_synchronize()
+            except Exception as error:
+                # Optional diagnostics must never replace a sampling failure.
+                LOG.warning("Unable to emit deferred CUDA profile: %s", error)
 
     return outer_sample_wrapper
 
@@ -55,6 +62,7 @@ def install_dynamic_vram_sample_fence(model, device: torch.device) -> bool:
     if callable(get_wrappers) and get_wrappers(
         wrapper_type, DYNAMIC_VRAM_FENCE_WRAPPER_KEY
     ):
+        CUDA_PHASE_PROFILER.defer_to_sampler_boundary()
         return False
 
     model.add_wrapper_with_key(
@@ -62,6 +70,10 @@ def install_dynamic_vram_sample_fence(model, device: torch.device) -> bool:
         DYNAMIC_VRAM_FENCE_WRAPPER_KEY,
         make_dynamic_vram_sample_fence(device),
     )
+    # The wrapper now owns the synchronization needed to safely read CUDA
+    # event timings.  Never insert another fence after an inner attention call:
+    # doing so would break ComfyUI's asynchronous weight prefetch pipeline.
+    CUDA_PHASE_PROFILER.defer_to_sampler_boundary()
     LOG.info("Enabled DynamicVRAM sampler-boundary CUDA fence")
     return True
 

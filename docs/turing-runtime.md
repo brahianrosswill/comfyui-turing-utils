@@ -341,6 +341,10 @@ enabling the transform.
 Optional phase timing is process-local and disabled unless
 `COMFYUI_TURING_UTILS_PROFILE_CALLS` is a positive integer. The disabled path
 creates no CUDA events and performs no synchronization.
+On DynamicVRAM, reaching the call limit only marks the report pending. Event
+timings are read after the existing outer sampler fence, avoiding a mid-model
+synchronization that would otherwise interrupt asynchronous weight prefetch.
+Non-DynamicVRAM execution retains the bounded end-of-window synchronization.
 
 Kernel 0.31 makes architecture validation part of the same bounded report. The
 Python summary publishes the architectures embedded by the wheel build and

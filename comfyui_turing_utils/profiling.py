@@ -67,10 +67,20 @@ class CudaPhaseProfiler:
         self.records: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
         self.shapes = Counter()
         self.reported = False
+        self.pending_report = False
+        self.defer_sync_to_sampler_boundary = False
 
     @property
     def enabled(self) -> bool:
-        return self.call_limit > 0 and not self.reported
+        return (
+            self.call_limit > 0
+            and not self.reported
+            and not self.pending_report
+        )
+
+    def defer_to_sampler_boundary(self) -> None:
+        """Use an existing outer sampler fence instead of a mid-model sync."""
+        self.defer_sync_to_sampler_boundary = True
 
     def call(self, phase: str, function: Callable, /, *args, **kwargs):
         if not self.enabled:
@@ -99,7 +109,16 @@ class CudaPhaseProfiler:
         if not self.records:
             self.reported = True
             return
+        self.pending_report = True
+        if self.defer_sync_to_sampler_boundary:
+            return
         self.records[-1][2].synchronize()
+        self.report_after_synchronize()
+
+    def report_after_synchronize(self) -> bool:
+        """Emit a pending report after the caller has already drained CUDA."""
+        if not self.pending_report or self.reported or not self.records:
+            return False
         totals = Counter()
         counts = Counter()
         for phase, start, end in self.records:
@@ -133,7 +152,9 @@ class CudaPhaseProfiler:
                 elapsed * 100.0 / total if total else 0.0,
             )
         self.records.clear()
+        self.pending_report = False
         self.reported = True
+        return True
 
 
 CUDA_PHASE_PROFILER = CudaPhaseProfiler(_profile_call_limit())

@@ -78,7 +78,11 @@ class DynamicVramFenceTest(unittest.TestCase):
         with mock.patch(
             "comfyui_turing_utils.adapters.dynamic_vram.torch.cuda.synchronize",
             side_effect=lambda device: events.append(("sync", device)),
-        ) as synchronize:
+        ) as synchronize, mock.patch.object(
+            dynamic_vram.CUDA_PHASE_PROFILER,
+            "report_after_synchronize",
+            side_effect=lambda: events.append("profile"),
+        ) as report:
             result = wrapper(Executor())
 
         self.assertEqual(result, "ok")
@@ -88,9 +92,11 @@ class DynamicVramFenceTest(unittest.TestCase):
                 ("sync", torch.device("cuda", 0)),
                 "sample",
                 ("sync", torch.device("cuda", 0)),
+                "profile",
             ],
         )
         self.assertEqual(synchronize.call_count, 2)
+        report.assert_called_once_with()
 
     def test_synchronizes_after_sampler_failure(self):
         class Executor:
@@ -102,11 +108,15 @@ class DynamicVramFenceTest(unittest.TestCase):
         )
         with mock.patch(
             "comfyui_turing_utils.adapters.dynamic_vram.torch.cuda.synchronize"
-        ) as synchronize:
+        ) as synchronize, mock.patch.object(
+            dynamic_vram.CUDA_PHASE_PROFILER,
+            "report_after_synchronize",
+        ) as report:
             with self.assertRaisesRegex(RuntimeError, "sample failed"):
                 wrapper(Executor())
 
         self.assertEqual(synchronize.call_count, 2)
+        report.assert_called_once_with()
 
 
 if __name__ == "__main__":

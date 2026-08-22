@@ -266,6 +266,9 @@ a bounded diagnostic run, set `COMFYUI_TURING_UTILS_PROFILE_CALLS` to the
 number of attention calls to collect before one report is emitted. Kernel 0.31
 also embeds the wheel's exact CUDA architecture set and, while this profiler is
 enabled, reports the specialization CUDA selected for dense/Sol attention.
+With DynamicVRAM, the report reuses the existing outer sampler fence instead
+of synchronizing after an inner attention call, so profiling does not break
+the asynchronous weight-prefetch pipeline.
 `compiled_attention=[sm75,sm86] native_arch=True` proves that the wheel contains
 an exact cubin for the active device. The native report additionally includes
 `binary_sm`, `ptx_compute`, registers, shared/local memory, active CTAs and
