@@ -20,6 +20,55 @@ _MIB = 1024**2
 _LOGGED_DECISIONS: set[tuple] = set()
 
 
+@dataclasses.dataclass(slots=True)
+class ActivationRuntimePlan:
+    """Mutable policy state owned by one sampler invocation.
+
+    CUDA free memory moves up and down while DynamicVRAM maps weights and while
+    PyTorch retires temporary buffers.  Treating every observation as a fresh
+    budget allowed a later layer to promote itself back to the full path.  The
+    per-row-count low-water mark makes automatic decisions monotonic for the
+    lifetime of a sampler without leaking state between queued executions.
+    """
+
+    available_floors: dict[tuple[str, int | None, int], int] = dataclasses.field(
+        default_factory=dict
+    )
+    reclaim_requests: dict[tuple[str, int | None, int, str], int] = (
+        dataclasses.field(default_factory=dict)
+    )
+    logged_decisions: set[tuple] = dataclasses.field(default_factory=set)
+
+    def observe_available(
+        self,
+        device: torch.device,
+        rows: int,
+        available_bytes: int,
+    ) -> int:
+        key = (device.type, device.index, int(rows))
+        previous = self.available_floors.get(key)
+        floor = int(available_bytes) if previous is None else min(
+            previous, int(available_bytes)
+        )
+        self.available_floors[key] = floor
+        return floor
+
+    def should_request_reclaim(
+        self,
+        device: torch.device,
+        rows: int,
+        operation: str,
+        deficit_bytes: int,
+    ) -> bool:
+        key = (device.type, device.index, int(rows), str(operation))
+        previous = self.reclaim_requests.get(key, 0)
+        deficit_bytes = int(deficit_bytes)
+        if deficit_bytes <= previous + 64 * _MIB:
+            return False
+        self.reclaim_requests[key] = deficit_bytes
+        return True
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class ActivationDecision:
     operation: str
@@ -34,6 +83,10 @@ class ActivationDecision:
     @property
     def streamed(self) -> bool:
         return 0 < self.chunk_rows < self.rows
+
+    @property
+    def tier(self) -> int:
+        return 1 if self.streamed else 0
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -51,6 +104,10 @@ class AttentionDecision:
     def sharded(self) -> bool:
         return 0 < self.head_group < self.heads
 
+    @property
+    def tier(self) -> int:
+        return 2 if self.sharded else 0
+
 
 @dataclasses.dataclass(frozen=True, slots=True)
 class FFNChannelDecision:
@@ -66,6 +123,12 @@ class FFNChannelDecision:
     @property
     def sharded(self) -> bool:
         return 0 < self.chunk_channels < self.expanded_size
+
+    @property
+    def tier(self) -> int:
+        if self.sharded:
+            return 3
+        return 1 if 0 < self.chunk_rows < self.rows else 0
 
 
 def _mode() -> str:
@@ -141,9 +204,175 @@ def _runtime_memory(device: torch.device) -> tuple[int, int, int]:
     return max(min(free, usable - allocated), 0), reserve, usable
 
 
+def _planning_available(
+    runtime_plan: ActivationRuntimePlan | None,
+    device: torch.device,
+    rows: int,
+    available: int,
+    mode: str,
+) -> int:
+    if runtime_plan is None or mode == "throughput":
+        return available
+    return runtime_plan.observe_available(device, rows, available)
+
+
+def _should_log(
+    runtime_plan: ActivationRuntimePlan | None,
+    key: tuple,
+) -> bool:
+    logged = (
+        runtime_plan.logged_decisions
+        if runtime_plan is not None
+        else _LOGGED_DECISIONS
+    )
+    if key in logged:
+        return False
+    logged.add(key)
+    return True
+
+
+def _memory_diagnostics(device: torch.device) -> tuple[int, int, int, int]:
+    """Best-effort allocator and DynamicVRAM pressure counters."""
+    allocated = reserved = raw_free = reclaimable = 0
+    try:
+        allocated = int(torch.cuda.memory_allocated(device))
+        reserved = int(torch.cuda.memory_reserved(device))
+        raw_free = int(torch.cuda.mem_get_info(device)[0])
+    except (RuntimeError, TypeError):
+        pass
+    try:
+        import comfy.memory_management as memory_management
+        import comfy_aimdo.model_vbar as model_vbar
+
+        if memory_management.aimdo_enabled:
+            reclaimable = int(model_vbar.vbars_analyze(device.index))
+    except (ImportError, AttributeError, RuntimeError, TypeError):
+        pass
+    return allocated, reserved, raw_free, reclaimable
+
+
+def _log_memory_diagnostics(device: torch.device) -> str:
+    allocated, reserved, raw_free, reclaimable = _memory_diagnostics(device)
+    return (
+        f"torch_active={allocated / 1024**3:.2f} GiB "
+        f"torch_reserved={reserved / 1024**3:.2f} GiB "
+        f"cuda_free={raw_free / 1024**3:.2f} GiB "
+        f"dynamic_reclaimable={reclaimable / 1024**3:.2f} GiB"
+    )
+
+
+def ensure_dynamic_vram_headroom(
+    base_model,
+    device: torch.device,
+    *,
+    rows: int,
+    operation: str,
+    estimated_peak_bytes: int,
+    runtime_plan: ActivationRuntimePlan | None = None,
+) -> int:
+    """Ask an AIMDO VBAR to release mappings only when a selected tier cannot fit.
+
+    This is deliberately not used to promote a layer to a faster tier.  It is
+    a last-mile handshake that protects the already selected activation plan
+    from weight mappings consuming its irreducible headroom between planning
+    and allocation. Non-DynamicVRAM ComfyUI installations are a no-op.
+    """
+    device = torch.device(device)
+    if base_model is None or device.type != "cuda":
+        return 0
+    try:
+        available, _reserve, usable = _runtime_memory(device)
+    except (ImportError, RuntimeError, TypeError):
+        return 0
+    safety = max(768 * _MIB, int(usable * 0.075))
+    desired = int(estimated_peak_bytes) + safety + 512 * _MIB
+    deficit = max(desired - available, 0)
+    if deficit <= 0:
+        return 0
+    if runtime_plan is not None and not runtime_plan.should_request_reclaim(
+        device, rows, operation, deficit
+    ):
+        return 0
+
+    patcher = getattr(base_model, "current_patcher", None)
+    is_dynamic = getattr(patcher, "is_dynamic", None)
+    get_vbar = getattr(patcher, "_vbar_get", None)
+    if not callable(is_dynamic) or not is_dynamic() or not callable(get_vbar):
+        return 0
+    try:
+        vbar = get_vbar()
+        free_memory = getattr(vbar, "free_memory", None)
+        if not callable(free_memory):
+            return 0
+        freed = int(free_memory(deficit) or 0)
+    except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+        LOG.debug("DynamicVRAM headroom request was unavailable: %s", error)
+        return 0
+    if freed > 0:
+        LOG.info(
+            "MiniMax H3 DynamicVRAM headroom: op=%s rows=%d requested=%.1f MiB "
+            "released=%.1f MiB %s",
+            operation,
+            rows,
+            deficit / _MIB,
+            freed / _MIB,
+            _log_memory_diagnostics(device),
+        )
+    return freed
+
+
 def _align_rows(value: int, alignment: int, minimum: int) -> int:
     value = value // alignment * alignment
     return max(value, minimum) if value >= minimum else 0
+
+
+def estimate_attention_lifecycle_peak(
+    *,
+    rows: int,
+    heads: int,
+    head_dim: int,
+    hidden_size: int,
+    element_size: int,
+    head_group: int,
+    compact_qk: bool,
+    cache_quantized_input: bool,
+    quantized_value: bool,
+) -> int:
+    """Estimate the peak across projection, V8 preparation and attention."""
+    rows = int(rows)
+    heads = int(heads)
+    head_dim = int(head_dim)
+    hidden_size = int(hidden_size)
+    element_size = int(element_size)
+    group = int(head_group)
+    features = rows * group * head_dim
+    output = rows * heads * head_dim * element_size
+    destination = 0 if group == heads else output
+    input_cache = rows * (hidden_size + 4) if cache_quantized_input else 0
+    if not compact_qk:
+        return destination + features * 8 + input_cache
+
+    qk_blocks = (rows + 63) // 64
+    qk_scales = qk_blocks * group * 5 * 4
+    compact = features * (2 + element_size) + qk_scales
+    value_int8 = features if quantized_value else 0
+    padded_blocks = ((qk_blocks + 15) // 16) * 16
+    summaries = (
+        3 * group * padded_blocks * head_dim * 2
+        + 2 * group * head_dim * 4
+    ) if quantized_value else 0
+    result = features * element_size
+    execution_peak = compact + value_int8 + summaries + result
+    tile_rows = min(rows, 16_384)
+    projected_tile = (
+        tile_rows * group * head_dim * element_size * 2
+        + tile_rows * (hidden_size + 4)
+    )
+    return (
+        destination
+        + max(compact + projected_tile, execution_peak)
+        + input_cache
+    )
 
 
 def decide_activation_chunks(
@@ -152,6 +381,8 @@ def decide_activation_chunks(
     operation: str,
     hidden_size: int,
     expanded_size: int,
+    heads: int | None = None,
+    runtime_plan: ActivationRuntimePlan | None = None,
 ) -> ActivationDecision:
     """Select the full or streamed H3 activation path.
 
@@ -164,6 +395,9 @@ def decide_activation_chunks(
         return ActivationDecision(operation, mode, rows, 0, 0, 0, 0, 0)
 
     available, reserve, usable = _runtime_memory(x.device)
+    planned_available = _planning_available(
+        runtime_plan, x.device, rows, available, mode
+    )
     element = int(x.element_size())
     hidden_size = int(hidden_size)
     expanded_size = int(expanded_size)
@@ -173,7 +407,7 @@ def decide_activation_chunks(
     # long-lived allocation is separately represented by --reserve-vram.
     safety = max(768 * _MIB, int(usable * 0.075))
     weight_scratch = 512 * _MIB
-    working = max(available - safety - weight_scratch, 0)
+    working = max(planned_available - safety - weight_scratch, 0)
 
     if operation == "mlp":
         # Persistent returned hidden output plus fc1 BF16, fused fc2 A8 input,
@@ -184,9 +418,25 @@ def decide_activation_chunks(
         cap, alignment, minimum = 32768, 256, 2048
     elif operation == "qkv":
         # Streamed projection retains Q/K INT8 and V BF16.  One tile holds the
-        # packed BF16 projection and temporary Q/K INT8 results.
-        persistent = rows * (4 * expanded_size)
-        per_row = 3 * expanded_size * element + 2 * expanded_size
+        # packed BF16 projection plus its quantized input row.  Q/K scales are
+        # allocated for ceil(rows/64) blocks and remain live with Q/K/V.
+        # ``expanded_size`` is heads*head_dim. There are five FP32 scale lanes
+        # per head block; infer heads from H3's 128-wide heads when possible.
+        inferred_heads = (
+            max(int(heads), 1)
+            if heads is not None
+            else max(expanded_size // 128, 1)
+        )
+        scale_bytes = ((rows + 63) // 64) * inferred_heads * 5 * 4
+        persistent = (
+            rows * (2 * expanded_size + expanded_size * element)
+            + scale_bytes
+        )
+        per_row = (
+            3 * expanded_size * element
+            + hidden_size
+            + 4
+        )
         cap, alignment, minimum = 16384, 64, 1024
     else:
         raise ValueError(f"unknown H3 activation operation: {operation}")
@@ -231,22 +481,24 @@ def decide_activation_chunks(
         chunk_rows,
         reserve // (256 * _MIB),
     )
-    if key not in _LOGGED_DECISIONS:
+    if _should_log(runtime_plan, key):
         LOG.info(
-            "MiniMax H3 activation policy: op=%s mode=%s rows=%d path=%s "
+            "MiniMax H3 activation policy: op=%s mode=%s tier=%d rows=%d path=%s "
             "chunk_rows=%d available=%.2f GiB reserve=%.2f GiB "
-            "estimated_peak(full/selected)=%.2f/%.2f GiB",
+            "planned_available=%.2f GiB estimated_peak(full/selected)=%.2f/%.2f GiB %s",
             operation,
             mode,
+            decision.tier,
             rows,
             "streamed" if decision.streamed else "throughput",
             chunk_rows,
             available / 1024**3,
             reserve / 1024**3,
+            planned_available / 1024**3,
             full_peak / 1024**3,
             streamed_peak / 1024**3,
+            _log_memory_diagnostics(x.device),
         )
-        _LOGGED_DECISIONS.add(key)
     return decision
 
 
@@ -257,6 +509,8 @@ def decide_attention_heads(
     head_dim: int,
     compact_qk: bool,
     quantized_input: bool,
+    quantized_value: bool = False,
+    runtime_plan: ActivationRuntimePlan | None = None,
 ) -> AttentionDecision:
     """Choose a whole-head group without changing global sequence attention."""
     rows = int(x.shape[0])
@@ -267,37 +521,24 @@ def decide_attention_heads(
         return AttentionDecision(mode, rows, heads, heads, False, 0, 0, 0)
 
     available, reserve, usable = _runtime_memory(x.device)
+    planned_available = _planning_available(
+        runtime_plan, x.device, rows, available, mode
+    )
     element = int(x.element_size())
     safety = max(768 * _MIB, int(usable * 0.075))
     weight_scratch = 512 * _MIB
-    working = max(available - safety - weight_scratch, 0)
-    output = rows * heads * head_dim * element
-    input_cache = (
-        rows * (int(x.shape[-1]) + 4) if quantized_input else 0
-    )
-
-    def group_local(group: int) -> int:
-        features = rows * group * head_dim
-        if not compact_qk:
-            # BF16 Q/K/V plus the BF16 attention result.
-            return features * 8
-        # Q8 + K8 + V16 remain live for the complete sequence. The fused
-        # quantizers retain five FP32 scale values per 64-token/head block.
-        compact = features * 4 + rows * group * 5 * 4 // 64
-        result = features * element
-        # Projection is streamed inside every head group. Q and K must overlap
-        # for fused RMSNorm/RoPE, while V can be emitted separately.
-        projected_tile = min(rows, 16_384) * group * head_dim * element * 2
-        return compact + result + projected_tile
-
+    working = max(planned_available - safety - weight_scratch, 0)
     def peak(group: int, cache_input: bool) -> int:
-        # The unsharded path returns its backend result directly and therefore
-        # does not allocate a second full attention-output buffer.
-        destination = 0 if group == heads else output
-        return (
-            destination
-            + group_local(group)
-            + (input_cache if cache_input and group != heads else 0)
+        return estimate_attention_lifecycle_peak(
+            rows=rows,
+            heads=heads,
+            head_dim=head_dim,
+            hidden_size=int(x.shape[-1]),
+            element_size=element,
+            head_group=group,
+            compact_qk=compact_qk,
+            cache_quantized_input=cache_input and group != heads,
+            quantized_value=quantized_value,
         )
 
     # A cut is legal whenever both sides cover complete ConvRot-256 blocks.
@@ -316,7 +557,8 @@ def decide_attention_heads(
     if override is not None:
         groups = [group for group in groups if group <= override] or [groups[-1]]
 
-    full_fits = peak(heads, False) <= working
+    fit_limit = int(working * 0.96)
+    full_fits = peak(heads, False) <= fit_limit
     if (mode == "throughput" or full_fits) and override is None:
         head_group = heads
         cache_input = False
@@ -324,11 +566,11 @@ def decide_attention_heads(
         head_group = groups[-1]
         cache_input = False
         for group in groups:
-            if peak(group, quantized_input) <= working:
+            if peak(group, quantized_input) <= fit_limit:
                 head_group = group
                 cache_input = quantized_input
                 break
-            if peak(group, False) <= working:
+            if peak(group, False) <= fit_limit:
                 head_group = group
                 cache_input = False
                 break
@@ -353,21 +595,23 @@ def decide_attention_heads(
         cache_input,
         reserve // (256 * _MIB),
     )
-    if key not in _LOGGED_DECISIONS:
+    if _should_log(runtime_plan, key):
         LOG.info(
-            "MiniMax H3 attention policy: mode=%s rows=%d heads=%d "
+            "MiniMax H3 attention policy: mode=%s tier=%d rows=%d heads=%d "
             "head_group=%d input_cache=%s available=%.2f GiB "
-            "reserve=%.2f GiB estimated_peak=%.2f GiB",
+            "reserve=%.2f GiB planned_available=%.2f GiB estimated_peak=%.2f GiB %s",
             mode,
+            decision.tier,
             rows,
             heads,
             head_group,
             cache_input,
             available / 1024**3,
             reserve / 1024**3,
+            planned_available / 1024**3,
             estimated / 1024**3,
+            _log_memory_diagnostics(x.device),
         )
-        _LOGGED_DECISIONS.add(key)
     return decision
 
 
@@ -376,6 +620,7 @@ def decide_ffn_channels(
     *,
     expanded_size: int,
     chunk_rows: int,
+    runtime_plan: ActivationRuntimePlan | None = None,
 ) -> FFNChannelDecision:
     """Select an exact ConvRot-aligned FFN intermediate shard."""
     rows = int(x.shape[0])
@@ -386,8 +631,11 @@ def decide_ffn_channels(
             mode, rows, expanded_size, chunk_rows, 0, 0, 0, 0
         )
     available, reserve, usable = _runtime_memory(x.device)
+    planned_available = _planning_available(
+        runtime_plan, x.device, rows, available, mode
+    )
     safety = max(768 * _MIB, int(usable * 0.075))
-    working = max(available - safety - 512 * _MIB, 0)
+    working = max(planned_available - safety - 512 * _MIB, 0)
     tile_rows = min(rows, chunk_rows or rows)
     hidden = int(x.shape[-1])
     persistent = rows * hidden * int(x.element_size())
@@ -444,28 +692,33 @@ def decide_ffn_channels(
         chunk_channels,
         reserve // (256 * _MIB),
     )
-    if key not in _LOGGED_DECISIONS:
+    if _should_log(runtime_plan, key):
         LOG.info(
-            "MiniMax H3 FFN policy: mode=%s rows=%d row_chunk=%d "
+            "MiniMax H3 FFN policy: mode=%s tier=%d rows=%d row_chunk=%d "
             "channel_chunk=%d available=%.2f GiB reserve=%.2f GiB "
-            "estimated_peak=%.2f GiB",
+            "planned_available=%.2f GiB estimated_peak=%.2f GiB %s",
             mode,
+            decision.tier,
             rows,
             chunk_rows,
             chunk_channels,
             available / 1024**3,
             reserve / 1024**3,
+            planned_available / 1024**3,
             estimated / 1024**3,
+            _log_memory_diagnostics(x.device),
         )
-        _LOGGED_DECISIONS.add(key)
     return decision
 
 
 __all__ = [
+    "ActivationRuntimePlan",
     "ActivationDecision",
     "AttentionDecision",
     "FFNChannelDecision",
     "decide_activation_chunks",
     "decide_attention_heads",
     "decide_ffn_channels",
+    "ensure_dynamic_vram_headroom",
+    "estimate_attention_lifecycle_peak",
 ]

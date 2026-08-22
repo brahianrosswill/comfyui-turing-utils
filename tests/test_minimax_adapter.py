@@ -468,7 +468,50 @@ class MiniMaxAdapterTest(unittest.TestCase):
 
         self.assertEqual(result, "ok")
         self.assertEqual(seen[0]["latent_shapes"], latent_shapes)
+        self.assertTrue(
+            callable(seen[0]["activation_plan"].observe_available)
+        )
         self.assertFalse(hasattr(base, minimax_adapter._MEMORY_CONTEXT_ATTR))
+
+    def test_memory_required_includes_serial_activation_floor_when_profiled(self):
+        class Base:
+            def get_dtype_inference(self):
+                return torch.bfloat16
+
+            def memory_required(self, input_shape, cond_shapes={}):
+                return 100
+
+        plan = minimax_adapter._MiniMaxMemoryShape(
+            1,
+            full_rows=127_275,
+            target_rows=127_275,
+            target_visual_rows=0,
+            target_audio_rows=0,
+            visual_condition_rows=0,
+            audio_condition_rows=0,
+            hidden_size=5376,
+            video_row_width=96,
+            audio_row_width=32,
+        )
+        profile = minimax_adapter._MiniMaxActivationProfile(
+            hidden_size=5376,
+            heads=56,
+            head_dim=128,
+            expanded_size=14_336,
+        )
+        base = Base()
+        base.memory_required = minimax_adapter._make_memory_required(
+            base, (), (), profile
+        )
+        required = base.memory_required(
+            [1, 1, 1],
+            cond_shapes={minimax_adapter._MEMORY_SHAPE_KEY: [plan]},
+        )
+
+        self.assertEqual(
+            required,
+            100 + profile.conservative_floor_bytes(127_275, 2),
+        )
 
     def test_temporal_topology_matches_the_target_video_tail(self):
         base = SimpleNamespace()

@@ -35,6 +35,8 @@ from .activation_policy import (
     decide_activation_chunks,
     decide_attention_heads,
     decide_ffn_channels,
+    ensure_dynamic_vram_headroom,
+    estimate_attention_lifecycle_peak,
 )
 from .layout import (
     ATTENTION_LAYOUT_KEY,
@@ -86,6 +88,26 @@ _MEMORY_ADAPTER_ATTR = "_turing_utils_minimax_memory_adapter"
 _OUTER_SAMPLE_WRAPPER_KEY = RUNTIME_OUTER_WRAPPER_KEY
 _ATTENTION_LAYOUT_KEY = ATTENTION_LAYOUT_KEY
 _STREAMED_QKV_EXECUTOR_ATTR = "turing_utils_streamed_qkv_executor"
+
+
+def _runtime_activation_plan(base_model):
+    if base_model is None:
+        return None
+    try:
+        context = getattr(base_model, RUNTIME_CONTEXT_ATTR, None)
+    except ReferenceError:
+        return None
+    return context.get("activation_plan") if isinstance(context, dict) else None
+
+
+def _weak_model_reference(base_model):
+    if base_model is None:
+        return None
+    try:
+        return weakref.proxy(base_model)
+    except TypeError:
+        # Test doubles and a few third-party wrappers are not weak-referenceable.
+        return base_model
 
 
 class _MiniMaxMemoryShape(list):
@@ -163,6 +185,78 @@ class _MiniMaxMemoryCond:
 
     def size(self):
         return self.cond
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _MiniMaxActivationProfile:
+    hidden_size: int
+    heads: int
+    head_dim: int
+    expanded_size: int
+
+    def conservative_floor_bytes(self, rows: int, element_size: int) -> int:
+        """Peak of the first safe streamed tiers, not a sum of serial ops."""
+        rows = int(rows)
+        element_size = int(element_size)
+        block_heads = 256 // math.gcd(256, self.head_dim)
+        half = max((self.heads // 2) // block_heads * block_heads, block_heads)
+        group = min(half, self.heads)
+        attention = estimate_attention_lifecycle_peak(
+            rows=rows,
+            heads=self.heads,
+            head_dim=self.head_dim,
+            hidden_size=self.hidden_size,
+            element_size=element_size,
+            head_group=group,
+            compact_qk=True,
+            cache_quantized_input=False,
+            quantized_value=True,
+        )
+
+        qkv_scales = ((rows + 63) // 64) * self.heads * 5 * 4
+        qkv_persistent = (
+            rows
+            * (
+                2 * self.heads * self.head_dim
+                + self.heads * self.head_dim * element_size
+            )
+            + qkv_scales
+        )
+        qkv_tile = min(rows, 16_384) * (
+            3 * self.heads * self.head_dim * element_size
+            + self.hidden_size
+            + 4
+        )
+        qkv = qkv_persistent + qkv_tile
+
+        mlp = rows * self.hidden_size * element_size + min(rows, 32_768) * (
+            2 * self.expanded_size * element_size
+            + self.expanded_size
+            + self.hidden_size * element_size
+        )
+        return max(attention, qkv, mlp)
+
+
+def _activation_profile(diffusion_model) -> _MiniMaxActivationProfile | None:
+    blocks = getattr(diffusion_model, "blocks", None)
+    if blocks is None or len(blocks) == 0:
+        return None
+    block = blocks[0]
+    attention = getattr(block, "attn", None)
+    mlp = getattr(block, "mlp", None)
+    fc2 = getattr(mlp, "fc2", None)
+    try:
+        profile = _MiniMaxActivationProfile(
+            hidden_size=int(getattr(diffusion_model, "hidden_size")),
+            heads=int(getattr(attention, "heads")),
+            head_dim=int(getattr(attention, "head_dim")),
+            expanded_size=int(getattr(fc2, "in_features")),
+        )
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if min(dataclasses.astuple(profile)) <= 0:
+        return None
+    return profile
 
 
 def _minimax_memory_shape(kwargs, latent_shapes, diffusion_model):
@@ -278,6 +372,7 @@ def _make_memory_required(
     base_model,
     w8_output_channels: tuple[int, ...],
     fixed_workspaces: tuple[int, ...],
+    activation_profile: _MiniMaxActivationProfile | None = None,
 ):
     original = OriginalMethod.capture(base_model.memory_required, base_model)
 
@@ -307,6 +402,10 @@ def _make_memory_required(
             for output_channels in w8_output_channels
         ]
         transient_workspaces.extend(fixed_workspaces)
+        if activation_profile is not None:
+            transient_workspaces.append(
+                activation_profile.conservative_floor_bytes(rows, dtype_size)
+            )
         if transient_workspaces:
             # Linear layers execute serially, so only the largest transient
             # workspace is live at once. Summing them would over-reserve VRAM.
@@ -328,6 +427,7 @@ def _linear_workspace_requirements(
 
 def _install_memory_planning(model, base_model, diffusion_model) -> bool:
     outputs, fixed_workspaces = _linear_workspace_requirements(base_model)
+    activation_profile = _activation_profile(diffusion_model)
     installed = install_memory_hooks(
         base_model,
         marker=_MEMORY_ADAPTER_ATTR,
@@ -338,15 +438,23 @@ def _install_memory_planning(model, base_model, diffusion_model) -> bool:
             base_model,
             outputs,
             fixed_workspaces,
+            activation_profile,
         ),
         required_methods=("get_dtype_inference",),
     )
     if not installed:
         return False
     LOG.info(
-        "Enabled MiniMax packed-sequence VRAM planning: W8 outputs=[%s] fixed_workspaces=[%s MiB]",
+        "Enabled MiniMax packed-sequence VRAM planning: W8 outputs=[%s] "
+        "fixed_workspaces=[%s MiB] activation_profile=%s",
         ",".join(map(str, outputs)) or "none",
         ",".join(f"{value / 1024**2:.1f}" for value in fixed_workspaces) or "none",
+        (
+            f"H{activation_profile.hidden_size}/A{activation_profile.heads}x"
+            f"{activation_profile.head_dim}/F{activation_profile.expanded_size}"
+            if activation_profile is not None
+            else "none"
+        ),
     )
     return True
 
@@ -1169,11 +1277,17 @@ def _stream_qkv_projection(
     return qk, value
 
 
-def _make_attention_forward(attention, attention_container, original=None):
+def _make_attention_forward(
+    attention,
+    attention_container,
+    original=None,
+    base_model=None,
+):
     original = OriginalMethod.capture(
         attention.forward if original is None else original,
         attention,
     )
+    base_model = _weak_model_reference(base_model)
 
     def forward(self, x, rope_freqs=None, transformer_options={}):
         executor = prepared_attention_executor(transformer_options)
@@ -1209,6 +1323,7 @@ def _make_attention_forward(attention, attention_container, original=None):
         # projection path instead of failing after committing partial output.
         stream_abi_available = reusable_k_anchor_available()
         qkv_is_w8 = convrot_weight_kind(self.qkv_proj.weight) == "w8a8"
+        runtime_plan = _runtime_activation_plan(base_model)
         if qkv_is_w8:
             head_decision = decide_attention_heads(
                 x,
@@ -1218,8 +1333,19 @@ def _make_attention_forward(attention, attention_container, original=None):
                     callable(streamed_executor) and stream_abi_available
                 ),
                 quantized_input=True,
+                quantized_value=bool(callable(streamed_executor)),
+                runtime_plan=runtime_plan,
             )
             if head_decision.sharded:
+                if base_model is not None:
+                    ensure_dynamic_vram_headroom(
+                        base_model,
+                        x.device,
+                        rows=int(x.shape[0]),
+                        operation="attention_heads",
+                        estimated_peak_bytes=head_decision.estimated_peak_bytes,
+                        runtime_plan=runtime_plan,
+                    )
                 output = _head_sharded_attention(
                     self,
                     x,
@@ -1255,8 +1381,19 @@ def _make_attention_forward(attention, attention_container, original=None):
                 operation="qkv",
                 hidden_size=int(x.shape[-1]),
                 expanded_size=int(self.heads * self.head_dim),
+                heads=int(self.heads),
+                runtime_plan=runtime_plan,
             )
             if decision.streamed:
+                if base_model is not None:
+                    ensure_dynamic_vram_headroom(
+                        base_model,
+                        x.device,
+                        rows=int(x.shape[0]),
+                        operation="qkv",
+                        estimated_peak_bytes=decision.streamed_peak_bytes,
+                        runtime_plan=runtime_plan,
+                    )
                 qk, value = _stream_qkv_projection(
                     self,
                     x,
@@ -1379,6 +1516,7 @@ def install_minimax_attention_sites(model, device: torch.device) -> AttentionSit
                 block.attn,
                 AttentionTensorContainer,
                 current,
+                root,
             ),
         )
         installed += 1
@@ -1638,8 +1776,13 @@ def _stream_mlp_channels(
         )
 
 
-def _make_mlp_forward(mlp: torch.nn.Module, audit: _RuntimeDispatchAudit):
+def _make_mlp_forward(
+    mlp: torch.nn.Module,
+    audit: _RuntimeDispatchAudit,
+    base_model=None,
+):
     original = OriginalMethod.capture(mlp.forward, mlp)
+    base_model = _weak_model_reference(base_model)
 
     def forward(self, x: torch.Tensor):
         blocker = None
@@ -1653,19 +1796,31 @@ def _make_mlp_forward(mlp: torch.nn.Module, audit: _RuntimeDispatchAudit):
         if blocker is not None:
             return original(self, x)
         expanded_size = int(getattr(self.fc2, "in_features", 0))
+        runtime_plan = _runtime_activation_plan(base_model)
         decision = decide_activation_chunks(
             x,
             operation="mlp",
             hidden_size=int(x.shape[-1]),
             expanded_size=expanded_size,
+            runtime_plan=runtime_plan,
         )
         if convrot_swiglu_channel_sharding_available():
             channel_decision = decide_ffn_channels(
                 x,
                 expanded_size=expanded_size,
                 chunk_rows=decision.chunk_rows,
+                runtime_plan=runtime_plan,
             )
             if channel_decision.sharded:
+                if base_model is not None:
+                    ensure_dynamic_vram_headroom(
+                        base_model,
+                        x.device,
+                        rows=int(x.shape[0]),
+                        operation="ffn_channels",
+                        estimated_peak_bytes=channel_decision.estimated_peak_bytes,
+                        runtime_plan=runtime_plan,
+                    )
                 output = _stream_mlp_channels(
                     self,
                     x,
@@ -1674,6 +1829,15 @@ def _make_mlp_forward(mlp: torch.nn.Module, audit: _RuntimeDispatchAudit):
                 )
                 if output is not None:
                     return output
+        if base_model is not None:
+            ensure_dynamic_vram_headroom(
+                base_model,
+                x.device,
+                rows=int(x.shape[0]),
+                operation="mlp",
+                estimated_peak_bytes=decision.streamed_peak_bytes,
+                runtime_plan=runtime_plan,
+            )
         if decision.streamed:
             return _stream_mlp(self, x, decision.chunk_rows)
         return fused_convrot_linear_input_act(
@@ -1797,7 +1961,7 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
         if hasattr(block.mlp, "fc2") and is_turing_convrot_linear(block.mlp.fc2):
             model.add_object_patch(
                 f"{name}.mlp.forward",
-                _make_mlp_forward(block.mlp, audit),
+                _make_mlp_forward(block.mlp, audit, root),
             )
             mlp_fusions += 1
         if callable(turing_segmented_rms_adaln):

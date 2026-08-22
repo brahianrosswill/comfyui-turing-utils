@@ -14,6 +14,7 @@ import math
 import weakref
 
 from ..methods import OriginalMethod, weak_method
+from .activation_policy import ActivationRuntimePlan
 
 from ...attention.layout import (
     ATTENTION_LAYOUT_KEY,
@@ -91,7 +92,16 @@ def make_minimax_runtime_context_wrapper(base_model):
         if latent_shapes is None and len(args) > 8:
             latent_shapes = args[8]
         previous = getattr(base_model, RUNTIME_CONTEXT_ATTR, None)
-        setattr(base_model, RUNTIME_CONTEXT_ATTR, {"latent_shapes": latent_shapes})
+        setattr(
+            base_model,
+            RUNTIME_CONTEXT_ATTR,
+            {
+                "latent_shapes": latent_shapes,
+                # The same mutable object survives the shallow runtime-context
+                # copies made for every diffusion forward and denoising step.
+                "activation_plan": ActivationRuntimePlan(),
+            },
+        )
         try:
             return executor(*args, **kwargs)
         finally:

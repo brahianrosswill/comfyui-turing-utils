@@ -179,6 +179,129 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
         self.assertEqual((56 - decision.head_group) % 2, 0)
         self.assertEqual((decision.head_group * 128) % 256, 0)
 
+    def test_sampler_plan_never_promotes_attention_after_free_memory_recovers(self):
+        plan = activation_policy.ActivationRuntimePlan()
+        with mock.patch.object(
+            activation_policy,
+            "_runtime_memory",
+            side_effect=(
+                (int(6.8 * _GIB), 4 * _GIB, 12 * _GIB),
+                (int(7.54 * _GIB), 4 * _GIB, 12 * _GIB),
+            ),
+        ):
+            first = activation_policy.decide_attention_heads(
+                _FakeActivation(127_275),
+                heads=56,
+                head_dim=128,
+                compact_qk=True,
+                quantized_input=True,
+                quantized_value=True,
+                runtime_plan=plan,
+            )
+            later = activation_policy.decide_attention_heads(
+                _FakeActivation(127_275),
+                heads=56,
+                head_dim=128,
+                compact_qk=True,
+                quantized_input=True,
+                quantized_value=True,
+                runtime_plan=plan,
+            )
+
+        self.assertEqual(first.head_group, 32)
+        self.assertEqual(later.head_group, first.head_group)
+        self.assertLess(first.head_group, 56)
+
+    def test_sampler_plan_never_increases_a_streamed_row_tile(self):
+        plan = activation_policy.ActivationRuntimePlan()
+        with mock.patch.object(
+            activation_policy,
+            "_runtime_memory",
+            side_effect=(
+                (int(5.5 * _GIB), 4 * _GIB, 12 * _GIB),
+                (10 * _GIB, 4 * _GIB, 12 * _GIB),
+            ),
+        ):
+            first = activation_policy.decide_activation_chunks(
+                _FakeActivation(127_275),
+                operation="qkv",
+                hidden_size=5376,
+                expanded_size=7168,
+                runtime_plan=plan,
+            )
+            later = activation_policy.decide_activation_chunks(
+                _FakeActivation(127_275),
+                operation="qkv",
+                hidden_size=5376,
+                expanded_size=7168,
+                runtime_plan=plan,
+            )
+
+        self.assertTrue(first.streamed)
+        self.assertEqual(later.chunk_rows, first.chunk_rows)
+
+    def test_attention_peak_includes_w8a8_value_and_summary_lifecycle(self):
+        with mock.patch.object(
+            activation_policy,
+            "_runtime_memory",
+            return_value=(10 * _GIB, 4 * _GIB, 12 * _GIB),
+        ):
+            without_v8 = activation_policy.decide_attention_heads(
+                _FakeActivation(127_275),
+                heads=56,
+                head_dim=128,
+                compact_qk=True,
+                quantized_input=True,
+                quantized_value=False,
+            )
+            with_v8 = activation_policy.decide_attention_heads(
+                _FakeActivation(127_275),
+                heads=56,
+                head_dim=128,
+                compact_qk=True,
+                quantized_input=True,
+                quantized_value=True,
+            )
+
+        self.assertGreater(
+            with_v8.estimated_peak_bytes,
+            without_v8.estimated_peak_bytes + int(0.7 * _GIB),
+        )
+
+    def test_dynamic_vram_headroom_reclaims_only_the_selected_tier_deficit(self):
+        vbar = SimpleNamespace(free_memory=mock.Mock(return_value=384 * 1024**2))
+        patcher = SimpleNamespace(
+            is_dynamic=lambda: True,
+            _vbar_get=lambda: vbar,
+        )
+        base = SimpleNamespace(current_patcher=patcher)
+        plan = activation_policy.ActivationRuntimePlan()
+        with mock.patch.object(
+            activation_policy,
+            "_runtime_memory",
+            return_value=(2 * _GIB, 0, 6 * _GIB),
+        ):
+            first = activation_policy.ensure_dynamic_vram_headroom(
+                base,
+                torch.device("cuda", 0),
+                rows=135_000,
+                operation="attention_heads",
+                estimated_peak_bytes=2 * _GIB,
+                runtime_plan=plan,
+            )
+            second = activation_policy.ensure_dynamic_vram_headroom(
+                base,
+                torch.device("cuda", 0),
+                rows=135_000,
+                operation="attention_heads",
+                estimated_peak_bytes=2 * _GIB,
+                runtime_plan=plan,
+            )
+
+        self.assertEqual(first, 384 * 1024**2)
+        self.assertEqual(second, 0)
+        vbar.free_memory.assert_called_once()
+
     def test_attention_head_override_uses_largest_legal_group(self):
         with (
             mock.patch.object(
