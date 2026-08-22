@@ -17,6 +17,7 @@ import torch
 
 LOG = logging.getLogger("comfyui-turing-utils")
 _MIB = 1024**2
+_VBAR_PAGE_BYTES = 32 * _MIB
 _LOGGED_DECISIONS: set[tuple] = set()
 
 
@@ -189,8 +190,86 @@ def _override_ffn_channels() -> int | None:
         return None
 
 
-def _runtime_memory(device: torch.device) -> tuple[int, int, int]:
-    """Return usable remaining bytes, total reserve, and usable ceiling."""
+def _dynamic_vbars(base_model, device: torch.device) -> tuple[object, ...]:
+    """Return unique DynamicVRAM VBARs, preferring inactive models first."""
+    if base_model is None:
+        return ()
+    device = torch.device(device)
+    current = getattr(base_model, "current_patcher", None)
+    candidates = []
+    try:
+        import comfy.model_management as model_management
+
+        candidates.extend(model_management.loaded_models())
+    except (ImportError, AttributeError, RuntimeError, TypeError):
+        pass
+
+    result = []
+    seen = set()
+
+    def resolve(patcher):
+        try:
+            if not patcher.is_dynamic():
+                return None
+            load_device = torch.device(
+                getattr(
+                    patcher,
+                    "load_device",
+                    device if patcher is current else None,
+                )
+            )
+            if load_device != device:
+                return None
+            return patcher._vbar_get()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+
+    current_vbar = resolve(current) if current is not None else None
+    current_vbar_id = id(current_vbar) if current_vbar is not None else None
+    for patcher in candidates:
+        vbar = resolve(patcher)
+        if vbar is None or id(vbar) == current_vbar_id:
+            continue
+        if id(vbar) in seen:
+            continue
+        seen.add(id(vbar))
+        result.append(vbar)
+    if current_vbar is not None and current_vbar_id not in seen:
+        result.append(current_vbar)
+    return tuple(result)
+
+
+def _vbar_reclaimable_bytes(vbar) -> int:
+    """Count resident, unpinned 32 MiB pages without noisy VBAR analysis."""
+    try:
+        residency = vbar.get_residency()
+        freeable_pages = sum(
+            1 for status in residency if (int(status) & 1) and not (int(status) & 2)
+        )
+        reclaimable = freeable_pages * _VBAR_PAGE_BYTES
+        loaded_size = int(vbar.loaded_size())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return 0
+    return max(min(reclaimable, loaded_size), 0)
+
+
+def _dynamic_vram_reclaimable(base_model, device: torch.device) -> int:
+    return sum(
+        _vbar_reclaimable_bytes(vbar)
+        for vbar in _dynamic_vbars(base_model, device)
+    )
+
+
+def _runtime_memory(
+    device: torch.device,
+    base_model=None,
+) -> tuple[int, int, int]:
+    """Return effective remaining bytes, total reserve, and usable ceiling.
+
+    DynamicVRAM resident pages are not ordinary free CUDA memory, but unpinned
+    pages can be evicted before an activation allocation.  Count only those
+    pages; pinned weights remain unavailable.
+    """
     import comfy.model_management as model_management
 
     total = int(model_management.get_total_memory(device))
@@ -198,10 +277,11 @@ def _runtime_memory(device: torch.device) -> tuple[int, int, int]:
     usable = max(total - reserve, 0)
     allocated = int(torch.cuda.memory_allocated(device))
     free = int(model_management.get_free_memory(device))
+    reclaimable = _dynamic_vram_reclaimable(base_model, device)
     # get_free_memory includes unused PyTorch cache.  The second bound is what
     # makes --reserve-vram a hard ceiling even when the display is temporarily
     # idle and nvidia-smi reports the memory as free.
-    return max(min(free, usable - allocated), 0), reserve, usable
+    return max(min(free + reclaimable, usable - allocated), 0), reserve, usable
 
 
 def _planning_available(
@@ -254,14 +334,18 @@ def _memory_diagnostics(device: torch.device) -> tuple[int, int, int, int]:
     return allocated, reserved, raw_free, aimdo_usage
 
 
-def _log_memory_diagnostics(device: torch.device) -> str:
+def _log_memory_diagnostics(device: torch.device, base_model=None) -> str:
     allocated, reserved, raw_free, aimdo_usage = _memory_diagnostics(device)
-    return (
+    result = (
         f"torch_active={allocated / 1024**3:.2f} GiB "
         f"torch_reserved={reserved / 1024**3:.2f} GiB "
         f"cuda_free={raw_free / 1024**3:.2f} GiB "
         f"aimdo_usage={aimdo_usage / 1024**3:.2f} GiB"
     )
+    if base_model is not None:
+        reclaimable = _dynamic_vram_reclaimable(base_model, device)
+        result += f" dynamic_reclaimable={reclaimable / 1024**3:.2f} GiB"
+    return result
 
 
 def ensure_dynamic_vram_headroom(
@@ -297,20 +381,21 @@ def ensure_dynamic_vram_headroom(
     ):
         return 0
 
-    patcher = getattr(base_model, "current_patcher", None)
-    is_dynamic = getattr(patcher, "is_dynamic", None)
-    get_vbar = getattr(patcher, "_vbar_get", None)
-    if not callable(is_dynamic) or not is_dynamic() or not callable(get_vbar):
-        return 0
-    try:
-        vbar = get_vbar()
+    freed = 0
+    remaining = deficit
+    for vbar in _dynamic_vbars(base_model, device):
         free_memory = getattr(vbar, "free_memory", None)
         if not callable(free_memory):
-            return 0
-        freed = int(free_memory(deficit) or 0)
-    except (AttributeError, RuntimeError, TypeError, ValueError) as error:
-        LOG.debug("DynamicVRAM headroom request was unavailable: %s", error)
-        return 0
+            continue
+        try:
+            released = max(int(free_memory(remaining) or 0), 0)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as error:
+            LOG.debug("DynamicVRAM headroom request was unavailable: %s", error)
+            continue
+        freed += released
+        remaining = max(remaining - released, 0)
+        if remaining <= 0:
+            break
     if freed > 0:
         LOG.info(
             "MiniMax H3 DynamicVRAM headroom: op=%s rows=%d requested=%.1f MiB "
@@ -319,7 +404,7 @@ def ensure_dynamic_vram_headroom(
             rows,
             deficit / _MIB,
             freed / _MIB,
-            _log_memory_diagnostics(device),
+            _log_memory_diagnostics(device, base_model),
         )
     return freed
 
@@ -386,6 +471,7 @@ def decide_activation_chunks(
     expanded_size: int,
     heads: int | None = None,
     runtime_plan: ActivationRuntimePlan | None = None,
+    base_model=None,
 ) -> ActivationDecision:
     """Select the full or streamed H3 activation path.
 
@@ -397,7 +483,7 @@ def decide_activation_chunks(
     if x.device.type != "cuda" or rows <= 0:
         return ActivationDecision(operation, mode, rows, 0, 0, 0, 0, 0)
 
-    available, reserve, usable = _runtime_memory(x.device)
+    available, reserve, usable = _runtime_memory(x.device, base_model)
     planned_available = _planning_available(
         runtime_plan, x.device, rows, available, mode
     )
@@ -500,7 +586,7 @@ def decide_activation_chunks(
             planned_available / 1024**3,
             full_peak / 1024**3,
             streamed_peak / 1024**3,
-            _log_memory_diagnostics(x.device),
+            _log_memory_diagnostics(x.device, base_model),
         )
     return decision
 
@@ -514,6 +600,7 @@ def decide_attention_heads(
     quantized_input: bool,
     quantized_value: bool = False,
     runtime_plan: ActivationRuntimePlan | None = None,
+    base_model=None,
 ) -> AttentionDecision:
     """Choose a whole-head group without changing global sequence attention."""
     rows = int(x.shape[0])
@@ -523,7 +610,7 @@ def decide_attention_heads(
     if x.device.type != "cuda" or rows <= 0 or heads <= 0:
         return AttentionDecision(mode, rows, heads, heads, False, 0, 0, 0)
 
-    available, reserve, usable = _runtime_memory(x.device)
+    available, reserve, usable = _runtime_memory(x.device, base_model)
     planned_available = _planning_available(
         runtime_plan, x.device, rows, available, mode
     )
@@ -560,7 +647,11 @@ def decide_attention_heads(
     if override is not None:
         groups = [group for group in groups if group <= override] or [groups[-1]]
 
-    fit_limit = int(working * 0.96)
+    # ``working`` already excludes both the general safety allowance and one
+    # streamed weight workspace.  A second percentage haircut pushed H3 D128
+    # just below the legal full-head boundary on a 12 GiB usable budget and
+    # doubled the number of exact attention passes.
+    fit_limit = working
     full_fits = peak(heads, False) <= fit_limit
     if (mode == "throughput" or full_fits) and override is None:
         head_group = heads
@@ -613,7 +704,7 @@ def decide_attention_heads(
             reserve / 1024**3,
             planned_available / 1024**3,
             estimated / 1024**3,
-            _log_memory_diagnostics(x.device),
+            _log_memory_diagnostics(x.device, base_model),
         )
     return decision
 
@@ -624,6 +715,7 @@ def decide_ffn_channels(
     expanded_size: int,
     chunk_rows: int,
     runtime_plan: ActivationRuntimePlan | None = None,
+    base_model=None,
 ) -> FFNChannelDecision:
     """Select an exact ConvRot-aligned FFN intermediate shard."""
     rows = int(x.shape[0])
@@ -633,7 +725,7 @@ def decide_ffn_channels(
         return FFNChannelDecision(
             mode, rows, expanded_size, chunk_rows, 0, 0, 0, 0
         )
-    available, reserve, usable = _runtime_memory(x.device)
+    available, reserve, usable = _runtime_memory(x.device, base_model)
     planned_available = _planning_available(
         runtime_plan, x.device, rows, available, mode
     )
@@ -709,7 +801,7 @@ def decide_ffn_channels(
             reserve / 1024**3,
             planned_available / 1024**3,
             estimated / 1024**3,
-            _log_memory_diagnostics(x.device),
+            _log_memory_diagnostics(x.device, base_model),
         )
     return decision
 

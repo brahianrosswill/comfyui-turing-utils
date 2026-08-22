@@ -1324,6 +1324,7 @@ def _make_attention_forward(
         stream_abi_available = reusable_k_anchor_available()
         qkv_is_w8 = convrot_weight_kind(self.qkv_proj.weight) == "w8a8"
         runtime_plan = _runtime_activation_plan(base_model)
+        head_decision = None
         if qkv_is_w8:
             head_decision = decide_attention_heads(
                 x,
@@ -1335,6 +1336,7 @@ def _make_attention_forward(
                 quantized_input=True,
                 quantized_value=bool(callable(streamed_executor)),
                 runtime_plan=runtime_plan,
+                base_model=base_model,
             )
             if head_decision.sharded:
                 if base_model is not None:
@@ -1368,6 +1370,16 @@ def _make_attention_forward(
                         return output
                     return self.out_proj(output)
 
+            if base_model is not None:
+                ensure_dynamic_vram_headroom(
+                    base_model,
+                    x.device,
+                    rows=int(x.shape[0]),
+                    operation="attention_execute",
+                    estimated_peak_bytes=head_decision.estimated_peak_bytes,
+                    runtime_plan=runtime_plan,
+                )
+
         if executor is None:
             return original(
                 self,
@@ -1383,6 +1395,7 @@ def _make_attention_forward(
                 expanded_size=int(self.heads * self.head_dim),
                 heads=int(self.heads),
                 runtime_plan=runtime_plan,
+                base_model=base_model,
             )
             if decision.streamed:
                 if base_model is not None:
@@ -1803,6 +1816,7 @@ def _make_mlp_forward(
             hidden_size=int(x.shape[-1]),
             expanded_size=expanded_size,
             runtime_plan=runtime_plan,
+            base_model=base_model,
         )
         if convrot_swiglu_channel_sharding_available():
             channel_decision = decide_ffn_channels(
@@ -1810,6 +1824,7 @@ def _make_mlp_forward(
                 expanded_size=expanded_size,
                 chunk_rows=decision.chunk_rows,
                 runtime_plan=runtime_plan,
+                base_model=base_model,
             )
             if channel_decision.sharded:
                 if base_model is not None:

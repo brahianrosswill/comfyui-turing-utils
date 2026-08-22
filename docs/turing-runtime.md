@@ -179,6 +179,14 @@ than a Turing/Ampere branch. ComfyUI's current free/reclaimable bytes and
 `--reserve-vram` ceiling select the highest-throughput fitting rung at every
 operator call.
 
+DynamicVRAM budgeting distinguishes physical CUDA free memory from evictable
+model residency. The adapter reads each VBAR's resident/pinned bitmap and adds
+only resident, unpinned 32 MiB pages to the effective budget, capped by the
+same `--reserve-vram` usable ceiling. When the selected tier needs those pages,
+inactive model VBARs are released before the current diffusion VBAR. This is a
+quiet replacement for `vbars_analyze`: pinned weights never inflate the budget
+and normal runs do not emit one warning per pinned page.
+
 QKV row tiles write directly into their final INT8 Q/K and BF16 V storage.
 Kernel 0.30 accepts a reusable K anchor computed from the same nine positions
 in the complete sequence, so streaming no longer disables adaptive anchoring.

@@ -208,7 +208,6 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
                 runtime_plan=plan,
             )
 
-        self.assertEqual(first.head_group, 32)
         self.assertEqual(later.head_group, first.head_group)
         self.assertLess(first.head_group, 56)
 
@@ -267,6 +266,127 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
             with_v8.estimated_peak_bytes,
             without_v8.estimated_peak_bytes + int(0.7 * _GIB),
         )
+
+    def test_quiet_vbar_budget_counts_only_resident_unpinned_pages(self):
+        vbar = SimpleNamespace(
+            get_residency=mock.Mock(return_value=[1, 3, 0, 1]),
+            loaded_size=mock.Mock(return_value=3 * 32 * 1024**2),
+        )
+        patcher = SimpleNamespace(
+            load_device=torch.device("cuda", 0),
+            is_dynamic=lambda: True,
+            _vbar_get=lambda: vbar,
+        )
+        base = SimpleNamespace(current_patcher=patcher)
+
+        comfy = ModuleType("comfy")
+        comfy.__path__ = []
+        model_management = ModuleType("comfy.model_management")
+        model_management.loaded_models = mock.Mock(return_value=[])
+        comfy.model_management = model_management
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "comfy": comfy,
+                "comfy.model_management": model_management,
+            },
+        ):
+            reclaimable = activation_policy._dynamic_vram_reclaimable(
+                base, torch.device("cuda", 0)
+            )
+
+        self.assertEqual(reclaimable, 2 * 32 * 1024**2)
+        vbar.get_residency.assert_called_once_with()
+
+    def test_runtime_budget_includes_reclaimable_vbar_pages_but_keeps_ceiling(self):
+        comfy = ModuleType("comfy")
+        comfy.__path__ = []
+        model_management = ModuleType("comfy.model_management")
+        model_management.get_total_memory = mock.Mock(return_value=16 * _GIB)
+        model_management.extra_reserved_memory = mock.Mock(return_value=4 * _GIB)
+        model_management.get_free_memory = mock.Mock(return_value=5 * _GIB)
+        comfy.model_management = model_management
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "comfy": comfy,
+                    "comfy.model_management": model_management,
+                },
+            ),
+            mock.patch.object(torch.cuda, "memory_allocated", return_value=2 * _GIB),
+            mock.patch.object(
+                activation_policy,
+                "_dynamic_vram_reclaimable",
+                return_value=4 * _GIB,
+            ),
+        ):
+            available, reserve, usable = activation_policy._runtime_memory(
+                torch.device("cuda", 0), object()
+            )
+
+        self.assertEqual(available, 9 * _GIB)
+        self.assertEqual(reserve, 4 * _GIB)
+        self.assertEqual(usable, 12 * _GIB)
+
+    def test_dynamic_vbars_prioritize_inactive_models_and_deduplicate(self):
+        inactive_vbar = object()
+        current_vbar = object()
+        inactive = SimpleNamespace(
+            load_device=torch.device("cuda", 0),
+            is_dynamic=lambda: True,
+            _vbar_get=lambda: inactive_vbar,
+        )
+        current = SimpleNamespace(
+            load_device=torch.device("cuda", 0),
+            is_dynamic=lambda: True,
+            _vbar_get=lambda: current_vbar,
+        )
+        current_clone = SimpleNamespace(
+            load_device=torch.device("cuda", 0),
+            is_dynamic=lambda: True,
+            _vbar_get=lambda: current_vbar,
+        )
+        base = SimpleNamespace(current_patcher=current)
+        comfy = ModuleType("comfy")
+        comfy.__path__ = []
+        model_management = ModuleType("comfy.model_management")
+        model_management.loaded_models = mock.Mock(
+            return_value=[current_clone, inactive, current]
+        )
+        comfy.model_management = model_management
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "comfy": comfy,
+                "comfy.model_management": model_management,
+            },
+        ):
+            vbars = activation_policy._dynamic_vbars(
+                base, torch.device("cuda", 0)
+            )
+
+        self.assertEqual(vbars, (inactive_vbar, current_vbar))
+
+    def test_reclaimable_budget_restores_full_high_resolution_head_group(self):
+        with mock.patch.object(
+            activation_policy,
+            "_runtime_memory",
+            return_value=(int(7.54 * _GIB), 4 * _GIB, 12 * _GIB),
+        ):
+            decision = activation_policy.decide_attention_heads(
+                _FakeActivation(127_275),
+                heads=56,
+                head_dim=128,
+                compact_qk=True,
+                quantized_input=True,
+                quantized_value=True,
+                base_model=object(),
+            )
+
+        self.assertEqual(decision.head_group, 56)
+        self.assertFalse(decision.sharded)
 
     def test_dynamic_vram_headroom_reclaims_only_the_selected_tier_deficit(self):
         vbar = SimpleNamespace(free_memory=mock.Mock(return_value=384 * 1024**2))

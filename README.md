@@ -139,6 +139,11 @@ FFN call, the adapter reads ComfyUI's live free/reclaimable memory and the
   the original fused fc2 performs the complete contraction once;
 - each layer's weights are cast/transferred once and reused by every row tile,
   so activation savings do not multiply Dynamic VRAM traffic.
+- under AIMDO DynamicVRAM, resident VBAR pages are inspected through their
+  resident/pinned flags. Only resident, unpinned pages count as reclaimable;
+  inactive-model pages are released before current diffusion weights when a
+  faster activation tier needs headroom. This avoids both pessimistic head
+  sharding and the noisy `vbars_analyze` diagnostic path.
 - the H3 video-VAE overlap accumulator uses the same sm75+ native capability
   gate, so Ampere does not lose that fused decode path.
 
