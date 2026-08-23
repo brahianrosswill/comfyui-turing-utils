@@ -229,9 +229,16 @@ The smallest legal ConvRot-aligned group meeting those constraints becomes the
 `saturation_group`; a larger fitting group is not selected unless the complete
 unsharded lifecycle fits with its normal safety margin. QKV and MLP row tiles
 cap at 16K, and FFN channel splitting similarly targets no more than four
-balanced, 256-aligned groups. These tile sizes already expose much more Tensor
-Core work than can run concurrently on current supported GPUs, so preserving
-hot model residency takes precedence over enlarging their transient state.
+balanced, 256-aligned groups. Once a dynamically paged QKV projection spans
+four such tiles, `auto` retains the saturated 16K path even if a momentary
+free-memory reading says the monolithic projection fits. The full QKV tensor
+adds no useful parallelism at that size, makes V preparation more expensive,
+and can displace the two-stream weight prefetch window. This rule depends on
+sequence geometry and DynamicVRAM residency, not on an Ampere/Turing device
+name; explicit `throughput` mode still forces the full path for profiling.
+These tile sizes already expose much more Tensor Core work than can run
+concurrently on current supported GPUs, so preserving hot model residency
+takes precedence over enlarging their transient state.
 The packed-sequence memory estimate uses the same 16K MLP tile and balanced
 head group, preventing ComfyUI from pre-evicting weights for an obsolete,
 larger transient estimate.

@@ -72,6 +72,19 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
             expanded_size=expanded,
         )
 
+    @staticmethod
+    def _dynamic_base():
+        patcher = SimpleNamespace(
+            load_device=torch.device("cuda", 0),
+            is_dynamic=lambda: True,
+            _vbar_get=lambda: SimpleNamespace(loaded_size=lambda: 4 * _GIB),
+            model_size=lambda: 20 * _GIB,
+        )
+        return SimpleNamespace(
+            current_patcher=patcher,
+            _turing_utils_minimax_layer_count=50,
+        )
+
     def test_twelve_gib_budget_keeps_low_resolution_throughput(self):
         # 15 s H3 at 480x864: 43,335 video + 1,206 audio target rows.
         with mock.patch.object(
@@ -84,6 +97,62 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
                     decision = self._decision(44_541, operation)
                     self.assertFalse(decision.streamed)
                     self.assertEqual(decision.chunk_rows, 0)
+
+    def test_dynamic_qkv_keeps_saturated_tile_when_full_projection_fits(self):
+        # A transiently idle desktop used to promote this exact workload back
+        # to a slower 60K-row monolithic QKV projection. Four saturated tiles
+        # retain the same math while preserving DynamicVRAM weight residency.
+        with mock.patch.object(
+            activation_policy,
+            "_runtime_memory",
+            return_value=(int(7.68 * _GIB), 4 * _GIB, 12 * _GIB),
+        ):
+            decision = activation_policy.decide_activation_chunks(
+                _FakeActivation(60_186),
+                operation="qkv",
+                hidden_size=5_376,
+                expanded_size=7_168,
+                heads=56,
+                base_model=self._dynamic_base(),
+            )
+
+        self.assertTrue(decision.streamed)
+        self.assertEqual(decision.chunk_rows, 16_384)
+
+    def test_dynamic_qkv_does_not_stream_before_four_saturated_tiles(self):
+        with mock.patch.object(
+            activation_policy,
+            "_runtime_memory",
+            return_value=(int(7.68 * _GIB), 4 * _GIB, 12 * _GIB),
+        ):
+            decision = activation_policy.decide_activation_chunks(
+                _FakeActivation(44_541),
+                operation="qkv",
+                hidden_size=5_376,
+                expanded_size=7_168,
+                heads=56,
+                base_model=self._dynamic_base(),
+            )
+
+        self.assertFalse(decision.streamed)
+        self.assertEqual(decision.chunk_rows, 0)
+
+    def test_saturated_qkv_rule_does_not_force_mlp_streaming(self):
+        with mock.patch.object(
+            activation_policy,
+            "_runtime_memory",
+            return_value=(int(9.90 * _GIB), 4 * _GIB, 12 * _GIB),
+        ):
+            decision = activation_policy.decide_activation_chunks(
+                _FakeActivation(60_186),
+                operation="mlp",
+                hidden_size=5_376,
+                expanded_size=14_336,
+                base_model=self._dynamic_base(),
+            )
+
+        self.assertFalse(decision.streamed)
+        self.assertEqual(decision.chunk_rows, 0)
 
     def test_twelve_gib_budget_streams_one_megapixel_stage(self):
         # The same clip after 2.5x area upscale to 768x1376 has 111,630 rows.

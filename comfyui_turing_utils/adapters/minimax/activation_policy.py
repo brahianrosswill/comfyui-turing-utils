@@ -26,6 +26,7 @@ _ATTENTION_QUERY_TILE_ROWS = 64
 _ATTENTION_TARGET_WAVES = 4
 _ATTENTION_CTAS_PER_SM = 2
 _MAX_BALANCED_SHARDS = 4
+_MIN_SATURATED_ROW_TILES = 4
 _MIN_SATURATED_GEMM_WIDTH = 1024
 _DEFAULT_WEIGHT_PREFETCH_BYTES = 512 * _MIB
 _MAX_WEIGHT_PREFETCH_BYTES = 1024 * _MIB
@@ -514,6 +515,35 @@ def _align_rows(value: int, alignment: int, minimum: int) -> int:
     return max(value, minimum) if value >= minimum else 0
 
 
+def _prefer_saturated_row_streaming(
+    *,
+    operation: str,
+    rows: int,
+    cap: int,
+    base_model,
+    device: torch.device,
+) -> bool:
+    """Keep a saturated QKV tile when monolithic output cannot add MFU.
+
+    Four 16K tiles are enough to amortize the row-streamed dispatches, while
+    each tile already contains substantially more W8 GEMM work than a current
+    GPU can execute concurrently.  For a dynamically paged DiT, making the
+    projection output larger beyond that point only consumes residency that
+    can hold the current/prefetched weights.  MLP is deliberately excluded:
+    its full fused fc1/fc2 path still benefits from avoiding repeated calls.
+
+    This is a workload- and residency-based rule, not a GPU-architecture
+    branch.  Explicit throughput mode remains the way to force a monolithic
+    projection for profiling.
+    """
+    return bool(
+        operation == "qkv"
+        and cap > 0
+        and math.ceil(int(rows) / int(cap)) >= _MIN_SATURATED_ROW_TILES
+        and _current_model_is_dynamic(base_model, device)
+    )
+
+
 def balanced_saturation_size(
     total: int,
     *,
@@ -707,12 +737,30 @@ def decide_activation_chunks(
 
     full_peak = persistent + rows * per_row
     override = _override_chunk_rows(operation)
+    saturation_limited = bool(
+        mode == "auto"
+        and override is None
+        and _prefer_saturated_row_streaming(
+            operation=operation,
+            rows=rows,
+            cap=cap,
+            base_model=base_model,
+            device=x.device,
+        )
+    )
     if mode == "throughput" and override is None:
         chunk_rows = 0
+        selection = "forced_throughput"
     elif override is not None:
         chunk_rows = min(rows, _align_rows(override, alignment, minimum))
-    elif mode == "auto" and full_peak <= int(working * 0.86):
+        selection = "override"
+    elif (
+        mode == "auto"
+        and not saturation_limited
+        and full_peak <= int(working * 0.86)
+    ):
         chunk_rows = 0
+        selection = "full_fit"
     else:
         tile_budget = max(working - persistent, 0)
         chunk_rows = min(
@@ -725,6 +773,7 @@ def decide_activation_chunks(
             # full activation.  An eventual CUDA OOM will then report the real
             # irreducible floor instead of requesting a multi-GiB temporary.
             chunk_rows = min(rows, minimum)
+        selection = "saturated_residency" if saturation_limited else "memory"
 
     streamed_peak = persistent + (chunk_rows or rows) * per_row
     decision = ActivationDecision(
@@ -743,12 +792,13 @@ def decide_activation_chunks(
         mode,
         rows,
         chunk_rows,
+        selection,
         reserve // (256 * _MIB),
     )
     if _should_log(runtime_plan, key):
         LOG.info(
             "MiniMax H3 activation policy: op=%s mode=%s tier=%d rows=%d path=%s "
-            "chunk_rows=%d available=%.2f GiB reserve=%.2f GiB "
+            "chunk_rows=%d selection=%s available=%.2f GiB reserve=%.2f GiB "
             "planned_available=%.2f GiB weight_prefetch=%.2f GiB "
             "estimated_peak(full/selected)=%.2f/%.2f GiB %s",
             operation,
@@ -757,6 +807,7 @@ def decide_activation_chunks(
             rows,
             "streamed" if decision.streamed else "throughput",
             chunk_rows,
+            selection,
             available / 1024**3,
             reserve / 1024**3,
             planned_available / 1024**3,

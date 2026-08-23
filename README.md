@@ -186,6 +186,11 @@ attention. Kernel 0.32 precomputes the adaptive K anchor from the same nine
 global sequence locations and reuses it while writing every row tile directly
 into the final Q/K storage. Row and head splitting therefore do not discard the
 global anchor, RMSNorm, RoPE, orthogonal rotation, scale blocks, or any K/V row.
+For a dynamically paged model, `auto` keeps a 16K QKV row tile after a sequence
+reaches four tiles even when transient free VRAM would permit the full
+projection. That tile is already compute-saturated; retaining it avoids
+whole-sequence V preparation and preserves prefetched weight pages. The rule is
+based on workload geometry and residency rather than the GPU architecture.
 Policy logs report both `head_group` and `saturation_group`; equality means the
 selected group has reached the modeled MFU plateau without growing its working
 set further.
