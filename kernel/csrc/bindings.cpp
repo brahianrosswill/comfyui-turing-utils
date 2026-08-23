@@ -932,6 +932,89 @@ at::Tensor turing_segmented_rms_adaln(at::Tensor input,
     return output;
 }
 
+void turing_segmented_mod_gate(at::Tensor input,
+                               at::Tensor gate,
+                               at::Tensor residual,
+                               at::Tensor segments) {
+    TORCH_CHECK(input.is_cuda() && input.dim() == 2 && input.is_contiguous(),
+                "input must be a contiguous 2D CUDA tensor");
+    check_float_like(input, "input");
+    TORCH_CHECK(gate.is_cuda() && gate.dim() == 2 && gate.stride(1) == 1,
+                "gate must be a CUDA matrix with contiguous rows");
+    TORCH_CHECK(residual.is_cuda() && residual.dim() == 2 && residual.is_contiguous(),
+                "residual must be a contiguous 2D CUDA tensor");
+    TORCH_CHECK(segments.is_cuda() && segments.dim() == 2 && segments.is_contiguous() &&
+                    segments.scalar_type() == at::kInt && segments.size(1) == 3,
+                "segments must be contiguous int32 triples on CUDA");
+    TORCH_CHECK(input.device() == gate.device() && input.device() == residual.device() &&
+                    input.device() == segments.device(),
+                "all segmented mod-gate tensors must use the same CUDA device");
+    TORCH_CHECK(input.scalar_type() == gate.scalar_type() &&
+                    input.scalar_type() == residual.scalar_type(),
+                "input, gate, and residual dtypes must match");
+    TORCH_CHECK(input.sizes() == residual.sizes() && gate.size(1) == input.size(1),
+                "residual must match input and gate must match hidden width");
+    TORCH_CHECK(input.size(0) > 0 && input.size(1) > 0 && gate.size(0) > 0 &&
+                    segments.size(0) > 0,
+                "segmented mod-gate dimensions must be positive");
+    const at::cuda::CUDAGuard device_guard(input.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major > 7 || (properties->major == 7 && properties->minor >= 5),
+                "segmented mod-gate requires sm75 or newer");
+    TorchOpContext ctx;
+    comfyui_turing_utils::kernels::turing_segmented_mod_gate(
+        from_torch(input), from_torch(gate), from_torch(residual), from_torch(segments));
+}
+
+at::Tensor turing_segmented_mod_gate_rms_adaln(at::Tensor input,
+                                                at::Tensor gate,
+                                                at::Tensor residual,
+                                                at::Tensor weight,
+                                                at::Tensor scale,
+                                                at::Tensor shift,
+                                                at::Tensor segments,
+                                                double epsilon) {
+    TORCH_CHECK(input.is_cuda() && input.dim() == 2 && input.is_contiguous(),
+                "input must be a contiguous 2D CUDA tensor");
+    check_float_like(input, "input");
+    TORCH_CHECK(gate.is_cuda() && gate.dim() == 2 && gate.stride(1) == 1 &&
+                    residual.is_cuda() && residual.dim() == 2 && residual.is_contiguous(),
+                "gate and residual must be CUDA matrices with contiguous rows");
+    TORCH_CHECK(segments.is_cuda() && segments.dim() == 2 && segments.is_contiguous() &&
+                    segments.scalar_type() == at::kInt && segments.size(1) == 3,
+                "segments must be contiguous int32 triples on CUDA");
+    TORCH_CHECK(input.device() == gate.device() && input.device() == residual.device() &&
+                    input.device() == segments.device(),
+                "all fused segmented tensors must use the same CUDA device");
+    TORCH_CHECK(input.scalar_type() == gate.scalar_type() &&
+                    input.scalar_type() == residual.scalar_type() &&
+                    input.sizes() == residual.sizes() && gate.size(1) == input.size(1),
+                "gate/residual dtype and shape must match input");
+    TORCH_CHECK(weight.is_cuda() && weight.dim() == 1 && weight.is_contiguous() &&
+                    weight.numel() == input.size(1),
+                "weight must be a contiguous CUDA vector matching hidden width");
+    TORCH_CHECK(scale.is_cuda() && scale.dim() == 2 && scale.stride(1) == 1 &&
+                    shift.is_cuda() && shift.dim() == 2 && shift.stride(1) == 1 &&
+                    scale.sizes() == shift.sizes() && scale.size(1) == input.size(1),
+                "scale and shift must be matching CUDA matrices");
+    TORCH_CHECK(weight.scalar_type() == input.scalar_type() &&
+                    scale.scalar_type() == input.scalar_type() &&
+                    shift.scalar_type() == input.scalar_type(),
+                "normalization parameter dtypes must match input");
+    TORCH_CHECK(input.device() == weight.device() && input.device() == scale.device() &&
+                    input.device() == shift.device(),
+                "normalization parameters must use the input CUDA device");
+    TORCH_CHECK(std::isfinite(epsilon) && epsilon > 0.0,
+                "RMSNorm epsilon must be finite and positive");
+    at::Tensor output = at::empty_like(input);
+    TorchOpContext ctx;
+    comfyui_turing_utils::kernels::turing_segmented_mod_gate_rms_adaln(
+        from_torch(input), from_torch(gate), from_torch(residual),
+        from_torch(weight), from_torch(scale), from_torch(shift),
+        from_torch(segments), from_torch(output), static_cast<float>(epsilon));
+    return output;
+}
+
 at::Tensor turing_layer_norm_adaln(at::Tensor input,
                                     at::Tensor scale,
                                     at::Tensor shift,
@@ -1073,6 +1156,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("turing_segmented_rms_adaln",
           &turing_segmented_rms_adaln,
           pybind11::arg("input"),
+          pybind11::arg("weight"),
+          pybind11::arg("scale"),
+          pybind11::arg("shift"),
+          pybind11::arg("segments"),
+          pybind11::arg("epsilon") = 1.0e-5);
+    m.def("turing_segmented_mod_gate",
+          &turing_segmented_mod_gate,
+          pybind11::arg("input"),
+          pybind11::arg("gate"),
+          pybind11::arg("residual"),
+          pybind11::arg("segments"));
+    m.def("turing_segmented_mod_gate_rms_adaln",
+          &turing_segmented_mod_gate_rms_adaln,
+          pybind11::arg("input"),
+          pybind11::arg("gate"),
+          pybind11::arg("residual"),
           pybind11::arg("weight"),
           pybind11::arg("scale"),
           pybind11::arg("shift"),

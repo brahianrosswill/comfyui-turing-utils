@@ -6,6 +6,8 @@ from .ops import (
     turing_codebook_w4a8_linear,
     turing_dequantize_int8_bf16,
     turing_segmented_rms_adaln,
+    turing_segmented_mod_gate,
+    turing_segmented_mod_gate_rms_adaln,
     turing_layer_norm_adaln,
     turing_gelu_int8_convrot_quantize,
     turing_gelu_int4_convrot_quantize,
@@ -19,7 +21,7 @@ from .ops import (
 )
 from . import turing_sage
 
-__version__ = "0.32.0"
+__version__ = "0.33.0"
 
 __all__ = [
     "turing_bf16_int8_convrot_quantize",
@@ -29,6 +31,8 @@ __all__ = [
     "turing_codebook_w4a8_linear",
     "turing_dequantize_int8_bf16",
     "turing_segmented_rms_adaln",
+    "turing_segmented_mod_gate",
+    "turing_segmented_mod_gate_rms_adaln",
     "turing_layer_norm_adaln",
     "turing_gelu_int8_convrot_quantize",
     "turing_gelu_int4_convrot_quantize",

@@ -285,3 +285,64 @@ def segmented_rms_adaln(
         return turing_segmented_rms_adaln(x, weight, scale, shift, table, float(norm.eps))
     finally:
         comfy.ops.uncast_bias_weight(norm, weight, bias, offload_stream)
+
+
+def segmented_mod_gate(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    residual: torch.Tensor,
+    segments: Sequence[tuple[int, int, int]],
+) -> torch.Tensor:
+    """Apply MiniMax's segmented gated residual in-place with one CUDA launch."""
+    table = _segment_table(segments, x.shape[0], gate.shape[0], x.device)
+    try:
+        op = getattr(load_kernel_package(), "turing_segmented_mod_gate")
+    except (ImportError, OSError, AttributeError) as exc:
+        raise RuntimeError(
+            "segmented mod-gate requires an updated comfyui-turing-utils-kernel"
+        ) from exc
+    op(x, gate, residual, table)
+    return x
+
+
+def segmented_mod_gate_rms_adaln(
+    norm: torch.nn.Module,
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    residual: torch.Tensor,
+    shift: torch.Tensor,
+    scale: torch.Tensor,
+    segments: Sequence[tuple[int, int, int]],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Update ``x`` and normalize the dtype-rounded result in one CUDA kernel."""
+    import comfy.ops
+
+    comfy.ops.run_every_op()
+    weight, bias, offload_stream = comfy.ops.cast_bias_weight(norm, x, offloadable=True)
+    try:
+        if bias is not None:
+            raise RuntimeError("fused segmented RMSNorm does not support a biased norm")
+        if weight is None:
+            weight = torch.ones(x.shape[-1], dtype=x.dtype, device=x.device)
+        table = _segment_table(segments, x.shape[0], scale.shape[0], x.device)
+        try:
+            op = getattr(
+                load_kernel_package(), "turing_segmented_mod_gate_rms_adaln"
+            )
+        except (ImportError, OSError, AttributeError) as exc:
+            raise RuntimeError(
+                "gated residual+RMSNorm fusion requires an updated comfyui-turing-utils-kernel"
+            ) from exc
+        normalized = op(
+            x,
+            gate,
+            residual,
+            weight,
+            scale,
+            shift,
+            table,
+            float(norm.eps),
+        )
+        return x, normalized
+    finally:
+        comfy.ops.uncast_bias_weight(norm, weight, bias, offload_stream)

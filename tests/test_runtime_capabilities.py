@@ -63,6 +63,8 @@ class KernelCapabilitiesTest(unittest.TestCase):
         )
         extension = SimpleNamespace(
             turing_segmented_rms_adaln=lambda *args: None,
+            turing_segmented_mod_gate=lambda *args: None,
+            turing_segmented_mod_gate_rms_adaln=lambda *args: None,
             turing_swiglu_int8_convrot_quantize_scaled=lambda *args: None,
         )
         sage = SimpleNamespace(
@@ -111,7 +113,7 @@ class KernelCapabilitiesTest(unittest.TestCase):
         ):
             result = capabilities.kernel_capabilities()
 
-        self.assertTrue(result.supports("core_fusions").supported)
+        self.assertFalse(result.supports("core_fusions").supported)
         self.assertFalse(result.supports("ffn_channel_sharding").supported)
 
     def test_missing_kernel_package_has_actionable_reason(self):

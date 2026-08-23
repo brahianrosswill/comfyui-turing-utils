@@ -234,6 +234,144 @@ __global__ void segmented_rms_adaln_kernel(
 }
 
 template <typename T>
+__global__ void segmented_mod_gate_kernel(
+    T *__restrict__ input,
+    const T *__restrict__ gate,
+    const T *__restrict__ residual,
+    const int *__restrict__ segments,
+    int hidden,
+    int parameter_rows,
+    int gate_stride,
+    int segment_count) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int mapped = find_modulation_row(segments, segment_count, row);
+    const int modulation_row = mapped >= 0 && mapped < parameter_rows ? mapped : 0;
+    const int64_t row_offset = static_cast<int64_t>(row) * hidden;
+    const T *gate_row = gate + static_cast<int64_t>(modulation_row) * gate_stride;
+    for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
+        const float updated = to_float(input[row_offset + col]) +
+                              to_float(residual[row_offset + col]) *
+                                  to_float(gate_row[col]);
+        input[row_offset + col] = from_float<T>(updated);
+    }
+}
+
+template <typename T>
+__global__ void segmented_mod_gate_rms_adaln_kernel(
+    T *__restrict__ input,
+    const T *__restrict__ gate,
+    const T *__restrict__ residual,
+    const T *__restrict__ weight,
+    const T *__restrict__ scale,
+    const T *__restrict__ shift,
+    const int *__restrict__ segments,
+    T *__restrict__ output,
+    int hidden,
+    int parameter_rows,
+    int gate_stride,
+    int scale_stride,
+    int shift_stride,
+    int segment_count,
+    float epsilon,
+    bool vectorized) {
+    __shared__ float warp_sums[kNormWarps];
+    __shared__ int modulation_row;
+
+    const int row = static_cast<int>(blockIdx.x);
+    const int tid = threadIdx.x;
+    const int lane = tid & (kWarpThreads - 1);
+    const int warp = tid / kWarpThreads;
+    if (tid == 0) {
+        const int mapped = find_modulation_row(segments, segment_count, row);
+        modulation_row = mapped >= 0 && mapped < parameter_rows ? mapped : 0;
+    }
+    __syncthreads();
+
+    const int mod_row = modulation_row;
+    const int64_t row_offset = static_cast<int64_t>(row) * hidden;
+    const T *gate_row = gate + static_cast<int64_t>(mod_row) * gate_stride;
+    float square_sum = 0.0f;
+    // Match the unfused boundary exactly: residual+gate is rounded back to the
+    // activation dtype before RMS statistics are accumulated.
+    if (vectorized) {
+        constexpr int kWidth = VecWidth<T>::value;
+        const int vector_count = hidden / kWidth;
+        Vec<T> *input_vectors = reinterpret_cast<Vec<T> *>(input + row_offset);
+        const Vec<T> *residual_vectors =
+            reinterpret_cast<const Vec<T> *>(residual + row_offset);
+        const Vec<T> *gate_vectors = reinterpret_cast<const Vec<T> *>(gate_row);
+        for (int index = tid; index < vector_count; index += kNormThreads) {
+            Vec<T> inputs = input_vectors[index];
+            const Vec<T> residuals = residual_vectors[index];
+            const Vec<T> gates = gate_vectors[index];
+#pragma unroll
+            for (int item = 0; item < kWidth; ++item) {
+                const T updated = from_float<T>(
+                    to_float(inputs.values[item]) +
+                    to_float(residuals.values[item]) * to_float(gates.values[item]));
+                inputs.values[item] = updated;
+                const float value = to_float(updated);
+                square_sum += value * value;
+            }
+            input_vectors[index] = inputs;
+        }
+    } else {
+        for (int col = tid; col < hidden; col += kNormThreads) {
+            const T updated = from_float<T>(
+                to_float(input[row_offset + col]) +
+                to_float(residual[row_offset + col]) * to_float(gate_row[col]));
+            input[row_offset + col] = updated;
+            const float value = to_float(updated);
+            square_sum += value * value;
+        }
+    }
+    square_sum = warp_reduce_sum(square_sum);
+    if (lane == 0) warp_sums[warp] = square_sum;
+    __syncthreads();
+
+    float total = 0.0f;
+#pragma unroll
+    for (int item = 0; item < kNormWarps; ++item) total += warp_sums[item];
+    const float inverse_rms = rsqrtf(total / static_cast<float>(hidden) + epsilon);
+    const T *scale_row = scale + static_cast<int64_t>(mod_row) * scale_stride;
+    const T *shift_row = shift + static_cast<int64_t>(mod_row) * shift_stride;
+    if (vectorized) {
+        constexpr int kWidth = VecWidth<T>::value;
+        const int vector_count = hidden / kWidth;
+        const Vec<T> *input_vectors =
+            reinterpret_cast<const Vec<T> *>(input + row_offset);
+        const Vec<T> *weight_vectors = reinterpret_cast<const Vec<T> *>(weight);
+        const Vec<T> *scale_vectors = reinterpret_cast<const Vec<T> *>(scale_row);
+        const Vec<T> *shift_vectors = reinterpret_cast<const Vec<T> *>(shift_row);
+        Vec<T> *output_vectors = reinterpret_cast<Vec<T> *>(output + row_offset);
+        for (int index = tid; index < vector_count; index += kNormThreads) {
+            const Vec<T> inputs = input_vectors[index];
+            const Vec<T> weights = weight_vectors[index];
+            const Vec<T> scales = scale_vectors[index];
+            const Vec<T> shifts = shift_vectors[index];
+            Vec<T> outputs;
+#pragma unroll
+            for (int item = 0; item < kWidth; ++item) {
+                const float normalized = to_float(inputs.values[item]) * inverse_rms;
+                const float result = normalized * to_float(weights.values[item]) *
+                                         (1.0f + to_float(scales.values[item])) +
+                                     to_float(shifts.values[item]);
+                outputs.values[item] = from_float<T>(result);
+            }
+            output_vectors[index] = outputs;
+        }
+    } else {
+        for (int col = tid; col < hidden; col += kNormThreads) {
+            const float normalized = to_float(input[row_offset + col]) * inverse_rms;
+            const float result = normalized * to_float(weight[col]) *
+                                     (1.0f + to_float(scale_row[col])) +
+                                 to_float(shift_row[col]);
+            output[row_offset + col] = from_float<T>(result);
+        }
+    }
+}
+
+template <typename T>
 __global__ void layer_norm_adaln_kernel(
     const T *__restrict__ input,
     const T *__restrict__ scale,
@@ -364,6 +502,105 @@ void turing_segmented_rms_adaln(Tensor input,
             input, weight, scale, shift, segments, output, epsilon);
     } else {
         throw std::runtime_error("segmented RMSNorm+AdaLN requires float16, bfloat16, or float32 input");
+    }
+}
+
+template <typename T>
+void launch_segmented_mod_gate(Tensor input,
+                               Tensor gate,
+                               Tensor residual,
+                               Tensor segments) {
+    segmented_mod_gate_kernel<T><<<
+        input.size(0), kNormThreads, 0, getCurrentCUDAStream()>>>(
+        static_cast<T *>(input.ptr),
+        static_cast<const T *>(gate.ptr),
+        static_cast<const T *>(residual.ptr),
+        static_cast<const int *>(segments.ptr),
+        input.size(1),
+        gate.size(0),
+        static_cast<int>(gate.shape.stride(0)),
+        segments.size(0));
+    checkCUDA(cudaGetLastError());
+}
+
+void turing_segmented_mod_gate(Tensor input,
+                               Tensor gate,
+                               Tensor residual,
+                               Tensor segments) {
+    if (input.scalar_type() == Tensor::BF16) {
+        launch_segmented_mod_gate<nv_bfloat16>(input, gate, residual, segments);
+    } else if (input.scalar_type() == Tensor::FP16) {
+        launch_segmented_mod_gate<half>(input, gate, residual, segments);
+    } else if (input.scalar_type() == Tensor::FP32) {
+        launch_segmented_mod_gate<float>(input, gate, residual, segments);
+    } else {
+        throw std::runtime_error("segmented mod-gate requires float16, bfloat16, or float32 input");
+    }
+}
+
+template <typename T>
+void launch_segmented_mod_gate_rms_adaln(Tensor input,
+                                          Tensor gate,
+                                          Tensor residual,
+                                          Tensor weight,
+                                          Tensor scale,
+                                          Tensor shift,
+                                          Tensor segments,
+                                          Tensor output,
+                                          float epsilon) {
+    constexpr int kWidth = VecWidth<T>::value;
+    const auto aligned = [](const void *pointer) {
+        return (reinterpret_cast<std::uintptr_t>(pointer) & 15U) == 0;
+    };
+    const bool vectorized = input.size(1) % kWidth == 0 &&
+        gate.shape.stride(0) % kWidth == 0 &&
+        scale.shape.stride(0) % kWidth == 0 &&
+        shift.shape.stride(0) % kWidth == 0 &&
+        aligned(input.ptr) && aligned(gate.ptr) && aligned(residual.ptr) &&
+        aligned(weight.ptr) && aligned(scale.ptr) && aligned(shift.ptr) &&
+        aligned(output.ptr);
+    segmented_mod_gate_rms_adaln_kernel<T><<<
+        input.size(0), kNormThreads, 0, getCurrentCUDAStream()>>>(
+        static_cast<T *>(input.ptr),
+        static_cast<const T *>(gate.ptr),
+        static_cast<const T *>(residual.ptr),
+        static_cast<const T *>(weight.ptr),
+        static_cast<const T *>(scale.ptr),
+        static_cast<const T *>(shift.ptr),
+        static_cast<const int *>(segments.ptr),
+        static_cast<T *>(output.ptr),
+        input.size(1),
+        scale.size(0),
+        static_cast<int>(gate.shape.stride(0)),
+        static_cast<int>(scale.shape.stride(0)),
+        static_cast<int>(shift.shape.stride(0)),
+        segments.size(0),
+        epsilon,
+        vectorized);
+    checkCUDA(cudaGetLastError());
+}
+
+void turing_segmented_mod_gate_rms_adaln(Tensor input,
+                                          Tensor gate,
+                                          Tensor residual,
+                                          Tensor weight,
+                                          Tensor scale,
+                                          Tensor shift,
+                                          Tensor segments,
+                                          Tensor output,
+                                          float epsilon) {
+    if (input.scalar_type() == Tensor::BF16) {
+        launch_segmented_mod_gate_rms_adaln<nv_bfloat16>(
+            input, gate, residual, weight, scale, shift, segments, output, epsilon);
+    } else if (input.scalar_type() == Tensor::FP16) {
+        launch_segmented_mod_gate_rms_adaln<half>(
+            input, gate, residual, weight, scale, shift, segments, output, epsilon);
+    } else if (input.scalar_type() == Tensor::FP32) {
+        launch_segmented_mod_gate_rms_adaln<float>(
+            input, gate, residual, weight, scale, shift, segments, output, epsilon);
+    } else {
+        throw std::runtime_error(
+            "segmented mod-gate+RMSNorm+AdaLN requires float16, bfloat16, or float32 input");
     }
 }
 

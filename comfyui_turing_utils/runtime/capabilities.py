@@ -105,7 +105,14 @@ def kernel_capabilities() -> KernelCapabilities:
         return KernelCapabilities(False, version, frozenset(), str(error))
 
     features = set()
-    if kernel_extension_has_symbol("turing_segmented_rms_adaln"):
+    if all(
+        kernel_extension_has_symbol(symbol)
+        for symbol in (
+            "turing_segmented_rms_adaln",
+            "turing_segmented_mod_gate",
+            "turing_segmented_mod_gate_rms_adaln",
+        )
+    ):
         features.add("core_fusions")
     if (
         version >= _MINIMUM_VERSIONS["ffn_channel_sharding"]

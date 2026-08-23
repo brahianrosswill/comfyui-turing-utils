@@ -185,7 +185,13 @@ class MiniMaxAdapterTest(unittest.TestCase):
                     mock.patch.object(minimax_model, "DiTBlock", FakeBlock),
                     mock.patch.dict(
                         sys.modules,
-                        {"comfyui_turing_utils_kernel": SimpleNamespace(turing_segmented_rms_adaln=mock.Mock())},
+                        {
+                            "comfyui_turing_utils_kernel": SimpleNamespace(
+                                turing_segmented_rms_adaln=mock.Mock(),
+                                turing_segmented_mod_gate=mock.Mock(),
+                                turing_segmented_mod_gate_rms_adaln=mock.Mock(),
+                            )
+                        },
                     ),
                 ):
                     count = minimax_adapter.apply_minimax_adapter(

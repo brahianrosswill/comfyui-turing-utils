@@ -1,10 +1,11 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's quantized
-runtime. Version 0.32.0 contains legacy packed W4A8 and grouped-codebook W4A8
+runtime. Version 0.33.0 contains legacy packed W4A8 and grouped-codebook W4A8
 Tensor Core GEMMs, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
-and LayerNorm modulation, bundled Sage attention, pure-INT8 W8A8 attention,
+and LayerNorm modulation, segmented gated-residual/RMSNorm fusion, bundled Sage
+attention, pure-INT8 W8A8 attention,
 and an explicitly patched production model-independent Sol sparse attention
 kernel with input-adaptive
 centroid threshold routing, stable-Sage INT8 QK for selected blocks, compact

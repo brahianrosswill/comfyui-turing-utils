@@ -109,6 +109,11 @@ struct AttentionGeometry
   static constexpr int kAttentionSharedBytes = 2 * kTileBytes;
   static constexpr int kRouteStorageOffset =
       kTileBytes + 2 * kSummaryTileBytes;
+  static constexpr int kSelectedStorageOffset =
+      kRouteStorageOffset + kMaxRouteBytes;
+  static constexpr int kSelectedCapacity =
+      (kAttentionSharedBytes - kSelectedStorageOffset - sizeof(int)) /
+      sizeof(uint16_t);
   static constexpr int kValueTiles = HeadDim / 16;
   static constexpr SwizzleMode kInt8Swizzle =
       HeadDim == 64 ? SwizzleMode::k64B : SwizzleMode::k128B;
@@ -116,6 +121,8 @@ struct AttentionGeometry
       kRouteStorageOffset + kMaxRouteBytes + kProxyScratchBytes <=
           kAttentionSharedBytes,
       "fused routing metadata must fit beside the 16-block summaries");
+  static_assert(kSelectedCapacity >= 1024,
+                "sparse route compaction must cover production sequences");
 };
 
 static_assert(AttentionGeometry<128>::kAttentionSharedBytes <= 64 * 1024);
@@ -677,6 +684,59 @@ __device__ __forceinline__ void compute_int8_qk(
       query, key, score, query_offset, key_offset);
 }
 
+template <int SelectedCapacity>
+__device__ __forceinline__ int compact_route_words(
+    const uint32_t *__restrict__ route_words,
+    int *__restrict__ selected_count,
+    uint16_t *__restrict__ selected_blocks,
+    int active_key_blocks)
+{
+  // One lane performs an ascending bit scan.  Route construction is tiny
+  // compared with exact attention and this deterministic compaction removes
+  // the four per-thread route registers that spill on long sm86 kernels.  The
+  // ascending order is intentional: changing it changes online-softmax
+  // rounding even when the selected set is identical.
+  int selected = 0;
+  if (threadIdx.x == 0 && threadIdx.y == 0)
+  {
+    const int route_word_count =
+        (active_key_blocks + kRouteWordBits - 1) / kRouteWordBits;
+    for (int word_index = 0; word_index < route_word_count; ++word_index)
+    {
+      uint32_t word = route_words[word_index];
+      while (word != 0)
+      {
+        const int bit = __ffs(static_cast<int>(word)) - 1;
+        const int key_block = word_index * kRouteWordBits + bit;
+        if (key_block < active_key_blocks)
+        {
+          if (selected < SelectedCapacity)
+            selected_blocks[selected] = static_cast<uint16_t>(key_block);
+          ++selected;
+        }
+        word &= word - 1;
+      }
+    }
+    *selected_count = selected <= SelectedCapacity ? selected : -selected;
+  }
+  __syncthreads();
+  return *selected_count;
+}
+
+__device__ __forceinline__ int next_shared_route_block(
+    const uint32_t *__restrict__ route_words,
+    int start,
+    int active_key_blocks)
+{
+  for (int key_block = start; key_block < active_key_blocks; ++key_block)
+  {
+    if ((route_words[key_block / kRouteWordBits] >>
+         (key_block % kRouteWordBits)) & 1U)
+      return key_block;
+  }
+  return active_key_blocks;
+}
+
 struct RouteWords
 {
   uint32_t word0;
@@ -698,16 +758,29 @@ __device__ __forceinline__ uint32_t route_word(
   }
 }
 
-__device__ __forceinline__ bool route_selected(
+__device__ __forceinline__ bool register_route_selected(
     const RouteWords &route_words,
     int key_block)
 {
   const int word_index = key_block / kRouteWordBits;
-  const int owner_lane = word_index % WARP_SIZE;
-  const int lane_slot = word_index / WARP_SIZE;
   const uint32_t word = __shfl_sync(
-      0xffffffff, route_word(route_words, lane_slot), owner_lane);
+      0xffffffff,
+      route_word(route_words, word_index / WARP_SIZE),
+      word_index % WARP_SIZE);
   return (word >> (key_block % kRouteWordBits)) & 1U;
+}
+
+__device__ __forceinline__ int next_register_route_block(
+    const RouteWords &route_words,
+    int start,
+    int active_key_blocks)
+{
+  for (int key_block = start; key_block < active_key_blocks; ++key_block)
+  {
+    if (register_route_selected(route_words, key_block))
+      return key_block;
+  }
+  return active_key_blocks;
 }
 
 template <int HeadDim>
@@ -834,6 +907,12 @@ __global__ void sparse_attention_kernel(
       shared_bytes + 2 * G::kInt8TileBytes);
   smem_t<SwizzleMode::k64B, 4> shared_selected_value_int8(
       shared_bytes + 2 * G::kInt8TileBytes);
+  uint32_t *shared_route = reinterpret_cast<uint32_t *>(
+      shared_bytes + G::kRouteStorageOffset);
+  int *shared_selected_count = reinterpret_cast<int *>(
+      shared_bytes + G::kSelectedStorageOffset);
+  uint16_t *shared_selected_blocks = reinterpret_cast<uint16_t *>(
+      shared_bytes + G::kSelectedStorageOffset + sizeof(int));
 
   const int query_block = blockIdx.x;
   const int query_head = blockIdx.y;
@@ -910,8 +989,6 @@ __global__ void sparse_attention_kernel(
   row_max[0][1] = -5000000.0f;
   denominator[0][0] = 1.0f;
   denominator[0][1] = 1.0f;
-  RouteWords local_route{};
-
   if constexpr (!ForceDense)
   {
   if constexpr (ExternalRoute)
@@ -925,30 +1002,10 @@ __global__ void sparse_attention_kernel(
              sla_query_blocks +
          query_block / 2) *
             route_word_count;
-    const int route_lane = threadIdx.x;
-    local_route.word0 = route_lane < route_word_count
-        ? route_head[route_lane]
-        : 0;
-    local_route.word1 = route_lane + WARP_SIZE < route_word_count
-        ? route_head[route_lane + WARP_SIZE]
-        : 0;
-    local_route.word2 = route_lane + 2 * WARP_SIZE < route_word_count
-        ? route_head[route_lane + 2 * WARP_SIZE]
-        : 0;
-    local_route.word3 = route_lane + 3 * WARP_SIZE < route_word_count
-        ? route_head[route_lane + 3 * WARP_SIZE]
-        : 0;
-    if (selected_count != nullptr && sparse_query && threadIdx.y == 0)
-    {
-      unsigned int count = __popc(local_route.word0) +
-          __popc(local_route.word1) + __popc(local_route.word2) +
-          __popc(local_route.word3);
-#pragma unroll
-      for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-        count += __shfl_down_sync(0xffffffff, count, offset);
-      if (threadIdx.x == 0)
-        atomicAdd(selected_count, static_cast<unsigned long long>(count));
-    }
+    for (int word = linear_thread; word < route_word_count;
+         word += kWarps * WARP_SIZE)
+      shared_route[word] = route_head[word];
+    __syncthreads();
   }
   else
   {
@@ -999,9 +1056,6 @@ __global__ void sparse_attention_kernel(
   if (route_original_basis)
     query_mean = inverse_route_hadamard<HeadDim>(
         query_mean, reduction_scratch);
-  uint32_t *shared_route = reinterpret_cast<uint32_t *>(
-      shared_bytes + G::kRouteStorageOffset);
-
   const float *key_mean = key_summary_mean +
       (static_cast<int64_t>(batch) * num_kv_heads + kv_head) * HeadDim;
   const float *key_variance = key_summary_variance +
@@ -1203,32 +1257,59 @@ __global__ void sparse_attention_kernel(
     __syncthreads();
   }
 
-  const int route_lane = threadIdx.x;
-  local_route.word0 = route_lane < route_word_count
-      ? shared_route[route_lane]
-      : 0;
-  local_route.word1 = route_lane + WARP_SIZE < route_word_count
-      ? shared_route[route_lane + WARP_SIZE]
-      : 0;
-  local_route.word2 = route_lane + 2 * WARP_SIZE < route_word_count
-      ? shared_route[route_lane + 2 * WARP_SIZE]
-      : 0;
-  local_route.word3 = route_lane + 3 * WARP_SIZE < route_word_count
-      ? shared_route[route_lane + 3 * WARP_SIZE]
-      : 0;
-  if (selected_count != nullptr && sparse_query && threadIdx.y == 0)
-  {
-    unsigned int count = __popc(local_route.word0) +
-        __popc(local_route.word1) + __popc(local_route.word2) +
-        __popc(local_route.word3);
-#pragma unroll
-    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-      count += __shfl_down_sync(0xffffffff, count, offset);
-    if (threadIdx.x == 0)
-      atomicAdd(selected_count, static_cast<unsigned long long>(count));
-  }
   __syncthreads();
   }
+  }
+
+  int compact_selected_count = 0;
+  int register_selected_count = 0;
+  RouteWords fp16_route{};
+  if constexpr (!ForceDense)
+  {
+    if constexpr (UseW8A8)
+    {
+      compact_selected_count = compact_route_words<G::kSelectedCapacity>(
+          shared_route,
+          shared_selected_count,
+          shared_selected_blocks,
+          active_key_blocks);
+      if (selected_count != nullptr && sparse_query &&
+          threadIdx.x == 0 && threadIdx.y == 0)
+      {
+        const unsigned long long count = static_cast<unsigned long long>(
+          compact_selected_count >= 0
+              ? compact_selected_count
+              : -compact_selected_count);
+        atomicAdd(selected_count, count);
+      }
+    }
+    else
+    {
+      const int route_word_count =
+          (active_key_blocks + kRouteWordBits - 1) / kRouteWordBits;
+      const int route_lane = threadIdx.x;
+      fp16_route.word0 = route_lane < route_word_count
+          ? shared_route[route_lane] : 0;
+      fp16_route.word1 = route_lane + WARP_SIZE < route_word_count
+          ? shared_route[route_lane + WARP_SIZE] : 0;
+      fp16_route.word2 = route_lane + 2 * WARP_SIZE < route_word_count
+          ? shared_route[route_lane + 2 * WARP_SIZE] : 0;
+      fp16_route.word3 = route_lane + 3 * WARP_SIZE < route_word_count
+          ? shared_route[route_lane + 3 * WARP_SIZE] : 0;
+      unsigned int count = __popc(fp16_route.word0) +
+          __popc(fp16_route.word1) + __popc(fp16_route.word2) +
+          __popc(fp16_route.word3);
+#pragma unroll
+      for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+        count += __shfl_down_sync(0xffffffff, count, offset);
+      register_selected_count = static_cast<int>(
+          __shfl_sync(0xffffffff, count, 0));
+      if (selected_count != nullptr && sparse_query &&
+          threadIdx.x == 0 && threadIdx.y == 0)
+        atomicAdd(
+            selected_count,
+            static_cast<unsigned long long>(register_selected_count));
+    }
   }
 
   // Selected blocks retain exact token-level attention. Q/K are quantized once
@@ -1244,27 +1325,13 @@ __global__ void sparse_attention_kernel(
   cp_async::commit_group();
   cp_async::wait_group<0>();
   __syncthreads();
-  // The dense W8A8 path used to share the sparse kernel's runtime two-block
-  // staging loop.  Even though dense execution never needs staged routing,
-  // that runtime loop kept the second-stage state live on SM75 and raised the
-  // D128 register footprint.  Make the dense specialization a compile-time
-  // one-block loop; sparse variants retain the selectable 64/128-token tile.
-  constexpr int kMaxKeyStages = ForceDense ? 1 : KeyStages;
-  constexpr int key_group_stride = kMaxKeyStages;
-  for (int key_group = 0; key_group < active_key_blocks;
-       key_group += key_group_stride)
+  int key_block = !ForceDense && sparse_query
+      ? (UseW8A8
+          ? next_shared_route_block(shared_route, 0, active_key_blocks)
+          : next_register_route_block(fp16_route, 0, active_key_blocks))
+      : 0;
+  if (key_block < active_key_blocks)
   {
-#pragma unroll
-    for (int key_stage = 0; key_stage < kMaxKeyStages; ++key_stage)
-    {
-    const int key_block = key_group + key_stage;
-    if (key_block >= active_key_blocks)
-      continue;
-    if constexpr (!ForceDense)
-    {
-      if (sparse_query && !route_selected(local_route, key_block))
-        continue;
-    }
     load_int8_tile_async<HeadDim>(
         key_int8_head_ptr,
         stride_sequence_k_int8,
@@ -1292,7 +1359,9 @@ __global__ void sparse_attention_kernel(
     }
     cp_async::wait_group<0>();
     __syncthreads();
-
+  }
+  while (key_block < active_key_blocks)
+  {
     int32_t integer_score[1][4][8];
     compute_int8_qk<HeadDim>(shared_query_int8, shared_key_int8, integer_score);
     float score[1][4][8];
@@ -1304,6 +1373,27 @@ __global__ void sparse_attention_kernel(
         score[0][key_tile][element] =
             __int2float_rz(integer_score[0][key_tile][element]);
     }
+    const int next_key_block = !ForceDense && sparse_query
+        ? (UseW8A8
+            ? next_shared_route_block(
+                shared_route, key_block + 1, active_key_blocks)
+            : next_register_route_block(
+                fp16_route, key_block + 1, active_key_blocks))
+        : key_block + 1;
+    const bool has_next = next_key_block < active_key_blocks;
+    __syncthreads();
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    if (has_next)
+    {
+      load_int8_tile_async<HeadDim>(
+          key_int8_head_ptr,
+          stride_sequence_k_int8,
+          next_key_block * kBlockTokens,
+          key_length,
+          shared_key_int8);
+      cp_async::commit_group();
+    }
+#endif
     const uint32_t key_lane_base =
         key_block * kBlockTokens + 2 * (threadIdx.x % 4);
     apply_out_of_bound_mask<1, 4>(key_lane_base, score, key_length);
@@ -1350,10 +1440,42 @@ __global__ void sparse_attention_kernel(
           probability,
           output_fragment,
           denominator,
-          value_offset);
+                               value_offset);
     }
     __syncthreads();
+    if (has_next)
+    {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 800
+      load_int8_tile_async<HeadDim>(
+          key_int8_head_ptr,
+          stride_sequence_k_int8,
+          next_key_block * kBlockTokens,
+          key_length,
+          shared_key_int8);
+      cp_async::commit_group();
+#endif
+      if constexpr (UseW8A8)
+      {
+        load_quantized_value_tile_async<HeadDim>(
+            value_int8_head_ptr,
+            Varlen ? total_value_length : padded_value_length,
+            next_key_block,
+            shared_selected_value_int8);
+        cp_async::commit_group();
+      }
+      else
+      {
+        load_half_tile<HeadDim, kBlockTokens>(
+            value_head_ptr,
+            stride_sequence_v,
+            next_key_block * kBlockTokens,
+            key_length,
+            shared_selected_value);
+      }
+      cp_async::wait_group<0>();
+      __syncthreads();
     }
+    key_block = next_key_block;
   }
 
   if constexpr (UseW8A8)

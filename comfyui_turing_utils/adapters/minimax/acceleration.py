@@ -56,6 +56,8 @@ from ...quantization.fusions import (
     convrot_weight_kind,
     fused_convrot_linear_input_act,
     is_turing_convrot_linear,
+    segmented_mod_gate,
+    segmented_mod_gate_rms_adaln,
     segmented_rms_adaln,
 )
 from ...quantization.dispatch import (
@@ -2057,14 +2059,16 @@ def _make_block_forward(
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
         h = segmented_rms_adaln(self.norm1, x, shift_msa, scale_msa, mod_segments)
-        x = mod_gate(
+        x, h = segmented_mod_gate_rms_adaln(
+            self.norm2,
             x,
             gate_msa,
             self.attn(h, rope_freqs=rope_freqs, transformer_options=transformer_options),
+            shift_mlp,
+            scale_mlp,
             mod_segments,
         )
-        h = segmented_rms_adaln(self.norm2, x, shift_mlp, scale_mlp, mod_segments)
-        return mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
+        return segmented_mod_gate(x, gate_mlp, self.mlp(h), mod_segments)
 
     return mark_forward_as_minimax_layout_provider(weak_method(forward, block))
 
@@ -2113,13 +2117,19 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
     mlp_fusions = 0
     attention_fusions = install_minimax_attention_sites(model, device).installed
     try:
-        turing_segmented_rms_adaln = getattr(
-            load_kernel_package(), "turing_segmented_rms_adaln"
+        kernel_package = load_kernel_package()
+        segmented_block_ops = (
+            getattr(kernel_package, "turing_segmented_rms_adaln"),
+            getattr(kernel_package, "turing_segmented_mod_gate"),
+            getattr(kernel_package, "turing_segmented_mod_gate_rms_adaln"),
         )
     except (ImportError, OSError, AttributeError):
-        turing_segmented_rms_adaln = None
+        segmented_block_ops = ()
 
-    expected_blocks = len(candidates) if callable(turing_segmented_rms_adaln) else 0
+    block_ops_available = bool(segmented_block_ops) and all(
+        callable(op) for op in segmented_block_ops
+    )
+    expected_blocks = len(candidates) if block_ops_available else 0
     audit = _RuntimeDispatchAudit(expected_blocks, eligible_fc2)
 
     for layer_index, (name, block) in enumerate(candidates):
@@ -2129,7 +2139,7 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
                 _make_mlp_forward(block.mlp, audit, root),
             )
             mlp_fusions += 1
-        if callable(turing_segmented_rms_adaln):
+        if block_ops_available:
             model.add_object_patch(
                 f"{name}.forward",
                 _make_block_forward(

@@ -96,6 +96,21 @@ void turing_segmented_rms_adaln(Tensor input,
                                  Tensor output,
                                  float epsilon);
 
+void turing_segmented_mod_gate(Tensor input,
+                                Tensor gate,
+                                Tensor residual,
+                                Tensor segments);
+
+void turing_segmented_mod_gate_rms_adaln(Tensor input,
+                                          Tensor gate,
+                                          Tensor residual,
+                                          Tensor weight,
+                                          Tensor scale,
+                                          Tensor shift,
+                                          Tensor segments,
+                                          Tensor output,
+                                          float epsilon);
+
 void turing_layer_norm_adaln(Tensor input,
                               Tensor scale,
                               Tensor shift,

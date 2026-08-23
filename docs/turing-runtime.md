@@ -446,9 +446,14 @@ metadata selects stable Sage.
 The CUDA kernel builds no global route map. Query/key/value summaries remain
 separate compact preprocessing tensors, while threshold routing executes inside
 each sparse Query CTA immediately before skipped-residual and selected-block
-online-softmax updates. The temporary route occupies CTA-local shared memory and
-four route words per lane, then survives in registers while the normal D64
-16 KiB or D128 32 KiB shared-memory tiles are reused. The kernel accepts at
+online-softmax updates. The temporary route occupies CTA-local shared memory. A
+single lane counts and compacts selected blocks into ascending 16-bit indices
+for bounded diagnostics, while the W8A8 exact path walks the same shared bitset
+in ascending order. This removes the former four route words per lane and their
+sm86 local-memory spill without changing selected-block or online-softmax
+order. The FP16-PV path keeps its route in registers because its 16 KiB value
+tile reuses the route arena after routing. The normal D64 16 KiB or D128 32 KiB
+shared-memory tiles are reused. The kernel accepts at
 most 4096 K/V blocks
 (262144 tokens) per call.
 
@@ -466,8 +471,9 @@ The Query CTA derives the route threshold from its INT8 Q tile and expands that
 tile into resident FP16 shared storage for skipped-block correction. One
 Q-to-K-centroid Tensor Core traversal supplies both the routing score and the
 online-softmax correction, with conflict-free per-warp shared partials instead
-of shared atomics. The compact route is then copied into four 32-bit registers
-per lane before the arena is reused for exact K/V tiles. Keeping both the FP16
+of shared atomics. The route count remains in shared memory while the W8A8
+exact traversal reads the shared bitset and the arena is reused for exact K/V
+tiles. Keeping both the FP16
 correction operand and the INT8 exact operand live would raise D128 shared
 storage above 32 KiB, so the production kernel deliberately re-reads the small
 INT8 Q tile instead of reducing CTA residency. Exact-Q staging is only 8 KiB
@@ -480,8 +486,8 @@ long-sequence kernel without changing the selected route or arithmetic order.
 A correctness gate requires bitwise-identical output between K64 and K128
 staging. The exact compute_75 image contains 24 variants for each native head
 dimension, all with zero stack/local-memory spill and unchanged 16 KiB D64 /
-32 KiB D128 dynamic shared memory. Register use ranges from 138--175 for D64
-and 180--255 for D128. Occupancy is reported for diagnosis but is not a
+32 KiB D128 dynamic shared memory. The 0.33 dual-architecture audit reports
+106--168 registers for D64 and 176--200 for D128. Occupancy is reported for diagnosis but is not a
 production gate; final resident-CTA throughput still requires real Turing
 profiling.
 
@@ -615,8 +621,11 @@ For native Ampere acceptance, use `COMFYUI_TURING_UTILS_ARCH_LIST="8.6"`.
 The resulting attention cubins use the `__CUDA_ARCH__ >= 800` async-copy and
 INT8 MMA paths; A40 preflight covers BF16 D64/D128 GQA for both Sol and W8A8.
 Sol's initial Q, exact Q/K, and W8 value tiles use the shared async-copy
-abstraction, which emits `cp.async` on sm80+ and the same synchronous loads on
-sm75. W8 projections use CUTLASS SM80 `m16n8k32` kernels with a per-shape
+abstraction. During exact sparse attention, sm80+ starts the next K transfer
+after current QK releases the K buffer and overlaps it with online-softmax/PV;
+V is replaced only after current PV completes. The same source emits a safe
+synchronous K-then-V schedule on sm75 and allocates no second shared tile. W8
+projections use CUTLASS SM80 `m16n8k32` kernels with a per-shape
 three-schedule cache; explicit policies remain available for controlled
 benchmarking. The common scale/bias/BF16 visitor is shared with sm75, so this
 is a schedule substitution rather than a model-specific numerical path.

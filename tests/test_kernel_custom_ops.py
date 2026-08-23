@@ -306,6 +306,22 @@ class KernelCustomOpContractTest(unittest.TestCase):
         )
         self.assertEqual(normalized.shape, x2.shape)
         self.assertEqual(normalized.dtype, x2.dtype)
+        residual = torch.empty_like(x2)
+        gate = torch.empty((2, 128), dtype=x2.dtype, device="meta")
+        self.assertIsNone(
+            kernel.turing_segmented_mod_gate(x2, gate, residual, segments)
+        )
+        fused_normalized = kernel.turing_segmented_mod_gate_rms_adaln(
+            x2,
+            gate,
+            residual,
+            torch.empty((128,), dtype=x2.dtype, device="meta"),
+            torch.empty((2, 128), dtype=x2.dtype, device="meta"),
+            torch.empty((2, 128), dtype=x2.dtype, device="meta"),
+            segments,
+        )
+        self.assertEqual(fused_normalized.shape, x2.shape)
+        self.assertEqual(fused_normalized.dtype, x2.dtype)
 
     def test_sol_and_varlen_are_fullgraph_leaves(self):
         q = torch.empty((1, 4, 129, 128), dtype=torch.bfloat16, device="meta")

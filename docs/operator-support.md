@@ -211,7 +211,8 @@ the final choice is based on measured latency on the target device.
 ## Model-specific integration
 
 - MiniMax H3 publishes packed text/image/video/audio token ranges, estimates
-  packed dynamic-VRAM allocations, fuses segmented RMSNorm+AdaLN, and fuses
+  packed dynamic-VRAM allocations, fuses segmented RMSNorm+AdaLN plus the
+  preceding dtype-rounded gated residual (with a standalone fused final gate), and fuses
   fc1 -> SwiGLU -> fc2-input quantization. Supported attention calls also fuse
   per-head RMSNorm+split-half RoPE directly into INT8 Q/K.
 - Wan publishes packed-context memory estimates and fuses its whole-row Q/K

@@ -489,6 +489,73 @@ def _turing_segmented_rms_adaln_fake(x, weight, scale, shift, segments, epsilon=
     return torch.empty_like(x)
 
 
+def _prepare_segmented_modulation(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    residual: torch.Tensor,
+    segments: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if x.device.type != "cuda" or torch.cuda.get_device_capability(x.device) < (7, 5):
+        raise RuntimeError("Segmented mod-gate requires an sm75-or-newer CUDA tensor")
+    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32) or x.ndim != 2:
+        raise TypeError("segmented mod-gate input must be a 2D floating tensor")
+    if not x.is_contiguous():
+        raise ValueError("segmented mod-gate mutates x and therefore requires contiguous storage")
+    residual = residual.to(device=x.device, dtype=x.dtype).contiguous()
+    gate = gate.to(device=x.device, dtype=x.dtype)
+    if gate.stride(-1) != 1:
+        gate = gate.contiguous()
+    if segments.device != x.device or segments.dtype != torch.int32:
+        raise ValueError("segments must be int32 on the input device")
+    return gate, residual, segments.contiguous()
+
+
+@torch.library.custom_op("turing_utils::segmented_mod_gate", mutates_args=("x",))
+def turing_segmented_mod_gate(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    residual: torch.Tensor,
+    segments: torch.Tensor,
+) -> None:
+    """Apply the segmented gated residual directly into ``x``."""
+    gate, residual, segments = _prepare_segmented_modulation(x, gate, residual, segments)
+    _C.turing_segmented_mod_gate(x, gate, residual, segments)
+
+
+@torch.library.custom_op(
+    "turing_utils::segmented_mod_gate_rms_adaln", mutates_args=("x",)
+)
+def turing_segmented_mod_gate_rms_adaln(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    segments: torch.Tensor,
+    epsilon: float = 1.0e-5,
+) -> torch.Tensor:
+    """Fuse a dtype-rounded gated residual with following RMSNorm+AdaLN."""
+    gate, residual, segments = _prepare_segmented_modulation(x, gate, residual, segments)
+    weight = weight.to(device=x.device, dtype=x.dtype).contiguous()
+    scale = scale.to(device=x.device, dtype=x.dtype)
+    shift = shift.to(device=x.device, dtype=x.dtype)
+    if scale.stride(-1) != 1:
+        scale = scale.contiguous()
+    if shift.stride(-1) != 1:
+        shift = shift.contiguous()
+    return _C.turing_segmented_mod_gate_rms_adaln(
+        x, gate, residual, weight, scale, shift, segments, epsilon
+    )
+
+
+@turing_segmented_mod_gate_rms_adaln.register_fake
+def _turing_segmented_mod_gate_rms_adaln_fake(
+    x, gate, residual, weight, scale, shift, segments, epsilon=1.0e-5
+):
+    return torch.empty_like(x)
+
+
 @torch.library.custom_op("turing_utils::layer_norm_adaln", mutates_args=())
 def turing_layer_norm_adaln(
     x: torch.Tensor,
