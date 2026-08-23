@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = ROOT / "kernel"
 COMFYUI_ROOT = ROOT.parents[1]
-EXPECTED_VERSION = "0.35.0"
+EXPECTED_VERSION = "0.36.0"
 
 
 def _run(command: list[str], *, cwd: Path = ROOT, env=None) -> None:
@@ -74,14 +74,15 @@ def _static_gate() -> None:
             raise RuntimeError(f"missing SM75 attention resource/ABI gate: {marker}")
     gemm = (KERNEL / "csrc/turing/w4a8.cu").read_text(encoding="utf-8")
     for marker in (
-        "COMFYUI_TURING_UTILS_GEMM_TUNE_BUDGET_MS",
-        "const int proxy_m = std::min(m, 4096)",
-        "const int finalist_count = std::min<int>(2, ranked.size())",
-        "estimated_full_ms",
-        "run_policy(selected, m)",
+        "properties->major >= 8 && n >= 16384",
+        "run_ampere_int8_tile<128, 256, 64, 64, 64, 64, 3>",
+        "run_int8_tile<128, 256, 64, 64>",
     ):
         if marker not in gemm:
-            raise RuntimeError(f"missing bounded Ampere GEMM tuning gate: {marker}")
+            raise RuntimeError(f"missing deterministic GEMM dispatch gate: {marker}")
+    for marker in ("run_auto_tuned", "GEMM_TUNE", "GEMM_CACHE"):
+        if marker in gemm:
+            raise RuntimeError(f"retired GEMM tuning marker remains: {marker}")
     cp_async = (KERNEL / "csrc/turing/sage/cp_async.cuh").read_text(encoding="utf-8")
     fallback = cp_async.split("#else", 1)[1].split("#endif", 1)[0]
     if "__threadfence_block" in fallback or "__syncthreads" in fallback:

@@ -27,7 +27,6 @@ from ...attention.stable import (
     prequantize_turing_qk,
     reusable_k_anchor_available,
 )
-from ...attention.tuning import attention_kernel_tuning
 from ...hardware import is_supported_attention_device
 from ...kernel_api import kernel_extension_has_symbol, load_kernel_package
 from ...profiling import CUDA_PHASE_PROFILER
@@ -790,7 +789,6 @@ def _stream_qkv_head_group(
     attention,
     x: torch.Tensor,
     transform: QKTransformSpec,
-    transformer_options: dict,
     qweight: torch.Tensor,
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
@@ -820,21 +818,16 @@ def _stream_qkv_head_group(
     value = torch.empty(
         (1, group, sequence, head_dim), dtype=x.dtype, device=x.device
     )
-    tuning = attention_kernel_tuning(transformer_options)
-    k_anchor = (
-        _head_group_k_anchor(
-            attention,
-            x,
-            transform,
-            qweight,
-            weight_scale,
-            bias,
-            head_start,
-            head_stop,
-            quantized_input,
-        )
-        if tuning.rotate_qk and tuning.stabilize_k
-        else None
+    k_anchor = _head_group_k_anchor(
+        attention,
+        x,
+        transform,
+        qweight,
+        weight_scale,
+        bias,
+        head_start,
+        head_stop,
+        quantized_input,
     )
     qk_type = None
     route_original_basis = False
@@ -897,7 +890,6 @@ def _stream_qkv_head_group(
             key,
             tile_transform,
             kernel="sol",
-            transformer_options=transformer_options,
             k_anchor=k_anchor,
             qk_output=(
                 q_int8[:, :, start:stop],
@@ -1088,7 +1080,6 @@ def _head_sharded_attention(
                     attention,
                     x,
                     transform,
-                    transformer_options,
                     qweight,
                     weight_scale,
                     bias,
@@ -1150,7 +1141,6 @@ def _stream_qkv_projection(
     attention,
     x: torch.Tensor,
     transform: QKTransformSpec,
-    transformer_options: dict,
     chunk_rows: int,
 ):
     """Project H3 QKV by rows while retaining only Q/K INT8 and V BF16."""
@@ -1193,34 +1183,30 @@ def _stream_qkv_projection(
     route_original_basis = False
     try:
         plain = convrot_w8_plain_tensors(weight) if original_w8 else None
-        tuning = attention_kernel_tuning(transformer_options)
-        if tuning.rotate_qk and tuning.stabilize_k:
-            if plain is not None:
-                qweight, weight_scale = plain
-                k_anchor = _head_group_k_anchor(
-                    attention,
-                    x,
-                    transform,
-                    qweight,
-                    weight_scale,
-                    bias,
-                    0,
-                    heads,
-                    None,
-                )
-            else:
-                k_anchor = _global_k_anchor(
-                    attention,
-                    x,
-                    weight,
-                    bias,
-                    transform,
-                    inner,
-                    heads,
-                    head_dim,
-                )
+        if plain is not None:
+            qweight, weight_scale = plain
+            k_anchor = _head_group_k_anchor(
+                attention,
+                x,
+                transform,
+                qweight,
+                weight_scale,
+                bias,
+                0,
+                heads,
+                None,
+            )
         else:
-            k_anchor = None
+            k_anchor = _global_k_anchor(
+                attention,
+                x,
+                weight,
+                bias,
+                transform,
+                inner,
+                heads,
+                head_dim,
+            )
         for start in range(0, sequence, chunk_rows):
             stop = min(start + chunk_rows, sequence)
             if plain is None:
@@ -1283,7 +1269,6 @@ def _stream_qkv_projection(
                 key,
                 tile_transform,
                 kernel="sol",
-                transformer_options=transformer_options,
                 k_anchor=k_anchor,
                 qk_output=(
                     q_int8[:, :, start:stop],
@@ -1474,7 +1459,6 @@ def _make_attention_forward(
                     self,
                     x,
                     transform,
-                    transformer_options,
                     decision.chunk_rows,
                 )
                 outcome = streamed_executor(

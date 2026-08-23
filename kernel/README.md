@@ -1,7 +1,7 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's quantized
-runtime. Version 0.35.0 contains legacy packed W4A8 and grouped-codebook W4A8
+runtime. Version 0.36.0 contains legacy packed W4A8 and grouped-codebook W4A8
 Tensor Core GEMMs, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, lossless single-pass half-width FC1/SwiGLU staging,
@@ -31,21 +31,11 @@ static/dynamic shared memory, local memory, active CTAs/warps per SM, and
 occupancy. These are diagnostic-only queries and are absent from the normal
 sampling path.
 
-Raw W8A8 uses cached per-device/per-shape micro-tuning on both native sm75 and
-sm80+. Version 0.35 persists the winning policy across processes with a key
-containing GPU UUID, SM, driver/runtime, kernel ABI, operator family, and MNK.
-Ampere candidates include two-, three-, and four-stage CUTLASS schedules,
-1/2/4/8-way identity threadblock swizzles, and 64x128, 64x256, 128x128, and
-128x256 CTA shapes. Cold Ampere searches rank the full candidate set on a
-4096-row prefix, then admit at most the best two policies to one full-shape
-confirmation round under a 500 ms per-shape launch budget. Set
-`COMFYUI_TURING_UTILS_GEMM_TUNE_LOG=1` to print the bounded first-use timings
-and selected policy; normal execution does not log or retune cached shapes.
-Set `COMFYUI_TURING_UTILS_GEMM_CACHE=0` to disable persistence, or set it to an
-explicit cache file/directory. Set
-`COMFYUI_TURING_UTILS_GEMM_TUNE_BUDGET_MS=0` to skip live search, or provide a
-non-negative millisecond budget up to 5000. CUDA Graph capture reuses an in-process winner
-when available and otherwise uses the static heuristic without file I/O.
+Raw W8A8 uses deterministic architecture and shape dispatch. SM75 uses the
+128x256x64 two-stage Tensor Core schedule. SM80 and newer use the native
+128x256x64 three-stage schedule for wide outputs (`N >= 16384`) and the proven
+lower-overhead SM75 schedule for narrow/deep projections. There are no first-use
+probes, process caches, persistent schedule files, or runtime search knobs.
 
 Every stable public tensor operator is registered through
 `torch.library.custom_op` with a fake/meta implementation: both W4A8 GEMMs, a
@@ -177,8 +167,8 @@ shared tile. Route-free dense W8A8 accepts either value for ABI compatibility
 but deliberately normalizes both to its faster compile-time CTA-K64 loop.
 Native D64 uses 16 KiB dynamic shared memory and
 native D128 uses 32 KiB; inputs below either width pad only to the next native
-specialization. Fused Hadamard Q/K rotation and adaptive K anchoring can be
-disabled only through the explicit experimental tuning patch.
+specialization. Fused Hadamard Q/K rotation and adaptive K anchoring are always
+enabled for the quantized production paths.
 The new Q/K preprocessing operator accepts FP16/BF16 D64/D128 HND/NHD tensors.
 Its largest D128 rotated/anchored specialization uses about 21.1 KiB static
 shared memory with no local spill in the compute_75 cubin, while D64 uses about

@@ -69,7 +69,6 @@ built-in adapters without importing ComfyUI node definitions.
 | `attention/orchestration.py` | shared sparse ModelPatcher/layout/executor installation mechanics |
 | `attention/layout.py` | versioned Query/KV modality topology contract and provider registry |
 | `attention/patches.py` | attention overrides and loader-independent ModelPatcher installation |
-| `attention/tuning.py` | explicit experimental launch/quantization policy metadata |
 | `quantization/convrot.py` | ConvRot metadata parsing and loaded-module format inspection |
 | `quantization/dispatch.py` | W8A8/W4A8/W4A4 activation quantization and GEMM dispatch |
 | `quantization/fusions.py` | model-independent fused activation and normalization operations |

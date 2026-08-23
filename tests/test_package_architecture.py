@@ -133,7 +133,6 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsMiniMaxH3BlockCachePatch",
                 "TuringUtilsSolSparseAttentionPatch",
                 "TuringUtilsSlaSparseAttentionPatch",
-                "TuringUtilsAttentionKernelTuningPatch",
                 "TuringUtilsResizeImageIfPresent",
                 "TuringUtilsVideoMotionContactSheet",
                 "TuringUtilsMiniMaxH3VideoVAEDecode",

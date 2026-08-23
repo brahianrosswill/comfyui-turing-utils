@@ -9,7 +9,6 @@ from .patches import (
     make_sla_attention_override,
 )
 from .sparse import turing_sla_sparse_attention, turing_sol_sparse_attention
-from .tuning import apply_attention_kernel_tuning_patch
 from .stable import (
     AttentionBackend,
     attention_backend_choices,
@@ -31,7 +30,6 @@ __all__ = [
     "apply_attention_backend",
     "apply_sparse_attention_patch",
     "apply_sla_attention_patch",
-    "apply_attention_kernel_tuning_patch",
     "attention_backend_choices",
     "bundled_available",
     "bundled_w8a8_available",

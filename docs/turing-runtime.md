@@ -28,7 +28,7 @@ not skip attention or quantized-kernel preflight.
 | `comfyui_turing_utils/runtime/` | device facts, real compiled-symbol capability resolution, and diagnostics |
 | `comfyui_turing_utils/loading/` | ConvRot discovery, Comfy construction, preflight, and adapter installation |
 | `comfyui_turing_utils/attention/` | prepared-attention protocol, stable Sage, sparse policies, semantic layout, and patches |
-| `comfyui_turing_utils/nodes/attention.py` | model-independent production Sol patch UI and explicit kernel tuning |
+| `comfyui_turing_utils/nodes/attention.py` | model-independent production Sol/SLA patch UI |
 | `comfyui_turing_utils/quantization/` | sm75+ W8/W4 format inspection, dispatch, and generic fusions |
 | `comfyui_turing_utils/adapters/minimax/` | MiniMax layout, packed-sequence planning, and fusions |
 | `comfyui_turing_utils/adapters/wan.py` | Wan/Bernini context-aware planning and Q/K preprocessing hooks |
@@ -108,11 +108,10 @@ L2 0.16035 and cosine 0.98738 for the legacy row-scaled signed W4 format. These
 are direction and format tests, not final exact-sm75 or model-quality acceptance
 results. Final throughput acceptance still requires an exact-sm75 run.
 
-The inline and raw-W8 long-sequence kernels use the same 256-thread CTA and
-shared-memory tile. Both 128x256 and 256x128 policies are compiled. The SM75
-cubin reports 244/248 registers for inline decode and 208/210 for raw W8,
-zero local-memory spill, and one resident CTA for each long policy; inline
-decode does not lower CTA density. The staged fallback uses 4,096-output-channel chunks,
+The inline and raw-W8 long-sequence kernels use the same fixed 128x256x64,
+256-thread CTA and shared-memory tile. The SM75 cubin reports zero local-memory
+spill and one resident CTA; inline decode does not lower CTA density. The
+staged fallback uses 4,096-output-channel chunks,
 matching Kitchen's production chunk policy, and is bounded at 112 MiB for H3
 fc2 and 21 MiB for qkv/fc1. MiniMax and Wan planning remain conservative for
 short or non-g16 inputs and reserve only the largest mutually exclusive staged
@@ -124,36 +123,13 @@ or local memory; the previous addressable temporary arrays required a 16-byte
 per-thread stack frame. The compatibility path remains bit exact with inline
 g16 decode, including predicated N edges.
 
-Exact-sm75 raw W8, signed W4, and long-sequence codebook W4 dispatch perform a
-one-time per-device/per-MNK tile microbenchmark and cache the result for the
-process. It measures both long policies instead of assuming that more resident
-CTAs or one fixed shared-memory budget predicts throughput. CUDA Graph capture
-reuses a process-local winner when one exists and otherwise uses the static
-heuristic without synchronizing or touching the filesystem. The tuning cost is
-paid once per distinct contraction shape and, from kernel 0.34 onward, its
-winner is persisted by GPU UUID, SM, driver/runtime, kernel ABI, operator
-family, and MNK. On A40 compute_75/PTX, the existing
-long-sequence 128x256 policy remained best for H3-like raw W8/W4, while
-codebook W4 at M=10,000, N=K=5,376 measured 4.38 ms for 256x128 versus 6.27 ms
-for 128x256. These numbers justify device measurement but do not select the
-Turing winner. `benchmark_backends.py --suite linear --tile-sweep` exposes all
-compiled policies for acceptance runs.
-
-Native sm80+ raw W8 uses the same per-device/per-MNK cache but benchmarks a
-shape-bounded CUTLASS set. Wide QKV/FC1 outputs compare 128x256 two/three-stage
-and 64x128/64x256 schedules with threadblock swizzles; narrower FC2/output
-projections compare 128x128 three/four-stage and 64x128 four-stage tiles.
-Kernel 0.35 ranks these candidates on a saturated 4096-row prefix and sends at
-most the two fastest policies to one full-shape confirmation round. A default
-500 ms per-shape admission budget prevents a large first-use contraction from
-starting after the remaining budget is exhausted. Turing and Ampere therefore share dispatch and cache policy while compiling only the
-architecture-specialized kernels each device can execute. Set
-`COMFYUI_TURING_UTILS_GEMM_TUNE_LOG=1` for one diagnostic line per new shape.
-Use `COMFYUI_TURING_UTILS_GEMM_CACHE=0` to disable persistent selections, or
-set it to an explicit file/directory for controlled deployments. Set
-`COMFYUI_TURING_UTILS_GEMM_TUNE_BUDGET_MS=0` to disable live search or specify
-a non-negative budget up to 5000 ms. Persistent and in-process hits bypass the
-search budget, and CUDA Graph capture never performs live tuning.
+Raw W8, signed W4, and long-sequence codebook W4 use deterministic dispatch.
+SM75 uses the fixed 128x256x64 two-stage Tensor Core schedule. Native sm80+
+uses the matching three-stage schedule for wide QKV/FC1 outputs and the proven
+lower-overhead SM75 schedule for narrow/deep FC2 and output projections. The
+runtime performs no first-use probes, synchronization, process caching, file
+I/O, or persistent schedule selection, so CUDA Graph capture follows the same
+path as normal execution.
 
 The stable Sage main loop was also rebuilt from historical commit `4255f3c`
 in an isolated worktree and compared with the current compute-75 image on the
@@ -370,9 +346,9 @@ only the contiguous V buffer required by the main kernel, while W8A8 retains
 only quantized V. Older kernels remain supported through the one-call ABI.
 All bundled attention kernels launch on PyTorch's current CUDA stream, which
 also makes the graph-leaf dense Sage/W8A8 operations safe for CUDA Graph
-capture. It also exposes logical CTA-K64/128 scheduling and fused
-Hadamard/adaptive-anchor quality controls through a separate experimental
-tuning patch. Logical K128 processes two K64 stages using the same shared tile.
+capture. Logical CTA-K scheduling is selected automatically from device
+resources, while fused Hadamard Q/K and adaptive K anchoring stay enabled on
+quantized production paths.
 
 Kernel 0.22 extends that lifetime contract upstream into model-owned Q/K
 preprocessing. MiniMax H3 passes raw projected Q/K together with per-head

@@ -110,7 +110,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(
             "csrc/turing/sage/overlap_blend.cu", extensions[2].kwargs["sources"]
         )
-        self.assertEqual(setup.call_args.kwargs["version"], "0.35.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.36.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -300,7 +300,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.35.0")
+        self.assertEqual(metadata["project"]["version"], "0.36.0")
 
     def test_overlap_epilogue_is_self_contained_and_deterministic_by_design(self):
         source = (
@@ -406,35 +406,24 @@ class KernelSetupTest(unittest.TestCase):
             benchmark,
         )
 
-    def test_linear_tiles_are_autotuned_only_on_exact_sm75(self):
+    def test_linear_tiles_use_deterministic_architecture_dispatch(self):
         bindings = (PLUGIN_ROOT / "kernel" / "csrc" / "bindings.cpp").read_text(
             encoding="utf-8"
         )
         source = (
             PLUGIN_ROOT / "kernel" / "csrc" / "turing" / "w4a8.cu"
         ).read_text(encoding="utf-8")
-        benchmark = (
-            PLUGIN_ROOT / "kernel" / "scripts" / "benchmark_backends.py"
-        ).read_text(encoding="utf-8")
-        self.assertIn('pybind11::arg("tile_policy") = 0', bindings)
-        self.assertIn("run_auto_tuned_tile", source)
-        self.assertIn("run_auto_tuned_ampere_tile", source)
-        self.assertIn("COMFYUI_TURING_UTILS_GEMM_TUNE_LOG", source)
-        self.assertIn("case 11:", source)
-        self.assertIn("case 16:", source)
-        self.assertIn("GemmIdentityThreadblockSwizzle<SwizzleN>", source)
-        self.assertIn("COMFYUI_TURING_UTILS_GEMM_CACHE", source)
-        self.assertIn("gemm_tune_device_fingerprint", source)
-        self.assertIn("properties.uuid", source)
-        self.assertIn("persistent_hit", source)
-        self.assertIn("COMFYUI_TURING_UTILS_GEMM_TUNE_BUDGET_MS", source)
-        self.assertIn("const int proxy_m = std::min(m, 4096)", source)
-        self.assertIn("const int finalist_count = std::min<int>(2, ranked.size())", source)
-        self.assertIn("estimated_full_ms", source)
-        self.assertIn("properties->major != 7 || properties->minor != 5", source)
-        self.assertIn("cudaStreamIsCapturing", source)
-        self.assertIn("codebook_tile_cache", source)
-        self.assertIn("--tile-sweep", benchmark)
+        self.assertNotIn("tile_policy", bindings)
+        self.assertNotIn("run_auto_tuned", source)
+        self.assertNotIn("GEMM_TUNE", source)
+        self.assertNotIn("GEMM_CACHE", source)
+        self.assertNotIn("PersistentTileTuneCache", source)
+        self.assertIn("properties->major >= 8 && n >= 16384", source)
+        self.assertIn(
+            "run_ampere_int8_tile<128, 256, 64, 64, 64, 64, 3>",
+            source,
+        )
+        self.assertIn("run_int8_tile<128, 256, 64, 64>", source)
 
     def test_legacy_w4a8_edges_remain_on_tensor_cores(self):
         bindings = (PLUGIN_ROOT / "kernel" / "csrc" / "bindings.cpp").read_text(

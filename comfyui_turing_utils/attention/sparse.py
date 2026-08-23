@@ -32,7 +32,6 @@ from .stable import (
     inspect_turing_attention_call,
     normalize_turing_attention_tensors,
 )
-from .tuning import attention_kernel_tuning
 from ..kernel_api import load_turing_sage
 
 
@@ -488,14 +487,12 @@ def prequantize_turing_sol_attention(
     routing_threshold: float,
     scale: float | None,
     use_w8a8: bool,
-    transformer_options=None,
 ) -> PrequantizedAttentionCall:
     q, k, v = normalize_turing_attention_tensors(q, k, v, call.attention)
     if call.attention.tensor_layout == "NHD":
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
-    tuning = attention_kernel_tuning(transformer_options)
     state = load_turing_sage().prequantize_sol_sageattn(
         q,
         k,
@@ -507,9 +504,9 @@ def prequantize_turing_sol_attention(
         threshold_sigma=routing_threshold,
         residual_subblocks=call.residual_subblocks,
         use_w8a8=bool(use_w8a8),
-        key_tile_tokens=tuning.key_tile_tokens,
-        rotate_qk=tuning.rotate_qk,
-        stabilize_k=tuning.stabilize_k,
+        key_tile_tokens=0,
+        rotate_qk=True,
+        stabilize_k=True,
     )
     return PrequantizedAttentionCall(state, call.attention)
 
@@ -522,9 +519,7 @@ def prequantize_turing_sol_attention_from_qk(
     routing_threshold: float,
     scale: float | None,
     use_w8a8: bool,
-    transformer_options=None,
 ) -> PrequantizedAttentionCall:
-    tuning = attention_kernel_tuning(transformer_options)
     state = load_turing_sage().prequantize_sol_sageattn_from_qk(
         qk,
         value,
@@ -534,7 +529,7 @@ def prequantize_turing_sol_attention_from_qk(
         threshold_sigma=routing_threshold,
         residual_subblocks=call.residual_subblocks,
         use_w8a8=bool(use_w8a8),
-        key_tile_tokens=tuning.key_tile_tokens,
+        key_tile_tokens=0,
     )
     return PrequantizedAttentionCall(state, call.attention)
 
@@ -548,14 +543,12 @@ def prequantize_turing_sla_attention(
     sparsity_ratio: float,
     scale: float | None,
     use_w8a8: bool,
-    transformer_options=None,
 ) -> PrequantizedAttentionCall:
     q, k, v = normalize_turing_attention_tensors(q, k, v, call.attention)
     if call.attention.tensor_layout == "NHD":
         q = q.transpose(1, 2).contiguous()
         k = k.transpose(1, 2).contiguous()
         v = v.transpose(1, 2).contiguous()
-    tuning = attention_kernel_tuning(transformer_options)
     state = load_turing_sage().prequantize_sla_sageattn(
         q,
         k,
@@ -566,9 +559,9 @@ def prequantize_turing_sla_attention(
         exact_kv_ranges=call.exact_kv_ranges,
         sparsity_ratio=sparsity_ratio,
         use_w8a8=bool(use_w8a8),
-        key_tile_tokens=tuning.key_tile_tokens,
-        rotate_qk=tuning.rotate_qk,
-        stabilize_k=tuning.stabilize_k,
+        key_tile_tokens=0,
+        rotate_qk=True,
+        stabilize_k=True,
     )
     return PrequantizedAttentionCall(state, call.attention)
 
@@ -581,9 +574,7 @@ def prequantize_turing_sla_attention_from_qk(
     sparsity_ratio: float,
     scale: float | None,
     use_w8a8: bool,
-    transformer_options=None,
 ) -> PrequantizedAttentionCall:
-    tuning = attention_kernel_tuning(transformer_options)
     state = load_turing_sage().prequantize_sla_sageattn_from_qk(
         qk,
         value,
@@ -592,7 +583,7 @@ def prequantize_turing_sla_attention_from_qk(
         exact_kv_ranges=call.exact_kv_ranges,
         sparsity_ratio=sparsity_ratio,
         use_w8a8=bool(use_w8a8),
-        key_tile_tokens=tuning.key_tile_tokens,
+        key_tile_tokens=0,
     )
     return PrequantizedAttentionCall(state, call.attention)
 
@@ -780,7 +771,6 @@ def turing_sol_sparse_attention(
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-    tuning = attention_kernel_tuning(transformer_options)
     sparse_result = _sol_sparse_sageattn(
         q,
         k,
@@ -793,9 +783,9 @@ def turing_sol_sparse_attention(
         residual_subblocks=residual_subblocks,
         return_stats=collect_route_stats,
         use_w8a8=bool(use_w8a8),
-        key_tile_tokens=tuning.key_tile_tokens,
-        rotate_qk=tuning.rotate_qk,
-        stabilize_k=tuning.stabilize_k,
+        key_tile_tokens=0,
+        rotate_qk=True,
+        stabilize_k=True,
     )
     if collect_route_stats:
         output, selected_device, possible_blocks = sparse_result
@@ -971,7 +961,6 @@ def turing_sla_sparse_attention(
         sparsity_ratio=sparsity_ratio,
         scale=kwargs.get("scale"),
         use_w8a8=use_w8a8,
-        transformer_options=kwargs.get("transformer_options"),
     )
     result = turing_sla_attention_from_prequantized(
         quantized,

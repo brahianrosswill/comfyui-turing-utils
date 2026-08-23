@@ -112,11 +112,6 @@ only after its CUDA sources or required version change.
   tensor lifetime, and optional W8A8 PV path, but deliberately does not add
   Sol's local blocks or skipped-block residual. Use it with the SLA-trained
   LoRA; `sparsity_ratio=0.85` matches the published runtime hyperparameter.
-- `Patch Turing Attention Kernel Tuning (Experimental)` overrides the logical
-  CTA-K schedule and the fused Hadamard/adaptive-anchor quality controls for
-  dense W8A8 and Sol. Its defaults are the production policy; explicit values
-  are intended for target-card profiling and do not affect stable Sage.
-
 ## MiniMax H3 automatic activation memory
 
 The H3 adapter uses one capability-based path on Turing, Ampere, Ada, Hopper,

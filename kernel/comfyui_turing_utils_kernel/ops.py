@@ -49,7 +49,7 @@ def turing_codebook_w4a8_linear(
 ) -> torch.Tensor:
     """SM75 grouped-codebook W4A8.
 
-    ``chunk_rows=0`` selects the production policy, ``-1`` forces inline
+    ``chunk_rows=0`` selects the production path, ``-1`` forces inline
     packed-W4 decode for supported long sequences, and a positive multiple of
     eight forces the bounded staged path.
     """
@@ -101,7 +101,7 @@ def turing_int8_linear(
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Raw SM75 W8A8 contraction used by package preflight and comparison."""
+    """Raw SM75+ W8A8 contraction used by package preflight and comparison."""
     if activation.device.type != "cuda":
         raise RuntimeError("Turing INT8 linear requires CUDA tensors")
     if torch.cuda.get_device_capability(activation.device) < (7, 5):

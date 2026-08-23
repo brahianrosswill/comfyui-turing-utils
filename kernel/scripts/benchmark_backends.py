@@ -255,7 +255,6 @@ def benchmark_linear(
     rows: tuple[int, ...],
     warmup: int,
     repeats: int,
-    tile_sweep: bool = False,
 ) -> None:
     try:
         from comfy_kitchen.backends import cuda as kitchen_cuda
@@ -348,71 +347,6 @@ def benchmark_linear(
                     ),
                 ),
             ]
-            if tile_sweep:
-                from comfyui_turing_utils_kernel import _C as low_level
-
-                maximum_tile_policy = 16 if torch.cuda.get_device_capability(device) >= (8, 0) else 5
-                for tile_policy in range(1, maximum_tile_policy + 1):
-                    measurements.append(
-                        Measurement(
-                            f"bundled raw W8A8 tile-policy {tile_policy}",
-                            "tile-diagnostic",
-                            _elapsed_ms(
-                                lambda tile_policy=tile_policy: low_level.turing_int8_linear(
-                                    activation,
-                                    decoded,
-                                    activation_scale,
-                                    channel_scale,
-                                    None,
-                                    tile_policy,
-                                ),
-                                warmup,
-                                repeats,
-                            ),
-                        )
-                    )
-                    measurements.append(
-                        Measurement(
-                            f"bundled packed W4A8 tile-policy {tile_policy}",
-                            "tile-diagnostic",
-                            _elapsed_ms(
-                                lambda tile_policy=tile_policy: low_level.turing_w4a8_linear(
-                                    activation,
-                                    packed_signed,
-                                    activation_scale,
-                                    channel_scale,
-                                    None,
-                                    tile_policy,
-                                ),
-                                warmup,
-                                repeats,
-                            ),
-                        )
-                    )
-                if m > 8192:
-                    for tile_policy in (4, 5):
-                        measurements.append(
-                            Measurement(
-                                f"bundled codebook W4A8 tile-policy {tile_policy}",
-                                "tile-diagnostic",
-                                _elapsed_ms(
-                                    lambda tile_policy=tile_policy: low_level.turing_codebook_w4a8_linear(
-                                        activation,
-                                        packed_codebook,
-                                        activation_scale,
-                                        group_scale.view(torch.uint8),
-                                        channel_scale,
-                                        codebook,
-                                        None,
-                                        16,
-                                        -1,
-                                        tile_policy,
-                                    ),
-                                    warmup,
-                                    repeats,
-                                ),
-                            )
-                        )
             if m > 8192:
                 measurements.append(
                     Measurement(
@@ -893,9 +827,8 @@ def benchmark_preprocessing(
                     repeats,
                 )
             if input_act == "swiglu" and raw_k == 28672:
-                # The low-level binding accepts a forced geometry only for
-                # reproducible tuning. The registered custom op remains on
-                # the production auto selector.
+                # Forced geometry remains a resource-validation aid; the
+                # registered custom op uses its production selector.
                 core = getattr(turing, "_C", None)
                 if core is not None:
                     for threads in (512, 768, 1024):
@@ -1108,14 +1041,6 @@ def main() -> None:
     parser.add_argument("--head-dim", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=5)
-    parser.add_argument(
-        "--tile-sweep",
-        action="store_true",
-        help=(
-            "report every compatible linear tile; production dispatch tunes "
-            "and caches schedules per shape and architecture"
-        ),
-    )
     args = parser.parse_args()
     device = torch.device(args.device)
     if device.type != "cuda" or not torch.cuda.is_available():
@@ -1142,7 +1067,6 @@ def main() -> None:
                 args.rows,
                 args.warmup,
                 args.repeats,
-                tile_sweep=args.tile_sweep,
             )
         if args.suite in ("preprocess", "all"):
             benchmark_preprocessing(device, args.rows, args.warmup, args.repeats)

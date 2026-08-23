@@ -1185,7 +1185,6 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
                 attention,
                 x,
                 SimpleNamespace(freqs=None),
-                {},
                 chunk_rows=64,
             )
 

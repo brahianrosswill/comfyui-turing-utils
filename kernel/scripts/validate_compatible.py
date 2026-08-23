@@ -200,6 +200,38 @@ def validate_w4a8(device: torch.device) -> None:
             atol=0.01,
         )
 
+    # Exercise both deterministic raw-W8 schedules. On SM80+ the wide case
+    # selects the native three-stage kernel; narrow/deep projections and SM75
+    # use the lower-overhead two-stage schedule.
+    for index, n in enumerate((5376, 16384)):
+        generator = torch.Generator(device=device).manual_seed(4360 + index)
+        m, k = 17, 256
+        activation = torch.randint(
+            -127, 128, (m, k), generator=generator, device=device, dtype=torch.int8
+        )
+        weight = torch.randint(
+            -127, 128, (n, k), generator=generator, device=device, dtype=torch.int8
+        )
+        activation_scale = (
+            torch.rand((m,), generator=generator, device=device) * 0.002 + 0.0001
+        )
+        weight_scale = (
+            torch.rand((n,), generator=generator, device=device) * 0.002 + 0.0001
+        )
+        output = comfyui_turing_utils_kernel.turing_int8_linear(
+            activation, weight, activation_scale, weight_scale
+        )
+        reference = (
+            activation.float() @ weight.float().t()
+        ) * activation_scale[:, None] * weight_scale[None, :]
+        _assert_close(
+            f"raw W8A8 M={m} N={n} K={k}",
+            output,
+            reference,
+            rtol=0.01,
+            atol=0.01,
+        )
+
     # Kijai's current MiniMax-H3 W4A8 files use Kitchen's symmetric grouped
     # codebook layout: packed 4-bit indices, E4M3 relative group scales, and
     # one FP32 channel scale.  Validate the exact decode contract separately

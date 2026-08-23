@@ -9,10 +9,9 @@ from . import patches as _patches
 from . import protocol as _protocol
 from . import sparse as _sparse
 from . import stable as _stable
-from . import tuning as _tuning
 
 
-for _module in (_protocol, _stable, _sparse, _patches, _tuning):
+for _module in (_protocol, _stable, _sparse, _patches):
     for _name, _value in vars(_module).items():
         if not _name.startswith("__"):
             globals()[_name] = _value
@@ -23,7 +22,7 @@ class _AttentionFacade(types.ModuleType):
 
     def __setattr__(self, name, value):
         super().__setattr__(name, value)
-        for module in (_protocol, _stable, _sparse, _patches, _tuning):
+        for module in (_protocol, _stable, _sparse, _patches):
             if hasattr(module, name):
                 setattr(module, name, value)
 

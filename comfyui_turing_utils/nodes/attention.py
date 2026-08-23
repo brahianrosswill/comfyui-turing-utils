@@ -1,67 +1,11 @@
-"""ComfyUI nodes for production attention patches and explicit kernel tuning."""
+"""ComfyUI nodes for production attention patches."""
 
 from __future__ import annotations
 
 from ..attention import (
-    apply_attention_kernel_tuning_patch,
     apply_sla_attention_patch,
     apply_sparse_attention_patch,
 )
-
-
-class AttentionKernelTuningPatch:
-    """Experimental launch/quantization controls; defaults preserve production policy."""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "model": ("MODEL",),
-                "key_tile": (
-                    ["auto", "64", "128"],
-                    {
-                        "default": "auto",
-                        "tooltip": "Logical K tokens scheduled per CTA iteration. 128 reuses the same 32 KiB shared tile for two 64-token stages; use this node only for profiling until measured on the target Turing GPU.",
-                    },
-                ),
-                "hadamard_qk": (
-                    "BOOLEAN",
-                    {
-                        "default": True,
-                        "tooltip": "Apply the fused randomized Hadamard transform before INT8 Q/K quantization. Enabled is the production-quality default.",
-                    },
-                ),
-                "adaptive_k_anchor": (
-                    "BOOLEAN",
-                    {
-                        "default": True,
-                        "tooltip": "Conditionally subtract an exact softmax-invariant K anchor when it improves quantization range. Ignored when Hadamard Q/K is disabled.",
-                    },
-                ),
-            }
-        }
-
-    RETURN_TYPES = ("MODEL",)
-    RETURN_NAMES = ("model",)
-    FUNCTION = "patch"
-    CATEGORY = "Turing Utils/patches"
-    TITLE = "Patch Turing Attention Kernel Tuning (Experimental)"
-
-    def patch(
-        self,
-        model,
-        key_tile: str = "auto",
-        hadamard_qk: bool = True,
-        adaptive_k_anchor: bool = True,
-    ):
-        return (
-            apply_attention_kernel_tuning_patch(
-                model,
-                key_tile=key_tile,
-                rotate_qk=hadamard_qk,
-                stabilize_k=adaptive_k_anchor,
-            ),
-        )
 
 
 class SolSparseAttentionPatch:

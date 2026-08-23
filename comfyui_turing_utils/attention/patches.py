@@ -178,7 +178,6 @@ def _make_dense_prepared_executor(kernel: str) -> Callable:
             key,
             request.qk_transform,
             kernel=kernel,
-            transformer_options=request.transformer_options,
         )
         del query, key
         quantized = _profiled(
@@ -190,7 +189,6 @@ def _make_dense_prepared_executor(kernel: str) -> Callable:
             kernel=kernel,
             scale=request.scale,
             is_causal=request.is_causal,
-            transformer_options=request.transformer_options,
         )
         del qk, value
         return AttentionExecutionOutcome(
@@ -244,7 +242,6 @@ def _make_dense_prepared_executor(kernel: str) -> Callable:
                 call,
                 kernel="w8a8",
                 scale=None,
-                transformer_options=transformer_options,
             )
             return AttentionExecutionOutcome(
                 _profiled(
@@ -329,7 +326,6 @@ def _make_dense_container_function(kernel: str) -> Callable:
             kernel=kernel,
             scale=kwargs.get("scale"),
             is_causal=bool(kwargs.get("is_causal", False)),
-            transformer_options=kwargs.get("transformer_options"),
         )
         del query, key, value
         return turing_attention_from_prequantized(quantized, kernel=kernel)
@@ -894,7 +890,6 @@ def make_sparse_attention_override(
             key,
             request.qk_transform,
             kernel="sol",
-            transformer_options=transformer_options,
         )
         del query, key
         quantized = _profiled(
@@ -906,7 +901,6 @@ def make_sparse_attention_override(
             routing_threshold=routing_threshold,
             scale=request.scale,
             use_w8a8=use_w8a8,
-            transformer_options=transformer_options,
         )
         del qk, value
         debug_key = (
@@ -1016,7 +1010,6 @@ def make_sparse_attention_override(
             routing_threshold=routing_threshold,
             scale=None,
             use_w8a8=True,
-            transformer_options=transformer_options,
         )
         debug_key = (
             sol_call.attention.input_dtype,
@@ -1200,7 +1193,6 @@ def make_sparse_attention_override(
                 routing_threshold=routing_threshold,
                 scale=kwargs.get("scale"),
                 use_w8a8=use_w8a8,
-                transformer_options=transformer_options,
             )
             del query, key, value
             debug_key = (
@@ -1460,7 +1452,6 @@ def make_sla_attention_override(
             key,
             request.qk_transform,
             kernel="sla",
-            transformer_options=transformer_options,
         )
         del query, key
         quantized = _profiled(
@@ -1472,7 +1463,6 @@ def make_sla_attention_override(
             sparsity_ratio=sparsity_ratio,
             scale=request.scale,
             use_w8a8=use_w8a8,
-            transformer_options=transformer_options,
         )
         del qk, value
         profile_route_density = CUDA_PHASE_PROFILER.enabled
@@ -1554,7 +1544,6 @@ def make_sla_attention_override(
                 sparsity_ratio=sparsity_ratio,
                 scale=None,
                 use_w8a8=True,
-                transformer_options=transformer_options,
             )
             profile_route_density = CUDA_PHASE_PROFILER.enabled
             result = _profiled(
@@ -1660,7 +1649,6 @@ def make_sla_attention_override(
                 sparsity_ratio=sparsity_ratio,
                 scale=kwargs.get("scale"),
                 use_w8a8=use_w8a8,
-                transformer_options=transformer_options,
             )
             del query, key, value
             profile_route_density = CUDA_PHASE_PROFILER.enabled

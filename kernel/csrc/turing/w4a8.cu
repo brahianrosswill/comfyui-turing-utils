@@ -5,25 +5,10 @@
 #include <cuda_runtime.h>
 
 #include <climits>
-#include <array>
 #include <algorithm>
-#include <cctype>
-#include <cstdio>
-#include <cstdlib>
 #include <cstdint>
-#include <filesystem>
-#include <fstream>
-#include <iomanip>
-#include <limits>
-#include <map>
-#include <mutex>
-#include <sstream>
 #include <stdexcept>
-#include <string>
-#include <tuple>
 #include <type_traits>
-#include <utility>
-#include <vector>
 
 #include "cutlass/cutlass.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
@@ -284,554 +269,6 @@ enum class WeightKind {
     kSignedW4,
     kCodebookW4,
 };
-
-struct TileTuneKey {
-    int device;
-    int m;
-    int n;
-    int k;
-
-    bool operator<(TileTuneKey const &other) const {
-        return std::tie(device, m, n, k) <
-            std::tie(other.device, other.m, other.n, other.k);
-    }
-};
-
-struct TileTuneCache {
-    std::mutex mutex;
-    std::map<TileTuneKey, int> selected_policy;
-};
-
-TileTuneCache w4_tile_cache;
-TileTuneCache w8_tile_cache;
-TileTuneCache ampere_w8_tile_cache;
-TileTuneCache codebook_tile_cache;
-
-constexpr const char *kGemmTuneAbi = "0.35.0";
-
-bool false_like_environment_value(const std::string &value) {
-    std::string lowered(value);
-    std::transform(
-        lowered.begin(), lowered.end(), lowered.begin(),
-        [](unsigned char character) {
-            return static_cast<char>(std::tolower(character));
-        });
-    return lowered == "0" || lowered == "off" || lowered == "false" ||
-        lowered == "no";
-}
-
-std::filesystem::path default_gemm_tune_cache_path() {
-    if (const char *configured =
-            std::getenv("COMFYUI_TURING_UTILS_GEMM_CACHE")) {
-        const std::string value(configured);
-        if (value.empty() || false_like_environment_value(value)) {
-            return {};
-        }
-        std::filesystem::path path(value);
-        std::error_code error;
-        if ((std::filesystem::exists(path, error) &&
-             std::filesystem::is_directory(path, error)) ||
-            (!value.empty() &&
-             (value.back() == '/' || value.back() == '\\'))) {
-            return path / "gemm_tuning_0_35.tsv";
-        }
-        return path;
-    }
-#if defined(_WIN32)
-    if (const char *base = std::getenv("LOCALAPPDATA")) {
-        return std::filesystem::path(base) / "comfyui-turing-utils" /
-            "gemm_tuning_0_35.tsv";
-    }
-    if (const char *base = std::getenv("TEMP")) {
-        return std::filesystem::path(base) / "comfyui-turing-utils" /
-            "gemm_tuning_0_35.tsv";
-    }
-#else
-    if (const char *base = std::getenv("XDG_CACHE_HOME")) {
-        return std::filesystem::path(base) / "comfyui-turing-utils" /
-            "gemm_tuning_0_35.tsv";
-    }
-    if (const char *base = std::getenv("HOME")) {
-        return std::filesystem::path(base) / ".cache" /
-            "comfyui-turing-utils" / "gemm_tuning_0_35.tsv";
-    }
-    if (const char *base = std::getenv("TMPDIR")) {
-        return std::filesystem::path(base) / "comfyui-turing-utils" /
-            "gemm_tuning_0_35.tsv";
-    }
-#endif
-    return {};
-}
-
-std::string gemm_tune_device_fingerprint(int device) {
-    cudaDeviceProp properties{};
-    checkCUDA(cudaGetDeviceProperties(&properties, device));
-    int driver_version = 0;
-    int runtime_version = 0;
-    checkCUDA(cudaDriverGetVersion(&driver_version));
-    checkCUDA(cudaRuntimeGetVersion(&runtime_version));
-    const cudaUUID_t &uuid = properties.uuid;
-    std::ostringstream fingerprint;
-    fingerprint << "uuid=";
-    fingerprint << std::hex << std::setfill('0');
-    for (unsigned char byte : uuid.bytes) {
-        fingerprint << std::setw(2) << static_cast<unsigned int>(byte);
-    }
-    fingerprint << std::dec
-                << ";sm=" << properties.major << properties.minor
-                << ";driver=" << driver_version
-                << ";runtime=" << runtime_version
-                << ";abi=" << kGemmTuneAbi;
-    return fingerprint.str();
-}
-
-struct PersistentTileTuneKey {
-    std::string fingerprint;
-    std::string family;
-    int m;
-    int n;
-    int k;
-
-    bool operator<(PersistentTileTuneKey const &other) const {
-        return std::tie(fingerprint, family, m, n, k) <
-            std::tie(other.fingerprint, other.family,
-                     other.m, other.n, other.k);
-    }
-};
-
-class PersistentTileTuneCache {
-public:
-    bool lookup(const PersistentTileTuneKey &key, int *policy) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        load_once();
-        auto found = selected_policy_.find(key);
-        if (found == selected_policy_.end()) {
-            return false;
-        }
-        *policy = found->second;
-        return true;
-    }
-
-    void store(const PersistentTileTuneKey &key, int policy) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        load_once();
-        if (path_.empty()) {
-            return;
-        }
-        selected_policy_[key] = policy;
-        std::error_code error;
-        const auto parent = path_.parent_path();
-        if (!parent.empty()) {
-            std::filesystem::create_directories(parent, error);
-            if (error) {
-                return;
-            }
-        }
-        std::ofstream output(path_, std::ios::out | std::ios::app);
-        if (!output) {
-            return;
-        }
-        output << key.fingerprint << '\t' << key.family << '\t'
-               << key.m << '\t' << key.n << '\t' << key.k << '\t'
-               << policy << '\n';
-        output.flush();
-    }
-
-private:
-    void load_once() {
-        if (loaded_) {
-            return;
-        }
-        loaded_ = true;
-        path_ = default_gemm_tune_cache_path();
-        if (path_.empty()) {
-            return;
-        }
-        std::ifstream input(path_);
-        std::string line;
-        while (std::getline(input, line)) {
-            std::istringstream row(line);
-            PersistentTileTuneKey key;
-            int policy = 0;
-            if (std::getline(row, key.fingerprint, '\t') &&
-                std::getline(row, key.family, '\t') &&
-                row >> key.m && row.get() == '\t' &&
-                row >> key.n && row.get() == '\t' &&
-                row >> key.k && row.get() == '\t' &&
-                row >> policy && policy > 0) {
-                selected_policy_[std::move(key)] = policy;
-            }
-        }
-    }
-
-    std::mutex mutex_;
-    bool loaded_ = false;
-    std::filesystem::path path_;
-    std::map<PersistentTileTuneKey, int> selected_policy_;
-};
-
-PersistentTileTuneCache persistent_tile_cache;
-
-bool valid_persistent_policy(const std::string &family, int policy) {
-    if (family == "sm80_w8") {
-        return policy >= 1 && policy <= 16;
-    }
-    if (family == "sm75_codebook") {
-        return policy == 4 || policy == 5;
-    }
-    return policy >= 1 && policy <= 5;
-}
-
-bool tile_tune_diagnostics_enabled() {
-    static const bool enabled = [] {
-        const char *value = std::getenv("COMFYUI_TURING_UTILS_GEMM_TUNE_LOG");
-        return value != nullptr && value[0] != '\0' && value[0] != '0';
-    }();
-    return enabled;
-}
-
-float ampere_tile_tune_budget_ms() {
-    static const float budget = [] {
-        constexpr float kDefaultBudgetMs = 500.0f;
-        const char *value =
-            std::getenv("COMFYUI_TURING_UTILS_GEMM_TUNE_BUDGET_MS");
-        if (value == nullptr || value[0] == '\0') {
-            return kDefaultBudgetMs;
-        }
-        char *end = nullptr;
-        const float parsed = std::strtof(value, &end);
-        if (end == value || *end != '\0' || parsed < 0.0f) {
-            return kDefaultBudgetMs;
-        }
-        // Zero deliberately disables live search while retaining in-process
-        // and persistent hits.  Bound user-provided budgets so a typo cannot
-        // turn first use into an unbounded full-shape sweep.
-        return parsed == 0.0f ? 0.0f : std::min(parsed, 5000.0f);
-    }();
-    return budget;
-}
-
-template <size_t Timings, typename Candidates>
-void report_tile_tuning(const char *architecture,
-                        int m,
-                        int n,
-                        int k,
-                        int selected,
-                        const Candidates &candidates,
-                        const std::array<float, Timings> &elapsed) {
-    if (!tile_tune_diagnostics_enabled()) {
-        return;
-    }
-    std::fprintf(
-        stderr,
-        "[Turing GEMM tune] arch=%s shape=%dx%dx%d selected=%d candidates=",
-        architecture, m, n, k, selected);
-    for (int policy : candidates) {
-        std::fprintf(stderr, "%d:%.3fms ", policy, elapsed[policy]);
-    }
-    std::fprintf(stderr, "\n");
-}
-
-template <typename RunPolicy>
-bool run_auto_tuned_tile(TileTuneCache &cache,
-                         const char *family,
-                         int m,
-                         int n,
-                         int k,
-                         int heuristic_policy,
-                         cudaStream_t stream,
-                         RunPolicy &&run_policy) {
-    int device = 0;
-    checkCUDA(cudaGetDevice(&device));
-    const TileTuneKey key{device, m, n, k};
-    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-    checkCUDA(cudaStreamIsCapturing(stream, &capture_status));
-    if (capture_status != cudaStreamCaptureStatusNone) {
-        std::lock_guard<std::mutex> lock(cache.mutex);
-        if (auto found = cache.selected_policy.find(key);
-            found != cache.selected_policy.end()) {
-            return run_policy(found->second);
-        }
-        return run_policy(heuristic_policy);
-    }
-
-    std::lock_guard<std::mutex> lock(cache.mutex);
-    if (auto found = cache.selected_policy.find(key);
-        found != cache.selected_policy.end()) {
-        if (run_policy(found->second)) {
-            return true;
-        }
-        cache.selected_policy.erase(found);
-    }
-    const PersistentTileTuneKey persistent_key{
-        gemm_tune_device_fingerprint(device), family, m, n, k};
-    int persisted_policy = 0;
-    if (persistent_tile_cache.lookup(persistent_key, &persisted_policy) &&
-        valid_persistent_policy(family, persisted_policy) &&
-        run_policy(persisted_policy)) {
-        cache.selected_policy.emplace(key, persisted_policy);
-        if (tile_tune_diagnostics_enabled()) {
-            std::fprintf(
-                stderr,
-                "[Turing GEMM tune] persistent_hit family=%s "
-                "shape=%dx%dx%d selected=%d\n",
-                family, m, n, k, persisted_policy);
-        }
-        return true;
-    }
-
-    std::array<int, 4> candidates{};
-    int candidate_count = 0;
-    if (m <= 32) {
-        candidates[candidate_count++] = 1;
-    } else if (m <= 128) {
-        candidates[candidate_count++] = 1;
-        candidates[candidate_count++] = 2;
-        candidates[candidate_count++] = 3;
-        candidates[candidate_count++] = 5;
-    } else if (m <= 512) {
-        candidates[candidate_count++] = 3;
-        candidates[candidate_count++] = 4;
-        candidates[candidate_count++] = 5;
-    } else {
-        candidates[candidate_count++] = 4;
-        candidates[candidate_count++] = 5;
-    }
-
-    std::array<float, 6> best_ms;
-    best_ms.fill(std::numeric_limits<float>::infinity());
-    for (int round = 0; round < 2; ++round) {
-        for (int index = 0; index < candidate_count; ++index) {
-            const int candidate_index = round == 0
-                ? index
-                : candidate_count - index - 1;
-            const int policy = candidates[candidate_index];
-            cudaEvent_t start = nullptr;
-            cudaEvent_t stop = nullptr;
-            checkCUDA(cudaEventCreate(&start));
-            checkCUDA(cudaEventCreate(&stop));
-            checkCUDA(cudaEventRecord(start, stream));
-            const bool launched = run_policy(policy);
-            checkCUDA(cudaEventRecord(stop, stream));
-            checkCUDA(cudaEventSynchronize(stop));
-            float elapsed_ms = std::numeric_limits<float>::infinity();
-            if (launched) {
-                checkCUDA(cudaEventElapsedTime(&elapsed_ms, start, stop));
-                best_ms[policy] = std::min(best_ms[policy], elapsed_ms);
-            }
-            checkCUDA(cudaEventDestroy(stop));
-            checkCUDA(cudaEventDestroy(start));
-        }
-    }
-
-    int selected = heuristic_policy;
-    for (int index = 0; index < candidate_count; ++index) {
-        const int policy = candidates[index];
-        if (best_ms[policy] < best_ms[selected] * 0.98f) {
-            selected = policy;
-        }
-    }
-    cache.selected_policy.emplace(key, selected);
-    persistent_tile_cache.store(persistent_key, selected);
-    if (tile_tune_diagnostics_enabled()) {
-        std::fprintf(
-            stderr,
-            "[Turing GEMM tune] family=%s shape=%dx%dx%d selected=%d candidates=",
-            family, m, n, k, selected);
-        for (int index = 0; index < candidate_count; ++index) {
-            const int policy = candidates[index];
-            std::fprintf(stderr, "%d:%.3fms ", policy, best_ms[policy]);
-        }
-        std::fprintf(stderr, "\n");
-    }
-    return run_policy(selected);
-}
-
-template <typename RunPolicy>
-bool run_auto_tuned_ampere_tile(TileTuneCache &cache,
-                                const char *family,
-                                int m,
-                                int n,
-                                int k,
-                                int heuristic_policy,
-                                cudaStream_t stream,
-                                RunPolicy &&run_policy) {
-    int device = 0;
-    checkCUDA(cudaGetDevice(&device));
-    const TileTuneKey key{device, m, n, k};
-    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
-    checkCUDA(cudaStreamIsCapturing(stream, &capture_status));
-    if (capture_status != cudaStreamCaptureStatusNone) {
-        std::lock_guard<std::mutex> lock(cache.mutex);
-        if (auto found = cache.selected_policy.find(key);
-            found != cache.selected_policy.end()) {
-            return run_policy(found->second, m);
-        }
-        return run_policy(heuristic_policy, m);
-    }
-    std::lock_guard<std::mutex> lock(cache.mutex);
-    if (auto found = cache.selected_policy.find(key);
-        found != cache.selected_policy.end()) {
-        if (run_policy(found->second, m)) {
-            return true;
-        }
-        cache.selected_policy.erase(found);
-    }
-    const PersistentTileTuneKey persistent_key{
-        gemm_tune_device_fingerprint(device), family, m, n, k};
-    int persisted_policy = 0;
-    if (persistent_tile_cache.lookup(persistent_key, &persisted_policy) &&
-        valid_persistent_policy(family, persisted_policy) &&
-        run_policy(persisted_policy, m)) {
-        cache.selected_policy.emplace(key, persisted_policy);
-        if (tile_tune_diagnostics_enabled()) {
-            std::fprintf(
-                stderr,
-                "[Turing GEMM tune] persistent_hit family=%s "
-                "shape=%dx%dx%d selected=%d\n",
-                family, m, n, k, persisted_policy);
-        }
-        return true;
-    }
-
-    // Keep tuning bounded by output width. Large QKV/FC1 contractions compare
-    // wide-N schedules; FC2/out projections compare lower-register narrow-N
-    // variants. Screening every policy on the full activation made first use
-    // disproportionately expensive for H3's 60k/127k rows. Instead, rank the
-    // full candidate set on a saturated 4096-row prefix, then admit only the
-    // best two to one full-shape confirmation round. The final production
-    // launch still covers all rows and is arithmetic-identical to the former
-    // path; the prefix writes are disposable tuning probes.
-    const bool wide_output = n >= 16384;
-    std::vector<int> candidates;
-    candidates.reserve(9);
-    const auto add_candidate = [&](int policy) {
-        if (std::find(candidates.begin(), candidates.end(), policy) ==
-            candidates.end()) {
-            candidates.push_back(policy);
-        }
-    };
-    add_candidate(heuristic_policy);
-    if (wide_output) {
-        add_candidate(6);
-        add_candidate(9);
-        add_candidate(11);
-        add_candidate(16);
-        add_candidate(8);
-        add_candidate(12);
-        if (m <= 32768) {
-            add_candidate(10);
-            add_candidate(13);
-        }
-    } else {
-        add_candidate(7);
-        add_candidate(8);
-        add_candidate(10);
-        add_candidate(12);
-        add_candidate(15);
-        add_candidate(6);
-    }
-    const int proxy_m = std::min(m, 4096);
-    const float budget_ms = ampere_tile_tune_budget_ms();
-    float spent_ms = 0.0f;
-    std::array<float, 17> proxy_elapsed;
-    std::array<float, 17> full_elapsed;
-    proxy_elapsed.fill(std::numeric_limits<float>::infinity());
-    full_elapsed.fill(std::numeric_limits<float>::infinity());
-
-    const auto measure = [&](int policy, int rows, float *elapsed) {
-        cudaEvent_t start = nullptr;
-        cudaEvent_t stop = nullptr;
-        checkCUDA(cudaEventCreate(&start));
-        checkCUDA(cudaEventCreate(&stop));
-        checkCUDA(cudaEventRecord(start, stream));
-        const bool launched = run_policy(policy, rows);
-        checkCUDA(cudaEventRecord(stop, stream));
-        checkCUDA(cudaEventSynchronize(stop));
-        float measured = std::numeric_limits<float>::infinity();
-        if (launched) {
-            checkCUDA(cudaEventElapsedTime(&measured, start, stop));
-            *elapsed = measured;
-            spent_ms += measured;
-        }
-        checkCUDA(cudaEventDestroy(stop));
-        checkCUDA(cudaEventDestroy(start));
-        return launched;
-    };
-
-    std::vector<int> ranked;
-    ranked.reserve(candidates.size());
-    if (budget_ms > 0.0f) {
-        for (int policy : candidates) {
-            if (spent_ms >= budget_ms) {
-                break;
-            }
-            if (measure(policy, proxy_m, &proxy_elapsed[policy])) {
-                ranked.push_back(policy);
-            }
-        }
-    }
-    std::stable_sort(
-        ranked.begin(), ranked.end(), [&](int left, int right) {
-            return proxy_elapsed[left] < proxy_elapsed[right];
-        });
-
-    // A full-shape launch is admitted only when its proxy-scaled cost fits the
-    // remaining budget. CUDA kernels cannot be pre-empted, so this admission
-    // test is what makes the search bounded instead of merely checking time
-    // after an unexpectedly expensive contraction has already started.
-    const int finalist_count = std::min<int>(2, ranked.size());
-    for (int index = 0; index < finalist_count; ++index) {
-        const int policy = ranked[index];
-        const float estimated_full_ms = proxy_elapsed[policy] *
-            static_cast<float>(m) / static_cast<float>(proxy_m);
-        if (spent_ms + estimated_full_ms > budget_ms) {
-            continue;
-        }
-        measure(policy, m, &full_elapsed[policy]);
-    }
-
-    int selected = heuristic_policy;
-    bool selected_from_full = false;
-    for (int index = 0; index < finalist_count; ++index) {
-        const int policy = ranked[index];
-        if (full_elapsed[policy] == std::numeric_limits<float>::infinity()) {
-            continue;
-        }
-        if (!selected_from_full ||
-            full_elapsed[policy] < full_elapsed[selected] * 0.98f) {
-            selected = policy;
-            selected_from_full = true;
-        }
-    }
-    if (!selected_from_full && !ranked.empty() &&
-        proxy_elapsed[ranked.front()] <
-            proxy_elapsed[heuristic_policy] * 0.95f) {
-        // If the budget cannot admit a full finalist, accept a proxy winner
-        // only when it clears a wider 5% margin. Otherwise retain the stable
-        // heuristic rather than persisting a noise-sensitive decision.
-        selected = ranked.front();
-    }
-    cache.selected_policy.emplace(key, selected);
-    persistent_tile_cache.store(persistent_key, selected);
-    if (tile_tune_diagnostics_enabled()) {
-        std::fprintf(
-            stderr,
-            "[Turing GEMM tune] family=%s shape=%dx%dx%d proxy_m=%d "
-            "budget=%.1fms spent=%.3fms selected=%d proxy=",
-            family, m, n, k, proxy_m, budget_ms, spent_ms, selected);
-        for (int policy : candidates) {
-            std::fprintf(stderr, "%d:%.3fms ", policy, proxy_elapsed[policy]);
-        }
-        std::fprintf(stderr, "full=");
-        for (int index = 0; index < finalist_count; ++index) {
-            const int policy = ranked[index];
-            std::fprintf(stderr, "%d:%.3fms ", policy, full_elapsed[policy]);
-        }
-        std::fprintf(stderr, "\n");
-    }
-    return run_policy(selected, m);
-}
 
 template <typename Output,
           WeightKind Kind,
@@ -1168,8 +605,7 @@ bool run_int8_tile(const int8_t *activation,
 // Native SM80 INT8 Tensor Core mainloop.  Keeping the same EVT epilogue as
 // the SM75 implementation makes this a schedule substitution only: integer
 // accumulation, row/channel scales, bias, and BF16 rounding are unchanged.
-template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages,
-          int SwizzleN = 1>
+template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages>
 struct AmpereInt8Gemm {
     using ElementA = int8_t;
     using ElementB = int8_t;
@@ -1182,8 +618,7 @@ struct AmpereInt8Gemm {
     using ThreadblockShape = cutlass::gemm::GemmShape<TBM, TBN, TBK>;
     using WarpShape = cutlass::gemm::GemmShape<WM, WN, WK>;
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 32>;
-    using Swizzle =
-        cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<SwizzleN>;
+    using Swizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
     static constexpr int Alignment = 16;
     static constexpr int AlignmentC = 8;
     static constexpr int EpilogueStages = 1;
@@ -1275,8 +710,7 @@ struct AmpereInt8Gemm {
     }
 };
 
-template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages,
-          int SwizzleN = 1>
+template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages>
 bool run_ampere_int8_tile(const int8_t *activation,
                           const int8_t *weight,
                           const float *activation_scale,
@@ -1289,7 +723,7 @@ bool run_ampere_int8_tile(const int8_t *activation,
                           int output_stride,
                           cudaStream_t stream) {
     return AmpereInt8Gemm<
-        TBM, TBN, TBK, WM, WN, WK, Stages, SwizzleN>::run(
+        TBM, TBN, TBK, WM, WN, WK, Stages>::run(
         activation, weight, activation_scale, weight_scale, bias, output,
         m, n, k, output_stride, stream);
 }
@@ -1334,56 +768,10 @@ bool dispatch(const int8_t *activation,
               int n,
               int k,
               int output_stride,
-              cudaStream_t stream,
-              int tile_policy) {
-    const auto run_policy = [&](int policy) {
-        switch (policy) {
-        case 1:
-            return run_tile<16, 64, 16, 32>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
-        case 2:
-            return run_tile<32, 64, 32, 32>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
-        case 3:
-            return run_tile<64, 128, 32, 64>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
-        case 4:
-            return run_tile<256, 128, 64, 64>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
-        case 5:
-            return run_tile<128, 256, 64, 64>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
-        default:
-            throw std::runtime_error("invalid Turing W4A8 tile policy");
-        }
-    };
-    if (tile_policy != 0) {
-        return run_policy(tile_policy);
-    }
-    int heuristic_policy;
-    if (m <= 32) {
-        heuristic_policy = 1;
-    } else if (m <= 128 && n < 8192) {
-        heuristic_policy = 2;
-    } else if (m <= 512) {
-        heuristic_policy = 3;
-    } else if (m <= 8192) {
-        heuristic_policy = 4;
-    } else {
-        heuristic_policy = 5;
-    }
-    const cudaDeviceProp *properties = getCurrentDeviceProperties();
-    if (properties->major != 7 || properties->minor != 5) {
-        return run_policy(heuristic_policy);
-    }
-    return run_auto_tuned_tile(
-        w4_tile_cache, "sm75_w4", m, n, k, heuristic_policy, stream,
-        run_policy);
+              cudaStream_t stream) {
+    return run_tile<128, 256, 64, 64>(
+        activation, weight, activation_scale, weight_scale, bias,
+        output, m, n, k, output_stride, stream);
 }
 
 bool dispatch_int8(const int8_t *activation,
@@ -1396,118 +784,16 @@ bool dispatch_int8(const int8_t *activation,
                    int n,
                    int k,
                    int output_stride,
-                   cudaStream_t stream,
-                   int tile_policy = 0) {
-    const auto run_sm75_policy = [&](int policy, int problem_m) {
-        switch (policy) {
-        case 1:
-            return run_int8_tile<16, 64, 16, 32>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, problem_m, n, k, output_stride, stream);
-        case 2:
-            return run_int8_tile<32, 64, 32, 32>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, problem_m, n, k, output_stride, stream);
-        case 3:
-            return run_int8_tile<64, 128, 32, 64>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, problem_m, n, k, output_stride, stream);
-        case 4:
-            return run_int8_tile<256, 128, 64, 64>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, problem_m, n, k, output_stride, stream);
-        case 5:
-            return run_int8_tile<128, 256, 64, 64>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, problem_m, n, k, output_stride, stream);
-        default:
-            throw std::runtime_error("invalid Turing INT8 tile policy");
-        }
-    };
-    const auto run_sm80_policy = [&](int policy, int problem_m) {
-        switch (policy) {
-        case 6:
-            return run_ampere_int8_tile<128, 256, 64, 64, 64, 64, 3>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, problem_m, n, k, output_stride, stream);
-        case 7:
-            return run_ampere_int8_tile<128, 128, 64, 64, 64, 64, 4>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, problem_m, n, k, output_stride, stream);
-        case 8:
-            return run_ampere_int8_tile<64, 128, 64, 32, 64, 64, 4>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, problem_m, n, k, output_stride, stream);
-        case 9:
-            return run_ampere_int8_tile<128, 256, 64, 64, 64, 64, 2>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, problem_m, n, k, output_stride, stream);
-        case 10:
-            return run_ampere_int8_tile<128, 128, 64, 64, 64, 64, 3>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, problem_m, n, k, output_stride, stream);
-        case 11:
-            return run_ampere_int8_tile<64, 256, 64, 32, 64, 64, 3>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, problem_m, n, k, output_stride, stream);
-        case 12:
-            return run_ampere_int8_tile<64, 128, 64, 32, 64, 64, 4, 2>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, problem_m, n, k, output_stride, stream);
-        case 13:
-            return run_ampere_int8_tile<64, 128, 64, 32, 64, 64, 4, 4>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, problem_m, n, k, output_stride, stream);
-        case 14:
-            return run_ampere_int8_tile<64, 128, 64, 32, 64, 64, 4, 8>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, problem_m, n, k, output_stride, stream);
-        case 15:
-            return run_ampere_int8_tile<128, 128, 64, 64, 64, 64, 3, 4>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, problem_m, n, k, output_stride, stream);
-        case 16:
-            return run_ampere_int8_tile<64, 256, 64, 32, 64, 64, 3, 4>(
-                activation, weight, activation_scale, weight_scale, bias,
-                output, problem_m, n, k, output_stride, stream);
-        default:
-            throw std::runtime_error("invalid SM80 INT8 tile policy");
-        }
-    };
+                   cudaStream_t stream) {
     const cudaDeviceProp *properties = getCurrentDeviceProperties();
-    if (tile_policy != 0) {
-        return properties->major >= 8 && tile_policy >= 6
-            ? run_sm80_policy(tile_policy, m)
-            : run_sm75_policy(tile_policy, m);
+    if (properties->major >= 8 && n >= 16384) {
+        return run_ampere_int8_tile<128, 256, 64, 64, 64, 64, 3>(
+            activation, weight, activation_scale, weight_scale, bias,
+            output, m, n, k, output_stride, stream);
     }
-    int heuristic_policy;
-    if (m <= 32) {
-        heuristic_policy = 1;
-    } else if (m <= 128 && n < 8192) {
-        heuristic_policy = 2;
-    } else if (m <= 512) {
-        heuristic_policy = 3;
-    } else if (m <= 8192) {
-        heuristic_policy = 4;
-    } else {
-        heuristic_policy = 5;
-    }
-    if (properties->major >= 8) {
-        const auto run_ampere_candidate = [&](int policy, int problem_m) {
-            return policy >= 6
-                ? run_sm80_policy(policy, problem_m)
-                : run_sm75_policy(policy, problem_m);
-        };
-        return run_auto_tuned_ampere_tile(
-            ampere_w8_tile_cache, "sm80_w8", m, n, k, heuristic_policy,
-            stream, run_ampere_candidate);
-    }
-    if (properties->major != 7 || properties->minor != 5) {
-        return run_sm75_policy(heuristic_policy, m);
-    }
-    return run_auto_tuned_tile(
-        w8_tile_cache, "sm75_w8", m, n, k, heuristic_policy, stream,
-        [&](int policy) { return run_sm75_policy(policy, m); });
+    return run_int8_tile<128, 256, 64, 64>(
+        activation, weight, activation_scale, weight_scale, bias,
+        output, m, n, k, output_stride, stream);
 }
 
 bool dispatch_codebook(const int8_t *activation,
@@ -1521,38 +807,17 @@ bool dispatch_codebook(const int8_t *activation,
                        int m,
                        int n,
                        int k,
-                       cudaStream_t stream,
-                       int tile_policy) {
-    // The long-sequence W8A8 policy is already register-limited to one CTA per
+                       cudaStream_t stream) {
+    // The long-sequence W8A8 schedule is already register-limited to one CTA per
     // SM75 SM. Inline decoding cannot reduce its CTA residency, while using it
-    // for smaller policies could cross a two-CTA register threshold. Keep the
+    // for smaller schedules could cross a two-CTA register threshold. Keep the
     // production inline path deliberately scoped to the long tile.
     if (m <= 8192) {
         return false;
     }
-    const auto run_policy = [&](int policy) {
-        if (policy == 4) {
-            return run_codebook_tile<256, 128, 64, 64>(
-                activation, weight, activation_scale, group_scale,
-                channel_scale, codebook, bias, output, m, n, k, stream);
-        }
-        if (policy == 5) {
-            return run_codebook_tile<128, 256, 64, 64>(
-                activation, weight, activation_scale, group_scale,
-                channel_scale, codebook, bias, output, m, n, k, stream);
-        }
-        throw std::runtime_error("invalid Turing codebook W4A8 tile policy");
-    };
-    if (tile_policy != 0) {
-        return run_policy(tile_policy);
-    }
-    const cudaDeviceProp *properties = getCurrentDeviceProperties();
-    if (properties->major != 7 || properties->minor != 5) {
-        return run_policy(5);
-    }
-    return run_auto_tuned_tile(
-        codebook_tile_cache, "sm75_codebook", m, n, k, 5, stream,
-        run_policy);
+    return run_codebook_tile<128, 256, 64, 64>(
+        activation, weight, activation_scale, group_scale,
+        channel_scale, codebook, bias, output, m, n, k, stream);
 }
 
 // Decode one 16-column vector per thread. This intentionally matches Kitchen's
@@ -1656,8 +921,7 @@ void turing_w4a8_linear(Tensor activation,
                         Tensor activation_scale,
                         Tensor weight_scale,
                         Tensor bias,
-                        Tensor output,
-                        int tile_policy) {
+                        Tensor output) {
     const int64_t m64 = activation.size(0);
     const int64_t k64 = activation.size(1);
     const int64_t n64 = weight.size(0);
@@ -1731,8 +995,7 @@ void turing_w4a8_linear(Tensor activation,
         n,
         k,
         static_cast<int>(output.stride(0)),
-        stream,
-        tile_policy);
+        stream);
     if (!launched) {
         throw std::runtime_error("CUTLASS SM75 W4A8 kernel rejected the problem shape");
     }
@@ -1749,8 +1012,7 @@ void turing_codebook_w4a8_linear(Tensor activation,
                                  Tensor workspace,
                                  Tensor output,
                                  int group_size,
-                                 bool inline_decode,
-                                 int tile_policy) {
+                                 bool inline_decode) {
     const int m = activation.size(0);
     const int k = activation.size(1);
     const int n = weight.size(0);
@@ -1796,8 +1058,7 @@ void turing_codebook_w4a8_linear(Tensor activation,
                 m,
                 n,
                 k,
-                stream,
-                tile_policy)) {
+                stream)) {
             throw std::runtime_error(
                 "inline CUTLASS SM75 codebook W4A8 rejected the problem shape");
         }
@@ -1841,8 +1102,7 @@ void turing_int8_linear(Tensor activation,
                         Tensor activation_scale,
                         Tensor weight_scale,
                         Tensor bias,
-                        Tensor output,
-                        int tile_policy) {
+                        Tensor output) {
     const int m = activation.size(0);
     const int k = activation.size(1);
     const int n = weight.size(0);
@@ -1863,8 +1123,7 @@ void turing_int8_linear(Tensor activation,
         n,
         k,
         static_cast<int>(output.stride(0)),
-        getCurrentCUDAStream(),
-        tile_policy);
+        getCurrentCUDAStream());
 
     if (!launched) {
         throw std::runtime_error("CUTLASS SM75 INT8 kernel rejected the problem shape");

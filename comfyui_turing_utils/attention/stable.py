@@ -14,7 +14,6 @@ from ..hardware import (
     is_supported_attention_device as _is_supported_attention_device,
     is_supported_turing_device,
 )
-from .tuning import attention_kernel_tuning
 from .protocol import QKTransformSpec
 
 
@@ -374,15 +373,13 @@ def prequantize_turing_qk(
     spec: QKTransformSpec,
     *,
     kernel: str,
-    transformer_options=None,
     k_anchor=None,
     qk_output=None,
 ):
     if kernel not in {"sage", "w8a8", "sol", "sla"}:
         raise ValueError(f"unsupported fused Q/K target: {kernel}")
-    tuning = attention_kernel_tuning(transformer_options)
-    rotate_qk = kernel in {"w8a8", "sol", "sla"} and tuning.rotate_qk
-    stabilize_k = kernel in {"w8a8", "sol", "sla"} and tuning.stabilize_k
+    rotate_qk = kernel in {"w8a8", "sol", "sla"}
+    stabilize_k = rotate_qk
     return load_turing_sage().prequantize_rms_rope_qk(
         q,
         k,
@@ -409,7 +406,6 @@ def prequantize_turing_attention_from_qk(
     kernel: str,
     scale: float | None,
     is_causal: bool = False,
-    transformer_options=None,
 ) -> PrequantizedAttentionCall:
     turing_sage = load_turing_sage()
     if kernel == "sage":
@@ -420,7 +416,6 @@ def prequantize_turing_attention_from_qk(
             sm_scale=scale,
         )
     elif kernel == "w8a8":
-        tuning = attention_kernel_tuning(transformer_options)
         state = turing_sage.prequantize_sol_sageattn_from_qk(
             qk,
             value,
@@ -429,7 +424,7 @@ def prequantize_turing_attention_from_qk(
             residual_subblocks=1,
             use_w8a8=True,
             force_dense=True,
-            key_tile_tokens=tuning.key_tile_tokens,
+            key_tile_tokens=0,
             is_causal=bool(is_causal),
         )
     else:
@@ -446,7 +441,6 @@ def prequantize_turing_attention(
     kernel: str,
     scale: float | None,
     is_causal: bool = False,
-    transformer_options=None,
 ) -> PrequantizedAttentionCall:
     q, k, v = normalize_turing_attention_tensors(q, k, v, call)
     turing_sage = load_turing_sage()
@@ -461,7 +455,6 @@ def prequantize_turing_attention(
             smooth_k=False,
         )
     elif kernel == "w8a8":
-        tuning = attention_kernel_tuning(transformer_options)
         if call.tensor_layout == "NHD":
             q = q.transpose(1, 2).contiguous()
             k = k.transpose(1, 2).contiguous()
@@ -476,9 +469,9 @@ def prequantize_turing_attention(
             residual_subblocks=1,
             use_w8a8=True,
             force_dense=True,
-            key_tile_tokens=tuning.key_tile_tokens,
-            rotate_qk=tuning.rotate_qk,
-            stabilize_k=tuning.stabilize_k,
+            key_tile_tokens=0,
+            rotate_qk=True,
+            stabilize_k=True,
             is_causal=bool(is_causal),
         )
     else:
@@ -669,7 +662,6 @@ def turing_sage_attention(
             )
             _LOGGED_FP32_COMPAT = True
     attention_kernel = _w8a8attn if turing_kernel == "w8a8" else _sageattn
-    tuning = attention_kernel_tuning(kwargs.get("transformer_options"))
     output = attention_kernel(
         q,
         k,
@@ -678,9 +670,9 @@ def turing_sage_attention(
         sm_scale=kwargs.get("scale"),
         **(
             {
-                "key_tile_tokens": tuning.key_tile_tokens,
-                "rotate_qk": tuning.rotate_qk,
-                "stabilize_k": tuning.stabilize_k,
+                "key_tile_tokens": 0,
+                "rotate_qk": True,
+                "stabilize_k": True,
                 "is_causal": bool(kwargs.get("is_causal", False)),
             }
             if turing_kernel == "w8a8"
