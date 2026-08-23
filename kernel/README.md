@@ -1,7 +1,7 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's quantized
-runtime. Version 0.34.0 contains legacy packed W4A8 and grouped-codebook W4A8
+runtime. Version 0.35.0 contains legacy packed W4A8 and grouped-codebook W4A8
 Tensor Core GEMMs, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, lossless single-pass half-width FC1/SwiGLU staging,
@@ -32,15 +32,19 @@ occupancy. These are diagnostic-only queries and are absent from the normal
 sampling path.
 
 Raw W8A8 uses cached per-device/per-shape micro-tuning on both native sm75 and
-sm80+. Version 0.34 persists the winning policy across processes with a key
+sm80+. Version 0.35 persists the winning policy across processes with a key
 containing GPU UUID, SM, driver/runtime, kernel ABI, operator family, and MNK.
 Ampere candidates include two-, three-, and four-stage CUTLASS schedules,
 1/2/4/8-way identity threadblock swizzles, and 64x128, 64x256, 128x128, and
-128x256 CTA shapes. Set
+128x256 CTA shapes. Cold Ampere searches rank the full candidate set on a
+4096-row prefix, then admit at most the best two policies to one full-shape
+confirmation round under a 500 ms per-shape launch budget. Set
 `COMFYUI_TURING_UTILS_GEMM_TUNE_LOG=1` to print the bounded first-use timings
 and selected policy; normal execution does not log or retune cached shapes.
 Set `COMFYUI_TURING_UTILS_GEMM_CACHE=0` to disable persistence, or set it to an
-explicit cache file/directory. CUDA Graph capture reuses an in-process winner
+explicit cache file/directory. Set
+`COMFYUI_TURING_UTILS_GEMM_TUNE_BUDGET_MS=0` to skip live search, or provide a
+non-negative millisecond budget up to 5000. CUDA Graph capture reuses an in-process winner
 when available and otherwise uses the static heuristic without file I/O.
 
 Every stable public tensor operator is registered through
@@ -103,7 +107,7 @@ exact-sm75 runtime choice; dense W8A8, Sol, and SLA share the bundled sm75+
 prepared-attention path, including protected dense work. The historical `_sm75`
 extension suffix is retained as an ABI name. `7.5+PTX` remains useful for
 compatibility validation, while an `8.6` build enables native Ampere async-copy
-and INT8 MMA instructions. Kernel 0.34 also instantiates CUTLASS SM80 W8A8
+and INT8 MMA instructions. Kernel 0.35 also instantiates CUTLASS SM80 W8A8
 `m16n8k32` contractions and caches the best supported tile for each M/N/K
 shape across process restarts; the sm75 implementation remains the fallback
 behind the same public operator. Both W8 and scaled-SwiGLU operators accept row-strided destination

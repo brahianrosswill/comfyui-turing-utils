@@ -23,7 +23,7 @@ from .ops import (
 )
 from . import turing_sage
 
-__version__ = "0.34.0"
+__version__ = "0.35.0"
 
 __all__ = [
     "turing_bf16_int8_convrot_quantize",

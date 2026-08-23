@@ -110,7 +110,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(
             "csrc/turing/sage/overlap_blend.cu", extensions[2].kwargs["sources"]
         )
-        self.assertEqual(setup.call_args.kwargs["version"], "0.34.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.35.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -300,7 +300,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.34.0")
+        self.assertEqual(metadata["project"]["version"], "0.35.0")
 
     def test_overlap_epilogue_is_self_contained_and_deterministic_by_design(self):
         source = (
@@ -427,6 +427,10 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn("gemm_tune_device_fingerprint", source)
         self.assertIn("properties.uuid", source)
         self.assertIn("persistent_hit", source)
+        self.assertIn("COMFYUI_TURING_UTILS_GEMM_TUNE_BUDGET_MS", source)
+        self.assertIn("const int proxy_m = std::min(m, 4096)", source)
+        self.assertIn("const int finalist_count = std::min<int>(2, ranked.size())", source)
+        self.assertIn("estimated_full_ms", source)
         self.assertIn("properties->major != 7 || properties->minor != 5", source)
         self.assertIn("cudaStreamIsCapturing", source)
         self.assertIn("codebook_tile_cache", source)

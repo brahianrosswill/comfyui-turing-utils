@@ -307,7 +307,7 @@ TileTuneCache w8_tile_cache;
 TileTuneCache ampere_w8_tile_cache;
 TileTuneCache codebook_tile_cache;
 
-constexpr const char *kGemmTuneAbi = "0.34.0";
+constexpr const char *kGemmTuneAbi = "0.35.0";
 
 bool false_like_environment_value(const std::string &value) {
     std::string lowered(value);
@@ -333,31 +333,31 @@ std::filesystem::path default_gemm_tune_cache_path() {
              std::filesystem::is_directory(path, error)) ||
             (!value.empty() &&
              (value.back() == '/' || value.back() == '\\'))) {
-            return path / "gemm_tuning_0_34.tsv";
+            return path / "gemm_tuning_0_35.tsv";
         }
         return path;
     }
 #if defined(_WIN32)
     if (const char *base = std::getenv("LOCALAPPDATA")) {
         return std::filesystem::path(base) / "comfyui-turing-utils" /
-            "gemm_tuning_0_34.tsv";
+            "gemm_tuning_0_35.tsv";
     }
     if (const char *base = std::getenv("TEMP")) {
         return std::filesystem::path(base) / "comfyui-turing-utils" /
-            "gemm_tuning_0_34.tsv";
+            "gemm_tuning_0_35.tsv";
     }
 #else
     if (const char *base = std::getenv("XDG_CACHE_HOME")) {
         return std::filesystem::path(base) / "comfyui-turing-utils" /
-            "gemm_tuning_0_34.tsv";
+            "gemm_tuning_0_35.tsv";
     }
     if (const char *base = std::getenv("HOME")) {
         return std::filesystem::path(base) / ".cache" /
-            "comfyui-turing-utils" / "gemm_tuning_0_34.tsv";
+            "comfyui-turing-utils" / "gemm_tuning_0_35.tsv";
     }
     if (const char *base = std::getenv("TMPDIR")) {
         return std::filesystem::path(base) / "comfyui-turing-utils" /
-            "gemm_tuning_0_34.tsv";
+            "gemm_tuning_0_35.tsv";
     }
 #endif
     return {};
@@ -488,6 +488,27 @@ bool tile_tune_diagnostics_enabled() {
         return value != nullptr && value[0] != '\0' && value[0] != '0';
     }();
     return enabled;
+}
+
+float ampere_tile_tune_budget_ms() {
+    static const float budget = [] {
+        constexpr float kDefaultBudgetMs = 500.0f;
+        const char *value =
+            std::getenv("COMFYUI_TURING_UTILS_GEMM_TUNE_BUDGET_MS");
+        if (value == nullptr || value[0] == '\0') {
+            return kDefaultBudgetMs;
+        }
+        char *end = nullptr;
+        const float parsed = std::strtof(value, &end);
+        if (end == value || *end != '\0' || parsed < 0.0f) {
+            return kDefaultBudgetMs;
+        }
+        // Zero deliberately disables live search while retaining in-process
+        // and persistent hits.  Bound user-provided budgets so a typo cannot
+        // turn first use into an unbounded full-shape sweep.
+        return parsed == 0.0f ? 0.0f : std::min(parsed, 5000.0f);
+    }();
+    return budget;
 }
 
 template <size_t Timings, typename Candidates>
@@ -644,14 +665,14 @@ bool run_auto_tuned_ampere_tile(TileTuneCache &cache,
         std::lock_guard<std::mutex> lock(cache.mutex);
         if (auto found = cache.selected_policy.find(key);
             found != cache.selected_policy.end()) {
-            return run_policy(found->second);
+            return run_policy(found->second, m);
         }
-        return run_policy(heuristic_policy);
+        return run_policy(heuristic_policy, m);
     }
     std::lock_guard<std::mutex> lock(cache.mutex);
     if (auto found = cache.selected_policy.find(key);
         found != cache.selected_policy.end()) {
-        if (run_policy(found->second)) {
+        if (run_policy(found->second, m)) {
             return true;
         }
         cache.selected_policy.erase(found);
@@ -661,7 +682,7 @@ bool run_auto_tuned_ampere_tile(TileTuneCache &cache,
     int persisted_policy = 0;
     if (persistent_tile_cache.lookup(persistent_key, &persisted_policy) &&
         valid_persistent_policy(family, persisted_policy) &&
-        run_policy(persisted_policy)) {
+        run_policy(persisted_policy, m)) {
         cache.selected_policy.emplace(key, persisted_policy);
         if (tile_tune_diagnostics_enabled()) {
             std::fprintf(
@@ -674,8 +695,13 @@ bool run_auto_tuned_ampere_tile(TileTuneCache &cache,
     }
 
     // Keep tuning bounded by output width. Large QKV/FC1 contractions compare
-    // three wide-N schedules; FC2/out projections compare the lower-register
-    // narrow-N variants. Two reversed rounds reject cold-cache/order noise.
+    // wide-N schedules; FC2/out projections compare lower-register narrow-N
+    // variants. Screening every policy on the full activation made first use
+    // disproportionately expensive for H3's 60k/127k rows. Instead, rank the
+    // full candidate set on a saturated 4096-row prefix, then admit only the
+    // best two to one full-shape confirmation round. The final production
+    // launch still covers all rows and is arithmetic-identical to the former
+    // path; the prefix writes are disposable tuning probes.
     const bool wide_output = n >= 16384;
     std::vector<int> candidates;
     candidates.reserve(9);
@@ -705,42 +731,106 @@ bool run_auto_tuned_ampere_tile(TileTuneCache &cache,
         add_candidate(15);
         add_candidate(6);
     }
-    std::array<float, 17> elapsed;
-    elapsed.fill(std::numeric_limits<float>::infinity());
-    for (int round = 0; round < 2; ++round) {
-        for (int index = 0; index < static_cast<int>(candidates.size()); ++index) {
-            const int candidate_index = round == 0
-                ? index
-                : static_cast<int>(candidates.size()) - index - 1;
-            const int policy = candidates[candidate_index];
-            cudaEvent_t start = nullptr;
-            cudaEvent_t stop = nullptr;
-            checkCUDA(cudaEventCreate(&start));
-            checkCUDA(cudaEventCreate(&stop));
-            checkCUDA(cudaEventRecord(start, stream));
-            const bool launched = run_policy(policy);
-            checkCUDA(cudaEventRecord(stop, stream));
-            checkCUDA(cudaEventSynchronize(stop));
-            if (launched) {
-                float measured = std::numeric_limits<float>::infinity();
-                checkCUDA(cudaEventElapsedTime(&measured, start, stop));
-                elapsed[policy] = std::min(elapsed[policy], measured);
+    const int proxy_m = std::min(m, 4096);
+    const float budget_ms = ampere_tile_tune_budget_ms();
+    float spent_ms = 0.0f;
+    std::array<float, 17> proxy_elapsed;
+    std::array<float, 17> full_elapsed;
+    proxy_elapsed.fill(std::numeric_limits<float>::infinity());
+    full_elapsed.fill(std::numeric_limits<float>::infinity());
+
+    const auto measure = [&](int policy, int rows, float *elapsed) {
+        cudaEvent_t start = nullptr;
+        cudaEvent_t stop = nullptr;
+        checkCUDA(cudaEventCreate(&start));
+        checkCUDA(cudaEventCreate(&stop));
+        checkCUDA(cudaEventRecord(start, stream));
+        const bool launched = run_policy(policy, rows);
+        checkCUDA(cudaEventRecord(stop, stream));
+        checkCUDA(cudaEventSynchronize(stop));
+        float measured = std::numeric_limits<float>::infinity();
+        if (launched) {
+            checkCUDA(cudaEventElapsedTime(&measured, start, stop));
+            *elapsed = measured;
+            spent_ms += measured;
+        }
+        checkCUDA(cudaEventDestroy(stop));
+        checkCUDA(cudaEventDestroy(start));
+        return launched;
+    };
+
+    std::vector<int> ranked;
+    ranked.reserve(candidates.size());
+    if (budget_ms > 0.0f) {
+        for (int policy : candidates) {
+            if (spent_ms >= budget_ms) {
+                break;
             }
-            checkCUDA(cudaEventDestroy(stop));
-            checkCUDA(cudaEventDestroy(start));
+            if (measure(policy, proxy_m, &proxy_elapsed[policy])) {
+                ranked.push_back(policy);
+            }
         }
     }
-    int selected = heuristic_policy;
-    for (int policy : candidates) {
-        if (elapsed[policy] < elapsed[selected] * 0.98f) {
-            selected = policy;
+    std::stable_sort(
+        ranked.begin(), ranked.end(), [&](int left, int right) {
+            return proxy_elapsed[left] < proxy_elapsed[right];
+        });
+
+    // A full-shape launch is admitted only when its proxy-scaled cost fits the
+    // remaining budget. CUDA kernels cannot be pre-empted, so this admission
+    // test is what makes the search bounded instead of merely checking time
+    // after an unexpectedly expensive contraction has already started.
+    const int finalist_count = std::min<int>(2, ranked.size());
+    for (int index = 0; index < finalist_count; ++index) {
+        const int policy = ranked[index];
+        const float estimated_full_ms = proxy_elapsed[policy] *
+            static_cast<float>(m) / static_cast<float>(proxy_m);
+        if (spent_ms + estimated_full_ms > budget_ms) {
+            continue;
         }
+        measure(policy, m, &full_elapsed[policy]);
+    }
+
+    int selected = heuristic_policy;
+    bool selected_from_full = false;
+    for (int index = 0; index < finalist_count; ++index) {
+        const int policy = ranked[index];
+        if (full_elapsed[policy] == std::numeric_limits<float>::infinity()) {
+            continue;
+        }
+        if (!selected_from_full ||
+            full_elapsed[policy] < full_elapsed[selected] * 0.98f) {
+            selected = policy;
+            selected_from_full = true;
+        }
+    }
+    if (!selected_from_full && !ranked.empty() &&
+        proxy_elapsed[ranked.front()] <
+            proxy_elapsed[heuristic_policy] * 0.95f) {
+        // If the budget cannot admit a full finalist, accept a proxy winner
+        // only when it clears a wider 5% margin. Otherwise retain the stable
+        // heuristic rather than persisting a noise-sensitive decision.
+        selected = ranked.front();
     }
     cache.selected_policy.emplace(key, selected);
     persistent_tile_cache.store(persistent_key, selected);
-    report_tile_tuning(
-        family, m, n, k, selected, candidates, elapsed);
-    return run_policy(selected);
+    if (tile_tune_diagnostics_enabled()) {
+        std::fprintf(
+            stderr,
+            "[Turing GEMM tune] family=%s shape=%dx%dx%d proxy_m=%d "
+            "budget=%.1fms spent=%.3fms selected=%d proxy=",
+            family, m, n, k, proxy_m, budget_ms, spent_ms, selected);
+        for (int policy : candidates) {
+            std::fprintf(stderr, "%d:%.3fms ", policy, proxy_elapsed[policy]);
+        }
+        std::fprintf(stderr, "full=");
+        for (int index = 0; index < finalist_count; ++index) {
+            const int policy = ranked[index];
+            std::fprintf(stderr, "%d:%.3fms ", policy, full_elapsed[policy]);
+        }
+        std::fprintf(stderr, "\n");
+    }
+    return run_policy(selected, m);
 }
 
 template <typename Output,
@@ -1308,78 +1398,78 @@ bool dispatch_int8(const int8_t *activation,
                    int output_stride,
                    cudaStream_t stream,
                    int tile_policy = 0) {
-    const auto run_sm75_policy = [&](int policy) {
+    const auto run_sm75_policy = [&](int policy, int problem_m) {
         switch (policy) {
         case 1:
             return run_int8_tile<16, 64, 16, 32>(
                 activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
+                output, problem_m, n, k, output_stride, stream);
         case 2:
             return run_int8_tile<32, 64, 32, 32>(
                 activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
+                output, problem_m, n, k, output_stride, stream);
         case 3:
             return run_int8_tile<64, 128, 32, 64>(
                 activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
+                output, problem_m, n, k, output_stride, stream);
         case 4:
             return run_int8_tile<256, 128, 64, 64>(
                 activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
+                output, problem_m, n, k, output_stride, stream);
         case 5:
             return run_int8_tile<128, 256, 64, 64>(
                 activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
+                output, problem_m, n, k, output_stride, stream);
         default:
             throw std::runtime_error("invalid Turing INT8 tile policy");
         }
     };
-    const auto run_sm80_policy = [&](int policy) {
+    const auto run_sm80_policy = [&](int policy, int problem_m) {
         switch (policy) {
         case 6:
             return run_ampere_int8_tile<128, 256, 64, 64, 64, 64, 3>(
                 activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
+                output, problem_m, n, k, output_stride, stream);
         case 7:
             return run_ampere_int8_tile<128, 128, 64, 64, 64, 64, 4>(
                 activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
+                output, problem_m, n, k, output_stride, stream);
         case 8:
             return run_ampere_int8_tile<64, 128, 64, 32, 64, 64, 4>(
                 activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
+                output, problem_m, n, k, output_stride, stream);
         case 9:
             return run_ampere_int8_tile<128, 256, 64, 64, 64, 64, 2>(
                 activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
+                output, problem_m, n, k, output_stride, stream);
         case 10:
             return run_ampere_int8_tile<128, 128, 64, 64, 64, 64, 3>(
                 activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
+                output, problem_m, n, k, output_stride, stream);
         case 11:
             return run_ampere_int8_tile<64, 256, 64, 32, 64, 64, 3>(
                 activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
+                output, problem_m, n, k, output_stride, stream);
         case 12:
             return run_ampere_int8_tile<64, 128, 64, 32, 64, 64, 4, 2>(
                 activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
+                output, problem_m, n, k, output_stride, stream);
         case 13:
             return run_ampere_int8_tile<64, 128, 64, 32, 64, 64, 4, 4>(
                 activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
+                output, problem_m, n, k, output_stride, stream);
         case 14:
             return run_ampere_int8_tile<64, 128, 64, 32, 64, 64, 4, 8>(
                 activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
+                output, problem_m, n, k, output_stride, stream);
         case 15:
             return run_ampere_int8_tile<128, 128, 64, 64, 64, 64, 3, 4>(
                 activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
+                output, problem_m, n, k, output_stride, stream);
         case 16:
             return run_ampere_int8_tile<64, 256, 64, 32, 64, 64, 3, 4>(
                 activation, weight, activation_scale, weight_scale, bias,
-                output, m, n, k, output_stride, stream);
+                output, problem_m, n, k, output_stride, stream);
         default:
             throw std::runtime_error("invalid SM80 INT8 tile policy");
         }
@@ -1387,8 +1477,8 @@ bool dispatch_int8(const int8_t *activation,
     const cudaDeviceProp *properties = getCurrentDeviceProperties();
     if (tile_policy != 0) {
         return properties->major >= 8 && tile_policy >= 6
-            ? run_sm80_policy(tile_policy)
-            : run_sm75_policy(tile_policy);
+            ? run_sm80_policy(tile_policy, m)
+            : run_sm75_policy(tile_policy, m);
     }
     int heuristic_policy;
     if (m <= 32) {
@@ -1403,21 +1493,21 @@ bool dispatch_int8(const int8_t *activation,
         heuristic_policy = 5;
     }
     if (properties->major >= 8) {
-        const auto run_ampere_candidate = [&](int policy) {
+        const auto run_ampere_candidate = [&](int policy, int problem_m) {
             return policy >= 6
-                ? run_sm80_policy(policy)
-                : run_sm75_policy(policy);
+                ? run_sm80_policy(policy, problem_m)
+                : run_sm75_policy(policy, problem_m);
         };
         return run_auto_tuned_ampere_tile(
             ampere_w8_tile_cache, "sm80_w8", m, n, k, heuristic_policy,
             stream, run_ampere_candidate);
     }
     if (properties->major != 7 || properties->minor != 5) {
-        return run_sm75_policy(heuristic_policy);
+        return run_sm75_policy(heuristic_policy, m);
     }
     return run_auto_tuned_tile(
         w8_tile_cache, "sm75_w8", m, n, k, heuristic_policy, stream,
-        run_sm75_policy);
+        [&](int policy) { return run_sm75_policy(policy, m); });
 }
 
 bool dispatch_codebook(const int8_t *activation,

@@ -142,13 +142,18 @@ compiled policies for acceptance runs.
 Native sm80+ raw W8 uses the same per-device/per-MNK cache but benchmarks a
 shape-bounded CUTLASS set. Wide QKV/FC1 outputs compare 128x256 two/three-stage
 and 64x128/64x256 schedules with threadblock swizzles; narrower FC2/output
-projections compare 128x128 three/four-stage and 64x128 four-stage tiles. Two
-reversed timing rounds retain the minimum and avoid selecting on cold-cache
-order. Turing and Ampere therefore share dispatch and cache policy while compiling only the
+projections compare 128x128 three/four-stage and 64x128 four-stage tiles.
+Kernel 0.35 ranks these candidates on a saturated 4096-row prefix and sends at
+most the two fastest policies to one full-shape confirmation round. A default
+500 ms per-shape admission budget prevents a large first-use contraction from
+starting after the remaining budget is exhausted. Turing and Ampere therefore share dispatch and cache policy while compiling only the
 architecture-specialized kernels each device can execute. Set
 `COMFYUI_TURING_UTILS_GEMM_TUNE_LOG=1` for one diagnostic line per new shape.
 Use `COMFYUI_TURING_UTILS_GEMM_CACHE=0` to disable persistent selections, or
-set it to an explicit file/directory for controlled deployments.
+set it to an explicit file/directory for controlled deployments. Set
+`COMFYUI_TURING_UTILS_GEMM_TUNE_BUDGET_MS=0` to disable live search or specify
+a non-negative budget up to 5000 ms. Persistent and in-process hits bypass the
+search budget, and CUDA Graph capture never performs live tuning.
 
 The stable Sage main loop was also rebuilt from historical commit `4255f3c`
 in an isolated worktree and compared with the current compute-75 image on the
