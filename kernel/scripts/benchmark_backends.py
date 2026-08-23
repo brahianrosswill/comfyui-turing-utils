@@ -351,7 +351,7 @@ def benchmark_linear(
             if tile_sweep:
                 from comfyui_turing_utils_kernel import _C as low_level
 
-                maximum_tile_policy = 11 if torch.cuda.get_device_capability(device) >= (8, 0) else 5
+                maximum_tile_policy = 16 if torch.cuda.get_device_capability(device) >= (8, 0) else 5
                 for tile_policy in range(1, maximum_tile_policy + 1):
                     measurements.append(
                         Measurement(

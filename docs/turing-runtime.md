@@ -128,9 +128,11 @@ Exact-sm75 raw W8, signed W4, and long-sequence codebook W4 dispatch perform a
 one-time per-device/per-MNK tile microbenchmark and cache the result for the
 process. It measures both long policies instead of assuming that more resident
 CTAs or one fixed shared-memory budget predicts throughput. CUDA Graph capture
-and non-sm75 compatibility runs use the static heuristic and never synchronize
-for tuning. The tuning cost is paid once per distinct contraction shape and is
-small compared with model initialization. On A40 compute_75/PTX, the existing
+reuses a process-local winner when one exists and otherwise uses the static
+heuristic without synchronizing or touching the filesystem. The tuning cost is
+paid once per distinct contraction shape and, from kernel 0.34 onward, its
+winner is persisted by GPU UUID, SM, driver/runtime, kernel ABI, operator
+family, and MNK. On A40 compute_75/PTX, the existing
 long-sequence 128x256 policy remained best for H3-like raw W8/W4, while
 codebook W4 at M=10,000, N=K=5,376 measured 4.38 ms for 256x128 versus 6.27 ms
 for 128x256. These numbers justify device measurement but do not select the
@@ -139,12 +141,14 @@ compiled policies for acceptance runs.
 
 Native sm80+ raw W8 uses the same per-device/per-MNK cache but benchmarks a
 shape-bounded CUTLASS set. Wide QKV/FC1 outputs compare 128x256 two/three-stage
-and 64x256 three-stage tiles; narrower FC2/output projections compare
-128x128 three/four-stage and 64x128 four-stage tiles. Two reversed timing
-rounds retain the minimum and avoid selecting on cold-cache order. Turing and
-Ampere therefore share dispatch and cache policy while compiling only the
+and 64x128/64x256 schedules with threadblock swizzles; narrower FC2/output
+projections compare 128x128 three/four-stage and 64x128 four-stage tiles. Two
+reversed timing rounds retain the minimum and avoid selecting on cold-cache
+order. Turing and Ampere therefore share dispatch and cache policy while compiling only the
 architecture-specialized kernels each device can execute. Set
 `COMFYUI_TURING_UTILS_GEMM_TUNE_LOG=1` for one diagnostic line per new shape.
+Use `COMFYUI_TURING_UTILS_GEMM_CACHE=0` to disable persistent selections, or
+set it to an explicit file/directory for controlled deployments.
 
 The stable Sage main loop was also rebuilt from historical commit `4255f3c`
 in an isolated worktree and compared with the current compute-75 image on the

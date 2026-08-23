@@ -737,6 +737,33 @@ __device__ __forceinline__ int next_shared_route_block(
   return active_key_blocks;
 }
 
+template <int SelectedCapacity>
+__device__ __forceinline__ int next_compact_route_block(
+    const uint32_t *__restrict__ route_words,
+    const uint16_t *__restrict__ selected_blocks,
+    int selected_count,
+    int selected_position,
+    int start,
+    int active_key_blocks)
+{
+  if (selected_count >= 0)
+  {
+    if (selected_position >= selected_count)
+      return active_key_blocks;
+    if (selected_position < SelectedCapacity)
+    {
+      const int candidate = static_cast<int>(
+          selected_blocks[selected_position]);
+      // A corrupted or stale compact entry must never become an out-of-range
+      // global K/V prefetch.  The bitmap remains authoritative and provides a
+      // deterministic ascending fallback without changing softmax order.
+      if (candidate >= start && candidate < active_key_blocks)
+        return candidate;
+    }
+  }
+  return next_shared_route_block(route_words, start, active_key_blocks);
+}
+
 struct RouteWords
 {
   uint32_t word0;
@@ -907,6 +934,14 @@ __global__ void sparse_attention_kernel(
       shared_bytes + 2 * G::kInt8TileBytes);
   smem_t<SwizzleMode::k64B, 4> shared_selected_value_int8(
       shared_bytes + 2 * G::kInt8TileBytes);
+  // Dense exact attention no longer needs the routing/selection storage once
+  // it enters the K/V loop.  On sm80+ reuse that final INT8-tile region as a
+  // second V stage so cp.async can overlap the next V load with the current
+  // probability x V MMA.  Sparse queries retain the compact selected-block
+  // list in this region; keeping their 32 KiB footprint preserves the third
+  // resident CTA on GA10x instead of trading occupancy for a 40 KiB buffer.
+  smem_t<SwizzleMode::k64B, 4> shared_selected_value_int8_next(
+      shared_bytes + 3 * G::kInt8TileBytes);
   uint32_t *shared_route = reinterpret_cast<uint32_t *>(
       shared_bytes + G::kRouteStorageOffset);
   int *shared_selected_count = reinterpret_cast<int *>(
@@ -1325,11 +1360,24 @@ __global__ void sparse_attention_kernel(
   cp_async::commit_group();
   cp_async::wait_group<0>();
   __syncthreads();
+  int selected_position = 0;
   int key_block = !ForceDense && sparse_query
       ? (UseW8A8
-          ? next_shared_route_block(shared_route, 0, active_key_blocks)
+          ? next_compact_route_block<G::kSelectedCapacity>(
+              shared_route,
+              shared_selected_blocks,
+              compact_selected_count,
+              selected_position,
+              0,
+              active_key_blocks)
           : next_register_route_block(fp16_route, 0, active_key_blocks))
       : 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+  const bool value_ping_pong = UseW8A8 && (ForceDense || !sparse_query);
+#else
+  constexpr bool value_ping_pong = false;
+#endif
+  int value_stage = 0;
   if (key_block < active_key_blocks)
   {
     load_int8_tile_async<HeadDim>(
@@ -1362,21 +1410,35 @@ __global__ void sparse_attention_kernel(
   }
   while (key_block < active_key_blocks)
   {
-    int32_t integer_score[1][4][8];
-    compute_int8_qk<HeadDim>(shared_query_int8, shared_key_int8, integer_score);
-    float score[1][4][8];
+    // Integer QK accumulators are dead before online softmax consumes the
+    // converted values.  Make that lifetime overlap explicit so nvcc does not
+    // reserve two independent 32-register score fragments on long D128
+    // instantiations.
+    union ScoreStorage
+    {
+      int32_t integer[1][4][8];
+      float floating[1][4][8];
+    } score_storage;
+    compute_int8_qk<HeadDim>(
+        shared_query_int8, shared_key_int8, score_storage.integer);
 #pragma unroll
     for (int key_tile = 0; key_tile < 4; ++key_tile)
     {
 #pragma unroll
       for (int element = 0; element < 8; ++element)
-        score[0][key_tile][element] =
-            __int2float_rz(integer_score[0][key_tile][element]);
+        score_storage.floating[0][key_tile][element] = __int2float_rz(
+            score_storage.integer[0][key_tile][element]);
     }
+    float (&score)[1][4][8] = score_storage.floating;
     const int next_key_block = !ForceDense && sparse_query
         ? (UseW8A8
-            ? next_shared_route_block(
-                shared_route, key_block + 1, active_key_blocks)
+            ? next_compact_route_block<G::kSelectedCapacity>(
+                shared_route,
+                shared_selected_blocks,
+                compact_selected_count,
+                ++selected_position,
+                key_block + 1,
+                active_key_blocks)
             : next_register_route_block(
                 fp16_route, key_block + 1, active_key_blocks))
         : key_block + 1;
@@ -1391,6 +1453,21 @@ __global__ void sparse_attention_kernel(
           next_key_block * kBlockTokens,
           key_length,
           shared_key_int8);
+      if constexpr (UseW8A8)
+      {
+        if (value_ping_pong)
+        {
+          smem_t<SwizzleMode::k64B, 4> next_value(
+              value_stage == 0
+                  ? shared_selected_value_int8_next.base
+                  : shared_selected_value_int8.base);
+          load_quantized_value_tile_async<HeadDim>(
+              value_int8_head_ptr,
+              Varlen ? total_value_length : padded_value_length,
+              next_key_block,
+              next_value);
+        }
+      }
       cp_async::commit_group();
     }
 #endif
@@ -1416,8 +1493,12 @@ __global__ void sparse_attention_kernel(
       RS_to_u8<1, 4>(score, probability_u8);
       accumulate_d<1, 4, ComputeUnit::kCudaCore>(score, denominator);
       float probability_scale[1][2] = {{1.0f, 1.0f}};
+      smem_t<SwizzleMode::k64B, 4> current_value(
+          value_stage == 0
+              ? shared_selected_value_int8.base
+              : shared_selected_value_int8_next.base);
       compute_int8_sv_permuted<1, 4, G::kValueTiles, SwizzleMode::k64B, 4>(
-          shared_selected_value_int8,
+          current_value,
           probability_scale,
           probability_u8,
           output_fragment);
@@ -1456,12 +1537,15 @@ __global__ void sparse_attention_kernel(
 #endif
       if constexpr (UseW8A8)
       {
-        load_quantized_value_tile_async<HeadDim>(
-            value_int8_head_ptr,
-            Varlen ? total_value_length : padded_value_length,
-            next_key_block,
-            shared_selected_value_int8);
-        cp_async::commit_group();
+        if (!value_ping_pong)
+        {
+          load_quantized_value_tile_async<HeadDim>(
+              value_int8_head_ptr,
+              Varlen ? total_value_length : padded_value_length,
+              next_key_block,
+              shared_selected_value_int8);
+          cp_async::commit_group();
+        }
       }
       else
       {
@@ -1474,6 +1558,8 @@ __global__ void sparse_attention_kernel(
       }
       cp_async::wait_group<0>();
       __syncthreads();
+      if (value_ping_pong)
+        value_stage ^= 1;
     }
     key_block = next_key_block;
   }

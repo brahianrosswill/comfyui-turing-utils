@@ -968,6 +968,32 @@ def validate_sparse(device: torch.device) -> None:
                     "Sol W8A8 threshold=-1000 must select every sparse Q/K block"
                 )
 
+    # Cross the first 16-block boundary explicitly.  The compact selected-K
+    # cursor and its bitmap fallback must remain finite, monotonic, and bit
+    # exact when a partial seventeenth block is present.
+    compact_sequence = 1025
+    compact_q = torch.randn(
+        (1, 2, compact_sequence, 128), device=device, dtype=torch.bfloat16
+    )
+    compact_k = torch.randn(
+        (1, 1, compact_sequence, 128), device=device, dtype=torch.bfloat16
+    )
+    compact_v = torch.randn_like(compact_k)
+    compact_sol = sol_sparse_sageattn(
+        compact_q,
+        compact_k,
+        compact_v,
+        threshold_sigma=-1000.0,
+        residual_subblocks=1,
+        use_w8a8=True,
+        key_tile_tokens=64,
+    )
+    compact_dense = w8a8attn(compact_q, compact_k, compact_v)
+    if not torch.equal(compact_sol, compact_dense):
+        raise RuntimeError(
+            "Sol compact route changed W8A8 results beyond 16 selected blocks"
+        )
+
     # Verify the CUDA route against an independently reconstructed policy in
     # the exact quantized score domain. This catches accidental use of the
     # original BF16/FP16 tensors or a scale/partial-block indexing mismatch.
