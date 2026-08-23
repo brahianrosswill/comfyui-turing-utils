@@ -279,6 +279,60 @@ def _turing_swiglu_int8_convrot_quantize_scaled_out_fake(
     return None
 
 
+@torch.library.custom_op(
+    "turing_utils::swiglu_convrot_shard_inplace",
+    mutates_args=("gate", "partial_absmax"),
+)
+def turing_swiglu_convrot_shard_inplace(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    partial_absmax: torch.Tensor,
+    channel_offset: int,
+) -> None:
+    """Consume one aligned up shard and rotate SwiGLU into ``gate`` in place."""
+    if gate.device.type != "cuda" or up.device != gate.device:
+        raise RuntimeError("sharded SwiGLU ConvRot requires same-device CUDA tensors")
+    if torch.cuda.get_device_capability(gate.device) < (7, 5):
+        raise RuntimeError("sharded SwiGLU ConvRot requires sm75 or newer")
+    _C.turing_swiglu_convrot_shard_inplace(
+        gate, up.contiguous(), partial_absmax, int(channel_offset)
+    )
+
+
+@turing_swiglu_convrot_shard_inplace.register_fake
+def _turing_swiglu_convrot_shard_inplace_fake(
+    gate, up, partial_absmax, channel_offset
+):
+    return None
+
+
+@torch.library.custom_op(
+    "turing_utils::int8_convrot_quantize_from_partials", mutates_args=()
+)
+def turing_int8_convrot_quantize_from_partials(
+    rotated: torch.Tensor,
+    partial_absmax: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Finish whole-row INT8 quantization from sharded ConvRot partials."""
+    if rotated.device.type != "cuda" or partial_absmax.device != rotated.device:
+        raise RuntimeError("ConvRot partial reduction requires same-device CUDA tensors")
+    return _C.turing_int8_convrot_quantize_from_partials(
+        rotated, partial_absmax
+    )
+
+
+@turing_int8_convrot_quantize_from_partials.register_fake
+def _turing_int8_convrot_quantize_from_partials_fake(
+    rotated, partial_absmax
+):
+    return (
+        torch.empty_like(rotated, dtype=torch.int8),
+        torch.empty(
+            (rotated.size(0), 1), dtype=torch.float32, device=rotated.device
+        ),
+    )
+
+
 @torch.library.custom_op("turing_utils::swiglu_int4_convrot_quantize", mutates_args=())
 def turing_swiglu_int4_convrot_quantize(
     x: torch.Tensor,

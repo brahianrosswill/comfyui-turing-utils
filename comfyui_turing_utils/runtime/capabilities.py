@@ -78,6 +78,7 @@ class RuntimeCapabilities:
             "overlap_accumulate",
             "core_fusions",
             "ffn_channel_sharding",
+            "ffn_half_width",
         }:
             if not self.device.tensor_core:
                 return CapabilityResult(False, "an NVIDIA sm75+ Tensor Core GPU is required")
@@ -121,6 +122,14 @@ def kernel_capabilities() -> KernelCapabilities:
         )
     ):
         features.add("ffn_channel_sharding")
+    if all(
+        kernel_extension_has_symbol(symbol)
+        for symbol in (
+            "turing_swiglu_convrot_shard_inplace",
+            "turing_int8_convrot_quantize_from_partials",
+        )
+    ):
+        features.add("ffn_half_width")
     if _probe(sage, "available"):
         features.add("stable_sage")
     probes = {

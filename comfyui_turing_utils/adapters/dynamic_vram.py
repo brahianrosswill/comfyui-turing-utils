@@ -6,7 +6,7 @@ import logging
 
 import torch
 
-from ..profiling import CUDA_PHASE_PROFILER
+from ..profiling import CUDA_PHASE_PROFILER, WORKFLOW_TIMELINE
 
 
 LOG = logging.getLogger("comfyui-turing-utils")
@@ -28,10 +28,16 @@ def make_dynamic_vram_sample_fence(device: torch.device):
 
     def outer_sample_wrapper(executor, *args, **kwargs):
         torch.cuda.synchronize(device)
+        timeline = WORKFLOW_TIMELINE.begin(device)
         try:
             return executor(*args, **kwargs)
         finally:
+            WORKFLOW_TIMELINE.record_end(timeline)
             torch.cuda.synchronize(device)
+            try:
+                WORKFLOW_TIMELINE.finish_after_synchronize(timeline)
+            except Exception as error:
+                LOG.warning("Unable to emit workflow timeline: %s", error)
             try:
                 CUDA_PHASE_PROFILER.report_after_synchronize()
             except Exception as error:

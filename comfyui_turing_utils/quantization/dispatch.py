@@ -69,6 +69,17 @@ def convrot_swiglu_channel_sharding_available() -> bool:
     return _kernel_available("turing_swiglu_int8_convrot_quantize_scaled")
 
 
+def convrot_swiglu_half_width_available() -> bool:
+    """Return whether single-pass, lossless half-width FFN staging is available."""
+    return all(
+        _kernel_available(name)
+        for name in (
+            "turing_swiglu_convrot_shard_inplace",
+            "turing_int8_convrot_quantize_from_partials",
+        )
+    )
+
+
 def _kernel_op(name: str):
     try:
         return getattr(load_kernel_package(), name)
@@ -486,6 +497,26 @@ def quantize_convrot_swiglu_with_scale(
         return output
     operation = _kernel_op("turing_swiglu_int8_convrot_quantize_scaled")
     return operation(x, scale, int(group_size))
+
+
+def rotate_convrot_swiglu_shard_inplace(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    partial_absmax: torch.Tensor,
+    channel_offset: int,
+) -> None:
+    """Rotate one aligned SwiGLU shard into the full-width gate buffer."""
+    operation = _kernel_op("turing_swiglu_convrot_shard_inplace")
+    operation(gate, up, partial_absmax, int(channel_offset))
+
+
+def quantize_convrot_from_partials(
+    rotated: torch.Tensor,
+    partial_absmax: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce sharded ConvRot maxima and quantize with one whole-row scale."""
+    operation = _kernel_op("turing_int8_convrot_quantize_from_partials")
+    return operation(rotated, partial_absmax)
 
 
 def _quantize_turing_int4_activation(

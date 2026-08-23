@@ -233,6 +233,26 @@ class KernelCustomOpContractTest(unittest.TestCase):
                 scaled_destination,
             )
         )
+        rotated_gate = torch.empty(
+            (3, 512), dtype=torch.bfloat16, device="meta"
+        )
+        partials = torch.empty((3, 2), dtype=torch.float32, device="meta")
+        self.assertIsNone(
+            kernel.turing_swiglu_convrot_shard_inplace(
+                rotated_gate,
+                torch.empty((3, 256), dtype=torch.bfloat16, device="meta"),
+                partials,
+                256,
+            )
+        )
+        sharded, sharded_scale = (
+            kernel.turing_int8_convrot_quantize_from_partials(
+                rotated_gate, partials
+            )
+        )
+        self.assertEqual(sharded.shape, rotated_gate.shape)
+        self.assertEqual(sharded.dtype, torch.int8)
+        self.assertEqual(sharded_scale.shape, (3, 1))
 
     def test_linear_epilogue_and_norm_fake_contracts(self):
         activation = torch.empty((7, 128), dtype=torch.int8, device="meta")

@@ -279,6 +279,72 @@ __global__ void swiglu_rotate_scaled_quantize_kernel(
 }
 
 template <typename InputType>
+__global__ void swiglu_rotate_shard_inplace_kernel(
+    InputType *__restrict__ gate,
+    const InputType *__restrict__ up,
+    float *__restrict__ partial_absmax,
+    int hidden,
+    int shard_width,
+    int channel_offset) {
+    extern __shared__ float smem[];
+    const int sub = threadIdx.x / kGroupThreads;
+    const int lane = threadIdx.x % kGroupThreads;
+    const int local_group = static_cast<int>(blockIdx.y) * kGroupsPerBlock + sub;
+    const int shard_groups = shard_width / kConvRotGroup;
+    const bool active = local_group < shard_groups;
+    const int row = static_cast<int>(blockIdx.x);
+    const int local_group_column = local_group * kConvRotGroup;
+    const int global_group_column = channel_offset + local_group_column;
+    const int base = lane * 4;
+    const int64_t gate_row = static_cast<int64_t>(row) * hidden;
+    const int64_t up_row = static_cast<int64_t>(row) * shard_width;
+    float *buf0 = smem + sub * (2 * kConvRotGroup);
+    float *buf1 = buf0 + kConvRotGroup;
+
+    const auto activated = [&](int delta) {
+        if (!active) {
+            return 0.0f;
+        }
+        const float gate_value = to_float(
+            gate[gate_row + global_group_column + base + delta]);
+        const float up_value = to_float(
+            up[up_row + local_group_column + base + delta]);
+        return (gate_value / (1.0f + expf(-gate_value))) * up_value;
+    };
+    const float x0 = activated(0);
+    const float x1 = activated(1);
+    const float x2 = activated(2);
+    const float x3 = activated(3);
+    buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
+    buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
+    buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
+    buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+    __syncthreads();
+    fht_stage<4>(buf1, buf0, lane);
+    __syncthreads();
+    fht_stage<16>(buf0, buf1, lane);
+    __syncthreads();
+
+    float local_max = 0.0f;
+    if (active) {
+        local_max = fht_store_absmax<64>(
+            buf1, gate + gate_row + global_group_column, lane);
+    }
+    buf0[lane] = local_max;
+    __syncthreads();
+    if (lane < 32) {
+        float value = fmaxf(buf0[lane], buf0[lane + 32]);
+        value = warp_reduce_max(value);
+        if (lane == 0 && active) {
+            const int global_group = global_group_column / kConvRotGroup;
+            partial_absmax[
+                static_cast<int64_t>(row) * (hidden / kConvRotGroup) +
+                global_group] = value;
+        }
+    }
+}
+
+template <typename InputType>
 __global__ void quantize_from_partials_kernel(
     const InputType *__restrict__ rotated,
     const float *__restrict__ partial_absmax,
@@ -619,6 +685,74 @@ void turing_swiglu_int8_convrot_quantize_scaled(Tensor input,
     } else {
         throw std::runtime_error(
             "scaled SwiGLU ConvRot requires float16 or bfloat16 input");
+    }
+    checkCUDA(cudaGetLastError());
+}
+
+void turing_swiglu_convrot_shard_inplace(Tensor gate,
+                                          Tensor up,
+                                          Tensor partial_absmax,
+                                          int channel_offset) {
+    const int rows = gate.size(0);
+    const int hidden = gate.size(1);
+    const int shard_width = up.size(1);
+    const int group_blocks = ceilDiv(
+        shard_width / kConvRotGroup, kGroupsPerBlock);
+    const dim3 grid(
+        static_cast<unsigned int>(rows),
+        static_cast<unsigned int>(group_blocks));
+    constexpr size_t smem_bytes =
+        kGroupsPerBlock * 2 * kConvRotGroup * sizeof(float);
+    if (gate.scalar_type() == Tensor::BF16) {
+        swiglu_rotate_shard_inplace_kernel<nv_bfloat16>
+            <<<grid, kRotateThreads, smem_bytes, getCurrentCUDAStream()>>>(
+                static_cast<nv_bfloat16 *>(gate.ptr),
+                static_cast<const nv_bfloat16 *>(up.ptr),
+                static_cast<float *>(partial_absmax.ptr),
+                hidden,
+                shard_width,
+                channel_offset);
+    } else if (gate.scalar_type() == Tensor::FP16) {
+        swiglu_rotate_shard_inplace_kernel<half>
+            <<<grid, kRotateThreads, smem_bytes, getCurrentCUDAStream()>>>(
+                static_cast<half *>(gate.ptr),
+                static_cast<const half *>(up.ptr),
+                static_cast<float *>(partial_absmax.ptr),
+                hidden,
+                shard_width,
+                channel_offset);
+    } else {
+        throw std::runtime_error(
+            "sharded SwiGLU ConvRot requires float16 or bfloat16 input");
+    }
+    checkCUDA(cudaGetLastError());
+}
+
+void turing_int8_convrot_quantize_from_partials(Tensor rotated,
+                                                 Tensor partial_absmax,
+                                                 Tensor output,
+                                                 Tensor scales) {
+    const int rows = rotated.size(0);
+    const int hidden = rotated.size(1);
+    if (rotated.scalar_type() == Tensor::BF16) {
+        quantize_from_partials_kernel<nv_bfloat16>
+            <<<rows, kQuantThreads, 0, getCurrentCUDAStream()>>>(
+                static_cast<const nv_bfloat16 *>(rotated.ptr),
+                static_cast<const float *>(partial_absmax.ptr),
+                static_cast<int8_t *>(output.ptr),
+                static_cast<float *>(scales.ptr),
+                hidden);
+    } else if (rotated.scalar_type() == Tensor::FP16) {
+        quantize_from_partials_kernel<half>
+            <<<rows, kQuantThreads, 0, getCurrentCUDAStream()>>>(
+                static_cast<const half *>(rotated.ptr),
+                static_cast<const float *>(partial_absmax.ptr),
+                static_cast<int8_t *>(output.ptr),
+                static_cast<float *>(scales.ptr),
+                hidden);
+    } else {
+        throw std::runtime_error(
+            "ConvRot partial reduction requires float16 or bfloat16 input");
     }
     checkCUDA(cudaGetLastError());
 }

@@ -137,6 +137,15 @@ for 128x256. These numbers justify device measurement but do not select the
 Turing winner. `benchmark_backends.py --suite linear --tile-sweep` exposes all
 compiled policies for acceptance runs.
 
+Native sm80+ raw W8 uses the same per-device/per-MNK cache but benchmarks a
+shape-bounded CUTLASS set. Wide QKV/FC1 outputs compare 128x256 two/three-stage
+and 64x256 three-stage tiles; narrower FC2/output projections compare
+128x128 three/four-stage and 64x128 four-stage tiles. Two reversed timing
+rounds retain the minimum and avoid selecting on cold-cache order. Turing and
+Ampere therefore share dispatch and cache policy while compiling only the
+architecture-specialized kernels each device can execute. Set
+`COMFYUI_TURING_UTILS_GEMM_TUNE_LOG=1` for one diagnostic line per new shape.
+
 The stable Sage main loop was also rebuilt from historical commit `4255f3c`
 in an isolated worktree and compared with the current compute-75 image on the
 same A40 tensors. Old/current timings were 0.7685/0.7677 ms at N=4096,
@@ -402,6 +411,27 @@ four buckets can capture both H3 resolutions and both attention/MLP phases in
 one run; `COMFYUI_TURING_UTILS_PROFILE_BUCKETS` changes that bound. Sparse
 selected/possible block counts stay as device scalars until the same outer
 fence, so route-density diagnostics do not add a hot-path `.item()`.
+
+`COMFYUI_TURING_UTILS_TIMELINE=1` adds an outer-sampler timeline without an
+extra sampler synchronization: it records CUDA elapsed time, wall time, their
+host/transfer residual, allocator start/end/peak, reserved memory, and
+DynamicVRAM reclaim counts at the already-required sampler fence. Combined
+with bounded phase profiling, this separates attention/MLP kernel time from
+weight waits and host or storage stalls across the low- and high-resolution
+samplers. It also emits named latent-upscale and visual/audio reference-encode
+spans; because these operations have no existing outer fence, timeline mode
+deliberately synchronizes around those diagnostic-only spans. The default path
+still creates no events or synchronization.
+
+When channel pressure requires FFN sharding and ABI 0.33 is available, the
+runtime uses a single-pass half-width path. FC1 gate channels are written once
+into an `F`-wide buffer; aligned up-channel shards are consumed immediately by
+the same FP32 SwiGLU and ConvRot arithmetic and overwrite the corresponding
+gate interval. A final reduction over all channel partials produces the same
+whole-row scale and INT8 activation as the full `2F` fused path. This replaces
+the older exact two-pass FC1 recomputation with roughly `F + channel_chunk`
+BF16 staging. The two-pass implementation remains the compatibility fallback
+for older kernel packages.
 
 Kernel 0.31 makes architecture validation part of the same bounded report. The
 Python summary publishes the architectures embedded by the wheel build and

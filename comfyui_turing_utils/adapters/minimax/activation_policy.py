@@ -14,6 +14,8 @@ import os
 
 import torch
 
+from ...profiling import WORKFLOW_TIMELINE
+
 from ...hardware import device_capabilities
 
 
@@ -493,6 +495,8 @@ def ensure_dynamic_vram_headroom(
         if remaining <= 0:
             break
     if freed > 0:
+        WORKFLOW_TIMELINE.sample("dynamic_vram_reclaims")
+        WORKFLOW_TIMELINE.sample("dynamic_vram_released_mib", freed / _MIB)
         LOG.info(
             "MiniMax H3 DynamicVRAM headroom: op=%s rows=%d requested=%.1f MiB "
             "released=%.1f MiB %s",
@@ -933,6 +937,7 @@ def decide_ffn_channels(
     *,
     expanded_size: int,
     chunk_rows: int,
+    half_width: bool = False,
     runtime_plan: ActivationRuntimePlan | None = None,
     base_model=None,
 ) -> FFNChannelDecision:
@@ -973,15 +978,26 @@ def decide_ffn_channels(
             tile_rows = min(rows, 4096)
             chunk_rows = tile_rows
         # Retain the complete compressed A8 row instead of a larger INT32
-        # output accumulator. Current fc1-input A8 and final BF16 output are
-        # also live; only the 2*C BF16 gate/up shard plus A8 scratch scales
-        # with the selected channel width.
-        fixed_per_row = expanded_size + hidden * 3
+        # output accumulator. ABI 0.33 additionally retains one F-wide BF16
+        # gate/rotated buffer and consumes only a C-wide BF16 up shard. Older
+        # ABIs retain a 2*C gate/up shard and a small A8 scratch during their
+        # exact two-pass reconstruction.
+        if half_width:
+            fixed_per_row = (
+                expanded_size * 3
+                + expanded_size // 64
+                + hidden * 3
+                + 8
+            )
+            channel_bytes = 2
+        else:
+            fixed_per_row = expanded_size + hidden * 3
+            channel_bytes = 5
         budget = max(
             working - persistent - tile_rows * fixed_per_row, 0
         )
         automatic = max(
-            (budget // max(tile_rows * 5, 1)) // 256 * 256,
+            (budget // max(tile_rows * channel_bytes, 1)) // 256 * 256,
             256,
         )
         saturation_channels = balanced_saturation_size(
@@ -1000,7 +1016,9 @@ def decide_ffn_channels(
         )
         estimated = (
             persistent
-            + tile_rows * (fixed_per_row + chunk_channels * 5)
+            + tile_rows * (
+                fixed_per_row + chunk_channels * channel_bytes
+            )
         )
     decision = FFNChannelDecision(
         mode,
@@ -1026,7 +1044,7 @@ def decide_ffn_channels(
             "MiniMax H3 FFN policy: mode=%s tier=%d rows=%d row_chunk=%d "
             "channel_chunk=%d available=%.2f GiB reserve=%.2f GiB "
             "planned_available=%.2f GiB weight_prefetch=%.2f GiB "
-            "estimated_peak=%.2f GiB %s",
+            "half_width=%s estimated_peak=%.2f GiB %s",
             mode,
             decision.tier,
             rows,
@@ -1036,6 +1054,7 @@ def decide_ffn_channels(
             reserve / 1024**3,
             planned_available / 1024**3,
             weight_scratch / 1024**3,
+            half_width,
             estimated / 1024**3,
             _log_memory_diagnostics(x.device, base_model),
         )

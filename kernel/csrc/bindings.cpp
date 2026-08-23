@@ -641,6 +641,88 @@ at::Tensor turing_swiglu_int8_convrot_quantize_scaled_out(
     return output;
 }
 
+void turing_swiglu_convrot_shard_inplace(
+    at::Tensor gate,
+    at::Tensor up,
+    at::Tensor partial_absmax,
+    int64_t channel_offset) {
+    check_cuda_2d(gate, "gate");
+    check_cuda_2d(up, "up");
+    check_cuda_2d(partial_absmax, "partial_absmax");
+    check_half_like(gate, "gate");
+    check_half_like(up, "up");
+    TORCH_CHECK(gate.is_contiguous() && up.is_contiguous() &&
+                    partial_absmax.is_contiguous(),
+                "sharded SwiGLU ConvRot tensors must be contiguous");
+    TORCH_CHECK(gate.device() == up.device() &&
+                    gate.device() == partial_absmax.device(),
+                "sharded SwiGLU ConvRot tensors must share a CUDA device");
+    TORCH_CHECK(gate.scalar_type() == up.scalar_type(),
+                "gate and up must use the same dtype");
+    TORCH_CHECK(partial_absmax.scalar_type() == at::kFloat,
+                "partial_absmax must use float32 storage");
+    const int64_t rows = gate.size(0);
+    const int64_t hidden = gate.size(1);
+    const int64_t shard_width = up.size(1);
+    TORCH_CHECK(rows > 0 && up.size(0) == rows,
+                "gate and up row counts must match");
+    TORCH_CHECK(hidden > 0 && hidden % 256 == 0 &&
+                    shard_width > 0 && shard_width % 256 == 0 &&
+                    channel_offset >= 0 && channel_offset % 256 == 0 &&
+                    channel_offset + shard_width <= hidden,
+                "sharded SwiGLU intervals must be 256-aligned and in range");
+    TORCH_CHECK(partial_absmax.size(0) == rows &&
+                    partial_absmax.size(1) == hidden / 256,
+                "partial_absmax must have shape [rows, hidden / 256]");
+    TORCH_CHECK(rows <= std::numeric_limits<int>::max() &&
+                    hidden <= std::numeric_limits<int>::max() &&
+                    shard_width <= std::numeric_limits<int>::max() &&
+                    channel_offset <= std::numeric_limits<int>::max(),
+                "sharded SwiGLU dimensions exceed the CUDA kernel range");
+    const at::cuda::CUDAGuard device_guard(gate.device());
+    TorchOpContext ctx;
+    comfyui_turing_utils::kernels::turing_swiglu_convrot_shard_inplace(
+        from_torch(gate),
+        from_torch(up),
+        from_torch(partial_absmax),
+        static_cast<int>(channel_offset));
+}
+
+std::tuple<at::Tensor, at::Tensor>
+turing_int8_convrot_quantize_from_partials(
+    at::Tensor rotated,
+    at::Tensor partial_absmax) {
+    check_cuda_2d(rotated, "rotated");
+    check_cuda_2d(partial_absmax, "partial_absmax");
+    check_half_like(rotated, "rotated");
+    TORCH_CHECK(rotated.is_contiguous() && partial_absmax.is_contiguous(),
+                "ConvRot partial reduction tensors must be contiguous");
+    TORCH_CHECK(rotated.device() == partial_absmax.device() &&
+                    partial_absmax.scalar_type() == at::kFloat,
+                "ConvRot partial reduction requires same-device FP32 partials");
+    const int64_t rows = rotated.size(0);
+    const int64_t hidden = rotated.size(1);
+    TORCH_CHECK(rows > 0 && hidden > 0 && hidden % 256 == 0 &&
+                    partial_absmax.size(0) == rows &&
+                    partial_absmax.size(1) == hidden / 256,
+                "ConvRot partial reduction shape is incompatible");
+    TORCH_CHECK(rows <= std::numeric_limits<int>::max() &&
+                    hidden <= std::numeric_limits<int>::max(),
+                "ConvRot partial reduction dimensions exceed the CUDA kernel range");
+    const at::cuda::CUDAGuard device_guard(rotated.device());
+    at::Tensor output = at::empty(
+        {rows, hidden}, rotated.options().dtype(at::kChar));
+    at::Tensor scales = at::empty(
+        {rows, 1}, rotated.options().dtype(at::kFloat));
+    TorchOpContext ctx;
+    comfyui_turing_utils::kernels::turing_int8_convrot_quantize_from_partials(
+        from_torch(rotated),
+        from_torch(partial_absmax),
+        from_torch(output),
+        from_torch(scales));
+    return {output, scales};
+}
+
 std::tuple<at::Tensor, at::Tensor> turing_swiglu_int4_convrot_quantize(
     at::Tensor input, int64_t group_size) {
     input = input.contiguous();
@@ -1122,6 +1204,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("scales"),
           pybind11::arg("output"),
           pybind11::arg("group_size") = 256);
+    m.def("turing_swiglu_convrot_shard_inplace",
+          &turing_swiglu_convrot_shard_inplace,
+          pybind11::arg("gate"),
+          pybind11::arg("up"),
+          pybind11::arg("partial_absmax"),
+          pybind11::arg("channel_offset"));
+    m.def("turing_int8_convrot_quantize_from_partials",
+          &turing_int8_convrot_quantize_from_partials,
+          pybind11::arg("rotated"),
+          pybind11::arg("partial_absmax"));
     m.def("turing_swiglu_int4_convrot_quantize",
           &turing_swiglu_int4_convrot_quantize,
           pybind11::arg("input"),

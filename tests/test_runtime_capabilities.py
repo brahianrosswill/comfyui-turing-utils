@@ -66,6 +66,8 @@ class KernelCapabilitiesTest(unittest.TestCase):
             turing_segmented_mod_gate=lambda *args: None,
             turing_segmented_mod_gate_rms_adaln=lambda *args: None,
             turing_swiglu_int8_convrot_quantize_scaled=lambda *args: None,
+            turing_swiglu_convrot_shard_inplace=lambda *args: None,
+            turing_int8_convrot_quantize_from_partials=lambda *args: None,
         )
         sage = SimpleNamespace(
             available=lambda: True,
@@ -89,6 +91,7 @@ class KernelCapabilitiesTest(unittest.TestCase):
 
         self.assertTrue(result.supports("core_fusions").supported)
         self.assertTrue(result.supports("ffn_channel_sharding").supported)
+        self.assertTrue(result.supports("ffn_half_width").supported)
         self.assertTrue(result.supports("sla").supported)
         self.assertTrue(result.supports("reusable_k_anchor").supported)
         self.assertFalse(result.supports("overlap_accumulate").supported)
@@ -115,6 +118,7 @@ class KernelCapabilitiesTest(unittest.TestCase):
 
         self.assertFalse(result.supports("core_fusions").supported)
         self.assertFalse(result.supports("ffn_channel_sharding").supported)
+        self.assertFalse(result.supports("ffn_half_width").supported)
 
     def test_missing_kernel_package_has_actionable_reason(self):
         with mock.patch(

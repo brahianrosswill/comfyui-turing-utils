@@ -41,8 +41,10 @@ implementation.
 | Activation quantization | `gelu_int8_convrot_quantize`, `gelu_int4_convrot_quantize` | Fused tanh-GELU and ConvRot activation quantization |
 | Activation quantization | `bf16_int8_convrot_quantize`, `bf16_int4_convrot_quantize` | BF16 row-buffer ConvRot quantization, optionally with SwiGLU |
 | Activation quantization | `swiglu_int8_convrot_quantize_scaled` | Quantize one aligned FFN channel interval with a precomputed whole-row scale |
+| Activation quantization | `swiglu_convrot_shard_inplace`, `int8_convrot_quantize_from_partials` | Single-pass half-width FC1 staging with in-place SwiGLU+ConvRot and exact whole-row quantization |
 | Activation quantization | `bf16_gelu_int8_convrot_quantize`, `bf16_gelu_int4_convrot_quantize` | BF16 row-buffer GELU and ConvRot quantization |
 | Normalization | `segmented_rms_adaln` | RMSNorm plus segmented AdaLN modulation |
+| Normalization | `segmented_mod_gate`, `segmented_mod_gate_rms_adaln` | In-place segmented residual gate, optionally fused with the following RMSNorm+AdaLN |
 | Normalization | `layer_norm_adaln` | LayerNorm plus AdaLN modulation |
 | Attention preprocessing | `qk_rms_rope_int8` | Fused RMSNorm, RoPE and production Q/K INT8 quantization |
 | Attention | `sage_attention` | Stable dense INT8-QK, FP16/BF16-PV SM75 attention |

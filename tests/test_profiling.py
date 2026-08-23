@@ -5,12 +5,17 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import torch
+
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from comfyui_turing_utils import profiling  # noqa: E402
-from comfyui_turing_utils.profiling import CudaPhaseProfiler  # noqa: E402
+from comfyui_turing_utils.profiling import (  # noqa: E402
+    CudaPhaseProfiler,
+    WorkflowTimeline,
+)
 
 
 class CudaPhaseProfilerTest(unittest.TestCase):
@@ -167,6 +172,76 @@ class CudaPhaseProfilerTest(unittest.TestCase):
             profiler.call("mlp", lambda: None)
             profiler.complete_operation("mlp", (64, 64))
         event.assert_not_called()
+
+
+class WorkflowTimelineTest(unittest.TestCase):
+    def test_disabled_timeline_has_zero_cuda_observation_overhead(self):
+        timeline = WorkflowTimeline(False)
+        function = mock.Mock(return_value="output")
+        with (
+            mock.patch.object(profiling.torch.cuda, "Event") as event,
+            mock.patch.object(profiling.torch.cuda, "synchronize") as synchronize,
+        ):
+            output = timeline.call(
+                "latent_upscale", torch.device("cuda", 0), function, 1, value=2
+            )
+
+        self.assertEqual(output, "output")
+        function.assert_called_once_with(1, value=2)
+        event.assert_not_called()
+        synchronize.assert_not_called()
+
+    def test_enabled_timeline_records_one_bounded_cuda_window(self):
+        timeline = WorkflowTimeline(True)
+        start = mock.Mock()
+        end = mock.Mock()
+        start.elapsed_time.return_value = 12.5
+
+        def function():
+            timeline.sample("dynamic_reclaims", 2)
+            return "output"
+
+        with (
+            mock.patch.object(
+                profiling.torch.cuda, "Event", side_effect=(start, end)
+            ),
+            mock.patch.object(profiling.torch.cuda, "synchronize") as synchronize,
+            mock.patch.object(profiling.torch.cuda, "reset_peak_memory_stats") as reset,
+            mock.patch.object(
+                profiling.torch.cuda,
+                "memory_allocated",
+                side_effect=(100 * 1024**2, 120 * 1024**2),
+            ),
+            mock.patch.object(
+                profiling.torch.cuda,
+                "memory_reserved",
+                side_effect=(140 * 1024**2, 160 * 1024**2),
+            ),
+            mock.patch.object(
+                profiling.torch.cuda,
+                "max_memory_allocated",
+                return_value=180 * 1024**2,
+            ),
+            mock.patch.object(
+                profiling.time, "perf_counter", side_effect=(10.0, 10.020)
+            ),
+            self.assertLogs("comfyui-turing-utils", level="WARNING") as logs,
+        ):
+            output = timeline.call(
+                "latent_upscale", torch.device("cuda", 0), function
+            )
+
+        self.assertEqual(output, "output")
+        self.assertEqual(synchronize.call_count, 2)
+        reset.assert_called_once_with(torch.device("cuda", 0))
+        start.record.assert_called_once_with()
+        end.record.assert_called_once_with()
+        start.elapsed_time.assert_called_once_with(end)
+        self.assertIsNone(timeline._active)
+        message = "\n".join(logs.output)
+        self.assertIn("label=latent_upscale", message)
+        self.assertIn("cuda=12.500 ms", message)
+        self.assertIn("dynamic_reclaims=2", message)
 
 
 if __name__ == "__main__":

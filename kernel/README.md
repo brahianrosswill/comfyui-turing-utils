@@ -4,7 +4,8 @@ Separately installed CUDA/PyTorch extension for the ComfyUI plugin's quantized
 runtime. Version 0.33.0 contains legacy packed W4A8 and grouped-codebook W4A8
 Tensor Core GEMMs, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
-and LayerNorm modulation, segmented gated-residual/RMSNorm fusion, bundled Sage
+and LayerNorm modulation, lossless single-pass half-width FC1/SwiGLU staging,
+segmented gated-residual/RMSNorm fusion, bundled Sage
 attention, pure-INT8 W8A8 attention,
 and an explicitly patched production model-independent Sol sparse attention
 kernel with input-adaptive
@@ -29,6 +30,12 @@ that CUDA actually selected: binary/PTX architecture, CTA geometry, registers,
 static/dynamic shared memory, local memory, active CTAs/warps per SM, and
 occupancy. These are diagnostic-only queries and are absent from the normal
 sampling path.
+
+Raw W8A8 uses cached per-device/per-shape micro-tuning on both native sm75 and
+sm80+. Ampere candidates include two-, three-, and four-stage CUTLASS schedules
+covering 64x128, 64x256, 128x128, and 128x256 CTA shapes. Set
+`COMFYUI_TURING_UTILS_GEMM_TUNE_LOG=1` to print the bounded first-use timings
+and selected policy; normal execution does not log or retune cached shapes.
 
 Every stable public tensor operator is registered through
 `torch.library.custom_op` with a fake/meta implementation: both W4A8 GEMMs, a

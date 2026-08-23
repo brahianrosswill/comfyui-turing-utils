@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -349,8 +350,121 @@ class CudaPhaseProfiler:
         return True
 
 
+def _timeline_enabled() -> bool:
+    value = os.environ.get("COMFYUI_TURING_UTILS_TIMELINE", "0").strip().lower()
+    return value not in ("", "0", "false", "off", "no")
+
+
+@dataclass(slots=True)
+class _TimelineWindow:
+    index: int
+    label: str
+    device: torch.device
+    wall_start: float
+    cuda_start: torch.cuda.Event
+    cuda_end: torch.cuda.Event
+    allocated_start: int
+    reserved_start: int
+    counters: Counter = field(default_factory=Counter)
+
+
+class WorkflowTimeline:
+    """Opt-in sampler timeline piggybacking on the mandatory outer fence."""
+
+    def __init__(self, enabled: bool):
+        self.enabled = bool(enabled)
+        self._next_index = 1
+        self._active: _TimelineWindow | None = None
+
+    def begin(
+        self, device: torch.device, label: str = "sampler"
+    ) -> _TimelineWindow | None:
+        if not self.enabled:
+            return None
+        device = torch.device(device)
+        torch.cuda.reset_peak_memory_stats(device)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        window = _TimelineWindow(
+            self._next_index,
+            str(label),
+            device,
+            time.perf_counter(),
+            start,
+            end,
+            int(torch.cuda.memory_allocated(device)),
+            int(torch.cuda.memory_reserved(device)),
+        )
+        self._next_index += 1
+        self._active = window
+        return window
+
+    def sample(self, name: str, value: int | float = 1) -> None:
+        if self._active is not None:
+            self._active.counters[str(name)] += value
+
+    def record_end(self, window: _TimelineWindow | None) -> None:
+        if window is not None:
+            window.cuda_end.record()
+
+    def finish_after_synchronize(self, window: _TimelineWindow | None) -> bool:
+        if window is None:
+            return False
+        wall_ms = (time.perf_counter() - window.wall_start) * 1000.0
+        cuda_ms = float(window.cuda_start.elapsed_time(window.cuda_end))
+        allocated_end = int(torch.cuda.memory_allocated(window.device))
+        reserved_end = int(torch.cuda.memory_reserved(window.device))
+        peak_allocated = int(torch.cuda.max_memory_allocated(window.device))
+        residual_ms = max(wall_ms - cuda_ms, 0.0)
+        counters = " ".join(
+            f"{name}={value}" for name, value in sorted(window.counters.items())
+        )
+        LOG.warning(
+            "[Turing timeline] span=%d label=%s wall=%.3f ms cuda=%.3f ms "
+            "host_or_transfer=%.3f ms allocated=%.1f->%.1f MiB "
+            "peak=%.1f MiB reserved=%.1f->%.1f MiB%s",
+            window.index,
+            window.label,
+            wall_ms,
+            cuda_ms,
+            residual_ms,
+            window.allocated_start / (1024.0 * 1024.0),
+            allocated_end / (1024.0 * 1024.0),
+            peak_allocated / (1024.0 * 1024.0),
+            window.reserved_start / (1024.0 * 1024.0),
+            reserved_end / (1024.0 * 1024.0),
+            f" counters=[{counters}]" if counters else "",
+        )
+        if self._active is window:
+            self._active = None
+        return True
+
+    def call(
+        self,
+        label: str,
+        device: torch.device,
+        function: Callable,
+        /,
+        *args,
+        **kwargs,
+    ):
+        """Measure a non-sampler GPU phase when timeline diagnostics are enabled."""
+        if not self.enabled or torch.device(device).type != "cuda":
+            return function(*args, **kwargs)
+        torch.cuda.synchronize(device)
+        window = self.begin(device, label)
+        try:
+            return function(*args, **kwargs)
+        finally:
+            self.record_end(window)
+            torch.cuda.synchronize(device)
+            self.finish_after_synchronize(window)
+
+
 CUDA_PHASE_PROFILER = CudaPhaseProfiler(
     _profile_call_limit(),
     _profile_bucket_limit(),
 )
-__all__ = ["CUDA_PHASE_PROFILER"]
+WORKFLOW_TIMELINE = WorkflowTimeline(_timeline_enabled())
+__all__ = ["CUDA_PHASE_PROFILER", "WORKFLOW_TIMELINE"]

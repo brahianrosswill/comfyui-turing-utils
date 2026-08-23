@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass
 
 import torch
+
+from ...profiling import WORKFLOW_TIMELINE
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -520,31 +522,36 @@ def _upscale_tensors(
         )
         for group in groups.values()
     )
-    comfy.model_management.load_models_gpu(
-        [upscale_model],
-        memory_required=memory_required,
-        force_full_load=True,
-    )
     device = upscale_model.load_device
-    output_device = comfy.model_management.intermediate_device()
-    outputs = {}
-    for group in groups.values():
-        batch_sizes = [int(tensor.shape[0]) for tensor in group]
-        source = torch.cat(
-            [tensor.to(device=device, dtype=dtype) for tensor in group],
-            dim=0,
+    def execute():
+        comfy.model_management.load_models_gpu(
+            [upscale_model],
+            memory_required=memory_required,
+            force_full_load=True,
         )
-        result = model(
-            source,
-            float(scale),
-            (int(source.shape[2]), target_height, target_width),
-        )
-        for tensor, upscaled in zip(group, result.split(batch_sizes, dim=0)):
-            outputs[id(tensor)] = upscaled.to(
-                device=output_device,
-                dtype=tensor.dtype,
+        output_device = comfy.model_management.intermediate_device()
+        outputs = {}
+        for group in groups.values():
+            batch_sizes = [int(tensor.shape[0]) for tensor in group]
+            source = torch.cat(
+                [tensor.to(device=device, dtype=dtype) for tensor in group],
+                dim=0,
             )
-    return outputs
+            result = model(
+                source,
+                float(scale),
+                (int(source.shape[2]), target_height, target_width),
+            )
+            for tensor, upscaled in zip(group, result.split(batch_sizes, dim=0)):
+                outputs[id(tensor)] = upscaled.to(
+                    device=output_device,
+                    dtype=tensor.dtype,
+                )
+        return outputs
+
+    return WORKFLOW_TIMELINE.call(
+        "latent_upscale", device, execute
+    )
 
 
 def _sync_conditioning(conditioning, outputs: dict[int, torch.Tensor]):

@@ -9,6 +9,8 @@ import re
 import torch
 import torchaudio
 
+from ...profiling import WORKFLOW_TIMELINE
+
 import comfy.utils
 
 
@@ -184,7 +186,11 @@ def _validate_visual_latent(value, name: str) -> torch.Tensor:
 
 
 def _encode_visual(vae, pixels: torch.Tensor, name: str) -> torch.Tensor:
-    return _validate_visual_latent(vae.encode(pixels), name)
+    device = getattr(vae, "load_device", pixels.device)
+    value = WORKFLOW_TIMELINE.call(
+        f"visual_reference_encode:{name}", device, vae.encode, pixels
+    )
+    return _validate_visual_latent(value, name)
 
 
 def _encode_audio(audio_vae, audio, name: str) -> torch.Tensor:
@@ -206,7 +212,14 @@ def _encode_audio(audio_vae, audio, name: str) -> torch.Tensor:
     target_rate = int(getattr(audio_vae, "audio_sample_rate", 32000))
     if source_rate != target_rate:
         waveform = torchaudio.functional.resample(waveform, source_rate, target_rate)
-    value = audio_vae.encode(waveform[:1].movedim(1, -1))
+    encode_input = waveform[:1].movedim(1, -1)
+    device = getattr(audio_vae, "load_device", encode_input.device)
+    value = WORKFLOW_TIMELINE.call(
+        f"audio_reference_encode:{name}",
+        device,
+        audio_vae.encode,
+        encode_input,
+    )
     if (
         not torch.is_tensor(value)
         or value.ndim != 4

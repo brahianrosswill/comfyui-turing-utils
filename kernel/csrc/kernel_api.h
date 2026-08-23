@@ -48,6 +48,16 @@ void turing_swiglu_int8_convrot_quantize_scaled(Tensor input,
                                                  Tensor scales,
                                                  Tensor output);
 
+void turing_swiglu_convrot_shard_inplace(Tensor gate,
+                                          Tensor up,
+                                          Tensor partial_absmax,
+                                          int channel_offset);
+
+void turing_int8_convrot_quantize_from_partials(Tensor rotated,
+                                                 Tensor partial_absmax,
+                                                 Tensor output,
+                                                 Tensor scales);
+
 void turing_swiglu_int4_convrot_quantize(Tensor input,
                                           Tensor rotated,
                                           Tensor partial_absmax,

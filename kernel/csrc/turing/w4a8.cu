@@ -6,6 +6,8 @@
 
 #include <climits>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <limits>
 #include <map>
@@ -296,6 +298,35 @@ TileTuneCache w8_tile_cache;
 TileTuneCache ampere_w8_tile_cache;
 TileTuneCache codebook_tile_cache;
 
+bool tile_tune_diagnostics_enabled() {
+    static const bool enabled = [] {
+        const char *value = std::getenv("COMFYUI_TURING_UTILS_GEMM_TUNE_LOG");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
+template <size_t Timings, typename Candidates>
+void report_tile_tuning(const char *architecture,
+                        int m,
+                        int n,
+                        int k,
+                        int selected,
+                        const Candidates &candidates,
+                        const std::array<float, Timings> &elapsed) {
+    if (!tile_tune_diagnostics_enabled()) {
+        return;
+    }
+    std::fprintf(
+        stderr,
+        "[Turing GEMM tune] arch=%s shape=%dx%dx%d selected=%d candidates=",
+        architecture, m, n, k, selected);
+    for (int policy : candidates) {
+        std::fprintf(stderr, "%d:%.3fms ", policy, elapsed[policy]);
+    }
+    std::fprintf(stderr, "\n");
+}
+
 template <typename RunPolicy>
 bool run_auto_tuned_tile(TileTuneCache &cache,
                          int m,
@@ -371,6 +402,17 @@ bool run_auto_tuned_tile(TileTuneCache &cache,
         }
     }
     cache.selected_policy.emplace(key, selected);
+    if (tile_tune_diagnostics_enabled()) {
+        std::fprintf(
+            stderr,
+            "[Turing GEMM tune] arch=sm75 shape=%dx%dx%d selected=%d candidates=",
+            m, n, k, selected);
+        for (int index = 0; index < candidate_count; ++index) {
+            const int policy = candidates[index];
+            std::fprintf(stderr, "%d:%.3fms ", policy, best_ms[policy]);
+        }
+        std::fprintf(stderr, "\n");
+    }
     return run_policy(selected);
 }
 
@@ -396,27 +438,37 @@ bool run_auto_tuned_ampere_tile(TileTuneCache &cache,
         return run_policy(found->second);
     }
 
-    // Compare native SM80 shapes with the best legacy schedule for this M.
-    // The SM80 128x256 tile wins sustained 16K-row H3 contractions, while the
-    // legacy narrow-M tile can still win short tails. One pass is enough for
-    // these long matrices and keeps first-run tuning bounded.
-    const std::array<int, 4> candidates = {heuristic_policy, 6, 7, 8};
-    std::array<float, 9> elapsed;
+    // Keep tuning bounded by output width. Large QKV/FC1 contractions compare
+    // three wide-N schedules; FC2/out projections compare the lower-register
+    // narrow-N variants. Two reversed rounds reject cold-cache/order noise.
+    const bool wide_output = n >= 16384;
+    const std::array<int, 5> candidates = wide_output
+        ? std::array<int, 5>{heuristic_policy, 6, 9, 11, 7}
+        : std::array<int, 5>{heuristic_policy, 7, 8, 10, 6};
+    std::array<float, 12> elapsed;
     elapsed.fill(std::numeric_limits<float>::infinity());
-    for (int policy : candidates) {
-        cudaEvent_t start = nullptr;
-        cudaEvent_t stop = nullptr;
-        checkCUDA(cudaEventCreate(&start));
-        checkCUDA(cudaEventCreate(&stop));
-        checkCUDA(cudaEventRecord(start, stream));
-        const bool launched = run_policy(policy);
-        checkCUDA(cudaEventRecord(stop, stream));
-        checkCUDA(cudaEventSynchronize(stop));
-        if (launched) {
-            checkCUDA(cudaEventElapsedTime(&elapsed[policy], start, stop));
+    for (int round = 0; round < 2; ++round) {
+        for (int index = 0; index < static_cast<int>(candidates.size()); ++index) {
+            const int candidate_index = round == 0
+                ? index
+                : static_cast<int>(candidates.size()) - index - 1;
+            const int policy = candidates[candidate_index];
+            cudaEvent_t start = nullptr;
+            cudaEvent_t stop = nullptr;
+            checkCUDA(cudaEventCreate(&start));
+            checkCUDA(cudaEventCreate(&stop));
+            checkCUDA(cudaEventRecord(start, stream));
+            const bool launched = run_policy(policy);
+            checkCUDA(cudaEventRecord(stop, stream));
+            checkCUDA(cudaEventSynchronize(stop));
+            if (launched) {
+                float measured = std::numeric_limits<float>::infinity();
+                checkCUDA(cudaEventElapsedTime(&measured, start, stop));
+                elapsed[policy] = std::min(elapsed[policy], measured);
+            }
+            checkCUDA(cudaEventDestroy(stop));
+            checkCUDA(cudaEventDestroy(start));
         }
-        checkCUDA(cudaEventDestroy(stop));
-        checkCUDA(cudaEventDestroy(start));
     }
     int selected = heuristic_policy;
     for (int policy : candidates) {
@@ -425,6 +477,8 @@ bool run_auto_tuned_ampere_tile(TileTuneCache &cache,
         }
     }
     cache.selected_policy.emplace(key, selected);
+    report_tile_tuning(
+        "sm80+", m, n, k, selected, candidates, elapsed);
     return run_policy(selected);
 }
 
@@ -1026,6 +1080,18 @@ bool dispatch_int8(const int8_t *activation,
                 output, m, n, k, output_stride, stream);
         case 8:
             return run_ampere_int8_tile<64, 128, 64, 32, 64, 64, 4>(
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
+        case 9:
+            return run_ampere_int8_tile<128, 256, 64, 64, 64, 64, 2>(
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
+        case 10:
+            return run_ampere_int8_tile<128, 128, 64, 64, 64, 64, 3>(
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
+        case 11:
+            return run_ampere_int8_tile<64, 256, 64, 32, 64, 64, 3>(
                 activation, weight, activation_scale, weight_scale, bias,
                 output, m, n, k, output_stride, stream);
         default:

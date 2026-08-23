@@ -291,9 +291,9 @@ def main() -> None:
         for name, metrics in _arch_records(core_output, "sm_86")
         if "DefaultGemmWithVisitor" in name and "4Sm80" in name
     ]
-    if len(ampere) != 3:
+    if len(ampere) != 6:
         raise RuntimeError(
-            "expected three CUTLASS SM80 W8A8 schedules in the exact sm86 cubin, "
+            "expected six CUTLASS SM80 W8A8 schedules in the exact sm86 cubin, "
             f"found {len(ampere)}"
         )
     ampere_summary = []
