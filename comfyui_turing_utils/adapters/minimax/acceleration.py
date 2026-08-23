@@ -29,7 +29,7 @@ from ...attention.stable import (
 )
 from ...attention.tuning import attention_kernel_tuning
 from ...hardware import is_supported_attention_device
-from ...kernel_api import load_kernel_package
+from ...kernel_api import kernel_extension_has_symbol, load_kernel_package
 from ...profiling import CUDA_PHASE_PROFILER
 from .activation_policy import (
     balanced_saturation_size,
@@ -69,6 +69,18 @@ from ...quantization.dispatch import (
 
 
 LOG = logging.getLogger("comfyui-turing-utils")
+
+
+def _profile_cuda(phase: str, function, /, *args, **kwargs):
+    if CUDA_PHASE_PROFILER.enabled:
+        return CUDA_PHASE_PROFILER.call(phase, function, *args, **kwargs)
+    return function(*args, **kwargs)
+
+
+def _direct_int8_output_available() -> bool:
+    return kernel_extension_has_symbol("turing_int8_linear_out")
+
+
 _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _BLOCK_FORWARD_PARAMETERS = (
     "x",
@@ -1032,7 +1044,9 @@ def _head_sharded_attention(
     from comfy.ldm.modules.attention import optimized_attention
 
     comfy.ops.run_every_op()
-    weight, bias, offload_stream = comfy.ops.cast_bias_weight(
+    weight, bias, offload_stream = _profile_cuda(
+        "minimax.qkv_weight_wait",
+        comfy.ops.cast_bias_weight,
         attention.qkv_proj,
         x,
         offloadable=True,
@@ -1114,9 +1128,11 @@ def _head_sharded_attention(
                     transformer_options=transformer_options,
                 ).squeeze(0)
                 del query, key, value
-            output[
-                :, head_start * head_dim : head_stop * head_dim
-            ].copy_(group_output)
+            _profile_cuda(
+                "minimax.head_output_store",
+                output[:, head_start * head_dim : head_stop * head_dim].copy_,
+                group_output,
+            )
             del group_output
         return output
     finally:
@@ -1159,7 +1175,9 @@ def _stream_qkv_projection(
 
     comfy.ops.run_every_op()
     original_w8 = convrot_weight_kind(attention.qkv_proj.weight) == "w8a8"
-    weight, bias, offload_stream = comfy.ops.cast_bias_weight(
+    weight, bias, offload_stream = _profile_cuda(
+        "minimax.qkv_weight_wait",
+        comfy.ops.cast_bias_weight,
         attention.qkv_proj,
         x,
         offloadable=True,
@@ -1201,14 +1219,24 @@ def _stream_qkv_projection(
         for start in range(0, sequence, chunk_rows):
             stop = min(start + chunk_rows, sequence)
             if plain is None:
-                projected = _linear_with_cast_weight(
-                    attention.qkv_proj, x[start:stop], weight, bias
+                projected = _profile_cuda(
+                    "minimax.qkv_projection_tile",
+                    _linear_with_cast_weight,
+                    attention.qkv_proj,
+                    x[start:stop],
+                    weight,
+                    bias,
                 )
             else:
-                qactivation, activation_scale = _quantize_qkv_rows(
-                    attention.qkv_proj, x[start:stop]
+                qactivation, activation_scale = _profile_cuda(
+                    "minimax.qkv_input_quantize",
+                    _quantize_qkv_rows,
+                    attention.qkv_proj,
+                    x[start:stop],
                 )
-                projected = convrot_w8_output_slice(
+                projected = _profile_cuda(
+                    "minimax.qkv_projection_tile",
+                    convrot_w8_output_slice,
                     qactivation,
                     activation_scale,
                     qweight,
@@ -1243,7 +1271,9 @@ def _stream_qkv_projection(
                 :,
                 k_scale_start : k_scale_start + (tile_rows + 63) // 64,
             ]
-            tile_qk = prequantize_turing_qk(
+            tile_qk = _profile_cuda(
+                "attention.qk_norm_rope_quant",
+                prequantize_turing_qk,
                 query,
                 key,
                 tile_transform,
@@ -1257,7 +1287,11 @@ def _stream_qkv_projection(
                     tile_k_scale,
                 ),
             )
-            value[:, :, start:stop].copy_(value_tile)
+            _profile_cuda(
+                "attention.value_prepare",
+                value[:, :, start:stop].copy_,
+                value_tile,
+            )
             qk_type = type(tile_qk)
             route_original_basis = bool(tile_qk.route_original_basis)
             del projected, query, key, value_tile, tile_qk
@@ -1315,7 +1349,6 @@ def _make_attention_forward(
                 transformer_options=transformer_options,
             )
 
-        profiling = CUDA_PHASE_PROFILER.enabled
         transform = _qk_transform(self, x, rope_freqs)
         streamed_executor = (
             getattr(executor, _STREAMED_QKV_EXECUTOR_ATTR, None)
@@ -1343,6 +1376,14 @@ def _make_attention_forward(
                 base_model=base_model,
             )
             if head_decision.sharded:
+                profile_shape = (1, self.heads, x.shape[0], self.head_dim)
+                CUDA_PHASE_PROFILER.begin_operation(
+                    "attention",
+                    profile_shape,
+                    adapter="minimax",
+                    path="head_sharded",
+                    head_group=head_decision.head_group,
+                )
                 if base_model is not None:
                     ensure_dynamic_vram_headroom(
                         base_model,
@@ -1364,15 +1405,14 @@ def _make_attention_forward(
                     head_decision.cache_quantized_input,
                 )
                 if output is not None:
-                    if profiling:
-                        output = CUDA_PHASE_PROFILER.call(
-                            "minimax.out_projection", self.out_proj, output
-                        )
-                        CUDA_PHASE_PROFILER.complete_attention(
-                            (1, self.heads, x.shape[0], self.head_dim)
-                        )
-                        return output
-                    return self.out_proj(output)
+                    output = _profile_cuda(
+                        "minimax.out_projection", self.out_proj, output
+                    )
+                    CUDA_PHASE_PROFILER.complete_operation(
+                        "attention", profile_shape
+                    )
+                    return output
+                CUDA_PHASE_PROFILER.cancel_operation()
 
             if base_model is not None:
                 # Automatic tiers already fit immediately usable memory, so
@@ -1395,6 +1435,7 @@ def _make_attention_forward(
                 rope_freqs=rope_freqs,
                 transformer_options=transformer_options,
             )
+        decision = None
         if callable(streamed_executor) and stream_abi_available:
             decision = decide_activation_chunks(
                 x,
@@ -1405,6 +1446,15 @@ def _make_attention_forward(
                 runtime_plan=runtime_plan,
                 base_model=base_model,
             )
+        profile_shape = (1, self.heads, x.shape[0], self.head_dim)
+        CUDA_PHASE_PROFILER.begin_operation(
+            "attention",
+            profile_shape,
+            adapter="minimax",
+            path="row_streamed" if decision is not None and decision.streamed else "full",
+            qkv_rows=(decision.chunk_rows if decision is not None else 0),
+        )
+        if decision is not None:
             if decision.streamed:
                 if base_model is not None:
                     ensure_dynamic_vram_headroom(
@@ -1431,27 +1481,21 @@ def _make_attention_forward(
                 )
                 del qk, value
                 if not outcome.supported:
+                    CUDA_PHASE_PROFILER.cancel_operation()
                     raise RuntimeError(
                         "streamed H3 QKV executor rejected a committed projection: "
                         f"{outcome.reason}"
                     )
                 output = outcome.output.squeeze(0)
-                if profiling:
-                    output = CUDA_PHASE_PROFILER.call(
-                        "minimax.out_projection", self.out_proj, output
-                    )
-                    CUDA_PHASE_PROFILER.complete_attention(
-                        (1, self.heads, x.shape[0], self.head_dim)
-                    )
-                    return output
-                return self.out_proj(output)
+                output = _profile_cuda(
+                    "minimax.out_projection", self.out_proj, output
+                )
+                CUDA_PHASE_PROFILER.complete_operation(
+                    "attention", profile_shape
+                )
+                return output
 
-        if profiling:
-            qkv = CUDA_PHASE_PROFILER.call(
-                "minimax.qkv_projection", self.qkv_proj, x
-            )
-        else:
-            qkv = self.qkv_proj(x)
+        qkv = _profile_cuda("minimax.qkv_projection", self.qkv_proj, x)
         sequence = x.shape[0]
         inner = self.heads * self.head_dim
         query, key, value = qkv.split(inner, dim=-1)
@@ -1470,6 +1514,7 @@ def _make_attention_forward(
         )
         if not outcome.supported:
             del query, key, value
+            CUDA_PHASE_PROFILER.cancel_operation()
             return original(
                 self,
                 x,
@@ -1477,15 +1522,9 @@ def _make_attention_forward(
                 transformer_options=transformer_options,
             )
         output = outcome.output.squeeze(0)
-        if profiling:
-            output = CUDA_PHASE_PROFILER.call(
-                "minimax.out_projection", self.out_proj, output
-            )
-            CUDA_PHASE_PROFILER.complete_attention(
-                (1, self.heads, sequence, self.head_dim)
-            )
-            return output
-        return self.out_proj(output)
+        output = _profile_cuda("minimax.out_projection", self.out_proj, output)
+        CUDA_PHASE_PROFILER.complete_operation("attention", profile_shape)
+        return output
 
     setattr(forward, _PREPARED_ATTENTION_FORWARD_ATTR, True)
     return weak_method(forward, attention)
@@ -1564,7 +1603,9 @@ def _stream_mlp(mlp: torch.nn.Module, x: torch.Tensor, chunk_rows: int):
     import comfy.ops
 
     comfy.ops.run_every_op()
-    fc1_weight, fc1_bias, fc1_stream = comfy.ops.cast_bias_weight(
+    fc1_weight, fc1_bias, fc1_stream = _profile_cuda(
+        "minimax.mlp.fc1_weight_wait",
+        comfy.ops.cast_bias_weight,
         mlp.fc1,
         x,
         offloadable=True,
@@ -1573,7 +1614,9 @@ def _stream_mlp(mlp: torch.nn.Module, x: torch.Tensor, chunk_rows: int):
     )
     fc2_weight = fc2_bias = fc2_stream = None
     try:
-        fc2_weight, fc2_bias, fc2_stream = comfy.ops.cast_bias_weight(
+        fc2_weight, fc2_bias, fc2_stream = _profile_cuda(
+            "minimax.mlp.fc2_weight_wait",
+            comfy.ops.cast_bias_weight,
             mlp.fc2,
             x,
             offloadable=True,
@@ -1586,13 +1629,36 @@ def _stream_mlp(mlp: torch.nn.Module, x: torch.Tensor, chunk_rows: int):
         )
         for start in range(0, x.shape[0], chunk_rows):
             stop = min(start + chunk_rows, x.shape[0])
-            expanded = _linear_with_cast_weight(
-                mlp.fc1, x[start:stop], fc1_weight, fc1_bias
+            expanded = _profile_cuda(
+                "minimax.mlp.fc1_tile",
+                _linear_with_cast_weight,
+                mlp.fc1,
+                x[start:stop],
+                fc1_weight,
+                fc1_bias,
             )
-            tile = convrot_linear_input_act_from_weight(
-                fc2_weight, fc2_bias, expanded, "swiglu"
-            )
-            output[start:stop].copy_(tile)
+            if _direct_int8_output_available():
+                tile = _profile_cuda(
+                    "minimax.mlp.swiglu_fc2_tile",
+                    convrot_linear_input_act_from_weight,
+                    fc2_weight,
+                    fc2_bias,
+                    expanded,
+                    "swiglu",
+                    output[start:stop],
+                )
+            else:
+                tile = _profile_cuda(
+                    "minimax.mlp.swiglu_fc2_tile",
+                    convrot_linear_input_act_from_weight,
+                    fc2_weight,
+                    fc2_bias,
+                    expanded,
+                    "swiglu",
+                )
+                _profile_cuda(
+                    "minimax.mlp.output_store", output[start:stop].copy_, tile
+                )
             del expanded, tile
         return output
     finally:
@@ -1624,6 +1690,7 @@ def _ffn_expanded_shard(
         dtype=output_dtype,
         device=qactivation.device,
     )
+    direct = _direct_int8_output_available()
     gate = convrot_w8_output_slice(
         qactivation,
         activation_scale,
@@ -1633,8 +1700,10 @@ def _ffn_expanded_shard(
         start,
         stop,
         output_dtype,
+        output=expanded[:, :width] if direct else None,
     )
-    expanded[:, :width].copy_(gate)
+    if not direct:
+        expanded[:, :width].copy_(gate)
     del gate
     up = convrot_w8_output_slice(
         qactivation,
@@ -1645,8 +1714,10 @@ def _ffn_expanded_shard(
         expanded_size + start,
         expanded_size + stop,
         output_dtype,
+        output=expanded[:, width:] if direct else None,
     )
-    expanded[:, width:].copy_(up)
+    if not direct:
+        expanded[:, width:].copy_(up)
     del up
     return expanded
 
@@ -1676,7 +1747,9 @@ def _stream_mlp_channels(
         return None
 
     comfy.ops.run_every_op()
-    fc1_weight, fc1_bias, fc1_stream = comfy.ops.cast_bias_weight(
+    fc1_weight, fc1_bias, fc1_stream = _profile_cuda(
+        "minimax.mlp.fc1_weight_wait",
+        comfy.ops.cast_bias_weight,
         mlp.fc1,
         x,
         offloadable=True,
@@ -1685,7 +1758,9 @@ def _stream_mlp_channels(
     )
     fc2_weight = fc2_bias = fc2_stream = None
     try:
-        fc2_weight, fc2_bias, fc2_stream = comfy.ops.cast_bias_weight(
+        fc2_weight, fc2_bias, fc2_stream = _profile_cuda(
+            "minimax.mlp.fc2_weight_wait",
+            comfy.ops.cast_bias_weight,
             mlp.fc2,
             x,
             offloadable=True,
@@ -1713,14 +1788,19 @@ def _stream_mlp_channels(
         )
         for row_start in range(0, x.shape[0], chunk_rows):
             row_stop = min(row_start + chunk_rows, x.shape[0])
-            qactivation, input_scale = _quantize_qkv_rows(
-                mlp.fc1, x[row_start:row_stop]
+            qactivation, input_scale = _profile_cuda(
+                "minimax.mlp.input_quantize",
+                _quantize_qkv_rows,
+                mlp.fc1,
+                x[row_start:row_stop],
             )
 
             whole_row_scale = None
             for start in range(0, expanded_size, chunk_channels):
                 stop = min(start + chunk_channels, expanded_size)
-                expanded = _ffn_expanded_shard(
+                expanded = _profile_cuda(
+                    "minimax.mlp.channel_scale_projection",
+                    _ffn_expanded_shard,
                     mlp,
                     qactivation,
                     input_scale,
@@ -1751,7 +1831,9 @@ def _stream_mlp_channels(
             )
             for start in range(0, expanded_size, chunk_channels):
                 stop = min(start + chunk_channels, expanded_size)
-                expanded = _ffn_expanded_shard(
+                expanded = _profile_cuda(
+                    "minimax.mlp.channel_output_projection",
+                    _ffn_expanded_shard,
                     mlp,
                     qactivation,
                     input_scale,
@@ -1763,22 +1845,46 @@ def _stream_mlp_channels(
                     stop,
                     x.dtype,
                 )
+                direct = _direct_int8_output_available()
                 quantized = quantize_convrot_swiglu_with_scale(
-                    expanded, whole_row_scale, 256
+                    expanded,
+                    whole_row_scale,
+                    256,
+                    output=activated[:, start:stop] if direct else None,
                 )
                 del expanded
-                activated[:, start:stop].copy_(quantized)
+                if not direct:
+                    activated[:, start:stop].copy_(quantized)
                 del quantized
 
-            tile = int8_linear_from_quantized(
-                activated,
-                whole_row_scale,
-                fc2_qweight,
-                fc2_weight_scale,
-                bias=None,
-                out_dtype=x.dtype,
-            )
-            output[row_start:row_stop].copy_(tile)
+            if _direct_int8_output_available():
+                tile = _profile_cuda(
+                    "minimax.mlp.fc2_tile",
+                    int8_linear_from_quantized,
+                    activated,
+                    whole_row_scale,
+                    fc2_qweight,
+                    fc2_weight_scale,
+                    bias=None,
+                    out_dtype=x.dtype,
+                    output=output[row_start:row_stop],
+                )
+            else:
+                tile = _profile_cuda(
+                    "minimax.mlp.fc2_tile",
+                    int8_linear_from_quantized,
+                    activated,
+                    whole_row_scale,
+                    fc2_qweight,
+                    fc2_weight_scale,
+                    bias=None,
+                    out_dtype=x.dtype,
+                )
+                _profile_cuda(
+                    "minimax.mlp.output_store",
+                    output[row_start:row_stop].copy_,
+                    tile,
+                )
             del (
                 activated,
                 input_scale,
@@ -1826,6 +1932,7 @@ def _make_mlp_forward(
             runtime_plan=runtime_plan,
             base_model=base_model,
         )
+        channel_decision = None
         if convrot_swiglu_channel_sharding_available():
             channel_decision = decide_ffn_channels(
                 x,
@@ -1835,6 +1942,15 @@ def _make_mlp_forward(
                 base_model=base_model,
             )
             if channel_decision.sharded:
+                profile_shape = (int(x.shape[0]), int(x.shape[-1]))
+                CUDA_PHASE_PROFILER.begin_operation(
+                    "mlp",
+                    profile_shape,
+                    adapter="minimax",
+                    path="channel_sharded",
+                    row_chunk=channel_decision.chunk_rows,
+                    channel_chunk=channel_decision.chunk_channels,
+                )
                 if base_model is not None:
                     ensure_dynamic_vram_headroom(
                         base_model,
@@ -1851,7 +1967,20 @@ def _make_mlp_forward(
                     chunk_channels=channel_decision.chunk_channels,
                 )
                 if output is not None:
+                    CUDA_PHASE_PROFILER.complete_operation(
+                        "mlp", profile_shape
+                    )
                     return output
+                CUDA_PHASE_PROFILER.cancel_operation()
+        profile_shape = (int(x.shape[0]), int(x.shape[-1]))
+        CUDA_PHASE_PROFILER.begin_operation(
+            "mlp",
+            profile_shape,
+            adapter="minimax",
+            path="row_streamed" if decision.streamed else "full",
+            row_chunk=decision.chunk_rows,
+            channel_chunk=0,
+        )
         if base_model is not None:
             ensure_dynamic_vram_headroom(
                 base_model,
@@ -1862,10 +1991,19 @@ def _make_mlp_forward(
                 runtime_plan=runtime_plan,
             )
         if decision.streamed:
-            return _stream_mlp(self, x, decision.chunk_rows)
-        return fused_convrot_linear_input_act(
-            self.fc2, self.fc1(x), "swiglu"
-        )
+            output = _stream_mlp(self, x, decision.chunk_rows)
+        else:
+            expanded = _profile_cuda("minimax.mlp.fc1", self.fc1, x)
+            output = _profile_cuda(
+                "minimax.mlp.swiglu_fc2",
+                fused_convrot_linear_input_act,
+                self.fc2,
+                expanded,
+                "swiglu",
+            )
+            del expanded
+        CUDA_PHASE_PROFILER.complete_operation("mlp", profile_shape)
+        return output
 
     return weak_method(forward, mlp)
 
@@ -1953,6 +2091,10 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
     ]
     if not candidates:
         return 0
+    try:
+        setattr(root, "_turing_utils_minimax_layer_count", len(candidates))
+    except (AttributeError, TypeError):
+        pass
 
     layout_status = ensure_minimax_attention_layout_provider(model)
     if layout_status.required and not layout_status.installed:

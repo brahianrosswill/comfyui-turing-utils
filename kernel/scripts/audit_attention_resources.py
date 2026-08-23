@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit exact-SM75 kernel resources without prescribing an occupancy target."""
+"""Audit exact SM75/SM86 kernel resources without prescribing occupancy."""
 
 from __future__ import annotations
 
@@ -54,15 +54,21 @@ def _sm75_section(output: str, marker: str | None = None) -> str:
     raise RuntimeError(f"built extension does not contain an exact sm75 cubin{suffix}")
 
 
-def _sm75_records(output: str) -> list[tuple[str, dict[str, int]]]:
+def _arch_records(output: str, architecture: str) -> list[tuple[str, dict[str, int]]]:
     sections = [
         section
         for section in output.split("Fatbin elf code:")
-        if re.search(r"\barch\s*=\s*sm_75\b", section)
+        if re.search(rf"\barch\s*=\s*{re.escape(architecture)}\b", section)
     ]
     if not sections:
-        raise RuntimeError("built extension does not contain an exact sm75 cubin")
+        raise RuntimeError(
+            f"built extension does not contain an exact {architecture} cubin"
+        )
     return [record for section in sections for record in _function_records(section)]
+
+
+def _sm75_records(output: str) -> list[tuple[str, dict[str, int]]]:
+    return _arch_records(output, "sm_75")
 
 
 def _function_records(section: str) -> list[tuple[str, dict[str, int]]]:
@@ -253,6 +259,7 @@ def main() -> None:
         metrics
         for name, metrics in w4_section_records
         if "TuringCodebookGemmKernel" not in name
+        and "DefaultGemmWithVisitor" not in name
         and "integer_subbyte" not in name
         and any(shape in name for shape in long_shapes)
     ]
@@ -274,6 +281,34 @@ def main() -> None:
         f"raw_w8:{[item['REG'] for item in raw_w8]} "
         f"register_limited_ctas=inline:{inline_ctas}/raw_w8:{raw_ctas} "
         "local=0 stack=0 shared_tile=identical; CTA density is reported, not gated"
+    )
+
+    # CUTLASS emits the SM80-specialized templates into every requested fatbin,
+    # but runtime dispatch can reach them only on SM80+. Audit the exact SM86
+    # cubin because that is the production Ampere schedule used by auto-tuning.
+    ampere = [
+        (name, metrics)
+        for name, metrics in _arch_records(core_output, "sm_86")
+        if "DefaultGemmWithVisitor" in name and "4Sm80" in name
+    ]
+    if len(ampere) != 3:
+        raise RuntimeError(
+            "expected three CUTLASS SM80 W8A8 schedules in the exact sm86 cubin, "
+            f"found {len(ampere)}"
+        )
+    ampere_summary = []
+    for name, metrics in ampere:
+        _validate_no_spill("CUTLASS SM80 W8A8", metrics)
+        shape = re.search(r"GemmShapeILi(\d+)ELi(\d+)ELi(\d+)", name)
+        if shape is None:
+            raise RuntimeError(f"cannot identify CUTLASS SM80 tile shape: {name}")
+        ampere_summary.append(
+            f"{shape.group(1)}x{shape.group(2)}x{shape.group(3)}@r{metrics['REG']}"
+        )
+    print(
+        "Ampere CUTLASS W8A8 resource audit passed: "
+        + " ".join(sorted(ampere_summary))
+        + " local=0 stack=0"
     )
 
 

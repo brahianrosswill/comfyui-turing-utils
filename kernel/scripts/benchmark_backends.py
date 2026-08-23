@@ -351,7 +351,8 @@ def benchmark_linear(
             if tile_sweep:
                 from comfyui_turing_utils_kernel import _C as low_level
 
-                for tile_policy in range(1, 6):
+                maximum_tile_policy = 8 if torch.cuda.get_device_capability(device) >= (8, 0) else 5
+                for tile_policy in range(1, maximum_tile_policy + 1):
                     measurements.append(
                         Measurement(
                             f"bundled raw W8A8 tile-policy {tile_policy}",
@@ -1110,7 +1111,10 @@ def main() -> None:
     parser.add_argument(
         "--tile-sweep",
         action="store_true",
-        help="report every compiled linear tile; production exact-sm75 dispatch tunes and caches automatically",
+        help=(
+            "report every compatible linear tile; production dispatch tunes "
+            "and caches schedules per shape and architecture"
+        ),
     )
     args = parser.parse_args()
     device = torch.device(args.device)

@@ -62,6 +62,7 @@ def convrot_w8_output_slice(
     start: int,
     stop: int,
     output_dtype: torch.dtype,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Evaluate a contiguous W8 output-channel interval."""
     from .dispatch import int8_linear_from_quantized
@@ -82,6 +83,7 @@ def convrot_w8_output_slice(
         sliced_scale,
         bias=sliced_bias,
         out_dtype=output_dtype,
+        output=output,
     )
 
 
@@ -90,6 +92,7 @@ def convrot_linear_input_act_from_weight(
     bias: torch.Tensor | None,
     x: torch.Tensor,
     input_act: str,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run a fused ConvRot activation against an already-cast weight.
 
@@ -111,7 +114,11 @@ def convrot_linear_input_act_from_weight(
     kind = convrot_weight_kind(weight)
     if kind is None or comfy.model_management.in_training:
         activated = comfy.ops.INPUT_ACT_EAGER[input_act](x)
-        return torch.nn.functional.linear(activated, weight, bias)
+        result = torch.nn.functional.linear(activated, weight, bias)
+        if output is not None:
+            output.copy_(result)
+            return output
+        return result
     if kind == "w8a8":
         qdata, scale = comfy.quant_ops.TensorWiseINT8Layout.get_plain_tensors(weight)
         return int8_linear(
@@ -123,13 +130,14 @@ def convrot_linear_input_act_from_weight(
             convrot=True,
             convrot_groupsize=weight._params.convrot_groupsize,
             input_act=input_act,
+            output=output,
         )
     if kind == "codebook_w4a8":
         qdata, s_rel, s_channel, correction, codebook = (
             comfy.quant_ops.AsymW4A8Int8Layout.get_plain_tensors(weight)
         )
         params = weight._params
-        return codebook_w4a8_linear(
+        result = codebook_w4a8_linear(
             x,
             qdata,
             s_rel,
@@ -142,10 +150,14 @@ def convrot_linear_input_act_from_weight(
             out_dtype=x.dtype,
             input_act=input_act,
         )
+        if output is not None:
+            output.copy_(result)
+            return output
+        return result
 
     qdata, scale = comfy.quant_ops.TensorCoreConvRotW4A4Layout.get_plain_tensors(weight)
     params = weight._params
-    return convrot_w4a4_linear(
+    result = convrot_w4a4_linear(
         x,
         qdata,
         scale,
@@ -155,6 +167,10 @@ def convrot_linear_input_act_from_weight(
         linear_dtype=params.linear_dtype,
         input_act=input_act,
     )
+    if output is not None:
+        output.copy_(result)
+        return output
+    return result
 
 
 def fused_convrot_linear_input_act(

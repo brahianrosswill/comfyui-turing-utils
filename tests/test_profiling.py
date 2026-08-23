@@ -122,6 +122,52 @@ class CudaPhaseProfilerTest(unittest.TestCase):
         end.synchronize.assert_called_once_with()
         self.assertTrue(profiler.reported)
 
+    def test_profiles_independent_attention_and_mlp_shape_buckets(self):
+        profiler = CudaPhaseProfiler(1, bucket_limit=4)
+        profiler.defer_to_sampler_boundary()
+        events = [mock.Mock() for _ in range(8)]
+        for event in events[::2]:
+            event.elapsed_time.return_value = 1.0
+
+        with mock.patch.object(
+            profiling.torch.cuda, "Event", side_effect=events
+        ):
+            for kind, shape, phase in (
+                ("attention", (1, 56, 60186, 128), "attention.execute"),
+                ("mlp", (60186, 5376), "minimax.mlp.swiglu_fc2"),
+                ("attention", (1, 56, 127275, 128), "attention.execute"),
+                ("mlp", (127275, 5376), "minimax.mlp.swiglu_fc2_tile"),
+            ):
+                self.assertTrue(
+                    profiler.begin_operation(kind, shape, path="test")
+                )
+                profiler.call(phase, lambda: None)
+                profiler.complete_operation(kind, shape)
+
+        self.assertEqual(len(profiler._buckets), 4)
+        self.assertTrue(all(bucket.pending for bucket in profiler._buckets.values()))
+        self.assertFalse(profiler.enabled)
+
+    def test_reported_bucket_suppresses_events_until_scope_completion(self):
+        profiler = CudaPhaseProfiler(1, bucket_limit=1)
+        profiler.defer_to_sampler_boundary()
+        start = mock.Mock()
+        end = mock.Mock()
+        start.elapsed_time.return_value = 1.0
+        with mock.patch.object(
+            profiling.torch.cuda, "Event", side_effect=(start, end)
+        ):
+            profiler.begin_operation("attention", (1, 1, 64, 64))
+            profiler.call("attention.execute", lambda: None)
+            profiler.complete_operation("attention", (1, 1, 64, 64))
+        with mock.patch.object(profiling.torch.cuda, "Event") as event:
+            self.assertFalse(
+                profiler.begin_operation("mlp", (64, 64), path="full")
+            )
+            profiler.call("mlp", lambda: None)
+            profiler.complete_operation("mlp", (64, 64))
+        event.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -12,13 +12,55 @@ PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT / "kernel"))
 
 from comfyui_turing_utils_kernel import turing_sage  # noqa: E402
-from comfyui_turing_utils_kernel.turing_sage import quant  # noqa: E402
+from comfyui_turing_utils_kernel.turing_sage import core, quant  # noqa: E402
 from comfyui_turing_utils_kernel.turing_sage.custom_ops import (  # noqa: E402
     qk_rms_rope_int8,
 )
 
 
 class TuringSageQuantContractTest(unittest.TestCase):
+    def test_key_tile_auto_policy_uses_resources_not_product_names(self):
+        core._KEY_TILE_CACHE.clear()
+        with mock.patch.object(torch.cuda, "get_device_capability", return_value=(8, 6)):
+            self.assertEqual(
+                core._automatic_key_tile_tokens(
+                    torch.device("cuda:0"),
+                    key_length=60186,
+                    head_dim=128,
+                    use_w8a8=True,
+                ),
+                64,
+            )
+            self.assertEqual(
+                core._automatic_key_tile_tokens(
+                    torch.device("cuda:0"),
+                    key_length=60186,
+                    head_dim=64,
+                    use_w8a8=True,
+                ),
+                128,
+            )
+        core._KEY_TILE_CACHE.clear()
+        with mock.patch.object(torch.cuda, "get_device_capability", return_value=(7, 5)):
+            self.assertEqual(
+                core._automatic_key_tile_tokens(
+                    torch.device("cuda:0"),
+                    key_length=60186,
+                    head_dim=128,
+                    use_w8a8=True,
+                ),
+                128,
+            )
+            self.assertEqual(
+                core._automatic_key_tile_tokens(
+                    torch.device("cuda:0"),
+                    key_length=512,
+                    head_dim=128,
+                    use_w8a8=True,
+                ),
+                64,
+            )
+
     def test_fused_qk_preprocessor_has_fake_tensor_contract(self):
         query = torch.empty((2, 4, 129, 128), dtype=torch.bfloat16, device="meta")
         key = torch.empty((2, 2, 129, 128), dtype=torch.bfloat16, device="meta")

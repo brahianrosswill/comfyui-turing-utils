@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = ROOT / "kernel"
 COMFYUI_ROOT = ROOT.parents[1]
-EXPECTED_VERSION = "0.31.0"
+EXPECTED_VERSION = "0.32.0"
 
 
 def _run(command: list[str], *, cwd: Path = ROOT, env=None) -> None:
@@ -185,6 +185,16 @@ def _static_gate() -> None:
             KERNEL / "csrc/bindings.cpp",
             core_binding,
             'm.def("turing_swiglu_int8_convrot_quantize_scaled"',
+        ),
+        (
+            KERNEL / "csrc/bindings.cpp",
+            core_binding,
+            'm.def("turing_swiglu_int8_convrot_quantize_scaled_out"',
+        ),
+        (
+            KERNEL / "csrc/bindings.cpp",
+            core_binding,
+            'm.def("turing_int8_linear_out"',
         ),
     ):
         if marker not in source:

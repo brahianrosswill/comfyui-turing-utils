@@ -241,7 +241,8 @@ __global__ void swiglu_rotate_scaled_quantize_kernel(
     const InputType *__restrict__ input,
     const float *__restrict__ scales,
     int8_t *__restrict__ output,
-    int k) {
+    int k,
+    int64_t output_stride) {
     extern __shared__ float smem[];
     const int sub = threadIdx.x / kGroupThreads;
     const int lane = threadIdx.x % kGroupThreads;
@@ -253,7 +254,7 @@ __global__ void swiglu_rotate_scaled_quantize_kernel(
     const int base = lane * 4;
     const int col = group_col + base;
     const int64_t input_row = static_cast<int64_t>(row) * (2 * k);
-    const int64_t output_row = static_cast<int64_t>(row) * k;
+    const int64_t output_row = static_cast<int64_t>(row) * output_stride;
     float *buf0 = smem + sub * (2 * kConvRotGroup);
     float *buf1 = buf0 + kConvRotGroup;
 
@@ -605,14 +606,16 @@ void turing_swiglu_int8_convrot_quantize_scaled(Tensor input,
                 static_cast<const nv_bfloat16 *>(input.ptr),
                 static_cast<const float *>(scales.ptr),
                 static_cast<int8_t *>(output.ptr),
-                k);
+                k,
+                output.stride(0));
     } else if (input.scalar_type() == Tensor::FP16) {
         swiglu_rotate_scaled_quantize_kernel<half>
             <<<grid, kRotateThreads, smem_bytes, getCurrentCUDAStream()>>>(
                 static_cast<const half *>(input.ptr),
                 static_cast<const float *>(scales.ptr),
                 static_cast<int8_t *>(output.ptr),
-                k);
+                k,
+                output.stride(0));
     } else {
         throw std::runtime_error(
             "scaled SwiGLU ConvRot requires float16 or bfloat16 input");

@@ -547,6 +547,32 @@ __device__ __forceinline__ void load_int8_tile(
 }
 
 template <int HeadDim>
+__device__ __forceinline__ void load_int8_tile_async(
+    const int8_t *__restrict__ source,
+    int64_t stride_sequence,
+    int row_start,
+    int row_limit,
+    const smem_t<AttentionGeometry<HeadDim>::kInt8Swizzle,
+                 AttentionGeometry<HeadDim>::kInt8Packs> &destination)
+{
+  using G = AttentionGeometry<HeadDim>;
+  const int linear_thread = threadIdx.y * WARP_SIZE + threadIdx.x;
+  for (int line = linear_thread; line < G::kInt8TilePacks;
+       line += kWarps * WARP_SIZE)
+  {
+    const int row = line / G::kInt8Packs;
+    const int column = line % G::kInt8Packs;
+    const uint32_t offset = destination.get_permuted_offset(row, column);
+    const int8_t *source_line = source +
+        static_cast<int64_t>(row_start + row) * stride_sequence +
+        column * 16;
+    destination.template load_128b_async<
+        cp_async::SharedMemFillMode::kFillZero>(
+        offset, source_line, row_start + row < row_limit);
+  }
+}
+
+template <int HeadDim>
 __device__ __forceinline__ void dequantize_int8_tile(
     const smem_t<AttentionGeometry<HeadDim>::kInt8Swizzle,
                  AttentionGeometry<HeadDim>::kInt8Packs> &source,
@@ -704,6 +730,29 @@ __device__ __forceinline__ void load_quantized_value_tile(
         static_cast<int64_t>(channel) * padded_sequence_length +
         key_block * kBlockTokens + sequence_pack * 16;
     shared_value.base[destination] = *reinterpret_cast<const b128_t *>(source);
+  }
+}
+
+template <int HeadDim>
+__device__ __forceinline__ void load_quantized_value_tile_async(
+    const int8_t *__restrict__ value,
+    int padded_sequence_length,
+    int key_block,
+    smem_t<SwizzleMode::k64B, 4> shared_value)
+{
+  const int linear_thread = threadIdx.y * WARP_SIZE + threadIdx.x;
+  constexpr int lines = HeadDim * kBlockTokens / 16;
+#pragma unroll
+  for (int line = linear_thread; line < lines; line += kWarps * WARP_SIZE)
+  {
+    const int channel = line / 4;
+    const int sequence_pack = line % 4;
+    const uint32_t destination = shared_value.get_permuted_offset(
+        channel, sequence_pack);
+    const int8_t *source = value +
+        static_cast<int64_t>(channel) * padded_sequence_length +
+        key_block * kBlockTokens + sequence_pack * 16;
+    shared_value.load_128b_async(destination, source);
   }
 }
 
@@ -906,12 +955,14 @@ __global__ void sparse_attention_kernel(
   // Route from the same INT8 Q and per-16-token scales consumed by exact Sage.
   // Keeping this tile in shared memory also avoids another global Q read when
   // constructing the correction operand below.
-  load_int8_tile<HeadDim>(
+  load_int8_tile_async<HeadDim>(
       query_int8_head_ptr,
       stride_sequence_q_int8,
       query_block * kBlockTokens,
       query_length,
       shared_initial_query_int8);
+  cp_async::commit_group();
+  cp_async::wait_group<0>();
   __syncthreads();
 
   const int query_token_start = query_block * kBlockTokens;
@@ -1184,12 +1235,14 @@ __global__ void sparse_attention_kernel(
   // with the production Sage per-16-row Q and per-64-row K scales, then use the
   // same SM75 INT8 Tensor Core MMA as stable Sage. V and output stay FP16/BF16
   // with FP32 online-softmax accumulation.
-  load_int8_tile<HeadDim>(
+  load_int8_tile_async<HeadDim>(
       query_int8_head_ptr,
       stride_sequence_q_int8,
       query_block * kBlockTokens,
       query_length,
       shared_query_int8);
+  cp_async::commit_group();
+  cp_async::wait_group<0>();
   __syncthreads();
   // The dense W8A8 path used to share the sparse kernel's runtime two-block
   // staging loop.  Even though dense execution never needs staged routing,
@@ -1212,7 +1265,7 @@ __global__ void sparse_attention_kernel(
       if (sparse_query && !route_selected(local_route, key_block))
         continue;
     }
-    load_int8_tile<HeadDim>(
+    load_int8_tile_async<HeadDim>(
         key_int8_head_ptr,
         stride_sequence_k_int8,
         key_block * kBlockTokens,
@@ -1220,14 +1273,16 @@ __global__ void sparse_attention_kernel(
         shared_key_int8);
     if constexpr (UseW8A8)
     {
-      load_quantized_value_tile<HeadDim>(
+      load_quantized_value_tile_async<HeadDim>(
           value_int8_head_ptr,
           Varlen ? total_value_length : padded_value_length,
           key_block,
           shared_selected_value_int8);
+      cp_async::commit_group();
     }
     else
     {
+      cp_async::commit_group();
       load_half_tile<HeadDim, kBlockTokens>(
           value_head_ptr,
           stride_sequence_v,
@@ -1235,6 +1290,7 @@ __global__ void sparse_attention_kernel(
           key_length,
           shared_selected_value);
     }
+    cp_async::wait_group<0>();
     __syncthreads();
 
     int32_t integer_score[1][4][8];

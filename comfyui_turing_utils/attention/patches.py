@@ -85,6 +85,20 @@ def _profiled(phase: str, function: Callable, /, *args, **kwargs):
     return function(*args, **kwargs)
 
 
+def _profile_route_stats(selected: torch.Tensor, possible: int) -> None:
+    """Attach sparse-route density without synchronizing the sampler.
+
+    ``selected`` stays on the device until the profiler report is emitted at
+    the existing sampler-boundary fence.  Normal execution therefore pays no
+    scalar readback or extra synchronization cost.
+    """
+    if not CUDA_PHASE_PROFILER.enabled:
+        return
+    selected_total = selected if selected.numel() == 1 else selected.sum()
+    CUDA_PHASE_PROFILER.sample_tensor("route_selected_blocks", selected_total)
+    CUDA_PHASE_PROFILER.sample("route_possible_blocks", int(possible))
+
+
 def _attention_layer_metadata(transformer_options) -> tuple[int | None, int | None]:
     layout = attention_semantic_layout(transformer_options)
     if layout is not None:
@@ -906,7 +920,8 @@ def make_sparse_attention_override(
             use_w8a8,
         )
         debug_context = route_debug_context(transformer_options, debug_key)
-        collect_stats = debug_context["collect"]
+        collect_debug_stats = debug_context["collect"]
+        collect_stats = collect_debug_stats or CUDA_PHASE_PROFILER.enabled
         result = _profiled(
             "attention.execute",
             turing_sol_attention_from_prequantized,
@@ -916,7 +931,9 @@ def make_sparse_attention_override(
         if not collect_stats:
             return AttentionExecutionOutcome(result)
         output, selected, possible = result
-        record_route_stats(selected, possible, sol_call, debug_key, debug_context)
+        _profile_route_stats(selected, possible)
+        if collect_debug_stats:
+            record_route_stats(selected, possible, sol_call, debug_key, debug_context)
         return AttentionExecutionOutcome(output)
 
     def streamed_qkv_executor(
@@ -1012,7 +1029,8 @@ def make_sparse_attention_override(
             True,
         )
         debug_context = route_debug_context(transformer_options, debug_key)
-        collect_stats = debug_context["collect"]
+        collect_debug_stats = debug_context["collect"]
+        collect_stats = collect_debug_stats or CUDA_PHASE_PROFILER.enabled
         result = _profiled(
             "attention.execute",
             turing_sol_attention_from_prequantized,
@@ -1022,7 +1040,9 @@ def make_sparse_attention_override(
         if not collect_stats:
             return AttentionExecutionOutcome(result)
         output, selected, possible = result
-        record_route_stats(selected, possible, sol_call, debug_key, debug_context)
+        _profile_route_stats(selected, possible)
+        if collect_debug_stats:
+            record_route_stats(selected, possible, sol_call, debug_key, debug_context)
         return AttentionExecutionOutcome(output)
 
     prepared_executor.capabilities = sparse_capabilities
@@ -1194,16 +1214,19 @@ def make_sparse_attention_override(
                 use_w8a8,
             )
             debug_context = route_debug_context(transformer_options, debug_key)
-            collect_stats = debug_context["collect"]
+            collect_debug_stats = debug_context["collect"]
+            collect_stats = collect_debug_stats or CUDA_PHASE_PROFILER.enabled
             result = turing_sol_attention_from_prequantized(
                 quantized,
                 return_stats=collect_stats,
             )
             if collect_stats:
                 output, selected, possible = result
-                record_route_stats(
-                    selected, possible, sol_call, debug_key, debug_context
-                )
+                _profile_route_stats(selected, possible)
+                if collect_debug_stats:
+                    record_route_stats(
+                        selected, possible, sol_call, debug_key, debug_context
+                    )
                 return output
             return result
 
@@ -1452,17 +1475,22 @@ def make_sla_attention_override(
             transformer_options=transformer_options,
         )
         del qk, value
+        profile_route_density = CUDA_PHASE_PROFILER.enabled
         result = _profiled(
             "attention.execute",
             turing_sla_attention_from_prequantized,
             quantized,
-            return_stats=debug_route_density,
+            return_stats=debug_route_density or profile_route_density,
         )
-        output = (
-            collect_stats(result, sla_call, transformer_options)
-            if debug_route_density
-            else result
-        )
+        if debug_route_density or profile_route_density:
+            output, selected, possible = result
+            _profile_route_stats(selected, possible)
+            if debug_route_density:
+                output = collect_stats(
+                    (output, selected, possible), sla_call, transformer_options
+                )
+        else:
+            output = result
         return AttentionExecutionOutcome(output)
 
     prepared_executor.capabilities = sparse_capabilities
@@ -1528,17 +1556,24 @@ def make_sla_attention_override(
                 use_w8a8=True,
                 transformer_options=transformer_options,
             )
+            profile_route_density = CUDA_PHASE_PROFILER.enabled
             result = _profiled(
                 "attention.execute",
                 turing_sla_attention_from_prequantized,
                 quantized,
-                return_stats=debug_route_density,
+                return_stats=debug_route_density or profile_route_density,
             )
-            output = (
-                collect_stats(result, sla_call, transformer_options)
-                if debug_route_density
-                else result
-            )
+            if debug_route_density or profile_route_density:
+                output, selected, possible = result
+                _profile_route_stats(selected, possible)
+                if debug_route_density:
+                    output = collect_stats(
+                        (output, selected, possible),
+                        sla_call,
+                        transformer_options,
+                    )
+            else:
+                output = result
             return AttentionExecutionOutcome(output)
 
         prepared_executor.turing_utils_streamed_qkv_executor = (
@@ -1628,15 +1663,20 @@ def make_sla_attention_override(
                 transformer_options=transformer_options,
             )
             del query, key, value
+            profile_route_density = CUDA_PHASE_PROFILER.enabled
             result = turing_sla_attention_from_prequantized(
                 quantized,
-                return_stats=debug_route_density,
+                return_stats=debug_route_density or profile_route_density,
             )
-            return (
-                collect_stats(result, sla_call, transformer_options)
-                if debug_route_density
-                else result
-            )
+            if not (debug_route_density or profile_route_density):
+                return result
+            output, selected, possible = result
+            _profile_route_stats(selected, possible)
+            if debug_route_density:
+                return collect_stats(
+                    (output, selected, possible), sla_call, transformer_options
+                )
+            return output
 
         attention_override.container_function = container_function
 

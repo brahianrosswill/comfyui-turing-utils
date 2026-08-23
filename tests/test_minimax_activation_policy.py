@@ -550,6 +550,43 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
         self.assertEqual(decision.head_group, 14)
         self.assertFalse(decision.cache_quantized_input)
 
+    def test_dynamic_weight_prefetch_reserve_tracks_two_average_blocks(self):
+        vbar = SimpleNamespace(loaded_size=lambda: 4 * _GIB)
+        patcher = SimpleNamespace(
+            load_device=torch.device("cuda", 0),
+            is_dynamic=lambda: True,
+            _vbar_get=lambda: vbar,
+            model_size=lambda: 20 * _GIB,
+        )
+        base = SimpleNamespace(
+            current_patcher=patcher,
+            _turing_utils_minimax_layer_count=50,
+        )
+
+        reserve = activation_policy._dynamic_weight_prefetch_reserve(
+            base, torch.device("cuda", 0)
+        )
+
+        self.assertEqual(reserve, 26 * 32 * 1024**2)
+
+    def test_dynamic_weight_prefetch_reserve_is_bounded(self):
+        patcher = SimpleNamespace(
+            load_device=torch.device("cuda", 0),
+            is_dynamic=lambda: True,
+            _vbar_get=lambda: SimpleNamespace(loaded_size=lambda: 100 * _GIB),
+            model_size=lambda: 100 * _GIB,
+        )
+        base = SimpleNamespace(
+            current_patcher=patcher,
+            _turing_utils_minimax_layer_count=2,
+        )
+
+        reserve = activation_policy._dynamic_weight_prefetch_reserve(
+            base, torch.device("cuda", 0)
+        )
+
+        self.assertEqual(reserve, 1024 * 1024**2)
+
     def test_short_attention_grid_raises_the_saturation_group(self):
         capabilities = SimpleNamespace(multiprocessor_count=46)
         with mock.patch.object(
@@ -835,14 +872,18 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
         ops.uncast_bias_weight = uncast
         comfy.ops = ops
 
-        def fused(weight, bias, expanded, input_act):
+        def fused(weight, bias, expanded, input_act, output=None):
             self.assertEqual(input_act, "swiglu")
             gate, up = expanded.chunk(2, dim=-1)
-            return torch.nn.functional.linear(
+            result = torch.nn.functional.linear(
                 torch.nn.functional.silu(gate) * up,
                 weight,
                 bias,
             )
+            if output is not None:
+                output.copy_(result)
+                return output
+            return result
 
         with (
             mock.patch.dict(
@@ -915,21 +956,29 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
 
         common_scales = []
 
-        def scaled_quantize(value, scale, _group_size):
+        def scaled_quantize(value, scale, _group_size, output=None):
             common_scales.append(scale.clone())
             marker = int(value[0, 0])
-            return torch.full(
+            result = torch.full(
                 (value.shape[0], value.shape[1] // 2),
                 marker,
                 dtype=torch.int8,
             )
+            if output is not None:
+                output.copy_(result)
+                return output
+            return result
 
         contractions = []
 
-        def contraction(activation, scale, *_args, **_kwargs):
+        def contraction(activation, scale, *_args, **kwargs):
             contractions.append((activation.clone(), scale.clone()))
             total = activation.to(torch.int32).sum(dim=-1)
-            return total[:, None].expand(-1, hidden).to(torch.bfloat16)
+            result = total[:, None].expand(-1, hidden).to(torch.bfloat16)
+            if kwargs.get("output") is not None:
+                kwargs["output"].copy_(result)
+                return kwargs["output"]
+            return result
 
         with (
             mock.patch.dict(sys.modules, {"comfy": comfy, "comfy.ops": ops}),
@@ -1288,6 +1337,55 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
         bundled.assert_called_once()
         self.assertEqual(bundled.call_args.args[3].shape, (8,))
         self.assertEqual(bundled.call_args.args[3].tolist(), [1.0] * 8)
+
+    def test_w8_direct_output_preserves_destination_stride(self):
+        qactivation = torch.zeros((4, 16), dtype=torch.int8)
+        weight = torch.zeros((8, 16), dtype=torch.int8)
+        activation_scale = torch.ones(4, dtype=torch.float32)
+        weight_scale = torch.ones((), dtype=torch.float32)
+        storage = torch.empty((4, 12), dtype=torch.bfloat16)
+        destination = storage[:, 2:10]
+
+        comfy_kitchen = ModuleType("comfy_kitchen")
+        comfy_kitchen.__path__ = []
+        backends = ModuleType("comfy_kitchen.backends")
+        backends.__path__ = []
+        cuda = ModuleType("comfy_kitchen.backends.cuda")
+        backends.cuda = cuda
+        comfy_kitchen.backends = backends
+
+        def write_output(*args):
+            args[4].fill_(3)
+
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {
+                    "comfy_kitchen": comfy_kitchen,
+                    "comfy_kitchen.backends": backends,
+                    "comfy_kitchen.backends.cuda": cuda,
+                },
+            ),
+            mock.patch.object(
+                dispatch,
+                "_kernel_op",
+                return_value=mock.Mock(side_effect=write_output),
+            ) as kernel_op,
+        ):
+            actual = dispatch._turing_int8_gemm(
+                qactivation,
+                weight,
+                activation_scale,
+                weight_scale,
+                bias=None,
+                output_dtype=torch.bfloat16,
+                output=destination,
+            )
+
+        self.assertIs(actual, destination)
+        self.assertEqual(actual.stride(), (12, 1))
+        torch.testing.assert_close(actual, torch.full_like(actual, 3))
+        kernel_op.assert_called_once_with("turing_int8_linear_out")
 
     def test_ampere_loader_preflights_the_shared_runtime(self):
         device = torch.device("cuda", 0)

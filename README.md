@@ -154,6 +154,10 @@ FFN call, the adapter reads ComfyUI's immediately usable memory and the
   FFN channel shards use the same four-way balance, while QKV and MLP row
   tiles cap at 16K. Larger activations offer little additional utilization but
   displace hot DynamicVRAM weight pages;
+- DynamicVRAM additionally reserves two average transformer blocks (bounded
+  to 512 MiB--1 GiB and aligned to AIMDO's page size) for the active and next
+  asynchronous weight stream. This reserve is derived from the active model's
+  VBAR size and layer count, not from a GPU-generation name;
 - a dynamically resident DiT does not retain the optional full-sequence INT8
   input cache during head sharding. Recomputing the inexpensive row
   quantization preserves roughly one hidden tensor of weight residency and
@@ -178,7 +182,7 @@ COMFYUI_TURING_UTILS_H3_FFN_CHUNK_CHANNELS=2048
 
 Overrides are diagnostic controls; `auto` is the production default. QKV
 streaming is available through bundled W8A8, Sol-W8A8, and SLA-W8A8 prepared
-attention. Kernel 0.30 precomputes the adaptive K anchor from the same nine
+attention. Kernel 0.32 precomputes the adaptive K anchor from the same nine
 global sequence locations and reuses it while writing every row tile directly
 into the final Q/K storage. Row and head splitting therefore do not discard the
 global anchor, RMSNorm, RoPE, orthogonal rotation, scale blocks, or any K/V row.
@@ -195,6 +199,11 @@ cannot make an arbitrarily reference-heavy 15-second workflow fit 6 GiB.
 None of these rungs requires Triton. If a Windows Kitchen build lacks its
 optional fixed-workspace W8 entry point, large aligned contractions use the
 bundled CUTLASS BF16-output kernel instead of allocating a full INT32 matrix.
+On sm80+, that kernel uses native `m16n8k32` INT8 Tensor Core instructions and
+caches the fastest of three CUTLASS tile schedules per exact M/N/K shape. Its
+epilogue and the scaled SwiGLU quantizer can write directly into row-strided
+destination views, removing row/channel-shard copy buffers without changing
+rounding.
 
 Some Python symbols and extension filenames still contain `turing`/`sm75` for
 backward ABI compatibility. They do not select a separate H3 implementation;
@@ -285,7 +294,10 @@ uses about 10.6 KiB.
 
 Internal CUDA phase timing is disabled by default and allocates no events. For
 a bounded diagnostic run, set `COMFYUI_TURING_UTILS_PROFILE_CALLS` to the
-number of attention calls to collect before one report is emitted. Kernel 0.31
+number of calls per operation/shape bucket to collect. Kernel 0.32 records up
+to four attention/MLP buckets by default, including weight-wait phases and
+deferred sparse-route counters; change the bound with
+`COMFYUI_TURING_UTILS_PROFILE_BUCKETS`. Kernel 0.31
 also embeds the wheel's exact CUDA architecture set and, while this profiler is
 enabled, reports the specialization CUDA selected for dense/Sol attention.
 With DynamicVRAM, the report reuses the existing outer sampler fence instead

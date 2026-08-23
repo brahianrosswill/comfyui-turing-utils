@@ -451,18 +451,41 @@ def quantize_convrot_swiglu_with_scale(
     x: torch.Tensor,
     scale: torch.Tensor,
     group_size: int = 256,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if not convrot_swiglu_channel_sharding_available():
         raise RuntimeError(
             "exact FFN channel sharding requires an updated "
             "comfyui-turing-utils-kernel; reinstall the kernel package"
         )
-    operation = _kernel_op(
-        "turing_swiglu_int8_convrot_quantize_scaled"
-    )
-    return operation(
-        x.contiguous(), scale.reshape(-1).contiguous(), int(group_size)
-    )
+    x = x.contiguous()
+    scale = scale.reshape(-1).contiguous()
+    if output is not None:
+        if (
+            output.shape != (x.shape[0], x.shape[1] // 2)
+            or output.dtype is not torch.int8
+            or output.device != x.device
+            or output.stride(1) != 1
+            or output.stride(0) < output.shape[1]
+        ):
+            raise ValueError(
+                "scaled SwiGLU direct output shape, dtype, device, or stride "
+                "is incompatible"
+            )
+        try:
+            operation = _kernel_op(
+                "turing_swiglu_int8_convrot_quantize_scaled_out"
+            )
+        except RuntimeError:
+            temporary = quantize_convrot_swiglu_with_scale(
+                x, scale, group_size
+            )
+            output.copy_(temporary)
+            return output
+        operation(x, scale, output, int(group_size))
+        return output
+    operation = _kernel_op("turing_swiglu_int8_convrot_quantize_scaled")
+    return operation(x, scale, int(group_size))
 
 
 def _quantize_turing_int4_activation(
@@ -620,6 +643,7 @@ def _turing_int8_gemm(
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None,
     output_dtype: torch.dtype,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Keep scalar scales in fused GEMMs and use the fast no-bias BF16 epilogue."""
     from comfy_kitchen.backends import cuda as kitchen_cuda
@@ -646,6 +670,42 @@ def _turing_int8_gemm(
             f"W8A8 weight scale must be scalar or have {n} values, "
             f"got {weight_scale.numel()}"
         )
+
+    if output is not None:
+        if (
+            output_dtype != torch.bfloat16
+            or output.shape != (m, n)
+            or output.dtype != torch.bfloat16
+            or output.device != qactivation.device
+            or output.stride(1) != 1
+            or output.stride(0) < n
+        ):
+            raise ValueError("W8A8 direct output shape, dtype, device, or stride is incompatible")
+        expanded_weight_scale = weight_scale
+        if expanded_weight_scale.numel() == 1:
+            expanded_weight_scale = expanded_weight_scale.expand(n).contiguous()
+        try:
+            bundled_out = _kernel_op("turing_int8_linear_out")
+        except RuntimeError:
+            temporary = _turing_int8_gemm(
+                qactivation,
+                weight,
+                activation_scale,
+                weight_scale,
+                bias,
+                output_dtype,
+            )
+            output.copy_(temporary)
+            return output
+        bundled_out(
+            qactivation,
+            weight,
+            activation_scale,
+            expanded_weight_scale,
+            output,
+            bias,
+        )
+        return output
 
     prefer_fused = getattr(kitchen_cuda, "_prefer_turing_fused_int8", None)
     fused_linear = getattr(kitchen_cuda, "_int8_linear_turing_quantized", None)
@@ -727,6 +787,7 @@ def int8_linear_from_quantized(
     weight_scale: torch.Tensor,
     bias: torch.Tensor | None = None,
     out_dtype: torch.dtype = torch.bfloat16,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run W8 GEMM from an activation quantized once by the caller."""
     if qactivation.ndim != 2 or weight.ndim != 2:
@@ -742,6 +803,7 @@ def int8_linear_from_quantized(
         weight_scale,
         bias,
         out_dtype,
+        output,
     )
 
 
@@ -754,6 +816,7 @@ def int8_linear(
     convrot: bool = False,
     convrot_groupsize: int = 256,
     input_act: str | None = None,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     from comfy_kitchen.backends import cuda as kitchen_cuda
     from comfy_kitchen.backends._activations import apply_input_act
@@ -764,7 +827,7 @@ def int8_linear(
         or not convrot
         or convrot_groupsize != 256
     ):
-        return kitchen_cuda.int8_linear(
+        result = kitchen_cuda.int8_linear(
             x,
             weight,
             weight_scale,
@@ -774,6 +837,10 @@ def int8_linear(
             convrot_groupsize=convrot_groupsize,
             input_act=input_act,
         )
+        if output is not None:
+            output.copy_(result)
+            return output
+        return result
 
     original_shape = x.shape
     x2d = x.reshape(-1, original_shape[-1]).contiguous()
@@ -796,6 +863,7 @@ def int8_linear(
         weight_scale,
         bias,
         output_dtype,
+        output,
     )
     return output.reshape(*original_shape[:-1], output_channels)
 

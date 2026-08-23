@@ -420,6 +420,65 @@ at::Tensor turing_int8_linear(at::Tensor activation,
     return output;
 }
 
+at::Tensor turing_int8_linear_out(at::Tensor activation,
+                                  at::Tensor weight,
+                                  at::Tensor activation_scale,
+                                  at::Tensor weight_scale,
+                                  std::optional<at::Tensor> bias,
+                                  at::Tensor output,
+                                  int64_t tile_policy) {
+    activation = activation.contiguous();
+    weight = weight.contiguous();
+    activation_scale = activation_scale.reshape({-1}).to(at::kFloat).contiguous();
+    weight_scale = weight_scale.reshape({-1}).to(at::kFloat).contiguous();
+    if (bias.has_value()) {
+        bias = bias.value().reshape({-1}).to(at::kFloat).contiguous();
+    }
+    check_cuda_2d(activation, "activation");
+    check_cuda_2d(weight, "weight");
+    TORCH_CHECK(activation.scalar_type() == at::kChar && weight.scalar_type() == at::kChar,
+                "Turing INT8 linear activation and weight must be int8");
+    TORCH_CHECK(output.is_cuda() && output.dim() == 2 &&
+                    output.scalar_type() == at::kBFloat16 && output.stride(1) == 1,
+                "INT8 direct output must be a row-major BF16 CUDA matrix");
+    TORCH_CHECK(output.size(0) == activation.size(0) &&
+                    output.size(1) == weight.size(0) &&
+                    output.stride(0) >= output.size(1),
+                "INT8 direct output shape/stride is incompatible");
+    TORCH_CHECK(activation.device() == weight.device() &&
+                    activation.device() == activation_scale.device() &&
+                    activation.device() == weight_scale.device() &&
+                    activation.device() == output.device(),
+                "Turing INT8 linear tensors must use the same CUDA device");
+    TORCH_CHECK(weight.size(1) == activation.size(1), "INT8 linear K dimensions must match");
+    TORCH_CHECK(activation.size(1) % 16 == 0 && weight.size(0) % 8 == 0,
+                "Turing INT8 linear requires K%16=0 and N%8=0");
+    TORCH_CHECK(activation_scale.numel() == activation.size(0),
+                "activation_scale must contain one value per row");
+    TORCH_CHECK(weight_scale.numel() == weight.size(0),
+                "weight_scale must contain one value per output channel");
+    if (bias.has_value()) {
+        TORCH_CHECK(bias.value().is_cuda() && bias.value().device() == activation.device() &&
+                        bias.value().numel() == weight.size(0),
+                    "bias must contain one value per output channel on the same CUDA device");
+    }
+    const at::cuda::CUDAGuard device_guard(activation.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major > 7 ||
+                    (properties->major == 7 && properties->minor >= 5),
+                "turing_int8_linear_out requires sm75 or newer");
+    TorchOpContext ctx;
+    comfyui_turing_utils::kernels::turing_int8_linear(
+        from_torch(activation),
+        from_torch(weight),
+        from_torch(activation_scale),
+        from_torch(weight_scale),
+        maybe_tensor(bias),
+        from_torch(output),
+        int_cast<int>(tile_policy));
+    return output;
+}
+
 at::Tensor turing_dequantize_int8_bf16(at::Tensor accumulator,
                                         at::Tensor activation_scale,
                                         at::Tensor weight_scale,
@@ -536,6 +595,46 @@ at::Tensor turing_swiglu_int8_convrot_quantize_scaled(
                 "scaled SwiGLU ConvRot requires sm75 or newer");
     at::Tensor output = at::empty(
         {rows, hidden}, input.options().dtype(at::kChar));
+    TorchOpContext ctx;
+    comfyui_turing_utils::kernels::turing_swiglu_int8_convrot_quantize_scaled(
+        from_torch(input), from_torch(scales), from_torch(output));
+    return output;
+}
+
+at::Tensor turing_swiglu_int8_convrot_quantize_scaled_out(
+    at::Tensor input,
+    at::Tensor scales,
+    at::Tensor output,
+    int64_t group_size) {
+    input = input.contiguous();
+    scales = scales.reshape({-1}).to(at::kFloat).contiguous();
+    check_cuda_2d(input, "input");
+    check_half_like(input, "input");
+    TORCH_CHECK(group_size == 256,
+                "scaled SwiGLU ConvRot only supports group_size=256");
+    TORCH_CHECK(input.size(1) % 2 == 0,
+                "scaled SwiGLU input width must be even");
+    const int64_t rows = input.size(0);
+    const int64_t hidden = input.size(1) / 2;
+    TORCH_CHECK(rows > 0 && hidden > 0 && hidden % group_size == 0,
+                "scaled SwiGLU width must be positive and divisible by 256");
+    TORCH_CHECK(scales.is_cuda() && scales.device() == input.device() &&
+                    scales.numel() == rows,
+                "scaled SwiGLU requires one FP32 scale per input row");
+    TORCH_CHECK(output.is_cuda() && output.device() == input.device() &&
+                    output.dim() == 2 && output.scalar_type() == at::kChar &&
+                    output.size(0) == rows && output.size(1) == hidden &&
+                    output.stride(1) == 1 && output.stride(0) >= hidden,
+                "scaled SwiGLU direct output shape/stride is incompatible");
+    TORCH_CHECK(rows <= std::numeric_limits<int>::max() &&
+                    hidden <= std::numeric_limits<int>::max() &&
+                    output.stride(0) <= std::numeric_limits<int>::max(),
+                "scaled SwiGLU dimensions exceed the CUDA kernel range");
+    const at::cuda::CUDAGuard device_guard(input.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major > 7 ||
+                    (properties->major == 7 && properties->minor >= 5),
+                "scaled SwiGLU ConvRot requires sm75 or newer");
     TorchOpContext ctx;
     comfyui_turing_utils::kernels::turing_swiglu_int8_convrot_quantize_scaled(
         from_torch(input), from_torch(scales), from_torch(output));
@@ -910,6 +1009,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("weight_scale"),
           pybind11::arg("bias") = std::nullopt,
           pybind11::arg("tile_policy") = 0);
+    m.def("turing_int8_linear_out",
+          &turing_int8_linear_out,
+          pybind11::arg("activation"),
+          pybind11::arg("weight"),
+          pybind11::arg("activation_scale"),
+          pybind11::arg("weight_scale"),
+          pybind11::arg("bias"),
+          pybind11::arg("output"),
+          pybind11::arg("tile_policy") = 0);
     m.def("turing_dequantize_int8_bf16",
           &turing_dequantize_int8_bf16,
           pybind11::arg("accumulator"),
@@ -924,6 +1032,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           &turing_swiglu_int8_convrot_quantize_scaled,
           pybind11::arg("input"),
           pybind11::arg("scales"),
+          pybind11::arg("group_size") = 256);
+    m.def("turing_swiglu_int8_convrot_quantize_scaled_out",
+          &turing_swiglu_int8_convrot_quantize_scaled_out,
+          pybind11::arg("input"),
+          pybind11::arg("scales"),
+          pybind11::arg("output"),
           pybind11::arg("group_size") = 256);
     m.def("turing_swiglu_int4_convrot_quantize",
           &turing_swiglu_int4_convrot_quantize,

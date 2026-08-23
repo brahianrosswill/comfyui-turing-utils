@@ -293,6 +293,7 @@ struct TileTuneCache {
 
 TileTuneCache w4_tile_cache;
 TileTuneCache w8_tile_cache;
+TileTuneCache ampere_w8_tile_cache;
 TileTuneCache codebook_tile_cache;
 
 template <typename RunPolicy>
@@ -366,6 +367,60 @@ bool run_auto_tuned_tile(TileTuneCache &cache,
     for (int index = 0; index < candidate_count; ++index) {
         const int policy = candidates[index];
         if (best_ms[policy] < best_ms[selected] * 0.98f) {
+            selected = policy;
+        }
+    }
+    cache.selected_policy.emplace(key, selected);
+    return run_policy(selected);
+}
+
+template <typename RunPolicy>
+bool run_auto_tuned_ampere_tile(TileTuneCache &cache,
+                                int m,
+                                int n,
+                                int k,
+                                int heuristic_policy,
+                                cudaStream_t stream,
+                                RunPolicy &&run_policy) {
+    int device = 0;
+    checkCUDA(cudaGetDevice(&device));
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    checkCUDA(cudaStreamIsCapturing(stream, &capture_status));
+    if (capture_status != cudaStreamCaptureStatusNone) {
+        return run_policy(heuristic_policy);
+    }
+    const TileTuneKey key{device, m, n, k};
+    std::lock_guard<std::mutex> lock(cache.mutex);
+    if (auto found = cache.selected_policy.find(key);
+        found != cache.selected_policy.end()) {
+        return run_policy(found->second);
+    }
+
+    // Compare native SM80 shapes with the best legacy schedule for this M.
+    // The SM80 128x256 tile wins sustained 16K-row H3 contractions, while the
+    // legacy narrow-M tile can still win short tails. One pass is enough for
+    // these long matrices and keeps first-run tuning bounded.
+    const std::array<int, 4> candidates = {heuristic_policy, 6, 7, 8};
+    std::array<float, 9> elapsed;
+    elapsed.fill(std::numeric_limits<float>::infinity());
+    for (int policy : candidates) {
+        cudaEvent_t start = nullptr;
+        cudaEvent_t stop = nullptr;
+        checkCUDA(cudaEventCreate(&start));
+        checkCUDA(cudaEventCreate(&stop));
+        checkCUDA(cudaEventRecord(start, stream));
+        const bool launched = run_policy(policy);
+        checkCUDA(cudaEventRecord(stop, stream));
+        checkCUDA(cudaEventSynchronize(stop));
+        if (launched) {
+            checkCUDA(cudaEventElapsedTime(&elapsed[policy], start, stop));
+        }
+        checkCUDA(cudaEventDestroy(stop));
+        checkCUDA(cudaEventDestroy(start));
+    }
+    int selected = heuristic_policy;
+    for (int policy : candidates) {
+        if (elapsed[policy] < elapsed[selected] * 0.98f) {
             selected = policy;
         }
     }
@@ -705,6 +760,131 @@ bool run_int8_tile(const int8_t *activation,
         stream);
 }
 
+// Native SM80 INT8 Tensor Core mainloop.  Keeping the same EVT epilogue as
+// the SM75 implementation makes this a schedule substitution only: integer
+// accumulation, row/channel scales, bias, and BF16 rounding are unchanged.
+template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages>
+struct AmpereInt8Gemm {
+    using ElementA = int8_t;
+    using ElementB = int8_t;
+    using ElementC = cutlass::bfloat16_t;
+    using AccumulatorT = int32_t;
+    using ComputeT = float;
+    using LayoutA = cutlass::layout::RowMajor;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using LayoutC = cutlass::layout::RowMajor;
+    using ThreadblockShape = cutlass::gemm::GemmShape<TBM, TBN, TBK>;
+    using WarpShape = cutlass::gemm::GemmShape<WM, WN, WK>;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 32>;
+    using Swizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
+    static constexpr int Alignment = 16;
+    static constexpr int AlignmentC = 8;
+    static constexpr int EpilogueStages = 1;
+
+    using ThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<
+        ThreadblockShape, WarpShape, ElementC, AlignmentC, EpilogueStages>;
+    using Accumulator = cutlass::epilogue::threadblock::VisitorAccFetch;
+    using XScale = cutlass::epilogue::threadblock::VisitorColBroadcast<
+        ThreadMap, ComputeT, cute::Stride<_1, _0, int32_t>>;
+    using WScale = cutlass::epilogue::threadblock::VisitorRowBroadcast<
+        ThreadMap, ComputeT, cute::Stride<_0, _1, int32_t>>;
+    using Bias = cutlass::epilogue::threadblock::VisitorRowBroadcast<
+        ThreadMap, ComputeT, cute::Stride<_0, _1, int32_t>>;
+    using Multiply = cutlass::epilogue::threadblock::VisitorCompute<
+        cutlass::multiplies, ComputeT, ComputeT,
+        cutlass::FloatRoundStyle::round_to_nearest>;
+    using ScaledActivation = cutlass::epilogue::threadblock::Sm80EVT<
+        Multiply, Accumulator, XScale>;
+    using ScaledOutput = cutlass::epilogue::threadblock::Sm80EVT<
+        Multiply, ScaledActivation, WScale>;
+    using Add = cutlass::epilogue::threadblock::VisitorCompute<
+        cutlass::plus, ElementC, ComputeT,
+        cutlass::FloatRoundStyle::round_to_nearest>;
+    using BiasedOutput = cutlass::epilogue::threadblock::Sm80EVT<
+        Add, ScaledOutput, Bias>;
+    using Store = cutlass::epilogue::threadblock::VisitorAuxStore<
+        ThreadMap, ElementC, cutlass::FloatRoundStyle::round_to_nearest,
+        cute::Stride<int64_t, _1, int64_t>>;
+    using Callbacks = cutlass::epilogue::threadblock::Sm80EVT<Store, BiasedOutput>;
+    using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmWithVisitor<
+        ElementA, LayoutA, cutlass::ComplexTransform::kNone, Alignment,
+        ElementB, LayoutB, cutlass::ComplexTransform::kNone, Alignment,
+        ElementC, LayoutC, AlignmentC,
+        AccumulatorT, ComputeT,
+        cutlass::arch::OpClassTensorOp, cutlass::arch::Sm80,
+        ThreadblockShape, WarpShape, InstructionShape, Callbacks, Swizzle,
+        Stages, cutlass::arch::OpMultiplyAddSaturate,
+        EpilogueStages>::GemmKernel;
+    using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
+
+    static bool run(const int8_t *activation,
+                    const int8_t *weight,
+                    const float *activation_scale,
+                    const float *weight_scale,
+                    const float *bias,
+                    __nv_bfloat16 *output,
+                    int m,
+                    int n,
+                    int k,
+                    int output_stride,
+                    cudaStream_t stream) {
+        cutlass::gemm::GemmCoord problem(m, n, k);
+        typename Callbacks::Arguments callbacks{
+            {{{{},
+               {const_cast<float *>(activation_scale), 0.0f, {_1{}, _0{}, m}},
+               {}},
+              {const_cast<float *>(weight_scale), 0.0f, {_0{}, _1{}, n}},
+              {}},
+             {const_cast<float *>(bias), 0.0f, {_0{}, _1{}, n}},
+             {}},
+            {reinterpret_cast<ElementC *>(output),
+             {output_stride, _1{}, static_cast<int64_t>(m) * output_stride}}};
+        typename Gemm::Arguments arguments(
+            cutlass::gemm::GemmUniversalMode::kGemm,
+            problem,
+            1,
+            callbacks,
+            const_cast<int8_t *>(activation),
+            const_cast<int8_t *>(weight),
+            nullptr,
+            nullptr,
+            static_cast<int64_t>(m) * k,
+            static_cast<int64_t>(n) * k,
+            0,
+            0,
+            k,
+            k,
+            0,
+            0);
+        Gemm gemm;
+        if (gemm.can_implement(arguments) != cutlass::Status::kSuccess ||
+            Gemm::get_workspace_size(arguments) != 0) {
+            return false;
+        }
+        if (gemm.initialize(arguments, nullptr, stream) != cutlass::Status::kSuccess) {
+            return false;
+        }
+        return gemm(stream) == cutlass::Status::kSuccess;
+    }
+};
+
+template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages>
+bool run_ampere_int8_tile(const int8_t *activation,
+                          const int8_t *weight,
+                          const float *activation_scale,
+                          const float *weight_scale,
+                          const float *bias,
+                          __nv_bfloat16 *output,
+                          int m,
+                          int n,
+                          int k,
+                          int output_stride,
+                          cudaStream_t stream) {
+    return AmpereInt8Gemm<TBM, TBN, TBK, WM, WN, WK, Stages>::run(
+        activation, weight, activation_scale, weight_scale, bias, output,
+        m, n, k, output_stride, stream);
+}
+
 template <int TBM, int TBN, int WM, int WN>
 bool run_codebook_tile(const int8_t *activation,
                        const int8_t *weight,
@@ -808,7 +988,7 @@ bool dispatch_int8(const int8_t *activation,
                    int output_stride,
                    cudaStream_t stream,
                    int tile_policy = 0) {
-    const auto run_policy = [&](int policy) {
+    const auto run_sm75_policy = [&](int policy) {
         switch (policy) {
         case 1:
             return run_int8_tile<16, 64, 16, 32>(
@@ -834,8 +1014,29 @@ bool dispatch_int8(const int8_t *activation,
             throw std::runtime_error("invalid Turing INT8 tile policy");
         }
     };
+    const auto run_sm80_policy = [&](int policy) {
+        switch (policy) {
+        case 6:
+            return run_ampere_int8_tile<128, 256, 64, 64, 64, 64, 3>(
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
+        case 7:
+            return run_ampere_int8_tile<128, 128, 64, 64, 64, 64, 4>(
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
+        case 8:
+            return run_ampere_int8_tile<64, 128, 64, 32, 64, 64, 4>(
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
+        default:
+            throw std::runtime_error("invalid SM80 INT8 tile policy");
+        }
+    };
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
     if (tile_policy != 0) {
-        return run_policy(tile_policy);
+        return properties->major >= 8 && tile_policy >= 6
+            ? run_sm80_policy(tile_policy)
+            : run_sm75_policy(tile_policy);
     }
     int heuristic_policy;
     if (m <= 32) {
@@ -849,12 +1050,21 @@ bool dispatch_int8(const int8_t *activation,
     } else {
         heuristic_policy = 5;
     }
-    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    if (properties->major >= 8) {
+        const auto run_ampere_candidate = [&](int policy) {
+            return policy >= 6
+                ? run_sm80_policy(policy)
+                : run_sm75_policy(policy);
+        };
+        return run_auto_tuned_ampere_tile(
+            ampere_w8_tile_cache, m, n, k, heuristic_policy, stream,
+            run_ampere_candidate);
+    }
     if (properties->major != 7 || properties->minor != 5) {
-        return run_policy(heuristic_policy);
+        return run_sm75_policy(heuristic_policy);
     }
     return run_auto_tuned_tile(
-        w8_tile_cache, m, n, k, heuristic_policy, stream, run_policy);
+        w8_tile_cache, m, n, k, heuristic_policy, stream, run_sm75_policy);
 }
 
 bool dispatch_codebook(const int8_t *activation,
@@ -1208,7 +1418,7 @@ void turing_int8_linear(Tensor activation,
         m,
         n,
         k,
-        n,
+        static_cast<int>(output.stride(0)),
         getCurrentCUDAStream(),
         tile_policy);
 

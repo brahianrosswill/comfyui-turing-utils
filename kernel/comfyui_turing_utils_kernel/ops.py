@@ -126,6 +126,39 @@ def _turing_int8_linear_fake(
     )
 
 
+@torch.library.custom_op(
+    "turing_utils::int8_linear_out", mutates_args=("output",)
+)
+def turing_int8_linear_out(
+    activation: torch.Tensor,
+    weight: torch.Tensor,
+    activation_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> None:
+    """Write W8A8 output into a row-major view with an arbitrary row stride."""
+    if activation.device.type != "cuda" or output.device != activation.device:
+        raise RuntimeError("Turing INT8 direct output requires one CUDA device")
+    if torch.cuda.get_device_capability(activation.device) < (7, 5):
+        raise RuntimeError("Turing INT8 direct output requires sm75 or newer")
+    _C.turing_int8_linear_out(
+        activation.contiguous(),
+        weight.contiguous(),
+        activation_scale.contiguous(),
+        weight_scale.contiguous(),
+        None if bias is None else bias.contiguous(),
+        output,
+    )
+
+
+@turing_int8_linear_out.register_fake
+def _turing_int8_linear_out_fake(
+    activation, weight, activation_scale, weight_scale, output, bias=None
+):
+    return None
+
+
 @torch.library.custom_op("turing_utils::dequantize_int8_bf16", mutates_args=())
 def turing_dequantize_int8_bf16(
     accumulator: torch.Tensor,
@@ -217,6 +250,33 @@ def _turing_swiglu_int8_convrot_quantize_scaled_fake(
         dtype=torch.int8,
         device=x.device,
     )
+
+
+@torch.library.custom_op(
+    "turing_utils::swiglu_int8_convrot_quantize_scaled_out",
+    mutates_args=("output",),
+)
+def turing_swiglu_int8_convrot_quantize_scaled_out(
+    x: torch.Tensor,
+    scales: torch.Tensor,
+    output: torch.Tensor,
+    group_size: int = 256,
+) -> None:
+    """Quantize one channel shard directly into its final INT8 row view."""
+    if x.device.type != "cuda" or output.device != x.device:
+        raise RuntimeError("scaled Turing SwiGLU direct output requires CUDA")
+    if torch.cuda.get_device_capability(x.device) < (7, 5):
+        raise RuntimeError("scaled Turing SwiGLU direct output requires sm75+")
+    _C.turing_swiglu_int8_convrot_quantize_scaled_out(
+        x.contiguous(), scales.contiguous(), output, group_size
+    )
+
+
+@turing_swiglu_int8_convrot_quantize_scaled_out.register_fake
+def _turing_swiglu_int8_convrot_quantize_scaled_out_fake(
+    x, scales, output, group_size=256
+):
+    return None
 
 
 @torch.library.custom_op("turing_utils::swiglu_int4_convrot_quantize", mutates_args=())

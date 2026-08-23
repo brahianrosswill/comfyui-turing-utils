@@ -1,7 +1,7 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's quantized
-runtime. Version 0.31.0 contains legacy packed W4A8 and grouped-codebook W4A8
+runtime. Version 0.32.0 contains legacy packed W4A8 and grouped-codebook W4A8
 Tensor Core GEMMs, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, bundled Sage attention, pure-INT8 W8A8 attention,
@@ -89,7 +89,11 @@ exact-sm75 runtime choice; dense W8A8, Sol, and SLA share the bundled sm75+
 prepared-attention path, including protected dense work. The historical `_sm75`
 extension suffix is retained as an ABI name. `7.5+PTX` remains useful for
 compatibility validation, while an `8.6` build enables native Ampere async-copy
-and INT8 MMA instructions.
+and INT8 MMA instructions. Kernel 0.32 also instantiates CUTLASS SM80 W8A8
+`m16n8k32` contractions and caches the best supported tile for each M/N/K
+shape; the sm75 implementation remains the fallback behind the same public
+operator. Both W8 and scaled-SwiGLU operators accept row-strided destination
+views, allowing activation shards to write at their final offsets.
 
 ```bash
 COMFYUI_TURING_UTILS_ARCH_LIST="7.5;8.0;8.6;8.9;9.0" \

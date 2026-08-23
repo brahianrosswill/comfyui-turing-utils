@@ -223,6 +223,16 @@ class KernelCustomOpContractTest(unittest.TestCase):
         self.assertEqual(scaled.shape, (3, 256))
         self.assertEqual(scaled.dtype, torch.int8)
         self.assertEqual(scaled.device.type, "meta")
+        scaled_destination = torch.empty(
+            (3, 256), dtype=torch.int8, device="meta"
+        )
+        self.assertIsNone(
+            kernel.turing_swiglu_int8_convrot_quantize_scaled_out(
+                x,
+                torch.empty((3,), dtype=torch.float32, device="meta"),
+                scaled_destination,
+            )
+        )
 
     def test_linear_epilogue_and_norm_fake_contracts(self):
         activation = torch.empty((7, 128), dtype=torch.int8, device="meta")
@@ -265,6 +275,18 @@ class KernelCustomOpContractTest(unittest.TestCase):
         )
         self.assertEqual(int8_linear.shape, (7, 64))
         self.assertEqual(int8_linear.dtype, torch.bfloat16)
+        direct_linear = torch.empty(
+            (7, 64), dtype=torch.bfloat16, device="meta"
+        )
+        self.assertIsNone(
+            kernel.turing_int8_linear_out(
+                activation,
+                torch.empty((64, 128), dtype=torch.int8, device="meta"),
+                row_scale,
+                column_scale,
+                direct_linear,
+            )
+        )
 
         accumulator = torch.empty((7, 80), dtype=torch.int32, device="meta")
         epilogue = kernel.turing_dequantize_int8_bf16(

@@ -190,6 +190,15 @@ the current diffusion VBAR is never explicitly reclaimed by this policy. This
 uses the quiet residency bitmap instead of `vbars_analyze`, so normal runs do
 not emit one warning per pinned page.
 
+The activation budget also protects the two asynchronous weight-offload
+streams. For a dynamic MiniMax model it estimates two average transformer
+blocks from the current patcher's staged model bytes and installed layer
+count, aligns that value to the 32 MiB VBAR page, and bounds it to
+512 MiB--1 GiB. This keeps
+the current/prefetched weights resident after an activation shard has already
+reached the modeled MFU plateau without introducing an Ampere/Turing policy
+branch.
+
 The sampler low-water mark is keyed by operation as well as sequence shape.
 Attention, QKV projection, and MLP observe different live-buffer boundaries;
 a low pre-attention reading must not force the later MLP to retain row
@@ -216,7 +225,7 @@ hidden tensor of hot weights and avoids a substantially costlier PCIe reload.
 Explicit chunk/head/channel overrides remain available for measurement.
 
 QKV row tiles write directly into their final INT8 Q/K and BF16 V storage.
-Kernel 0.30 accepts a reusable K anchor computed from the same nine positions
+Kernel 0.32 accepts a reusable K anchor computed from the same nine positions
 in the complete sequence, so streaming no longer disables adaptive anchoring.
 If attention must be split further, only whole heads are grouped; every group
 still contains every token and calls the workflow-selected backend. Legal group
@@ -233,6 +242,12 @@ once, including its normal BF16 epilogue. The A8 row is smaller than an INT32
 output accumulator for H3, so this removes full fc1/SwiGLU intermediates
 without changing the contraction, but costs extra fc1 work and is selected only
 after row streaming cannot satisfy the budget or when explicitly diagnosed.
+
+Kernel 0.32 extends the W8 and scaled-SwiGLU ABIs with row-strided output
+views. Gate/up channel intervals, the final compressed A8 interval, and the
+fc2 row interval therefore land at their final offsets instead of allocating
+then copying per-shard tensors. Older kernels retain the same numerical path
+through an allocate-and-copy compatibility fallback.
 
 Wan/Bernini reference shapes are padded per stream before aggregation. The
 outer sampling wrapper also supplies the real sampler batch, so repeated
@@ -381,6 +396,12 @@ On DynamicVRAM, reaching the call limit only marks the report pending. Event
 timings are read after the existing outer sampler fence, avoiding a mid-model
 synchronization that would otherwise interrupt asynchronous weight prefetch.
 Non-DynamicVRAM execution retains the bounded end-of-window synchronization.
+
+Profiling is bucketed by operation, shape, and execution path. The default
+four buckets can capture both H3 resolutions and both attention/MLP phases in
+one run; `COMFYUI_TURING_UTILS_PROFILE_BUCKETS` changes that bound. Sparse
+selected/possible block counts stay as device scalars until the same outer
+fence, so route-density diagnostics do not add a hot-path `.item()`.
 
 Kernel 0.31 makes architecture validation part of the same bounded report. The
 Python summary publishes the architectures embedded by the wheel build and
@@ -593,6 +614,12 @@ and end-to-end test.
 For native Ampere acceptance, use `COMFYUI_TURING_UTILS_ARCH_LIST="8.6"`.
 The resulting attention cubins use the `__CUDA_ARCH__ >= 800` async-copy and
 INT8 MMA paths; A40 preflight covers BF16 D64/D128 GQA for both Sol and W8A8.
+Sol's initial Q, exact Q/K, and W8 value tiles use the shared async-copy
+abstraction, which emits `cp.async` on sm80+ and the same synchronous loads on
+sm75. W8 projections use CUTLASS SM80 `m16n8k32` kernels with a per-shape
+three-schedule cache; explicit policies remain available for controlled
+benchmarking. The common scale/bias/BF16 visitor is shared with sm75, so this
+is a schedule substitution rather than a model-specific numerical path.
 The historical `_sage_*_sm75` module names remain stable ABI identifiers.
 On the initial native-sm86 direction check (`N=4096`, H8, D128, BF16), dense
 W8A8 measured 0.840 ms, Sol FP16-PV 0.428 ms, and Sol W8A8 0.417 ms at 19.7%

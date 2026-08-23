@@ -10,14 +10,16 @@ from .ops import (
     turing_gelu_int8_convrot_quantize,
     turing_gelu_int4_convrot_quantize,
     turing_int8_linear,
+    turing_int8_linear_out,
     turing_swiglu_int8_convrot_quantize,
     turing_swiglu_int8_convrot_quantize_scaled,
+    turing_swiglu_int8_convrot_quantize_scaled_out,
     turing_swiglu_int4_convrot_quantize,
     turing_w4a8_linear,
 )
 from . import turing_sage
 
-__version__ = "0.31.0"
+__version__ = "0.32.0"
 
 __all__ = [
     "turing_bf16_int8_convrot_quantize",
@@ -31,8 +33,10 @@ __all__ = [
     "turing_gelu_int8_convrot_quantize",
     "turing_gelu_int4_convrot_quantize",
     "turing_int8_linear",
+    "turing_int8_linear_out",
     "turing_swiglu_int8_convrot_quantize",
     "turing_swiglu_int8_convrot_quantize_scaled",
+    "turing_swiglu_int8_convrot_quantize_scaled_out",
     "turing_swiglu_int4_convrot_quantize",
     "turing_w4a8_linear",
     "turing_sage",

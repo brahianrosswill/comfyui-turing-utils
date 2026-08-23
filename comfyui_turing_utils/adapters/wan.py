@@ -86,16 +86,14 @@ def _make_self_attention_forward(attention, attention_container, original=None):
 
         import comfy.model_management
 
-        profiling = CUDA_PHASE_PROFILER.enabled
-        if profiling:
-            query = CUDA_PHASE_PROFILER.call("wan.q_projection", self.q, x)
-            key = CUDA_PHASE_PROFILER.call("wan.k_projection", self.k, x)
-            value = CUDA_PHASE_PROFILER.call("wan.v_projection", self.v, x)
-        else:
-            query = self.q(x)
-            key = self.k(x)
-            value = self.v(x)
         batch, sequence = x.shape[:2]
+        profile_shape = (batch, self.num_heads, sequence, self.head_dim)
+        CUDA_PHASE_PROFILER.begin_operation(
+            "attention", profile_shape, adapter="wan", path="full"
+        )
+        query = CUDA_PHASE_PROFILER.call("wan.q_projection", self.q, x)
+        key = CUDA_PHASE_PROFILER.call("wan.k_projection", self.k, x)
+        value = CUDA_PHASE_PROFILER.call("wan.v_projection", self.v, x)
         query = query.view(batch, sequence, self.num_heads, self.head_dim)
         key = key.view(batch, sequence, self.num_heads, self.head_dim)
         value = value.view(batch, sequence, self.num_heads, self.head_dim)
@@ -121,6 +119,7 @@ def _make_self_attention_forward(attention, attention_container, original=None):
         )
         if not outcome.supported:
             del query, key, value
+            CUDA_PHASE_PROFILER.cancel_operation()
             return original(
                 self,
                 x,
@@ -128,13 +127,9 @@ def _make_self_attention_forward(attention, attention_container, original=None):
                 transformer_options=transformer_options,
             )
         output = outcome.output
-        if profiling:
-            output = CUDA_PHASE_PROFILER.call("wan.out_projection", self.o, output)
-            CUDA_PHASE_PROFILER.complete_attention(
-                (batch, self.num_heads, sequence, self.head_dim)
-            )
-            return output
-        return self.o(output)
+        output = CUDA_PHASE_PROFILER.call("wan.out_projection", self.o, output)
+        CUDA_PHASE_PROFILER.complete_operation("attention", profile_shape)
+        return output
 
     setattr(forward, _PREPARED_ATTENTION_FORWARD_ATTR, True)
     return weak_method(forward, attention)

@@ -20,6 +20,60 @@ _SOL_POLICY_CACHE: OrderedDict[
     tuple, tuple[torch.Tensor, torch.Tensor, int]
 ] = OrderedDict()
 _SOL_POLICY_CACHE_LOCK = Lock()
+_KEY_TILE_CACHE: OrderedDict[tuple, int] = OrderedDict()
+_KEY_TILE_CACHE_LOCK = Lock()
+_KEY_TILE_CACHE_LIMIT = 32
+
+
+def _automatic_key_tile_tokens(
+    device: torch.device,
+    *,
+    key_length: int,
+    head_dim: int,
+    use_w8a8: bool,
+) -> int:
+    """Choose the resident Sol schedule from kernel resource pressure.
+
+    Two 64-token stages were originally selected solely from sequence length.
+    On SM80+ the D=128 W8A8 two-stage specialization consumes substantially
+    more registers without increasing CTA-level parallelism; the one-stage
+    kernel therefore wins once its 64-token loop already saturates the GPU.
+    This is capability/resource scheduling, not a product-name branch.
+    """
+    device = torch.device(device)
+    device_index = device.index
+    if device.type == "cuda" and device_index is None:
+        device_index = torch.cuda.current_device()
+    capability = (
+        torch.cuda.get_device_capability(device_index)
+        if device.type == "cuda"
+        else (0, 0)
+    )
+    cache_key = (
+        device.type,
+        device_index,
+        capability,
+        int(key_length),
+        int(head_dim),
+        bool(use_w8a8),
+    )
+    with _KEY_TILE_CACHE_LOCK:
+        cached = _KEY_TILE_CACHE.get(cache_key)
+        if cached is not None:
+            _KEY_TILE_CACHE.move_to_end(cache_key)
+            return cached
+
+    if key_length <= 1024:
+        selected = 64
+    elif use_w8a8 and head_dim >= 128 and capability >= (8, 0):
+        selected = 64
+    else:
+        selected = 128
+    with _KEY_TILE_CACHE_LOCK:
+        _KEY_TILE_CACHE[cache_key] = selected
+        while len(_KEY_TILE_CACHE) > _KEY_TILE_CACHE_LIMIT:
+            _KEY_TILE_CACHE.popitem(last=False)
+    return selected
 
 
 @dataclass(frozen=True, slots=True)
@@ -841,7 +895,12 @@ def prequantize_sol_sageattn_from_qk(
     if key_tile_tokens not in (0, 64, 128):
         raise ValueError("key_tile_tokens must be 0 (auto), 64, or 128")
     if key_tile_tokens == 0:
-        key_tile_tokens = 128 if qk.key_int8.size(2) > 1024 else 64
+        key_tile_tokens = _automatic_key_tile_tokens(
+            qk.key_int8.device,
+            key_length=qk.key_int8.size(2),
+            head_dim=qk.original_head_dim,
+            use_w8a8=bool(use_w8a8),
+        )
     residual_subblocks = int(residual_subblocks)
     if residual_subblocks not in (1, 2):
         raise ValueError("residual_subblocks must be 1 or 2")
@@ -1114,7 +1173,12 @@ def prequantize_sla_sageattn_from_qk(
     if key_tile_tokens not in (0, 64, 128):
         raise ValueError("key_tile_tokens must be 0 (auto), 64, or 128")
     if key_tile_tokens == 0:
-        key_tile_tokens = 128 if qk.key_int8.size(2) > 1024 else 64
+        key_tile_tokens = _automatic_key_tile_tokens(
+            qk.key_int8.device,
+            key_length=qk.key_int8.size(2),
+            head_dim=qk.original_head_dim,
+            use_w8a8=bool(use_w8a8),
+        )
 
     sparse_query_blocks, exact_kv_blocks, sparse_block_count = _sol_block_policy(
         qk.query_int8.device,

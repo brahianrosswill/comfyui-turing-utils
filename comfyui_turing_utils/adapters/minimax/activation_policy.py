@@ -25,6 +25,8 @@ _ATTENTION_TARGET_WAVES = 4
 _ATTENTION_CTAS_PER_SM = 2
 _MAX_BALANCED_SHARDS = 4
 _MIN_SATURATED_GEMM_WIDTH = 1024
+_DEFAULT_WEIGHT_PREFETCH_BYTES = 512 * _MIB
+_MAX_WEIGHT_PREFETCH_BYTES = 1024 * _MIB
 _LOGGED_DECISIONS: set[tuple] = set()
 
 
@@ -277,6 +279,41 @@ def _current_model_is_dynamic(base_model, device: torch.device) -> bool:
         )
     except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
         return False
+
+
+def _dynamic_weight_prefetch_reserve(base_model, device: torch.device) -> int:
+    """Reserve two average DiT blocks for ComfyUI's two offload streams.
+
+    This is intentionally derived from the active VBAR rather than GPU model
+    names. Once an activation shard reaches its MFU plateau, retaining the
+    current and prefetched block is worth more than growing that shard.
+    """
+    default = _DEFAULT_WEIGHT_PREFETCH_BYTES
+    if not _current_model_is_dynamic(base_model, device):
+        return default
+    try:
+        patcher = base_model.current_patcher
+        vbar = patcher._vbar_get()
+        model_size = getattr(patcher, "model_size", None)
+        model_bytes = int(
+            model_size() if callable(model_size) else vbar.loaded_size()
+        )
+        layers = max(
+            int(getattr(base_model, "_turing_utils_minimax_layer_count", 0)),
+            1,
+        )
+    except (
+        AttributeError,
+        ReferenceError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return default
+    if model_bytes <= 0 or layers <= 1:
+        return default
+    reserve = math.ceil((2 * model_bytes / layers) / _VBAR_PAGE_BYTES) * _VBAR_PAGE_BYTES
+    return min(max(int(reserve), default), _MAX_WEIGHT_PREFETCH_BYTES)
 
 
 def _vbar_reclaimable_bytes(vbar) -> int:
@@ -625,7 +662,7 @@ def decide_activation_chunks(
     # CUDA graph/kernel scratch, and the desktop compositor.  The compositor's
     # long-lived allocation is separately represented by --reserve-vram.
     safety = max(768 * _MIB, int(usable * 0.075))
-    weight_scratch = 512 * _MIB
+    weight_scratch = _dynamic_weight_prefetch_reserve(base_model, x.device)
     working = max(planned_available - safety - weight_scratch, 0)
 
     if operation == "mlp":
@@ -708,7 +745,8 @@ def decide_activation_chunks(
         LOG.info(
             "MiniMax H3 activation policy: op=%s mode=%s tier=%d rows=%d path=%s "
             "chunk_rows=%d available=%.2f GiB reserve=%.2f GiB "
-            "planned_available=%.2f GiB estimated_peak(full/selected)=%.2f/%.2f GiB %s",
+            "planned_available=%.2f GiB weight_prefetch=%.2f GiB "
+            "estimated_peak(full/selected)=%.2f/%.2f GiB %s",
             operation,
             mode,
             decision.tier,
@@ -718,6 +756,7 @@ def decide_activation_chunks(
             available / 1024**3,
             reserve / 1024**3,
             planned_available / 1024**3,
+            weight_scratch / 1024**3,
             full_peak / 1024**3,
             streamed_peak / 1024**3,
             _log_memory_diagnostics(x.device, base_model),
@@ -765,7 +804,7 @@ def decide_attention_heads(
     )
     element = int(x.element_size())
     safety = max(768 * _MIB, int(usable * 0.075))
-    weight_scratch = 512 * _MIB
+    weight_scratch = _dynamic_weight_prefetch_reserve(base_model, x.device)
     working = max(planned_available - safety - weight_scratch, 0)
 
     def peak(group: int, cache_input: bool) -> int:
@@ -870,7 +909,8 @@ def decide_attention_heads(
         LOG.info(
             "MiniMax H3 attention policy: mode=%s tier=%d rows=%d heads=%d "
             "head_group=%d saturation_group=%d input_cache=%s available=%.2f GiB "
-            "reserve=%.2f GiB planned_available=%.2f GiB estimated_peak=%.2f GiB %s",
+            "reserve=%.2f GiB planned_available=%.2f GiB weight_prefetch=%.2f GiB "
+            "estimated_peak=%.2f GiB %s",
             mode,
             decision.tier,
             rows,
@@ -881,6 +921,7 @@ def decide_attention_heads(
             available / 1024**3,
             reserve / 1024**3,
             planned_available / 1024**3,
+            weight_scratch / 1024**3,
             estimated / 1024**3,
             _log_memory_diagnostics(x.device, base_model),
         )
@@ -913,7 +954,8 @@ def decide_ffn_channels(
         "mlp",
     )
     safety = max(768 * _MIB, int(usable * 0.075))
-    working = max(planned_available - safety - 512 * _MIB, 0)
+    weight_scratch = _dynamic_weight_prefetch_reserve(base_model, x.device)
+    working = max(planned_available - safety - weight_scratch, 0)
     tile_rows = min(rows, chunk_rows or rows)
     hidden = int(x.shape[-1])
     persistent = rows * hidden * int(x.element_size())
@@ -983,7 +1025,8 @@ def decide_ffn_channels(
         LOG.info(
             "MiniMax H3 FFN policy: mode=%s tier=%d rows=%d row_chunk=%d "
             "channel_chunk=%d available=%.2f GiB reserve=%.2f GiB "
-            "planned_available=%.2f GiB estimated_peak=%.2f GiB %s",
+            "planned_available=%.2f GiB weight_prefetch=%.2f GiB "
+            "estimated_peak=%.2f GiB %s",
             mode,
             decision.tier,
             rows,
@@ -992,6 +1035,7 @@ def decide_ffn_channels(
             available / 1024**3,
             reserve / 1024**3,
             planned_available / 1024**3,
+            weight_scratch / 1024**3,
             estimated / 1024**3,
             _log_memory_diagnostics(x.device, base_model),
         )
