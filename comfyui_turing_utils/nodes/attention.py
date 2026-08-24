@@ -327,36 +327,11 @@ class LegacySlaSparseAttentionPatch:
         )
 
 
-def _partial_step_inputs() -> dict:
-    return {
-        "partial_dense_prefix_steps": (
-            "INT",
-            {
-                "default": 0,
-                "min": 0,
-                "max": 1000,
-                "step": 1,
-                "tooltip": "Dense leading steps only when the sampler starts below the model's full sigma_max, such as a low-noise second pass.",
-            },
-        ),
-        "partial_dense_suffix_steps": (
-            "INT",
-            {
-                "default": 0,
-                "min": 0,
-                "max": 1000,
-                "step": 1,
-                "tooltip": "Dense trailing steps only for a partial-denoise sampler. Full and partial schedules are detected from sigma values, not call order.",
-            },
-        ),
-    }
-
-
 def _rewrite_dense_backend_tooltips(required: dict) -> dict:
     required = dict(required)
     explanations = {
-        "dense_prefix_steps": "Leading steps on a full-denoise schedule that use the loader-selected dense backend across every transformer layer.",
-        "dense_suffix_steps": "Trailing steps on a full-denoise schedule that use the loader-selected dense backend across every transformer layer.",
+        "dense_prefix_steps": "Leading steps of every sampler invocation that use the loader-selected dense backend across every transformer layer.",
+        "dense_suffix_steps": "Trailing steps of every sampler invocation that use the loader-selected dense backend across every transformer layer.",
         "dense_prefix_layers": "Leading transformer layers kept on the loader-selected dense backend during sparse steps.",
         "dense_suffix_layers": "Trailing transformer layers kept on the loader-selected dense backend during sparse steps.",
     }
@@ -377,14 +352,8 @@ class SolSparseAttentionPatch(LegacySolSparseAttentionPatch):
     def INPUT_TYPES(cls):
         inputs = LegacySolSparseAttentionPatch.INPUT_TYPES()
         required = _rewrite_dense_backend_tooltips(inputs["required"])
-        # Keep the related schedule controls adjacent in newly created nodes.
-        rebuilt = {}
-        for name, spec in required.items():
-            rebuilt[name] = spec
-            if name == "dense_suffix_steps":
-                rebuilt.update(_partial_step_inputs())
         return {
-            "required": rebuilt,
+            "required": required,
             "optional": {
                 "debug_route_density": inputs["optional"]["debug_route_density"]
             },
@@ -402,8 +371,6 @@ class SolSparseAttentionPatch(LegacySolSparseAttentionPatch):
         sparse_reference_audio: bool = False,
         dense_prefix_steps: int = 1,
         dense_suffix_steps: int = 0,
-        partial_dense_prefix_steps: int = 0,
-        partial_dense_suffix_steps: int = 0,
         dense_prefix_layers: int = 2,
         dense_suffix_layers: int = 0,
         debug_route_density: bool = False,
@@ -420,8 +387,6 @@ class SolSparseAttentionPatch(LegacySolSparseAttentionPatch):
                 sparse_reference_audio=sparse_reference_audio,
                 dense_prefix_steps=dense_prefix_steps,
                 dense_suffix_steps=dense_suffix_steps,
-                partial_dense_prefix_steps=partial_dense_prefix_steps,
-                partial_dense_suffix_steps=partial_dense_suffix_steps,
                 dense_prefix_layers=dense_prefix_layers,
                 dense_suffix_layers=dense_suffix_layers,
                 debug_route_density=debug_route_density,
@@ -438,13 +403,8 @@ class SlaSparseAttentionPatch(LegacySlaSparseAttentionPatch):
     def INPUT_TYPES(cls):
         inputs = LegacySlaSparseAttentionPatch.INPUT_TYPES()
         required = _rewrite_dense_backend_tooltips(inputs["required"])
-        rebuilt = {}
-        for name, spec in required.items():
-            rebuilt[name] = spec
-            if name == "dense_suffix_steps":
-                rebuilt.update(_partial_step_inputs())
         return {
-            "required": rebuilt,
+            "required": required,
             "optional": {
                 "debug_route_density": inputs["optional"]["debug_route_density"]
             },
@@ -461,8 +421,6 @@ class SlaSparseAttentionPatch(LegacySlaSparseAttentionPatch):
         sparse_reference_audio: bool = False,
         dense_prefix_steps: int = 0,
         dense_suffix_steps: int = 0,
-        partial_dense_prefix_steps: int = 0,
-        partial_dense_suffix_steps: int = 0,
         dense_prefix_layers: int = 0,
         dense_suffix_layers: int = 0,
         debug_route_density: bool = False,
@@ -478,8 +436,6 @@ class SlaSparseAttentionPatch(LegacySlaSparseAttentionPatch):
                 sparse_reference_audio=sparse_reference_audio,
                 dense_prefix_steps=dense_prefix_steps,
                 dense_suffix_steps=dense_suffix_steps,
-                partial_dense_prefix_steps=partial_dense_prefix_steps,
-                partial_dense_suffix_steps=partial_dense_suffix_steps,
                 dense_prefix_layers=dense_prefix_layers,
                 dense_suffix_layers=dense_suffix_layers,
                 debug_route_density=debug_route_density,

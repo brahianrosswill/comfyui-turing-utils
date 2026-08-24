@@ -107,8 +107,8 @@ only after its CUDA sources or required version change.
   dense first/last-layer protection, and an internal automatic short-sequence
   crossover. It inherits `w8a8`, `sage`, or `sdpa` from `Load ConvRot DiT`:
   W8A8 selects integer sparse PV, while Sage/SDPA select the floating FP16
-  sparse core. Partial-denoise prefix/suffix controls are independent from a
-  full schedule, detected by sigma range rather than sampler call order.
+  sparse core. Dense prefix/suffix counts are local to every sampler invocation,
+  so one configured model can feed both stages without pass-specific controls.
 - `Configure SLA Sparse Attention` implements the MiniMax H3 Turbo-SLA runtime as
   fixed-budget 128-query by 64-key Top-K routing. It shares Sol's semantic
   reference protection, dense step/layer scheduling, fused Q/K preprocessing,
@@ -335,9 +335,8 @@ contract, and calls Sage directly. Dense Sol/SLA protection therefore does not
 fall back through the original model attention or repeat QKV projection. The
 same bridge covers explicit SDPA and third-party-loader fallback paths.
 
-Sol keeps the first full-denoise step and the first two transformer layers
-dense by default. Partial denoise defaults to zero dense prefix/suffix steps
-and can be configured independently. If
+Sol keeps the first step of every sampler invocation and the first two
+transformer layers dense by default. If
 `dense_prefix_layers + dense_suffix_layers` reaches or exceeds
 the runtime layer count, every layer dispatches directly to the selected dense
 W8A8, Sage, or SDPA backend and skips all Sol preprocessing.

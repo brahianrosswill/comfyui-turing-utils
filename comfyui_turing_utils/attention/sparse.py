@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import math
 from collections.abc import Callable
 
 import torch
@@ -203,29 +202,17 @@ def _sparse_dense_schedule(
     state: dict[str, object] | None = None,
     *,
     track_step: bool = False,
-    partial_prefix_steps: int | None = None,
-    partial_suffix_steps: int | None = None,
-    full_sigma_max: float | None = None,
 ) -> bool:
     """Select dense steps from the sampler's actual sigma schedule.
 
-    A schedule beginning below the model's full ``sigma_max`` is a partial
-    denoise pass (for example the low-noise stage after latent upscaling).  It
-    gets an independent prefix/suffix policy instead of resetting and reusing
-    the full-pass counters.  Runtime state lives in ``transformer_options`` by
-    default, so a shared model can serve multiple samplers without mutable
-    state leaking between ModelPatcher branches.
+    Prefix and suffix counts are local to every sampler invocation. Runtime
+    state lives in ``transformer_options`` by default, so a shared model can
+    serve multiple samplers without mutable state leaking between ModelPatcher
+    branches.
     """
-    partial_prefix_steps = (
-        prefix_steps if partial_prefix_steps is None else int(partial_prefix_steps)
-    )
-    partial_suffix_steps = (
-        suffix_steps if partial_suffix_steps is None else int(partial_suffix_steps)
-    )
-    if (
-        max(prefix_steps, suffix_steps, partial_prefix_steps, partial_suffix_steps) <= 0
-        and not track_step
-    ) or not isinstance(transformer_options, dict):
+    if (max(prefix_steps, suffix_steps) <= 0 and not track_step) or not isinstance(
+        transformer_options, dict
+    ):
         return False
     if state is None:
         state = transformer_options.setdefault(
@@ -248,32 +235,16 @@ def _sparse_dense_schedule(
     if (
         state.get("sample_sigmas") is sample_sigmas
         and state.get("current_sigmas") is current_sigmas
-        and state.get("policy")
-        == (
-            prefix_steps,
-            suffix_steps,
-            partial_prefix_steps,
-            partial_suffix_steps,
-            full_sigma_max,
-        )
+        and state.get("policy") == (prefix_steps, suffix_steps)
     ):
         return bool(state["dense"])
-    is_partial = False
-    if full_sigma_max is not None and math.isfinite(float(full_sigma_max)):
-        schedule_start = float(sample_sigmas.flatten()[0].detach().float().item())
-        sigma_max = float(full_sigma_max)
-        tolerance = max(abs(sigma_max) * 1.0e-4, 1.0e-6)
-        is_partial = schedule_start < sigma_max - tolerance
-    selected_prefix_steps = partial_prefix_steps if is_partial else prefix_steps
-    selected_suffix_steps = partial_suffix_steps if is_partial else suffix_steps
     current = current_sigmas.flatten()[0].to(sample_sigmas)
     step = int(torch.argmin((sample_sigmas.flatten() - current).abs()).item())
     sampling_steps = sample_sigmas.numel() - 1
-    effective_prefix_steps = min(selected_prefix_steps, sampling_steps)
-    effective_suffix_steps = min(selected_suffix_steps, sampling_steps)
+    effective_prefix_steps = min(prefix_steps, sampling_steps)
+    effective_suffix_steps = min(suffix_steps, sampling_steps)
     dense = step < effective_prefix_steps or (
-        effective_suffix_steps > 0
-        and step >= sampling_steps - effective_suffix_steps
+        effective_suffix_steps > 0 and step >= sampling_steps - effective_suffix_steps
     )
     state.clear()
     state.update(
@@ -284,14 +255,7 @@ def _sparse_dense_schedule(
         sampling_steps=sampling_steps,
         prefix_steps=effective_prefix_steps,
         suffix_steps=effective_suffix_steps,
-        is_partial=is_partial,
-        policy=(
-            prefix_steps,
-            suffix_steps,
-            partial_prefix_steps,
-            partial_suffix_steps,
-            full_sigma_max,
-        ),
+        policy=(prefix_steps, suffix_steps),
     )
     return dense
 
@@ -389,7 +353,10 @@ def _inspect_sparse_attention_call(
     if reason is not None:
         return None, reason
     effective_min_sequence = min_sequence_tokens or SPARSE_AUTO_MIN_SEQUENCE
-    if call.query_tokens < effective_min_sequence or call.key_tokens < effective_min_sequence:
+    if (
+        call.query_tokens < effective_min_sequence
+        or call.key_tokens < effective_min_sequence
+    ):
         return None, f"sequences shorter than {effective_min_sequence} tokens"
     if _required_sparse_layout_missing(
         transformer_options,
@@ -409,8 +376,7 @@ def _inspect_sparse_attention_call(
     )
     if (
         reject_fully_protected_query
-        and sum(stop - start for start, stop in dense_query_ranges)
-        >= call.query_tokens
+        and sum(stop - start for start, stop in dense_query_ranges) >= call.query_tokens
     ):
         return None, "all Query tokens are protected"
     exact_kv_ranges = _sparse_protected_ranges(
@@ -855,15 +821,19 @@ def turing_sol_sparse_attention(
                         dtype=torch.float32,
                     )
                     density = selected / possible.clamp_min(1.0)
-                    summary = torch.stack(
-                        (
-                            selected.sum(),
-                            possible.sum(),
-                            density.min(),
-                            density.mean(),
-                            density.max(),
+                    summary = (
+                        torch.stack(
+                            (
+                                selected.sum(),
+                                possible.sum(),
+                                density.min(),
+                                density.mean(),
+                                density.max(),
+                            )
                         )
-                    ).cpu().tolist()
+                        .cpu()
+                        .tolist()
+                    )
                     first_layer = min(entry[2] for entry in entries)
                     last_layer = max(entry[2] for entry in entries)
                     LOG.warning(
@@ -919,8 +889,10 @@ def turing_sol_sparse_attention(
             route_keys.add(kernel_key)
     else:
         output = sparse_result
-    result = output if call.skip_output_reshape else output.transpose(1, 2).reshape(
-        call.batch, -1, call.heads * call.head_dim
+    result = (
+        output
+        if call.skip_output_reshape
+        else output.transpose(1, 2).reshape(call.batch, -1, call.heads * call.head_dim)
     )
     return result.to(input_dtype) if input_dtype == torch.float32 else result
 

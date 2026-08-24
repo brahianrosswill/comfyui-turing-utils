@@ -297,11 +297,10 @@ modality, step, layer, and residual-quality controls do not invalidate the
 large loader node. A model from another loader is bootstrapped from its current
 attention override, with SDPA as the conservative default.
 
-The same configured model may feed full- and partial-denoise samplers. The
-runtime classifies them from the first schedule sigma relative to the model's
-`sigma_max`, then applies the corresponding full or partial dense-prefix/suffix
-settings. No global invocation counter is used and Sol/SLA alternation does not
-stack attention overrides.
+The same configured model may feed multiple full- or partial-denoise samplers.
+Dense prefix/suffix counts are evaluated against each sampler's own sigma list,
+so every invocation starts at its local step zero. No global invocation counter
+is used and Sol/SLA alternation does not stack attention overrides.
 
 SLA is likewise installed only by its independent patch node and requires
 kernel 0.29.1. It shares the Sol layout contract, dense schedules, fused Q/K
@@ -461,10 +460,9 @@ path.
 `skipped_residual=1x64` is the official-style fast default. `2x32` changes only
 the skipped-block reconstruction; it deliberately shares the identical route.
 `dense_prefix_steps=1`, `dense_suffix_steps=0`, `dense_prefix_layers=2`, and
-`dense_suffix_layers=0` match the default full-denoise protection policy.
-`partial_dense_prefix_steps=0` and `partial_dense_suffix_steps=0` independently
-cover schedules which begin below the model's full `sigma_max`; this permits one
-Sol-configured model branch to feed both stages of a 4+2, 6+2, or 8+2 graph.
+`dense_suffix_layers=0` match the default protection policy for every sampler
+invocation. One Sol-configured model branch can therefore feed both stages of a
+4+2, 6+2, or 8+2 graph without pass-specific controls.
 Every dense step or layer calls the loader-selected protected backend directly:
 route-free bundled W8A8, stable bundled Sage, or SDPA. Sage/SDPA select Sol's
 floating FP16 sparse core, while W8A8 selects its integer PV core. If the prefix

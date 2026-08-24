@@ -48,8 +48,6 @@ class SparseAttentionNodeTest(unittest.TestCase):
                 "sparse_reference_audio",
                 "dense_prefix_steps",
                 "dense_suffix_steps",
-                "partial_dense_prefix_steps",
-                "partial_dense_suffix_steps",
                 "dense_prefix_layers",
                 "dense_suffix_layers",
             ),
@@ -65,8 +63,6 @@ class SparseAttentionNodeTest(unittest.TestCase):
         self.assertEqual(inputs["dense_prefix_steps"][1]["default"], 1)
         self.assertEqual(inputs["dense_suffix_steps"][0], "INT")
         self.assertEqual(inputs["dense_suffix_steps"][1]["default"], 0)
-        self.assertEqual(inputs["partial_dense_prefix_steps"][1]["default"], 0)
-        self.assertEqual(inputs["partial_dense_suffix_steps"][1]["default"], 0)
         self.assertEqual(inputs["dense_prefix_layers"][1]["default"], 2)
         self.assertEqual(inputs["dense_suffix_layers"][1]["default"], 0)
         optional = attention_nodes.SolSparseAttentionPatch.INPUT_TYPES()["optional"]
@@ -117,15 +113,12 @@ class SparseAttentionNodeTest(unittest.TestCase):
             sparse_reference_audio=True,
             dense_prefix_steps=2,
             dense_suffix_steps=1,
-            partial_dense_prefix_steps=0,
-            partial_dense_suffix_steps=0,
             dense_prefix_layers=3,
             dense_suffix_layers=4,
             debug_route_density=False,
             use_w8a8=None,
             dense_backend="sdpa",
             dense_override=mock.ANY,
-            full_sigma_max=None,
         )
 
     def test_sla_schema_matches_semantic_sparse_controls(self):
@@ -144,8 +137,6 @@ class SparseAttentionNodeTest(unittest.TestCase):
                 "sparse_reference_audio",
                 "dense_prefix_steps",
                 "dense_suffix_steps",
-                "partial_dense_prefix_steps",
-                "partial_dense_suffix_steps",
                 "dense_prefix_layers",
                 "dense_suffix_layers",
             ),
@@ -188,8 +179,6 @@ class SparseAttentionNodeTest(unittest.TestCase):
                 sparse_reference_audio=True,
                 dense_prefix_steps=2,
                 dense_suffix_steps=1,
-                partial_dense_prefix_steps=1,
-                partial_dense_suffix_steps=0,
                 dense_prefix_layers=3,
                 dense_suffix_layers=4,
             )
@@ -204,8 +193,6 @@ class SparseAttentionNodeTest(unittest.TestCase):
             sparse_reference_audio=True,
             dense_prefix_steps=2,
             dense_suffix_steps=1,
-            partial_dense_prefix_steps=1,
-            partial_dense_suffix_steps=0,
             dense_prefix_layers=3,
             dense_suffix_layers=4,
             debug_route_density=False,
@@ -229,8 +216,6 @@ class SparseAttentionNodeTest(unittest.TestCase):
                 sparse_reference_audio=True,
                 dense_prefix_steps=2,
                 dense_suffix_steps=1,
-                partial_dense_prefix_steps=1,
-                partial_dense_suffix_steps=0,
                 dense_prefix_layers=3,
                 dense_suffix_layers=4,
             )
@@ -246,12 +231,11 @@ class SparseAttentionNodeTest(unittest.TestCase):
             sparse_reference_audio=True,
             dense_prefix_steps=2,
             dense_suffix_steps=1,
-            partial_dense_prefix_steps=1,
-            partial_dense_suffix_steps=0,
             dense_prefix_layers=3,
             dense_suffix_layers=4,
             debug_route_density=False,
         )
+
 
 if __name__ == "__main__":
     unittest.main()
