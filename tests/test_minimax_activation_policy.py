@@ -41,6 +41,26 @@ class _FakePrequantizedQK:
 
 
 class MiniMaxActivationPolicyTest(unittest.TestCase):
+    def test_prepared_attention_fallback_warning_is_bounded_per_shape(self):
+        options = {}
+        with self.assertLogs("comfyui-turing-utils", level="WARNING") as captured:
+            acceleration._warn_attention_fallback(
+                options,
+                path="head_sharded",
+                rows=127_272,
+                reason="streamed executor unavailable",
+            )
+            acceleration._warn_attention_fallback(
+                options,
+                path="head_sharded",
+                rows=127_272,
+                reason="streamed executor unavailable",
+            )
+
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("path=head_sharded", captured.output[0])
+        self.assertIn("rows=127272", captured.output[0])
+
     def setUp(self):
         self.environment = mock.patch.dict(
             os.environ,

@@ -190,9 +190,12 @@ def install_attention_runtime(
         config.active_override, "prepared_attention_executor", None
     )
     if callable(active_executor):
-        transformer_options[ATTENTION_EXECUTOR_KEY] = getattr(
-            dispatcher, "prepared_attention_executor"
-        )
+        # Prepared model sites already execute inside one ModelPatcher branch.
+        # Bind that branch's resolved executor directly so head/row streaming
+        # cannot silently change strategy if runtime metadata is copied or
+        # merged by ComfyUI between sampler stages.  The stable dispatcher is
+        # still used by optimized_attention's legacy/container entry point.
+        transformer_options[ATTENTION_EXECUTOR_KEY] = active_executor
     else:
         transformer_options.pop(ATTENTION_EXECUTOR_KEY, None)
 

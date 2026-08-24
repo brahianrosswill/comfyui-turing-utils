@@ -106,6 +106,7 @@ _MEMORY_ADAPTER_ATTR = "_turing_utils_minimax_memory_adapter"
 _OUTER_SAMPLE_WRAPPER_KEY = RUNTIME_OUTER_WRAPPER_KEY
 _ATTENTION_LAYOUT_KEY = ATTENTION_LAYOUT_KEY
 _STREAMED_QKV_EXECUTOR_ATTR = "turing_utils_streamed_qkv_executor"
+_ATTENTION_FALLBACK_WARNINGS_KEY = object()
 
 
 def _runtime_activation_plan(base_model):
@@ -116,6 +117,30 @@ def _runtime_activation_plan(base_model):
     except ReferenceError:
         return None
     return context.get("activation_plan") if isinstance(context, dict) else None
+
+
+def _warn_attention_fallback(
+    transformer_options,
+    *,
+    path: str,
+    rows: int,
+    reason: str,
+) -> None:
+    signature = (str(path), int(rows), str(reason))
+    if isinstance(transformer_options, dict):
+        warnings = transformer_options.setdefault(
+            _ATTENTION_FALLBACK_WARNINGS_KEY, set()
+        )
+        if not isinstance(warnings, set):
+            warnings = set()
+            transformer_options[_ATTENTION_FALLBACK_WARNINGS_KEY] = warnings
+        if signature in warnings:
+            return
+        warnings.add(signature)
+    LOG.warning(
+        "MiniMax prepared attention fallback: path=%s rows=%d reason=%s",
+        *signature,
+    )
 
 
 def _weak_model_reference(base_model):
@@ -1054,6 +1079,12 @@ def _head_sharded_attention(
     try:
         plain = convrot_w8_plain_tensors(weight)
         if plain is None:
+            _warn_attention_fallback(
+                transformer_options,
+                path="head_sharded",
+                rows=int(x.shape[0]),
+                reason="cast QKV weight is not plain W8A8",
+            )
             return None
         qweight, weight_scale = plain
         quantized_input = (
@@ -1098,6 +1129,12 @@ def _head_sharded_attention(
                 )
                 del qk, value
                 if not outcome.supported:
+                    _warn_attention_fallback(
+                        transformer_options,
+                        path="head_sharded",
+                        rows=sequence,
+                        reason=outcome.reason,
+                    )
                     return None
                 group_output = outcome.output.squeeze(0)
             else:
@@ -1420,6 +1457,12 @@ def _make_attention_forward(
                 )
 
         if executor is None:
+            _warn_attention_fallback(
+                transformer_options,
+                path="prepared",
+                rows=int(x.shape[0]),
+                reason="prepared executor is unavailable",
+            )
             return original(
                 self,
                 x,
@@ -1505,6 +1548,12 @@ def _make_attention_forward(
         if not outcome.supported:
             del query, key, value
             CUDA_PHASE_PROFILER.cancel_operation()
+            _warn_attention_fallback(
+                transformer_options,
+                path="projected",
+                rows=sequence,
+                reason=outcome.reason,
+            )
             return original(
                 self,
                 x,

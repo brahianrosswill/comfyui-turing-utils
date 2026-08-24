@@ -290,8 +290,10 @@ When either logical sequence is shorter than the 64-token SM75 CTA, the facade
 uses a bounded exact FP32 SDPA path. It contains fewer than 4096 scores per head
 and cannot reproduce the large-sequence SDPA allocation failure.
 
-The ConvRot loader installs a stable runtime dispatcher and records its dense
-backend as an immutable capability. Independent `Configure Sol/SLA Sparse
+The ConvRot loader installs a stable legacy/container runtime dispatcher and
+records its dense backend as an immutable capability. Each ModelPatcher branch
+binds the resolved prepared executor directly, so fused row/head streaming does
+not depend on a second runtime lookup. Independent `Configure Sol/SLA Sparse
 Attention` nodes change the strategy configuration only; their routing,
 modality, step, layer, and residual-quality controls do not invalidate the
 large loader node. A model from another loader is bootstrapped from its current

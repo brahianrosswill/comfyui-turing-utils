@@ -314,10 +314,12 @@ an exact cubin for the active device. The native report additionally includes
 `binary_sm`, `ptx_compute`, registers, shared/local memory, active CTAs and
 occupancy; the historical `_sm75` extension filename remains only an ABI name.
 
-The loader now installs one stable attention runtime dispatcher. Sol and SLA
-change only its immutable strategy configuration; they do not stack another
-model-side attention implementation or require separate patched model branches
-for full and partial denoise samplers. The selected dense backend is inherited:
+The loader now installs one stable legacy/container attention dispatcher. Sol
+and SLA change only its immutable strategy configuration, while every
+ModelPatcher branch binds its resolved prepared executor directly for the fused
+QKV hot path. They do not stack another model-side attention implementation or
+require separate patched model branches for full and partial denoise samplers.
+The selected dense backend is inherited:
 `w8a8` uses the signed-V/unsigned-probability Tensor Core path for selected
 exact blocks, while `sage` and `sdpa` use the FP16 sparse core. Dense protected
 steps/layers remain on the selected Sage or SDPA backend. Skipped-block

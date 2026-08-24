@@ -56,8 +56,16 @@ class AttentionRuntimeTest(unittest.TestCase):
         def sol(original, *args, **kwargs):
             return "sol"
 
+        def dense_prepared(request):
+            return request
+
+        def sol_prepared(request):
+            return request
+
         dense.turing_utils_attention_backend = "sdpa"
         dense.turing_utils_attention_implementation = "test:sdpa"
+        dense.prepared_attention_executor = dense_prepared
+        sol.prepared_attention_executor = sol_prepared
         dispatcher = attention.make_attention_runtime_dispatcher(dense)
         options = {}
         base = attention.AttentionRuntimeConfig(
@@ -70,6 +78,10 @@ class AttentionRuntimeTest(unittest.TestCase):
             dispatcher(None, transformer_options=options),
             "dense",
         )
+        self.assertIs(
+            options[attention.ATTENTION_EXECUTOR_KEY],
+            dense_prepared,
+        )
 
         sparse = base.with_strategy("sol", "test:sol", sol)
         attention.install_attention_runtime(options, sparse, dispatcher=dispatcher)
@@ -77,6 +89,10 @@ class AttentionRuntimeTest(unittest.TestCase):
         self.assertEqual(
             dispatcher(None, transformer_options=options),
             "sol",
+        )
+        self.assertIs(
+            options[attention.ATTENTION_EXECUTOR_KEY],
+            sol_prepared,
         )
 
         def replacement_dense(original, *args, **kwargs):
@@ -217,10 +233,16 @@ class AttentionRuntimeTest(unittest.TestCase):
                 "comfyui_turing_utils.attention.orchestration.ensure_prepared_attention_sites"
             ) as ensure_sites,
         ):
-            attention.apply_sparse_attention_patch(model)
+            patched = attention.apply_sparse_attention_patch(model)
 
         ensure_layout.assert_not_called()
         ensure_sites.assert_not_called()
+        self.assertIs(
+            patched.model_options["transformer_options"][
+                attention.ATTENTION_EXECUTOR_KEY
+            ],
+            sol.prepared_attention_executor,
+        )
 
     def test_sdpa_base_selects_fp16_sol_sparse_numeric_path(self):
         q = torch.zeros((1, 2, 256, 128), dtype=torch.bfloat16)
