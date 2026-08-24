@@ -183,7 +183,12 @@ def load_convrot_model(
     )
     install_dynamic_vram_sample_fence(model, load_device)
     apply_model_adapters(model, load_device)
-    apply_attention_backend(model, attention_backend, device=load_device)
+    apply_attention_backend(
+        model,
+        attention_backend,
+        device=load_device,
+        native_runtime=True,
+    )
     model.cached_patcher_init = (
         load_convrot_model,
         (str(model_path), force_int8_gemm, attention_backend),

@@ -274,8 +274,8 @@ invisibly to `sage` and are not displayed by the loader.
 |---|---|---|---|
 | `sage` on Turing | INT8, per-16-token Q-warp scales | disabled | FP16 V tiles with direct FP32 accumulation |
 | `w8a8` on sm75+ | stable-Sage INT8 score domain | optional adaptive K anchor | channel-wise signed INT8 V and unsigned INT8 probabilities, INT32 Tensor Core PV, FP32 online state |
-| `Patch Sol Sparse Attention` | fused 64-token centroid routing; selected tiles reuse stable Sage INT8 QK | input-adaptive `mean + tau * std` threshold | exact FP16 V tiles plus skipped-block V centroids, FP32 online accumulation |
-| `Patch SLA Sparse Attention` | one route shared by adjacent Q64 CTAs (logical Q128 x K64); selected tiles reuse stable Sage INT8 QK | fixed Top-K budget; Smooth-K-invariant ordering | selected exact FP16 V tiles or optional W8A8 PV; no skipped-block residual |
+| `Configure Sol Sparse Attention` | fused 64-token centroid routing; selected tiles reuse stable Sage INT8 QK | input-adaptive `mean + tau * std` threshold | inherited W8A8 exact PV, or FP16 exact V tiles for Sage/SDPA; skipped-block V centroids and FP32 online accumulation |
+| `Configure SLA Sparse Attention` | one route shared by adjacent Q64 CTAs (logical Q128 x K64); selected tiles reuse stable Sage INT8 QK | fixed Top-K budget; Smooth-K-invariant ordering | inherited W8A8 PV or FP16 selected tiles; no skipped-block residual |
 
 Integer Q/K MMA accumulates into INT32. The stable facade supports FP16 and
 BF16 Q/K/V, HND/NHD, GQA, causal mode, unequal Q/KV lengths, head dimensions
@@ -290,10 +290,18 @@ When either logical sequence is shorter than the 64-token SM75 CTA, the facade
 uses a bounded exact FP32 SDPA path. It contains fewer than 4096 scores per head
 and cannot reproduce the large-sequence SDPA allocation failure.
 
-The sparse backend is installed only by the independent
-`Patch Sol Sparse Attention` node and is never a loader option. Keeping a
-separate node is intentional: its routing, modality, step, layer, and residual
-quality parameters do not belong in the loader.
+The ConvRot loader installs a stable runtime dispatcher and records its dense
+backend as an immutable capability. Independent `Configure Sol/SLA Sparse
+Attention` nodes change the strategy configuration only; their routing,
+modality, step, layer, and residual-quality controls do not invalidate the
+large loader node. A model from another loader is bootstrapped from its current
+attention override, with SDPA as the conservative default.
+
+The same configured model may feed full- and partial-denoise samplers. The
+runtime classifies them from the first schedule sigma relative to the model's
+`sigma_max`, then applies the corresponding full or partial dense-prefix/suffix
+settings. No global invocation counter is used and Sol/SLA alternation does not
+stack attention overrides.
 
 SLA is likewise installed only by its independent patch node and requires
 kernel 0.29.1. It shares the Sol layout contract, dense schedules, fused Q/K
@@ -315,7 +323,7 @@ blocks are supported. Other calls use bundled stable Sage without model-family,
 sampling-step checks. A model adapter may publish semantic layer and topology
 metadata; unknown models remain fully generic.
 
-The bundled `w8a8` backend and Sol's `use_w8a8` option require kernel 0.23.0.
+The bundled `w8a8` backend and the inherited Sol/SLA W8A8 path require kernel 0.23.0.
 They support sm75 and newer native cubins and head dimensions 1--128. Dense W8A8
 supports fixed HND/NHD and native packed-varlen inputs, GQA, unequal Q/K
 lengths, and an upper-left causal diagonal; arbitrary masks remain unsupported.
@@ -359,6 +367,13 @@ consumed by dense Sage, dense W8A8, Sol FP16-PV, and Sol W8A8 for supported H3
 and Wan/Bernini self-attention calls. It therefore
 avoids materializing normalized/rotated BF16 Q/K. Protected Sol steps and layers
 use the corresponding dense finalizer without repeating preprocessing.
+Exact-sm75 uses the bundled quantizing finalizer. Ampere and newer external
+Sage, plus explicit SDPA, use a floating prepared finalizer which applies the
+same protocol RMSNorm/RoPE transform to the existing projected Q/K and hands
+those tensors directly to the registered ComfyUI backend. Rejection happens
+before tensor ownership transfer, so protocol-incompatible causal calls and
+unsupported dtype, device, or RoPE layouts retain the original-model fallback
+without partial consumption. Masks are forwarded to the selected dense backend.
 The handoff is installed through a model-neutral attention-site registry, so
 an explicit Sol patch on an official ComfyUI-loaded H3 or Bernini model can use
 the same fused path as the ConvRot loader. Capability rejection occurs before
@@ -446,9 +461,13 @@ path.
 `skipped_residual=1x64` is the official-style fast default. `2x32` changes only
 the skipped-block reconstruction; it deliberately shares the identical route.
 `dense_prefix_steps=1`, `dense_suffix_steps=0`, `dense_prefix_layers=2`, and
-`dense_suffix_layers=0` match the default protection policy. Every dense step or
-layer calls the selected protected backend directly: route-free bundled W8A8
-by default, or stable bundled Sage when `use_w8a8` is disabled. If the prefix
+`dense_suffix_layers=0` match the default full-denoise protection policy.
+`partial_dense_prefix_steps=0` and `partial_dense_suffix_steps=0` independently
+cover schedules which begin below the model's full `sigma_max`; this permits one
+Sol-configured model branch to feed both stages of a 4+2, 6+2, or 8+2 graph.
+Every dense step or layer calls the loader-selected protected backend directly:
+route-free bundled W8A8, stable bundled Sage, or SDPA. Sage/SDPA select Sol's
+floating FP16 sparse core, while W8A8 selects its integer PV core. If the prefix
 and suffix layer counts sum to at least the runtime layer count, every valid
 layer takes this direct dense path and no Sol summaries or routing are built.
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Callable
 
 import torch
@@ -199,16 +200,40 @@ def _sparse_dense_schedule(
     transformer_options,
     prefix_steps: int,
     suffix_steps: int,
-    state: dict[str, object],
+    state: dict[str, object] | None = None,
     *,
     track_step: bool = False,
+    partial_prefix_steps: int | None = None,
+    partial_suffix_steps: int | None = None,
+    full_sigma_max: float | None = None,
 ) -> bool:
+    """Select dense steps from the sampler's actual sigma schedule.
+
+    A schedule beginning below the model's full ``sigma_max`` is a partial
+    denoise pass (for example the low-noise stage after latent upscaling).  It
+    gets an independent prefix/suffix policy instead of resetting and reusing
+    the full-pass counters.  Runtime state lives in ``transformer_options`` by
+    default, so a shared model can serve multiple samplers without mutable
+    state leaking between ModelPatcher branches.
+    """
+    partial_prefix_steps = (
+        prefix_steps if partial_prefix_steps is None else int(partial_prefix_steps)
+    )
+    partial_suffix_steps = (
+        suffix_steps if partial_suffix_steps is None else int(partial_suffix_steps)
+    )
     if (
-        prefix_steps <= 0
-        and suffix_steps <= 0
+        max(prefix_steps, suffix_steps, partial_prefix_steps, partial_suffix_steps) <= 0
         and not track_step
     ) or not isinstance(transformer_options, dict):
         return False
+    if state is None:
+        state = transformer_options.setdefault(
+            "_turing_utils_sparse_schedule_state", {}
+        )
+        if not isinstance(state, dict):
+            state = {}
+            transformer_options["_turing_utils_sparse_schedule_state"] = state
     sample_sigmas = transformer_options.get("sample_sigmas")
     current_sigmas = transformer_options.get("sigmas")
     if not torch.is_tensor(sample_sigmas) or not torch.is_tensor(current_sigmas):
@@ -223,13 +248,29 @@ def _sparse_dense_schedule(
     if (
         state.get("sample_sigmas") is sample_sigmas
         and state.get("current_sigmas") is current_sigmas
+        and state.get("policy")
+        == (
+            prefix_steps,
+            suffix_steps,
+            partial_prefix_steps,
+            partial_suffix_steps,
+            full_sigma_max,
+        )
     ):
         return bool(state["dense"])
+    is_partial = False
+    if full_sigma_max is not None and math.isfinite(float(full_sigma_max)):
+        schedule_start = float(sample_sigmas.flatten()[0].detach().float().item())
+        sigma_max = float(full_sigma_max)
+        tolerance = max(abs(sigma_max) * 1.0e-4, 1.0e-6)
+        is_partial = schedule_start < sigma_max - tolerance
+    selected_prefix_steps = partial_prefix_steps if is_partial else prefix_steps
+    selected_suffix_steps = partial_suffix_steps if is_partial else suffix_steps
     current = current_sigmas.flatten()[0].to(sample_sigmas)
     step = int(torch.argmin((sample_sigmas.flatten() - current).abs()).item())
     sampling_steps = sample_sigmas.numel() - 1
-    effective_prefix_steps = min(prefix_steps, sampling_steps)
-    effective_suffix_steps = min(suffix_steps, sampling_steps)
+    effective_prefix_steps = min(selected_prefix_steps, sampling_steps)
+    effective_suffix_steps = min(selected_suffix_steps, sampling_steps)
     dense = step < effective_prefix_steps or (
         effective_suffix_steps > 0
         and step >= sampling_steps - effective_suffix_steps
@@ -243,6 +284,14 @@ def _sparse_dense_schedule(
         sampling_steps=sampling_steps,
         prefix_steps=effective_prefix_steps,
         suffix_steps=effective_suffix_steps,
+        is_partial=is_partial,
+        policy=(
+            prefix_steps,
+            suffix_steps,
+            partial_prefix_steps,
+            partial_suffix_steps,
+            full_sigma_max,
+        ),
     )
     return dense
 

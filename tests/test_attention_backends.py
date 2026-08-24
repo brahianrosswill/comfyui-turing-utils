@@ -26,6 +26,124 @@ class FakeModel:
 
 
 class AttentionBackendsTest(unittest.TestCase):
+    def test_external_prepared_executor_consumes_projected_qkv_once(self):
+        tensors = [
+            torch.zeros((1, 2, 64, 128), dtype=torch.bfloat16)
+            for _ in range(3)
+        ]
+        q, k, v = (
+            comfy_attention.AttentionTensorContainer(tensor) for tensor in tensors
+        )
+        spec = attention_backends.QKTransformSpec(
+            attention_backends.RMSNormSpec(
+                torch.ones(128, dtype=torch.bfloat16), 1e-6, "head"
+            ),
+            attention_backends.RMSNormSpec(
+                torch.ones(128, dtype=torch.bfloat16), 1e-6, "head"
+            ),
+            attention_backends.RotaryEmbeddingSpec(None, 0, "none"),
+        )
+        output = torch.zeros((1, 64, 256), dtype=torch.bfloat16)
+        dense = mock.Mock(return_value=output)
+        executor = attention_backends._make_external_prepared_executor(
+            dense, "sage"
+        )
+        request = attention_backends.PreparedAttention.from_hnd(
+            q, k, v, heads=2, qk_transform=spec, transformer_options={}
+        )
+
+        with mock.patch(
+            "attention._prepared_qk_transform",
+            return_value=(tensors[0], tensors[1]),
+        ) as transform:
+            outcome = executor(request)
+
+        self.assertIs(outcome.output, output)
+        transform.assert_called_once_with(tensors[0], tensors[1], spec)
+        dense.assert_called_once()
+        self.assertIs(dense.call_args.args[1], tensors[0])
+        self.assertIs(dense.call_args.args[2], tensors[1])
+        self.assertIs(dense.call_args.args[3], tensors[2])
+        self.assertTrue(dense.call_args.kwargs["skip_reshape"])
+        self.assertIsNone(q.tensor)
+        self.assertIsNone(k.tensor)
+        self.assertIsNone(v.tensor)
+
+    def test_external_prepared_h3_transform_matches_comfy_fused_semantics(self):
+        import comfy.quant_ops
+        from comfy.ldm.minimax.model import rope_rotation_table
+
+        query = torch.randn((1, 2, 8, 128), dtype=torch.bfloat16)
+        key = torch.randn_like(query)
+        query_weight = torch.randn(128, dtype=torch.bfloat16)
+        key_weight = torch.randn(128, dtype=torch.bfloat16)
+        freqs = rope_rotation_table(
+            torch.randn((8, 64), dtype=torch.float32), torch.bfloat16
+        )
+        spec = attention_backends.QKTransformSpec(
+            attention_backends.RMSNormSpec(
+                query_weight, 1e-6, "head"
+            ),
+            attention_backends.RMSNormSpec(key_weight, 1e-6, "head"),
+            attention_backends.RotaryEmbeddingSpec(
+                freqs, 64, "split_half"
+            ),
+        )
+
+        actual_query, actual_key = attention_backends._prepared_qk_transform(
+            query.clone(), key.clone(), spec
+        )
+        expected_query, expected_key = comfy.quant_ops.ck.rms_rope_split_half(
+            query.transpose(1, 2),
+            key.transpose(1, 2),
+            freqs,
+            query_weight,
+            key_weight,
+            epsilon=1e-6,
+            rot_dim=64,
+        )
+
+        torch.testing.assert_close(
+            actual_query, expected_query.transpose(1, 2)
+        )
+        torch.testing.assert_close(actual_key, expected_key.transpose(1, 2))
+
+    def test_external_prepared_wan_row_transform_matches_comfy_semantics(self):
+        import comfy.rmsnorm
+        from comfy.ldm.flux.math import apply_rope1, rope
+
+        batch, heads, tokens, head_dim = 1, 2, 8, 64
+        query = torch.randn((batch, heads, tokens, head_dim))
+        key = torch.randn_like(query)
+        query_weight = torch.randn(heads * head_dim)
+        key_weight = torch.randn(heads * head_dim)
+        freqs = rope(torch.randn((batch, tokens)), head_dim, 10_000).unsqueeze(2)
+        spec = attention_backends.QKTransformSpec(
+            attention_backends.RMSNormSpec(query_weight, 1e-6, "row"),
+            attention_backends.RMSNormSpec(key_weight, 1e-6, "row"),
+            attention_backends.RotaryEmbeddingSpec(
+                freqs, head_dim, "interleaved"
+            ),
+        )
+
+        actual_query, actual_key = attention_backends._prepared_qk_transform(
+            query.clone(), key.clone(), spec
+        )
+
+        def expected(value, weight):
+            value = value.transpose(1, 2)
+            value = comfy.rmsnorm.rms_norm(
+                value.reshape(batch, tokens, heads * head_dim),
+                weight,
+                1e-6,
+            ).reshape(batch, tokens, heads, head_dim)
+            return apply_rope1(value, freqs).transpose(1, 2)
+
+        torch.testing.assert_close(
+            actual_query, expected(query, query_weight)
+        )
+        torch.testing.assert_close(actual_key, expected(key, key_weight))
+
     def test_fused_qk_preprocessing_requires_022_kernel_abi(self):
         sage_module = SimpleNamespace(fused_qk_preprocessing_available=lambda: True)
         for version, expected in (("0.21.0", False), ("0.22.0", True)):
@@ -730,6 +848,36 @@ class AttentionBackendsTest(unittest.TestCase):
             "bundled_turing_sage",
         )
 
+    def test_non_turing_sage_exposes_external_prepared_executor(self):
+        target = mock.Mock(return_value="sage")
+        backend = attention_backends.AttentionBackend(
+            option="sage",
+            attention_function="sage",
+            label="sage",
+        )
+        with (
+            mock.patch("attention.is_supported_turing_device", return_value=False),
+            mock.patch(
+                "attention._select_attention_backend",
+                return_value=(backend, target),
+            ),
+        ):
+            override = attention_backends.make_attention_override(
+                "sage", device=torch.device("cuda", 0)
+            )
+
+        self.assertEqual(
+            override.turing_utils_attention_implementation,
+            "comfy:sage",
+        )
+        self.assertTrue(
+            callable(getattr(override, "prepared_attention_executor", None))
+        )
+        self.assertEqual(
+            override.prepared_attention_executor.turing_utils_attention_backend,
+            "sage",
+        )
+
     def test_turing_explicit_sage_selects_bundled_backend(self):
         model = FakeModel()
         q = torch.randn(1, 2, 4, 8, dtype=torch.bfloat16)
@@ -936,6 +1084,84 @@ class AttentionBackendsTest(unittest.TestCase):
         self.assertEqual(
             sparse.call_args.kwargs["debug_context"]["last_sparse_layer"], 49
         )
+
+    def test_sol_and_sla_dense_protection_use_external_sage_prepared_path(self):
+        spec = attention_backends.QKTransformSpec(
+            attention_backends.RMSNormSpec(
+                torch.ones(128, dtype=torch.bfloat16), 1e-6, "head"
+            ),
+            attention_backends.RMSNormSpec(
+                torch.ones(128, dtype=torch.bfloat16), 1e-6, "head"
+            ),
+            attention_backends.RotaryEmbeddingSpec(None, 0, "none"),
+        )
+        expected = torch.zeros((1, 4096, 256), dtype=torch.bfloat16)
+        for maker, available, preflight in (
+            (
+                attention_backends.make_sparse_attention_override,
+                "attention.bundled_sparse_available",
+                "attention.preflight_bundled_sparse",
+            ),
+            (
+                attention_backends.make_sla_attention_override,
+                "attention.bundled_sla_available",
+                "attention.preflight_bundled_sla",
+            ),
+        ):
+            with self.subTest(strategy=maker.__name__):
+                qkv = [
+                    comfy_attention.AttentionTensorContainer(
+                        torch.zeros(
+                            (1, 2, 4096, 128), dtype=torch.bfloat16
+                        )
+                    )
+                    for _ in range(3)
+                ]
+                dense = mock.Mock()
+                dense.turing_utils_attention_implementation = "comfy:sage"
+                dense.prepared_attention_executor = mock.Mock(
+                    return_value=attention_backends.AttentionExecutionOutcome(
+                        expected
+                    )
+                )
+                with (
+                    mock.patch(
+                        "attention.is_supported_attention_device",
+                        return_value=True,
+                    ),
+                    mock.patch(available, return_value=True),
+                    mock.patch(preflight),
+                    mock.patch(
+                        "attention.fused_qk_preprocessing_available",
+                        return_value=True,
+                    ),
+                ):
+                    override = maker(
+                        torch.device("cuda", 0),
+                        dense_backend="sage",
+                        dense_override=dense,
+                        dense_prefix_steps=0,
+                        dense_prefix_layers=1,
+                    )
+                request = attention_backends.PreparedAttention.from_hnd(
+                    *qkv,
+                    heads=2,
+                    qk_transform=spec,
+                    transformer_options={
+                        "turing_utils_attention_layout": {
+                            "layer_index": 0,
+                            "layer_count": 50,
+                        }
+                    },
+                )
+                outcome = override.prepared_attention_executor(request)
+
+                self.assertIs(outcome.output, expected)
+                dense.prepared_attention_executor.assert_called_once_with(request)
+                self.assertEqual(override.turing_utils_dense_backend, "sage")
+                self.assertEqual(
+                    override.turing_utils_sparse_numeric_backend, "fp16"
+                )
 
     def test_sparse_w8a8_preflights_and_uses_w8a8_for_protected_layers(self):
         q = torch.zeros((1, 2, 4096, 128), dtype=torch.bfloat16)

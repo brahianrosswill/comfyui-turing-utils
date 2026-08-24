@@ -32,7 +32,7 @@ class SparseAttentionNodeTest(unittest.TestCase):
     def test_schema_exposes_tunable_sparse_parameters(self):
         self.assertEqual(
             attention_nodes.SolSparseAttentionPatch.TITLE,
-            "Patch Sol Sparse Attention",
+            "Configure Sol Sparse Attention",
         )
         inputs = attention_nodes.SolSparseAttentionPatch.INPUT_TYPES()["required"]
         self.assertEqual(
@@ -48,6 +48,8 @@ class SparseAttentionNodeTest(unittest.TestCase):
                 "sparse_reference_audio",
                 "dense_prefix_steps",
                 "dense_suffix_steps",
+                "partial_dense_prefix_steps",
+                "partial_dense_suffix_steps",
                 "dense_prefix_layers",
                 "dense_suffix_layers",
             ),
@@ -63,11 +65,12 @@ class SparseAttentionNodeTest(unittest.TestCase):
         self.assertEqual(inputs["dense_prefix_steps"][1]["default"], 1)
         self.assertEqual(inputs["dense_suffix_steps"][0], "INT")
         self.assertEqual(inputs["dense_suffix_steps"][1]["default"], 0)
+        self.assertEqual(inputs["partial_dense_prefix_steps"][1]["default"], 0)
+        self.assertEqual(inputs["partial_dense_suffix_steps"][1]["default"], 0)
         self.assertEqual(inputs["dense_prefix_layers"][1]["default"], 2)
         self.assertEqual(inputs["dense_suffix_layers"][1]["default"], 0)
         optional = attention_nodes.SolSparseAttentionPatch.INPUT_TYPES()["optional"]
-        self.assertEqual(tuple(optional), ("use_w8a8", "debug_route_density"))
-        self.assertTrue(optional["use_w8a8"][1]["default"])
+        self.assertEqual(tuple(optional), ("debug_route_density",))
         self.assertFalse(optional["debug_route_density"][1]["default"])
 
     def test_patch_clones_model_and_installs_generic_override(self):
@@ -97,7 +100,10 @@ class SparseAttentionNodeTest(unittest.TestCase):
             "optimized_attention_override", model.model_options["transformer_options"]
         )
         options = patched.model_options["transformer_options"]
-        self.assertIs(options["optimized_attention_override"], override)
+        runtime = options[attention_backends.ATTENTION_RUNTIME_CONFIG_KEY]
+        self.assertEqual(runtime.strategy, "sol")
+        self.assertEqual(runtime.dense_backend, "sdpa")
+        self.assertIs(runtime.strategy_override, override)
         self.assertTrue(options["existing"])
         make_override.assert_called_once_with(
             torch.device("cuda", 0),
@@ -111,15 +117,20 @@ class SparseAttentionNodeTest(unittest.TestCase):
             sparse_reference_audio=True,
             dense_prefix_steps=2,
             dense_suffix_steps=1,
+            partial_dense_prefix_steps=0,
+            partial_dense_suffix_steps=0,
             dense_prefix_layers=3,
             dense_suffix_layers=4,
             debug_route_density=False,
-            use_w8a8=True,
+            use_w8a8=None,
+            dense_backend="sdpa",
+            dense_override=mock.ANY,
+            full_sigma_max=None,
         )
 
     def test_sla_schema_matches_semantic_sparse_controls(self):
         node = attention_nodes.SlaSparseAttentionPatch
-        self.assertEqual(node.TITLE, "Patch SLA Sparse Attention")
+        self.assertEqual(node.TITLE, "Configure SLA Sparse Attention")
         inputs = node.INPUT_TYPES()["required"]
         self.assertEqual(
             tuple(inputs),
@@ -133,6 +144,8 @@ class SparseAttentionNodeTest(unittest.TestCase):
                 "sparse_reference_audio",
                 "dense_prefix_steps",
                 "dense_suffix_steps",
+                "partial_dense_prefix_steps",
+                "partial_dense_suffix_steps",
                 "dense_prefix_layers",
                 "dense_suffix_layers",
             ),
@@ -147,8 +160,16 @@ class SparseAttentionNodeTest(unittest.TestCase):
         self.assertTrue(inputs["sparse_reference_video"][1]["default"])
         self.assertFalse(inputs["sparse_reference_audio"][1]["default"])
         optional = node.INPUT_TYPES()["optional"]
-        self.assertEqual(tuple(optional), ("use_w8a8", "debug_route_density"))
-        self.assertTrue(optional["use_w8a8"][1]["default"])
+        self.assertEqual(tuple(optional), ("debug_route_density",))
+
+    def test_legacy_node_schema_preserves_positional_w8a8_widget(self):
+        for node in (
+            attention_nodes.LegacySolSparseAttentionPatch,
+            attention_nodes.LegacySlaSparseAttentionPatch,
+        ):
+            optional = node.INPUT_TYPES()["optional"]
+            self.assertEqual(tuple(optional), ("use_w8a8", "debug_route_density"))
+            self.assertTrue(optional["use_w8a8"][1]["default"])
 
     def test_sla_node_returns_the_patched_model(self):
         model = object()
@@ -159,16 +180,18 @@ class SparseAttentionNodeTest(unittest.TestCase):
         ) as apply_patch:
             output = attention_nodes.SlaSparseAttentionPatch().patch(
                 model,
-                0.8,
-                "manual",
-                128,
-                True,
-                False,
-                True,
-                2,
-                1,
-                3,
-                4,
+                sparsity_ratio=0.8,
+                prefix_policy="manual",
+                manual_prefix_tokens=128,
+                sparse_reference_image=True,
+                sparse_reference_video=False,
+                sparse_reference_audio=True,
+                dense_prefix_steps=2,
+                dense_suffix_steps=1,
+                partial_dense_prefix_steps=1,
+                partial_dense_suffix_steps=0,
+                dense_prefix_layers=3,
+                dense_suffix_layers=4,
             )
         self.assertEqual(output, (patched,))
         apply_patch.assert_called_once_with(
@@ -181,9 +204,10 @@ class SparseAttentionNodeTest(unittest.TestCase):
             sparse_reference_audio=True,
             dense_prefix_steps=2,
             dense_suffix_steps=1,
+            partial_dense_prefix_steps=1,
+            partial_dense_suffix_steps=0,
             dense_prefix_layers=3,
             dense_suffix_layers=4,
-            use_w8a8=True,
             debug_route_density=False,
         )
 
@@ -196,17 +220,19 @@ class SparseAttentionNodeTest(unittest.TestCase):
         ) as apply_patch:
             output = attention_nodes.SolSparseAttentionPatch().patch(
                 model,
-                0.85,
-                "manual",
-                256,
-                "1x64",
-                True,
-                False,
-                True,
-                2,
-                1,
-                3,
-                4,
+                routing_threshold=0.85,
+                prefix_policy="manual",
+                manual_prefix_tokens=256,
+                skipped_residual="1x64",
+                sparse_reference_image=True,
+                sparse_reference_video=False,
+                sparse_reference_audio=True,
+                dense_prefix_steps=2,
+                dense_suffix_steps=1,
+                partial_dense_prefix_steps=1,
+                partial_dense_suffix_steps=0,
+                dense_prefix_layers=3,
+                dense_suffix_layers=4,
             )
         self.assertEqual(output, (patched,))
         apply_patch.assert_called_once_with(
@@ -220,9 +246,10 @@ class SparseAttentionNodeTest(unittest.TestCase):
             sparse_reference_audio=True,
             dense_prefix_steps=2,
             dense_suffix_steps=1,
+            partial_dense_prefix_steps=1,
+            partial_dense_suffix_steps=0,
             dense_prefix_layers=3,
             dense_suffix_layers=4,
-            use_w8a8=True,
             debug_route_density=False,
         )
 

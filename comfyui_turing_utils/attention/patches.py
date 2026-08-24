@@ -12,10 +12,14 @@ from .layout import attention_semantic_layout
 from .integration import ensure_prepared_attention_sites
 from .orchestration import install_sparse_attention_override
 from .protocol import (
-    ATTENTION_EXECUTOR_KEY,
     AttentionBackendCapabilities,
     AttentionExecutionOutcome,
     PreparedAttention,
+)
+from .runtime import (
+    AttentionRuntimeConfig,
+    attention_runtime_config,
+    install_attention_runtime,
 )
 from .sparse import (
     _sparse_dense_layer,
@@ -43,7 +47,6 @@ from .stable import (
     SPARSE_REFERENCE_VIDEO,
     SPARSE_ROUTING_THRESHOLD,
     SPARSE_SKIPPED_RESIDUAL,
-    SPARSE_USE_W8A8,
     SLA_DENSE_PREFIX_LAYERS,
     SLA_DENSE_PREFIX_STEPS,
     SLA_DENSE_SUFFIX_LAYERS,
@@ -253,6 +256,209 @@ def _make_dense_prepared_executor(kernel: str) -> Callable:
             )
 
         executor.turing_utils_streamed_qkv_executor = streamed_qkv_executor
+    return executor
+
+
+def _prepared_external_call_reason(request: PreparedAttention) -> str | None:
+    query, key, value = request.peek_qkv()
+    if query.dtype != key.dtype or query.dtype != value.dtype:
+        return "prepared Q/K/V dtypes differ"
+    if query.device != key.device or query.device != value.device:
+        return "prepared Q/K/V devices differ"
+    if query.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        return f"prepared Q/K/V dtype {query.dtype} is unsupported"
+    freqs = request.qk_transform.freqs
+    if torch.is_tensor(freqs):
+        if freqs.device != query.device:
+            return "prepared RoPE frequencies are on a different device"
+        if freqs.ndim < 3:
+            return "prepared RoPE frequencies have no token/head axes"
+        frequency_tokens = int(freqs.shape[1])
+        if frequency_tokens not in {
+            1,
+            request.query_tokens,
+            request.key_tokens,
+        }:
+            return "prepared RoPE token count does not match Q or K"
+        if request.query_tokens != request.key_tokens and frequency_tokens != 1:
+            return "one prepared RoPE table cannot describe asymmetric Q/K"
+        frequency_heads = int(freqs.shape[2])
+        if frequency_heads not in {1, request.heads, request.kv_heads}:
+            return "prepared RoPE head count does not match Q or K"
+        if request.heads != request.kv_heads and frequency_heads != 1:
+            return "one prepared RoPE table cannot describe GQA head groups"
+    return None
+
+
+def _prepared_rms_norm_hnd(value: torch.Tensor, spec) -> torch.Tensor:
+    weight = spec.weight.to(device=value.device, dtype=value.dtype)
+    if spec.scope == "head":
+        return torch.nn.functional.rms_norm(
+            value,
+            (value.shape[-1],),
+            weight=weight,
+            eps=spec.epsilon,
+        )
+    batch, heads, tokens, head_dim = value.shape
+    nhd = value.transpose(1, 2)
+    flattened = nhd.reshape(batch, tokens, heads * head_dim)
+    normalized = torch.nn.functional.rms_norm(
+        flattened,
+        (heads * head_dim,),
+        weight=weight,
+        eps=spec.epsilon,
+    )
+    return normalized.view(batch, tokens, heads, head_dim).transpose(1, 2)
+
+
+def _prepared_rope_one(
+    value: torch.Tensor,
+    freqs: torch.Tensor,
+    *,
+    rot_dim: int,
+    pairing: str,
+) -> torch.Tensor:
+    nhd = value.transpose(1, 2)
+    prefix = nhd[..., :rot_dim]
+    if pairing == "interleaved":
+        source = prefix.to(freqs.dtype).reshape(
+            *prefix.shape[:-1], -1, 1, 2
+        )
+    elif pairing == "split_half":
+        source = (
+            prefix.reshape(*prefix.shape[:-1], 2, -1)
+            .movedim(-2, -1)
+            .unsqueeze(-2)
+            .to(freqs.dtype)
+        )
+    else:
+        raise ValueError(f"unsupported prepared RoPE pairing: {pairing}")
+    if source.shape[2] != 1 and freqs.shape[2] != 1:
+        if source.shape[2] != freqs.shape[2]:
+            freqs = freqs[:, :, : source.shape[2]]
+    rotated = freqs[..., 0] * source[..., 0]
+    rotated.addcmul_(freqs[..., 1], source[..., 1])
+    if pairing == "split_half":
+        rotated = rotated.movedim(-1, -2)
+    rotated = rotated.reshape(*prefix.shape).to(value.dtype)
+    if rot_dim != nhd.shape[-1]:
+        rotated = torch.cat((rotated, nhd[..., rot_dim:]), dim=-1)
+    return rotated.transpose(1, 2)
+
+
+def _prepared_qk_transform(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    spec,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply a prepared request's exact floating Q/K transform once.
+
+    Bundled Sage/W8A8/Sol consume this contract through their quantizing fused
+    preprocessor.  External Sage and SDPA need the same RMSNorm/RoPE semantics
+    in floating point before receiving the already-projected tensors.
+    """
+    pairing = spec.rotary.pairing
+    freqs = spec.freqs
+    if pairing != "none" and spec.query_norm.scope == "head":
+        try:
+            import comfy.quant_ops
+
+            q_nhd = query.transpose(1, 2)
+            k_nhd = key.transpose(1, 2)
+            q_weight = spec.query_norm_weight.to(
+                device=query.device, dtype=query.dtype
+            )
+            k_weight = spec.key_norm_weight.to(
+                device=key.device, dtype=key.dtype
+            )
+            suffix = "_split_half" if pairing == "split_half" else ""
+            fused = getattr(comfy.quant_ops.ck, f"rms_rope{suffix}", None)
+            fused_one = getattr(comfy.quant_ops.ck, f"rms_rope{suffix}1", None)
+            kwargs = {"epsilon": spec.epsilon}
+            if pairing == "split_half":
+                kwargs["rot_dim"] = spec.rot_dim
+            if q_nhd.shape == k_nhd.shape and callable(fused):
+                transformed = fused(
+                    q_nhd,
+                    k_nhd,
+                    freqs,
+                    q_weight,
+                    k_weight,
+                    **kwargs,
+                )
+                return transformed[0].transpose(1, 2), transformed[1].transpose(1, 2)
+            if callable(fused_one):
+                return (
+                    fused_one(q_nhd, freqs, q_weight, **kwargs).transpose(1, 2),
+                    fused_one(k_nhd, freqs, k_weight, **kwargs).transpose(1, 2),
+                )
+        except (AttributeError, ImportError, RuntimeError, TypeError):
+            # The mathematical fallback below keeps official/older Comfy builds
+            # functional when their fused floating transform rejects the call.
+            pass
+
+    query = _prepared_rms_norm_hnd(query, spec.query_norm)
+    key = _prepared_rms_norm_hnd(key, spec.key_norm)
+    if pairing == "none":
+        return query, key
+    return (
+        _prepared_rope_one(
+            query,
+            freqs,
+            rot_dim=spec.rot_dim,
+            pairing=pairing,
+        ),
+        _prepared_rope_one(
+            key,
+            freqs,
+            rot_dim=spec.rot_dim,
+            pairing=pairing,
+        ),
+    )
+
+
+def _make_external_prepared_executor(
+    dense_override: Callable,
+    backend: str,
+) -> Callable:
+    """Adapt projected Q/K/V directly to a ComfyUI-owned dense backend."""
+    capabilities = AttentionBackendCapabilities(supports_mask=True)
+
+    def executor(request: PreparedAttention) -> AttentionExecutionOutcome:
+        reason = capabilities.unsupported_reason(request)
+        if reason is None:
+            reason = _prepared_external_call_reason(request)
+        if reason is not None:
+            return AttentionExecutionOutcome.unsupported(reason)
+        query, key, value = request.consume_qkv()
+        query, key = _profiled(
+            "attention.qk_norm_rope",
+            _prepared_qk_transform,
+            query,
+            key,
+            request.qk_transform,
+        )
+        output = _profiled(
+            "attention.execute",
+            dense_override,
+            _default_attention_fallback(),
+            query,
+            key,
+            value,
+            request.heads,
+            mask=request.mask,
+            skip_reshape=True,
+            skip_output_reshape=request.skip_output_reshape,
+            enable_gqa=request.heads != request.kv_heads,
+            low_precision_attention=request.low_precision_attention,
+            is_causal=request.is_causal,
+            scale=request.scale,
+        )
+        del query, key, value
+        return AttentionExecutionOutcome(output)
+
+    executor.capabilities = capabilities
+    executor.turing_utils_attention_backend = backend
     return executor
 
 
@@ -571,6 +777,10 @@ def make_attention_override(option: str, device: torch.device | None = None) -> 
             backend,
             target,
         )
+    if not bundled_turing:
+        attention_override.prepared_attention_executor = (
+            _make_external_prepared_executor(attention_override, backend.option)
+        )
     return attention_override
 
 
@@ -586,10 +796,15 @@ def make_sparse_attention_override(
     sparse_reference_audio: bool = SPARSE_REFERENCE_AUDIO,
     dense_prefix_steps: int = SPARSE_DENSE_PREFIX_STEPS,
     dense_suffix_steps: int = SPARSE_DENSE_SUFFIX_STEPS,
+    partial_dense_prefix_steps: int = 0,
+    partial_dense_suffix_steps: int = 0,
     dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
     dense_suffix_layers: int = SPARSE_DENSE_SUFFIX_LAYERS,
     debug_route_density: bool = False,
-    use_w8a8: bool = SPARSE_USE_W8A8,
+    use_w8a8: bool | None = None,
+    dense_backend: str | None = None,
+    dense_override: Callable | None = None,
+    full_sigma_max: float | None = None,
 ) -> Callable:
     min_sequence_tokens = int(min_sequence_tokens)
     routing_threshold = float(routing_threshold)
@@ -601,10 +816,17 @@ def make_sparse_attention_override(
     sparse_reference_audio = bool(sparse_reference_audio)
     dense_prefix_steps = int(dense_prefix_steps)
     dense_suffix_steps = int(dense_suffix_steps)
+    partial_dense_prefix_steps = int(partial_dense_prefix_steps)
+    partial_dense_suffix_steps = int(partial_dense_suffix_steps)
     dense_prefix_layers = int(dense_prefix_layers)
     dense_suffix_layers = int(dense_suffix_layers)
     debug_route_density = bool(debug_route_density)
-    use_w8a8 = bool(use_w8a8)
+    if dense_backend is None:
+        # Direct API callers retain the historical W8A8 default.  Runtime
+        # configuration nodes pass the loader's explicit dense backend.
+        dense_backend = "w8a8" if use_w8a8 is not False else "sage"
+    dense_backend = normalize_attention_backend(dense_backend)
+    use_w8a8 = dense_backend == "w8a8"
     if min_sequence_tokens < 0:
         raise ValueError("min_sequence_tokens must be non-negative")
     if not math.isfinite(routing_threshold):
@@ -619,6 +841,10 @@ def make_sparse_attention_override(
         raise ValueError("dense_prefix_steps must be non-negative")
     if dense_suffix_steps < 0:
         raise ValueError("dense_suffix_steps must be non-negative")
+    if partial_dense_prefix_steps < 0:
+        raise ValueError("partial_dense_prefix_steps must be non-negative")
+    if partial_dense_suffix_steps < 0:
+        raise ValueError("partial_dense_suffix_steps must be non-negative")
     if dense_prefix_layers < 0:
         raise ValueError("dense_prefix_layers must be non-negative")
     if dense_suffix_layers < 0:
@@ -639,13 +865,23 @@ def make_sparse_attention_override(
             raise RuntimeError(
                 "Sol W8A8 requires comfyui-turing-utils-kernel 0.28.0 or newer"
             )
-    schedule_state: dict[str, object] = {}
+    schedule_state_key = object()
+    standalone_schedule_state: dict[str, object] = {}
+
+    def schedule_state_for(transformer_options) -> dict[str, object]:
+        if not isinstance(transformer_options, dict):
+            return standalone_schedule_state
+        state = transformer_options.setdefault(schedule_state_key, {})
+        if isinstance(state, dict):
+            return state
+        state = {}
+        transformer_options[schedule_state_key] = state
+        return state
     debug_route_keys: set[tuple] = set()
     debug_route_state: dict[tuple, list[tuple[torch.Tensor, int, int]]] = {}
     debug_dense_reasons: set[str] = set()
-    dense_override = make_attention_override(
-        "w8a8" if use_w8a8 else "sage", device=device
-    )
+    if dense_override is None:
+        dense_override = make_attention_override(dense_backend, device=device)
     dense_prepared_executor = getattr(
         dense_override, "prepared_attention_executor", None
     )
@@ -710,6 +946,7 @@ def make_sparse_attention_override(
         )
 
     def route_debug_context(transformer_options, kernel_key: tuple):
+        schedule_state = schedule_state_for(transformer_options)
         layer_index, layer_count = _attention_layer_metadata(transformer_options)
         step = schedule_state.get("step")
         sampling_steps = schedule_state.get("sampling_steps")
@@ -844,7 +1081,10 @@ def make_sparse_attention_override(
             transformer_options,
             dense_prefix_steps,
             dense_suffix_steps,
-            schedule_state,
+            schedule_state_for(transformer_options),
+            partial_prefix_steps=partial_dense_prefix_steps,
+            partial_suffix_steps=partial_dense_suffix_steps,
+            full_sigma_max=full_sigma_max,
         ) or _sparse_dense_layer(
             transformer_options,
             dense_prefix_layers,
@@ -969,7 +1209,10 @@ def make_sparse_attention_override(
             transformer_options,
             dense_prefix_steps,
             dense_suffix_steps,
-            schedule_state,
+            schedule_state_for(transformer_options),
+            partial_prefix_steps=partial_dense_prefix_steps,
+            partial_suffix_steps=partial_dense_suffix_steps,
+            full_sigma_max=full_sigma_max,
         ) or _sparse_dense_layer(
             transformer_options,
             dense_prefix_layers,
@@ -1049,11 +1292,15 @@ def make_sparse_attention_override(
             original, *fallback_args, **fallback_kwargs
         )
         transformer_options = kwargs.get("transformer_options")
+        schedule_state = schedule_state_for(transformer_options)
         dense_schedule = _sparse_dense_schedule(
             transformer_options,
             dense_prefix_steps,
             dense_suffix_steps,
             schedule_state,
+            partial_prefix_steps=partial_dense_prefix_steps,
+            partial_suffix_steps=partial_dense_suffix_steps,
+            full_sigma_max=full_sigma_max,
         )
         dense_layer = _sparse_dense_layer(
             transformer_options,
@@ -1135,7 +1382,10 @@ def make_sparse_attention_override(
                 transformer_options,
                 dense_prefix_steps,
                 dense_suffix_steps,
-                schedule_state,
+                schedule_state_for(transformer_options),
+                partial_prefix_steps=partial_dense_prefix_steps,
+                partial_suffix_steps=partial_dense_suffix_steps,
+                full_sigma_max=full_sigma_max,
             ) or _sparse_dense_layer(
                 transformer_options,
                 dense_prefix_layers,
@@ -1227,7 +1477,15 @@ def make_sparse_attention_override(
     attention_override.turing_utils_attention_backend = "sol_sparse_attn"
     attention_override.turing_utils_attention_implementation = "bundled_sol_sparse"
     attention_override.turing_utils_dense_implementation = (
-        dense_override.turing_utils_attention_implementation
+        getattr(
+            dense_override,
+            "turing_utils_attention_implementation",
+            f"inherited:{dense_backend}",
+        )
+    )
+    attention_override.turing_utils_dense_backend = dense_backend
+    attention_override.turing_utils_sparse_numeric_backend = (
+        "w8a8" if use_w8a8 else "fp16"
     )
     if fused_qk_preprocessing_available():
         attention_override.prepared_attention_executor = prepared_executor
@@ -1245,10 +1503,15 @@ def make_sla_attention_override(
     sparse_reference_audio: bool = SPARSE_REFERENCE_AUDIO,
     dense_prefix_steps: int = SLA_DENSE_PREFIX_STEPS,
     dense_suffix_steps: int = SLA_DENSE_SUFFIX_STEPS,
+    partial_dense_prefix_steps: int = 0,
+    partial_dense_suffix_steps: int = 0,
     dense_prefix_layers: int = SLA_DENSE_PREFIX_LAYERS,
     dense_suffix_layers: int = SLA_DENSE_SUFFIX_LAYERS,
     debug_route_density: bool = False,
-    use_w8a8: bool = SPARSE_USE_W8A8,
+    use_w8a8: bool | None = None,
+    dense_backend: str | None = None,
+    dense_override: Callable | None = None,
+    full_sigma_max: float | None = None,
 ) -> Callable:
     min_sequence_tokens = int(min_sequence_tokens)
     sparsity_ratio = float(sparsity_ratio)
@@ -1259,10 +1522,15 @@ def make_sla_attention_override(
     sparse_reference_audio = bool(sparse_reference_audio)
     dense_prefix_steps = int(dense_prefix_steps)
     dense_suffix_steps = int(dense_suffix_steps)
+    partial_dense_prefix_steps = int(partial_dense_prefix_steps)
+    partial_dense_suffix_steps = int(partial_dense_suffix_steps)
     dense_prefix_layers = int(dense_prefix_layers)
     dense_suffix_layers = int(dense_suffix_layers)
     debug_route_density = bool(debug_route_density)
-    use_w8a8 = bool(use_w8a8)
+    if dense_backend is None:
+        dense_backend = "w8a8" if use_w8a8 is not False else "sage"
+    dense_backend = normalize_attention_backend(dense_backend)
+    use_w8a8 = dense_backend == "w8a8"
     if min_sequence_tokens < 0:
         raise ValueError("min_sequence_tokens must be non-negative")
     if not math.isfinite(sparsity_ratio) or not 0.0 <= sparsity_ratio < 1.0:
@@ -1274,6 +1542,8 @@ def make_sla_attention_override(
     if min(
         dense_prefix_steps,
         dense_suffix_steps,
+        partial_dense_prefix_steps,
+        partial_dense_suffix_steps,
         dense_prefix_layers,
         dense_suffix_layers,
     ) < 0:
@@ -1291,11 +1561,21 @@ def make_sla_attention_override(
     if use_w8a8 and not bundled_w8a8_available():
         raise RuntimeError("SLA W8A8 requires the bundled W8A8 attention ABI")
 
-    schedule_state: dict[str, object] = {}
+    schedule_state_key = object()
+    standalone_schedule_state: dict[str, object] = {}
+
+    def schedule_state_for(transformer_options) -> dict[str, object]:
+        if not isinstance(transformer_options, dict):
+            return standalone_schedule_state
+        state = transformer_options.setdefault(schedule_state_key, {})
+        if isinstance(state, dict):
+            return state
+        state = {}
+        transformer_options[schedule_state_key] = state
+        return state
     debug_route_keys: set[tuple] = set()
-    dense_override = make_attention_override(
-        "w8a8" if use_w8a8 else "sage", device=device
-    )
+    if dense_override is None:
+        dense_override = make_attention_override(dense_backend, device=device)
     dense_prepared_executor = getattr(
         dense_override, "prepared_attention_executor", None
     )
@@ -1374,6 +1654,7 @@ def make_sla_attention_override(
         )
 
     def collect_stats(result, sla_call, transformer_options):
+        schedule_state = schedule_state_for(transformer_options)
         output, selected, possible = result
         layer_index, _ = _attention_layer_metadata(transformer_options)
         debug_key = (
@@ -1408,7 +1689,10 @@ def make_sla_attention_override(
             transformer_options,
             dense_prefix_steps,
             dense_suffix_steps,
-            schedule_state,
+            schedule_state_for(transformer_options),
+            partial_prefix_steps=partial_dense_prefix_steps,
+            partial_suffix_steps=partial_dense_suffix_steps,
+            full_sigma_max=full_sigma_max,
         ) or _sparse_dense_layer(
             transformer_options,
             dense_prefix_layers,
@@ -1671,11 +1955,102 @@ def make_sla_attention_override(
     attention_override.turing_utils_attention_backend = "sla_sparse_attn"
     attention_override.turing_utils_attention_implementation = "bundled_sla_sparse"
     attention_override.turing_utils_dense_implementation = (
-        dense_override.turing_utils_attention_implementation
+        getattr(
+            dense_override,
+            "turing_utils_attention_implementation",
+            f"inherited:{dense_backend}",
+        )
+    )
+    attention_override.turing_utils_dense_backend = dense_backend
+    attention_override.turing_utils_sparse_numeric_backend = (
+        "w8a8" if use_w8a8 else "fp16"
     )
     if fused_qk_preprocessing_available():
         attention_override.prepared_attention_executor = prepared_executor
     return attention_override
+
+
+def _model_sigma_max(model) -> float | None:
+    """Read the model sampling ceiling without coupling to one Comfy version."""
+    sampling = None
+    getter = getattr(model, "get_model_object", None)
+    if callable(getter):
+        try:
+            sampling = getter("model_sampling")
+        except (AttributeError, KeyError):
+            sampling = None
+    if sampling is None:
+        inner = getattr(model, "model", None)
+        sampling = getattr(inner, "model_sampling", None)
+    value = getattr(sampling, "sigma_max", None)
+    if torch.is_tensor(value):
+        if value.numel() != 1:
+            return None
+        value = value.detach().float().item()
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _attention_base_runtime(
+    model,
+    *,
+    use_w8a8: bool | None,
+) -> AttentionRuntimeConfig:
+    """Resolve the immutable dense base used by a Sol/SLA strategy.
+
+    Models loaded by the ConvRot loader already carry this capability marker.
+    Official and third-party loaders are bootstrapped from their current
+    override when possible, otherwise from SDPA.  ``use_w8a8`` is accepted
+    only for legacy node/workflow compatibility.
+    """
+    transformer_options = model.model_options.setdefault("transformer_options", {})
+    config = attention_runtime_config(transformer_options)
+    if config is not None:
+        if use_w8a8 is None:
+            return config
+        requested = "w8a8" if bool(use_w8a8) else "sage"
+        if requested == config.dense_backend:
+            return config
+        dense_override = make_attention_override(requested, device=model.load_device)
+        return AttentionRuntimeConfig(
+            dense_backend=requested,
+            dense_implementation=dense_override.turing_utils_attention_implementation,
+            dense_override=dense_override,
+            native_runtime=config.native_runtime,
+        )
+
+    current = transformer_options.get("optimized_attention_override")
+    if use_w8a8 is not None:
+        dense_backend = "w8a8" if bool(use_w8a8) else "sage"
+        current = None
+    else:
+        dense_backend = transformer_options.get(
+            "turing_utils_attention_base_backend",
+            transformer_options.get("turing_utils_attention_backend", "sdpa"),
+        )
+        if dense_backend not in {"w8a8", "sage", "sdpa"}:
+            dense_backend = getattr(
+                current, "turing_utils_attention_backend", "sdpa"
+            )
+        if dense_backend not in {"w8a8", "sage", "sdpa"}:
+            dense_backend = "sdpa"
+
+    if not callable(current):
+        current = make_attention_override(dense_backend, device=model.load_device)
+    implementation = getattr(
+        current,
+        "turing_utils_attention_implementation",
+        f"inherited:{dense_backend}",
+    )
+    return AttentionRuntimeConfig(
+        dense_backend=dense_backend,
+        dense_implementation=implementation,
+        dense_override=current,
+        native_runtime=False,
+    )
 
 
 def apply_sparse_attention_patch(
@@ -1690,11 +2065,15 @@ def apply_sparse_attention_patch(
     sparse_reference_audio: bool = SPARSE_REFERENCE_AUDIO,
     dense_prefix_steps: int = SPARSE_DENSE_PREFIX_STEPS,
     dense_suffix_steps: int = SPARSE_DENSE_SUFFIX_STEPS,
+    partial_dense_prefix_steps: int = 0,
+    partial_dense_suffix_steps: int = 0,
     dense_prefix_layers: int = SPARSE_DENSE_PREFIX_LAYERS,
     dense_suffix_layers: int = SPARSE_DENSE_SUFFIX_LAYERS,
     debug_route_density: bool = False,
-    use_w8a8: bool = SPARSE_USE_W8A8,
+    use_w8a8: bool | None = None,
 ):
+    runtime = _attention_base_runtime(model, use_w8a8=use_w8a8)
+    sigma_max = _model_sigma_max(model)
     override = make_sparse_attention_override(
         model.load_device,
         min_sequence_tokens=min_sequence_tokens,
@@ -1707,17 +2086,23 @@ def apply_sparse_attention_patch(
         sparse_reference_audio=sparse_reference_audio,
         dense_prefix_steps=dense_prefix_steps,
         dense_suffix_steps=dense_suffix_steps,
+        partial_dense_prefix_steps=partial_dense_prefix_steps,
+        partial_dense_suffix_steps=partial_dense_suffix_steps,
         dense_prefix_layers=dense_prefix_layers,
         dense_suffix_layers=dense_suffix_layers,
         debug_route_density=debug_route_density,
         use_w8a8=use_w8a8,
+        dense_backend=runtime.dense_backend,
+        dense_override=runtime.dense_override,
+        full_sigma_max=sigma_max,
     )
     patched = install_sparse_attention_override(
         model,
         override,
         strategy="Sol sparse",
-        backend="sol_sparse_attn",
+        backend="sol",
         implementation="bundled_sol_sparse",
+        runtime_config=runtime,
     )
     patched = patched.model
     dense_implementation = getattr(
@@ -1730,8 +2115,9 @@ def apply_sparse_attention_patch(
         "prefix_policy=%s manual_prefix=%d local_radius=1 "
         "skipped_residual=%s sparse_reference=(image=%s,video=%s,audio=%s) "
         "dense_prefix_steps=%d dense_suffix_steps=%d "
+        "partial_dense_prefix_steps=%d partial_dense_suffix_steps=%d "
         "dense_prefix_layers=%d dense_suffix_layers=%d "
-        "dense_backend=%s pv_backend=%s debug_route_density=%s",
+        "dense_backend=%s dense_impl=%s pv_backend=%s debug_route_density=%s",
         routing_threshold,
         prefix_policy,
         manual_prefix_tokens,
@@ -1741,10 +2127,16 @@ def apply_sparse_attention_patch(
         sparse_reference_audio,
         dense_prefix_steps,
         dense_suffix_steps,
+        partial_dense_prefix_steps,
+        partial_dense_suffix_steps,
         dense_prefix_layers,
         dense_suffix_layers,
+        runtime.dense_backend,
         dense_implementation,
-        "u8xs8_tensorcore" if use_w8a8 else "fp16_tensorcore",
+        "u8xs8_tensorcore"
+        if getattr(override, "turing_utils_sparse_numeric_backend", "fp16")
+        == "w8a8"
+        else "fp16_tensorcore",
         debug_route_density,
     )
     return patched
@@ -1761,11 +2153,15 @@ def apply_sla_attention_patch(
     sparse_reference_audio: bool = SPARSE_REFERENCE_AUDIO,
     dense_prefix_steps: int = SLA_DENSE_PREFIX_STEPS,
     dense_suffix_steps: int = SLA_DENSE_SUFFIX_STEPS,
+    partial_dense_prefix_steps: int = 0,
+    partial_dense_suffix_steps: int = 0,
     dense_prefix_layers: int = SLA_DENSE_PREFIX_LAYERS,
     dense_suffix_layers: int = SLA_DENSE_SUFFIX_LAYERS,
     debug_route_density: bool = False,
-    use_w8a8: bool = SPARSE_USE_W8A8,
+    use_w8a8: bool | None = None,
 ):
+    runtime = _attention_base_runtime(model, use_w8a8=use_w8a8)
+    sigma_max = _model_sigma_max(model)
     override = make_sla_attention_override(
         model.load_device,
         min_sequence_tokens=min_sequence_tokens,
@@ -1777,17 +2173,23 @@ def apply_sla_attention_patch(
         sparse_reference_audio=sparse_reference_audio,
         dense_prefix_steps=dense_prefix_steps,
         dense_suffix_steps=dense_suffix_steps,
+        partial_dense_prefix_steps=partial_dense_prefix_steps,
+        partial_dense_suffix_steps=partial_dense_suffix_steps,
         dense_prefix_layers=dense_prefix_layers,
         dense_suffix_layers=dense_suffix_layers,
         debug_route_density=debug_route_density,
         use_w8a8=use_w8a8,
+        dense_backend=runtime.dense_backend,
+        dense_override=runtime.dense_override,
+        full_sigma_max=sigma_max,
     )
     patched = install_sparse_attention_override(
         model,
         override,
         strategy="SLA",
-        backend="sla_sparse_attn",
+        backend="sla",
         implementation="bundled_sla_sparse",
+        runtime_config=runtime,
     )
     patched = patched.model
     LOG.info(
@@ -1795,8 +2197,9 @@ def apply_sla_attention_patch(
         "topology=128x64 smooth_k=True prefix_policy=%s manual_prefix=%d "
         "sparse_reference=(image=%s,video=%s,audio=%s) "
         "dense_prefix_steps=%d dense_suffix_steps=%d "
+        "partial_dense_prefix_steps=%d partial_dense_suffix_steps=%d "
         "dense_prefix_layers=%d dense_suffix_layers=%d "
-        "dense_backend=%s pv_backend=%s debug_route_density=%s",
+        "dense_backend=%s dense_impl=%s pv_backend=%s debug_route_density=%s",
         sparsity_ratio,
         prefix_policy,
         manual_prefix_tokens,
@@ -1805,25 +2208,42 @@ def apply_sla_attention_patch(
         sparse_reference_audio,
         dense_prefix_steps,
         dense_suffix_steps,
+        partial_dense_prefix_steps,
+        partial_dense_suffix_steps,
         dense_prefix_layers,
         dense_suffix_layers,
+        runtime.dense_backend,
         override.turing_utils_dense_implementation,
-        "u8xs8_tensorcore" if use_w8a8 else "fp16_tensorcore",
+        "u8xs8_tensorcore"
+        if getattr(override, "turing_utils_sparse_numeric_backend", "fp16")
+        == "w8a8"
+        else "fp16_tensorcore",
         debug_route_density,
     )
     return patched
 
 
-def apply_attention_backend(model, option: str, device: torch.device | None = None):
+def apply_attention_backend(
+    model,
+    option: str,
+    device: torch.device | None = None,
+    *,
+    native_runtime: bool = False,
+):
     option = normalize_attention_backend(option)
     transformer_options = model.model_options.setdefault("transformer_options", {})
     override = make_attention_override(option, device=device)
     selected = override.turing_utils_attention_backend
     implementation = override.turing_utils_attention_implementation
-    transformer_options["optimized_attention_override"] = override
+    config = AttentionRuntimeConfig(
+        dense_backend=selected,
+        dense_implementation=implementation,
+        dense_override=override,
+        native_runtime=bool(native_runtime),
+    )
+    install_attention_runtime(transformer_options, config)
     prepared_executor = getattr(override, "prepared_attention_executor", None)
     if callable(prepared_executor):
-        transformer_options[ATTENTION_EXECUTOR_KEY] = prepared_executor
         target_device = device if device is not None else getattr(model, "load_device", None)
         if isinstance(target_device, torch.device):
             site_status = ensure_prepared_attention_sites(model, target_device)
@@ -1833,14 +2253,11 @@ def apply_attention_backend(model, option: str, device: torch.device | None = No
                     site_status.model_kind,
                     site_status.reason,
                 )
-    else:
-        transformer_options.pop(ATTENTION_EXECUTOR_KEY, None)
-    transformer_options["turing_utils_attention_backend"] = selected
-    transformer_options["turing_utils_attention_implementation"] = implementation
     LOG.info(
-        "Turing Utils attention backend override: %s via %s (requested %s)",
+        "Turing Utils attention runtime: dense=%s via %s requested=%s native=%s",
         selected,
         implementation,
         option,
+        native_runtime,
     )
     return model

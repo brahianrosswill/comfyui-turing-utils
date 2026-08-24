@@ -99,19 +99,25 @@ only after its CUDA sources or required version change.
   storyboard from a loaded `VIDEO` or decoded `IMAGE` frame batch. It can use
   uniform or motion-weighted sampling and optionally wraps each panel in
   annotated film rails so frame numbers and timestamps stay outside the image.
-- `Patch Sol Sparse Attention` applies the production model-generic,
+- `Configure Sol Sparse Attention` applies the production model-generic,
   loader-independent
   long-sequence sparse backend. It uses an input-adaptive statistical threshold,
   keeps one 64-token skipped-block centroid by default, accepts semantic
   multimodal layout metadata, and exposes integer dense-step safeguards,
-  dense first/last-layer protection, the native integer W8A8 PV path by default, and an
-  internal automatic short-sequence crossover.
-- `Patch SLA Sparse Attention` implements the MiniMax H3 Turbo-SLA runtime as
+  dense first/last-layer protection, and an internal automatic short-sequence
+  crossover. It inherits `w8a8`, `sage`, or `sdpa` from `Load ConvRot DiT`:
+  W8A8 selects integer sparse PV, while Sage/SDPA select the floating FP16
+  sparse core. Partial-denoise prefix/suffix controls are independent from a
+  full schedule, detected by sigma range rather than sampler call order.
+- `Configure SLA Sparse Attention` implements the MiniMax H3 Turbo-SLA runtime as
   fixed-budget 128-query by 64-key Top-K routing. It shares Sol's semantic
   reference protection, dense step/layer scheduling, fused Q/K preprocessing,
-  tensor lifetime, and optional W8A8 PV path, but deliberately does not add
-  Sol's local blocks or skipped-block residual. Use it with the SLA-trained
+  tensor lifetime, and inherited W8A8/FP16 numeric path, but deliberately does
+  not add Sol's local blocks or skipped-block residual. Use it with the SLA-trained
   LoRA; `sparsity_ratio=0.85` matches the published runtime hyperparameter.
+  Existing `Patch Sol/SLA Sparse Attention` node IDs remain registered as
+  legacy compatibility nodes so saved positional `use_w8a8` widgets do not
+  shift. New workflows should use the `Configure` nodes.
 ## MiniMax H3 automatic activation memory
 
 The H3 adapter uses one capability-based path on Turing, Ampere, Ada, Hopper,
@@ -308,20 +314,33 @@ an exact cubin for the active device. The native report additionally includes
 `binary_sm`, `ptx_compute`, registers, shared/local memory, active CTAs and
 occupancy; the historical `_sm75` extension filename remains only an ABI name.
 
-Sol's `use_w8a8` switch is enabled by default. Selected exact blocks and
-protected dense steps/layers use the
-same signed-V/unsigned-probability Tensor Core path. Skipped-block correction
-keeps original V centroids and FP32 online state, so the switch changes exact
-PV throughput rather than the routing policy. Both variants keep a 64-query
+The loader now installs one stable attention runtime dispatcher. Sol and SLA
+change only its immutable strategy configuration; they do not stack another
+model-side attention implementation or require separate patched model branches
+for full and partial denoise samplers. The selected dense backend is inherited:
+`w8a8` uses the signed-V/unsigned-probability Tensor Core path for selected
+exact blocks, while `sage` and `sdpa` use the FP16 sparse core. Dense protected
+steps/layers remain on the selected Sage or SDPA backend. Skipped-block
+correction keeps original V centroids and FP32 online state, so the numeric
+path does not alter routing. Both variants keep a 64-query
 tile. Native D64 uses 16 KiB dynamic shared memory, while D128 uses 32 KiB. The
 automatic logical K schedule uses 64 tokens for short K and two sequential
 64-token stages for K above 1024.
 These are the current production geometries, not global resource limits.
 
-Sol keeps the first denoising step and the first two transformer layers dense
-by default. If `dense_prefix_layers + dense_suffix_layers` reaches or exceeds
+On architectures where `sage` delegates to ComfyUI's registered SageAttention,
+the runtime exposes a floating prepared-attention finalizer. It consumes the
+already-projected Q/K/V exactly once, applies the model-published RMSNorm/RoPE
+contract, and calls Sage directly. Dense Sol/SLA protection therefore does not
+fall back through the original model attention or repeat QKV projection. The
+same bridge covers explicit SDPA and third-party-loader fallback paths.
+
+Sol keeps the first full-denoise step and the first two transformer layers
+dense by default. Partial denoise defaults to zero dense prefix/suffix steps
+and can be configured independently. If
+`dense_prefix_layers + dense_suffix_layers` reaches or exceeds
 the runtime layer count, every layer dispatches directly to the selected dense
-W8A8 or Sage backend and skips all Sol preprocessing.
+W8A8, Sage, or SDPA backend and skips all Sol preprocessing.
 
 The `sdpa` option keeps ComfyUI's `AttentionTensorContainer` ownership path.
 On exact-sm75, BF16 Q/K/V are consumed and converted one at a time to FP16 before

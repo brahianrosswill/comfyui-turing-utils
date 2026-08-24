@@ -604,7 +604,12 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
         self.assertIsNone(fake_model.compute_dtype)
         normalize_dtypes.assert_not_called()
         apply_adapters.assert_called_once_with(fake_model, torch.device("cuda", 0))
-        apply_backend.assert_called_once_with(fake_model, "w8a8", device=torch.device("cuda", 0))
+        apply_backend.assert_called_once_with(
+            fake_model,
+            "w8a8",
+            device=torch.device("cuda", 0),
+            native_runtime=True,
+        )
         self.assertEqual(
             fake_model.cached_patcher_init,
             (
@@ -647,7 +652,12 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
             fake_model, torch.device("cuda", 0), torch.bfloat16
         )
         apply_adapters.assert_called_once_with(fake_model, torch.device("cuda", 0))
-        apply_backend.assert_called_once_with(fake_model, "w8a8", device=torch.device("cuda", 0))
+        apply_backend.assert_called_once_with(
+            fake_model,
+            "w8a8",
+            device=torch.device("cuda", 0),
+            native_runtime=True,
+        )
 
     def test_load_clip_forces_mixed_ops_and_preserves_activation_override(self):
         state_dict = {

@@ -316,7 +316,9 @@ class MiniMaxLayoutProviderTest(unittest.TestCase):
             options[ATTENTION_LAYOUT_REQUIREMENT_KEY],
             minimax_layout.MINIMAX_H3_LAYOUT_KIND,
         )
-        self.assertIs(options["optimized_attention_override"], override)
+        runtime = attention.attention_runtime_config(options)
+        self.assertEqual(runtime.strategy, "sol")
+        self.assertIs(runtime.strategy_override, override)
         self.assertEqual(len(patched.object_patches), 3)
         self.assertEqual(len(patched.wrappers), 1)
         self.assertFalse(model.object_patches)

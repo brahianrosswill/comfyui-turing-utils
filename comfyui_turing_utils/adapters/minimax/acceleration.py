@@ -15,6 +15,7 @@ import torch
 from ..methods import OriginalMethod, weak_method
 from ..memory import install_memory_hooks, scan_quantized_workspaces
 from ...attention.integration import AttentionSiteStatus, execute_projected_attention
+from ...attention.layout import ATTENTION_LAYOUT_REQUIREMENT_KEY
 from ...attention.protocol import (
     QKTransformSpec,
     RMSNormSpec,
@@ -2263,6 +2264,13 @@ def apply_minimax_adapter(model, device: torch.device) -> int:
         pass
 
     layout_status = ensure_minimax_attention_layout_provider(model)
+    if layout_status.installed:
+        transformer_options = model.model_options.setdefault(
+            "transformer_options", {}
+        )
+        transformer_options[ATTENTION_LAYOUT_REQUIREMENT_KEY] = (
+            layout_status.model_kind
+        )
     if layout_status.required and not layout_status.installed:
         LOG.warning(
             "MiniMax H3 attention layout provider could not be installed: %s",

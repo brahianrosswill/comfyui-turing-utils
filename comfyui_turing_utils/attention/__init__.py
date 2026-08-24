@@ -8,6 +8,15 @@ from .patches import (
     make_sparse_attention_override,
     make_sla_attention_override,
 )
+from .runtime import (
+    ATTENTION_RUNTIME_CONFIG_KEY,
+    ATTENTION_RUNTIME_PROTOCOL_VERSION,
+    AttentionRuntimeConfig,
+    attention_runtime_config,
+    install_attention_runtime,
+    is_attention_runtime_dispatcher,
+    make_attention_runtime_dispatcher,
+)
 from .sparse import turing_sla_sparse_attention, turing_sol_sparse_attention
 from .stable import (
     AttentionBackend,
@@ -27,15 +36,22 @@ from .stable import (
 
 __all__ = [
     "AttentionBackend",
+    "ATTENTION_RUNTIME_CONFIG_KEY",
+    "ATTENTION_RUNTIME_PROTOCOL_VERSION",
+    "AttentionRuntimeConfig",
     "apply_attention_backend",
     "apply_sparse_attention_patch",
     "apply_sla_attention_patch",
     "attention_backend_choices",
+    "attention_runtime_config",
     "bundled_available",
     "bundled_w8a8_available",
     "bundled_sparse_available",
     "bundled_sla_available",
     "make_attention_override",
+    "install_attention_runtime",
+    "is_attention_runtime_dispatcher",
+    "make_attention_runtime_dispatcher",
     "make_sparse_attention_override",
     "make_sla_attention_override",
     "normalize_attention_backend",

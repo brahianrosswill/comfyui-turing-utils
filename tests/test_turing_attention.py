@@ -680,6 +680,45 @@ class TuringAttentionContractTest(unittest.TestCase):
         self.assertEqual(state["step"], 2)
         self.assertEqual(state["sampling_steps"], 4)
 
+    def test_sparse_dense_schedule_distinguishes_full_and_partial_denoise(self):
+        full = torch.tensor([1.0, 0.7, 0.3, 0.0])
+        partial = torch.tensor([0.2, 0.1, 0.0])
+        full_options = {"sample_sigmas": full, "sigmas": full[0:1]}
+        partial_options = {"sample_sigmas": partial, "sigmas": partial[0:1]}
+
+        self.assertTrue(
+            turing_attention._sparse_dense_schedule(
+                full_options,
+                1,
+                0,
+                partial_prefix_steps=0,
+                partial_suffix_steps=0,
+                full_sigma_max=1.0,
+            )
+        )
+        self.assertFalse(
+            turing_attention._sparse_dense_schedule(
+                partial_options,
+                1,
+                0,
+                partial_prefix_steps=0,
+                partial_suffix_steps=0,
+                full_sigma_max=1.0,
+            )
+        )
+        self.assertTrue(
+            turing_attention._sparse_dense_schedule(
+                partial_options,
+                1,
+                0,
+                partial_prefix_steps=1,
+                partial_suffix_steps=0,
+                full_sigma_max=1.0,
+            )
+        )
+        state = partial_options["_turing_utils_sparse_schedule_state"]
+        self.assertTrue(state["is_partial"])
+
     def test_experimental_sparse_fp32_uses_bf16_boundary_and_restores_output(self):
         q = torch.zeros((1, 1, 4096, 128), dtype=torch.float32)
         kernel_output = torch.ones_like(q, dtype=torch.bfloat16)

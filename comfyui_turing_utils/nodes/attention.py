@@ -8,7 +8,7 @@ from ..attention import (
 )
 
 
-class SolSparseAttentionPatch:
+class LegacySolSparseAttentionPatch:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -172,7 +172,7 @@ class SolSparseAttentionPatch:
         )
 
 
-class SlaSparseAttentionPatch:
+class LegacySlaSparseAttentionPatch:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -322,6 +322,166 @@ class SlaSparseAttentionPatch:
                 dense_prefix_layers=dense_prefix_layers,
                 dense_suffix_layers=dense_suffix_layers,
                 use_w8a8=use_w8a8,
+                debug_route_density=debug_route_density,
+            ),
+        )
+
+
+def _partial_step_inputs() -> dict:
+    return {
+        "partial_dense_prefix_steps": (
+            "INT",
+            {
+                "default": 0,
+                "min": 0,
+                "max": 1000,
+                "step": 1,
+                "tooltip": "Dense leading steps only when the sampler starts below the model's full sigma_max, such as a low-noise second pass.",
+            },
+        ),
+        "partial_dense_suffix_steps": (
+            "INT",
+            {
+                "default": 0,
+                "min": 0,
+                "max": 1000,
+                "step": 1,
+                "tooltip": "Dense trailing steps only for a partial-denoise sampler. Full and partial schedules are detected from sigma values, not call order.",
+            },
+        ),
+    }
+
+
+def _rewrite_dense_backend_tooltips(required: dict) -> dict:
+    required = dict(required)
+    explanations = {
+        "dense_prefix_steps": "Leading steps on a full-denoise schedule that use the loader-selected dense backend across every transformer layer.",
+        "dense_suffix_steps": "Trailing steps on a full-denoise schedule that use the loader-selected dense backend across every transformer layer.",
+        "dense_prefix_layers": "Leading transformer layers kept on the loader-selected dense backend during sparse steps.",
+        "dense_suffix_layers": "Trailing transformer layers kept on the loader-selected dense backend during sparse steps.",
+    }
+    for name, tooltip in explanations.items():
+        kind, settings = required[name]
+        settings = dict(settings)
+        settings["tooltip"] = tooltip
+        required[name] = (kind, settings)
+    return required
+
+
+class SolSparseAttentionPatch(LegacySolSparseAttentionPatch):
+    """Configure Sol while inheriting the loader-selected dense backend."""
+
+    TITLE = "Configure Sol Sparse Attention"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = LegacySolSparseAttentionPatch.INPUT_TYPES()
+        required = _rewrite_dense_backend_tooltips(inputs["required"])
+        # Keep the related schedule controls adjacent in newly created nodes.
+        rebuilt = {}
+        for name, spec in required.items():
+            rebuilt[name] = spec
+            if name == "dense_suffix_steps":
+                rebuilt.update(_partial_step_inputs())
+        return {
+            "required": rebuilt,
+            "optional": {
+                "debug_route_density": inputs["optional"]["debug_route_density"]
+            },
+        }
+
+    def patch(
+        self,
+        model,
+        routing_threshold: float = 1.0,
+        prefix_policy: str = "auto",
+        manual_prefix_tokens: int = 0,
+        skipped_residual: str = "1x64",
+        sparse_reference_image: bool = False,
+        sparse_reference_video: bool = True,
+        sparse_reference_audio: bool = False,
+        dense_prefix_steps: int = 1,
+        dense_suffix_steps: int = 0,
+        partial_dense_prefix_steps: int = 0,
+        partial_dense_suffix_steps: int = 0,
+        dense_prefix_layers: int = 2,
+        dense_suffix_layers: int = 0,
+        debug_route_density: bool = False,
+    ):
+        return (
+            apply_sparse_attention_patch(
+                model,
+                routing_threshold=routing_threshold,
+                prefix_policy=prefix_policy,
+                manual_prefix_tokens=manual_prefix_tokens,
+                skipped_residual=skipped_residual,
+                sparse_reference_image=sparse_reference_image,
+                sparse_reference_video=sparse_reference_video,
+                sparse_reference_audio=sparse_reference_audio,
+                dense_prefix_steps=dense_prefix_steps,
+                dense_suffix_steps=dense_suffix_steps,
+                partial_dense_prefix_steps=partial_dense_prefix_steps,
+                partial_dense_suffix_steps=partial_dense_suffix_steps,
+                dense_prefix_layers=dense_prefix_layers,
+                dense_suffix_layers=dense_suffix_layers,
+                debug_route_density=debug_route_density,
+            ),
+        )
+
+
+class SlaSparseAttentionPatch(LegacySlaSparseAttentionPatch):
+    """Configure SLA while inheriting the loader-selected dense backend."""
+
+    TITLE = "Configure SLA Sparse Attention"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        inputs = LegacySlaSparseAttentionPatch.INPUT_TYPES()
+        required = _rewrite_dense_backend_tooltips(inputs["required"])
+        rebuilt = {}
+        for name, spec in required.items():
+            rebuilt[name] = spec
+            if name == "dense_suffix_steps":
+                rebuilt.update(_partial_step_inputs())
+        return {
+            "required": rebuilt,
+            "optional": {
+                "debug_route_density": inputs["optional"]["debug_route_density"]
+            },
+        }
+
+    def patch(
+        self,
+        model,
+        sparsity_ratio: float = 0.85,
+        prefix_policy: str = "auto",
+        manual_prefix_tokens: int = 0,
+        sparse_reference_image: bool = False,
+        sparse_reference_video: bool = True,
+        sparse_reference_audio: bool = False,
+        dense_prefix_steps: int = 0,
+        dense_suffix_steps: int = 0,
+        partial_dense_prefix_steps: int = 0,
+        partial_dense_suffix_steps: int = 0,
+        dense_prefix_layers: int = 0,
+        dense_suffix_layers: int = 0,
+        debug_route_density: bool = False,
+    ):
+        return (
+            apply_sla_attention_patch(
+                model,
+                sparsity_ratio=sparsity_ratio,
+                prefix_policy=prefix_policy,
+                manual_prefix_tokens=manual_prefix_tokens,
+                sparse_reference_image=sparse_reference_image,
+                sparse_reference_video=sparse_reference_video,
+                sparse_reference_audio=sparse_reference_audio,
+                dense_prefix_steps=dense_prefix_steps,
+                dense_suffix_steps=dense_suffix_steps,
+                partial_dense_prefix_steps=partial_dense_prefix_steps,
+                partial_dense_suffix_steps=partial_dense_suffix_steps,
+                dense_prefix_layers=dense_prefix_layers,
+                dense_suffix_layers=dense_suffix_layers,
                 debug_route_density=debug_route_density,
             ),
         )
