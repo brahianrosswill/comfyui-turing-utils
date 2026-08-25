@@ -525,12 +525,32 @@ The official-style `1x64` and quality `2x32` residual paths, plus the 64- and
 This removes runtime loop bounds and second-stage state from the default
 long-sequence kernel without changing the selected route or arithmetic order.
 A correctness gate requires bitwise-identical output between K64 and K128
-staging. The exact compute_75 image contains 24 variants for each native head
-dimension, all with zero stack/local-memory spill and unchanged 16 KiB D64 /
-32 KiB D128 dynamic shared memory. The 0.33 dual-architecture audit reports
-106--168 registers for D64 and 176--200 for D128. Occupancy is reported for diagnosis but is not a
-production gate; final resident-CTA throughput still requires real Turing
-profiling.
+staging. The 0.33 compute_75 image contained 24 variants for each native head
+dimension with unchanged 16 KiB D64 / 32 KiB D128 dynamic shared memory. The
+0.37 dual-architecture build contains 38 reachable/compatibility variants per
+dimension because the host dispatcher must carry both baseline and SM80+
+specializations in one fat binary. The resource gate allows only the known
+16-byte CUDA argument frame, rejects true LOCAL storage, and reports register
+residency rather than prescribing occupancy. Final resident-CTA throughput
+still requires real Turing profiling.
+
+Kernel 0.37 keeps that mathematical contract while removing two routing-side
+bottlenecks. Aligned residual ranges are formed with warp ballots instead of
+per-block shared atomics, and route words are compacted by stable warp prefix
+scans rather than a serial lane. The resulting K-block list is still strictly
+ascending, so exact attention and online-softmax accumulation keep their prior
+order. Native SM80+ builds additionally select a 20/40-KiB D64/D128
+precomputed-summary W8A8 specialization that pipelines summary and selected-V
+loads with `cp.async`; exact SM75 continues through the common synchronous
+fallback and unchanged 16/32-KiB layout. Dispatch is capability-based and does
+not introduce model, GPU-product, or tuning-cache policy branches.
+
+On an A40 exact-sm86 A/B run using identical BF16 inputs (`N=32768`, `H=8`,
+`D=128`, 16.12% selected route), the same current kernel with the SM80+
+pipeline compile-disabled measured a 7.29 ms median, versus 6.82 ms with the
+pipeline enabled (about 6.5% faster). K64 pipelined and K128 baseline staging
+remained bitwise identical. This is a directional Ampere kernel measurement,
+not a claim about full H3 workflow time or GA104 clock/residency behavior.
 
 With the 0.23 causal/varlen specializations, compute_75 reports zero local and
 stack storage for all dense W8A8 variants. D128 uses 180 registers for fixed

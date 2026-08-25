@@ -46,6 +46,9 @@ constexpr int kSummaryTileTokens = 16;
 constexpr int kMaxRouteBytes = kMaxRouteWords * sizeof(uint32_t);
 constexpr int kProxyScratchBytes =
     kWarps * kSummaryTileTokens * sizeof(float);
+constexpr int kCompactionScratchWords = 2 * kWarps;
+constexpr int kCompactionScratchBytes =
+    kCompactionScratchWords * sizeof(uint32_t);
 constexpr int kSlaQueryBlockTokens = 128;
 
 __device__ __forceinline__ bool route_convrot_negative_sign(int channel)
@@ -112,8 +115,12 @@ struct AttentionGeometry
   static constexpr int kSelectedStorageOffset =
       kRouteStorageOffset + kMaxRouteBytes;
   static constexpr int kSelectedCapacity =
-      (kAttentionSharedBytes - kSelectedStorageOffset - sizeof(int)) /
+      (kAttentionSharedBytes - kSelectedStorageOffset - sizeof(int) -
+       kCompactionScratchBytes) /
       sizeof(uint16_t);
+  static constexpr int kCompactionScratchOffset =
+      kSelectedStorageOffset + sizeof(int) +
+      kSelectedCapacity * sizeof(uint16_t);
   static constexpr int kValueTiles = HeadDim / 16;
   static constexpr SwizzleMode kInt8Swizzle =
       HeadDim == 64 ? SwizzleMode::k64B : SwizzleMode::k128B;
@@ -123,9 +130,53 @@ struct AttentionGeometry
       "fused routing metadata must fit beside the 16-block summaries");
   static_assert(kSelectedCapacity >= 1024,
                 "sparse route compaction must cover production sequences");
+  static_assert(
+      kCompactionScratchOffset + kCompactionScratchBytes <=
+          kAttentionSharedBytes,
+      "sparse route compaction scratch must fit in shared memory");
 };
 
 static_assert(AttentionGeometry<128>::kAttentionSharedBytes <= 64 * 1024);
+
+template <int HeadDim, bool SparseValuePipeline>
+struct AttentionStorage
+{
+  using G = AttentionGeometry<HeadDim>;
+  // A sparse SM80+ V pipeline needs one additional INT8 V tile.  Moving route
+  // metadata behind that tile keeps the exact phase's two V stages disjoint
+  // from the stable compact list.  The default SM75/storage layout is
+  // unchanged and remains exactly two 32 KiB CTAs per 64 KiB SM at D128.
+  static constexpr int kRouteStorageOffset = SparseValuePipeline
+      ? G::kAttentionSharedBytes
+      : G::kRouteStorageOffset;
+  static constexpr int kAttentionSharedBytes = G::kAttentionSharedBytes +
+      (SparseValuePipeline ? G::kInt8TileBytes : 0);
+  static constexpr int kSelectedStorageOffset =
+      kRouteStorageOffset + kMaxRouteBytes;
+  static constexpr int kSelectedCapacity =
+      (kAttentionSharedBytes - kSelectedStorageOffset - sizeof(int) -
+       kCompactionScratchBytes) /
+      sizeof(uint16_t);
+  static constexpr int kCompactionScratchOffset =
+      kSelectedStorageOffset + sizeof(int) +
+      kSelectedCapacity * sizeof(uint16_t);
+  static_assert(
+      !SparseValuePipeline ||
+          (G::kRouteStorageOffset >= 3 * G::kInt8TileBytes &&
+           G::kRouteStorageOffset + 2 * G::kSummaryTileBytes <=
+               4 * G::kInt8TileBytes),
+      "pipelined summaries must fit in the later reused exact-V stage");
+  static_assert(
+      !SparseValuePipeline ||
+          4 * G::kInt8TileBytes <= G::kAttentionSharedBytes,
+      "two exact-V stages must end before pipelined route metadata");
+  static_assert(kSelectedCapacity >= 1024,
+                "attention storage must cover production sparse routes");
+  static_assert(
+      kCompactionScratchOffset + kCompactionScratchBytes <=
+          kAttentionSharedBytes,
+      "attention storage exceeds dynamic shared memory");
+};
 
 template <typename T>
 __device__ __forceinline__ float scalar_to_float(T value);
@@ -523,6 +574,32 @@ __device__ __forceinline__ void load_half_tile(
   }
 }
 
+template <int HeadDim, int Rows>
+__device__ __forceinline__ void load_half_tile_async(
+    const half *__restrict__ source,
+    int64_t stride_sequence,
+    int row_start,
+    int row_limit,
+    const smem_t<SwizzleMode::k128B, AttentionGeometry<HeadDim>::kHalfPacks> &destination)
+{
+  using G = AttentionGeometry<HeadDim>;
+  const int linear_thread = threadIdx.y * WARP_SIZE + threadIdx.x;
+  static_assert(Rows > 0 && Rows <= kBlockTokens && Rows % 16 == 0);
+  constexpr int tile_packs = Rows * G::kHalfPacks;
+  for (int line = linear_thread; line < tile_packs;
+       line += kWarps * WARP_SIZE)
+  {
+    const int row = line / G::kHalfPacks;
+    const int column = line % G::kHalfPacks;
+    const uint32_t offset = destination.get_permuted_offset(row, column);
+    const half *source_line = source +
+        static_cast<int64_t>(row_start + row) * stride_sequence + column * 8;
+    destination.template load_128b_async<
+        cp_async::SharedMemFillMode::kFillZero>(
+        offset, source_line, row_start + row < row_limit);
+  }
+}
+
 template <int HeadDim>
 __device__ __forceinline__ void load_int8_tile(
     const int8_t *__restrict__ source,
@@ -689,38 +766,65 @@ __device__ __forceinline__ int compact_route_words(
     const uint32_t *__restrict__ route_words,
     int *__restrict__ selected_count,
     uint16_t *__restrict__ selected_blocks,
+    uint32_t *__restrict__ scratch,
     int active_key_blocks)
 {
-  // One lane performs an ascending bit scan.  Route construction is tiny
-  // compared with exact attention and this deterministic compaction removes
-  // the four per-thread route registers that spill on long sm86 kernels.  The
-  // ascending order is intentional: changing it changes online-softmax
-  // rounding even when the selected set is identical.
-  int selected = 0;
-  if (threadIdx.x == 0 && threadIdx.y == 0)
+  // Each thread owns one ascending route word.  Warp scans plus four shared
+  // warp totals assign stable, non-overlapping output ranges without making a
+  // single lane enumerate every selected block.  Words and bits retain their
+  // original ascending order, which keeps online-softmax rounding unchanged.
+  const int linear_thread = threadIdx.y * WARP_SIZE + threadIdx.x;
+  const int lane = threadIdx.x;
+  const int warp = threadIdx.y;
+  const int route_word_count =
+      (active_key_blocks + kRouteWordBits - 1) / kRouteWordBits;
+  uint32_t word = linear_thread < route_word_count
+      ? route_words[linear_thread]
+      : 0;
+  const int final_word_bits = active_key_blocks % kRouteWordBits;
+  if (linear_thread == route_word_count - 1 && final_word_bits != 0)
+    word &= (1U << final_word_bits) - 1U;
+  unsigned int word_count = __popc(word);
+  unsigned int inclusive = word_count;
+#pragma unroll
+  for (int offset = 1; offset < WARP_SIZE; offset <<= 1)
   {
-    const int route_word_count =
-        (active_key_blocks + kRouteWordBits - 1) / kRouteWordBits;
-    for (int word_index = 0; word_index < route_word_count; ++word_index)
+    const unsigned int other = __shfl_up_sync(
+        0xffffffffu, inclusive, offset);
+    if (lane >= offset)
+      inclusive += other;
+  }
+  if (lane == WARP_SIZE - 1)
+    scratch[warp] = inclusive;
+  __syncthreads();
+  if (linear_thread == 0)
+  {
+    unsigned int running = 0;
+#pragma unroll
+    for (int warp_index = 0; warp_index < kWarps; ++warp_index)
     {
-      uint32_t word = route_words[word_index];
-      while (word != 0)
-      {
-        const int bit = __ffs(static_cast<int>(word)) - 1;
-        const int key_block = word_index * kRouteWordBits + bit;
-        if (key_block < active_key_blocks)
-        {
-          if (selected < SelectedCapacity)
-            selected_blocks[selected] = static_cast<uint16_t>(key_block);
-          ++selected;
-        }
-        word &= word - 1;
-      }
+      scratch[kWarps + warp_index] = running;
+      running += scratch[warp_index];
     }
-    *selected_count = selected <= SelectedCapacity ? selected : -selected;
+    *selected_count = running <= SelectedCapacity
+        ? static_cast<int>(running)
+        : -static_cast<int>(running);
   }
   __syncthreads();
-  return *selected_count;
+  const unsigned int output_start =
+      scratch[kWarps + warp] + inclusive - word_count;
+  const int selected = *selected_count;
+  unsigned int output_index = output_start;
+  while (word != 0)
+  {
+    const int bit = __ffs(static_cast<int>(word)) - 1;
+    const int key_block = linear_thread * kRouteWordBits + bit;
+    if (key_block < active_key_blocks && output_index < SelectedCapacity)
+      selected_blocks[output_index++] = static_cast<uint16_t>(key_block);
+    word &= word - 1;
+  }
+  __syncthreads();
+  return selected;
 }
 
 __device__ __forceinline__ int next_shared_route_block(
@@ -858,7 +962,7 @@ __device__ __forceinline__ void load_quantized_value_tile_async(
 
 template <int HeadDim, typename T, bool UseW8A8, bool ForceDense,
           bool IsCausal, bool Varlen, int ResidualSubblocks, int KeyStages,
-          bool ExternalRoute = false>
+          bool ExternalRoute = false, bool SparseValuePipeline = false>
 __global__ void sparse_attention_kernel(
     const int8_t *__restrict__ query_int8,
     const int8_t *__restrict__ key_int8,
@@ -905,6 +1009,7 @@ __global__ void sparse_attention_kernel(
     int route_original_basis)
 {
   using G = AttentionGeometry<HeadDim>;
+  using S = AttentionStorage<HeadDim, SparseValuePipeline>;
   static_assert(
       ResidualSubblocks == 1 || ResidualSubblocks == 2,
       "Sol residual geometry must be 1x64 or 2x32");
@@ -913,10 +1018,14 @@ __global__ void sparse_attention_kernel(
       "exact attention stages must cover 64 or 128 K tokens");
   static_assert(!ForceDense || KeyStages == 1);
   static_assert(!ExternalRoute || (!ForceDense && !Varlen && !IsCausal));
+  static_assert(
+      !SparseValuePipeline ||
+          (UseW8A8 && !ForceDense && !Varlen && !IsCausal),
+      "the extra V stage is scoped to non-causal W8A8 sparse routes");
   static_assert(!IsCausal || ForceDense,
                 "causal masking is supported only by dense W8A8");
   static_assert(
-      G::kAttentionSharedBytes <= 64 * 1024,
+      S::kAttentionSharedBytes <= 64 * 1024,
       "sparse attention exceeds the configured shared-memory limit");
   extern __shared__ int8_t shared_bytes[];
   smem_t<SwizzleMode::k128B, G::kHalfPacks> shared_correction_query(shared_bytes);
@@ -924,6 +1033,12 @@ __global__ void sparse_attention_kernel(
       shared_bytes + G::kTileBytes);
   smem_t<SwizzleMode::k128B, G::kHalfPacks> shared_summary_value(
       shared_bytes + G::kTileBytes + G::kSummaryTileBytes);
+  // Routing finishes before exact PV starts, so the alternate summary pair
+  // intentionally aliases the alternate INT8 V tile across those two phases.
+  smem_t<SwizzleMode::k128B, G::kHalfPacks> shared_summary_key_next(
+      shared_bytes + G::kRouteStorageOffset);
+  smem_t<SwizzleMode::k128B, G::kHalfPacks> shared_summary_value_next(
+      shared_bytes + G::kRouteStorageOffset + G::kSummaryTileBytes);
   smem_t<SwizzleMode::k128B, G::kHalfPacks> shared_output(shared_bytes);
   smem_t<G::kInt8Swizzle, G::kInt8Packs> shared_query_int8(shared_bytes);
   smem_t<G::kInt8Swizzle, G::kInt8Packs> shared_initial_query_int8(
@@ -943,11 +1058,13 @@ __global__ void sparse_attention_kernel(
   smem_t<SwizzleMode::k64B, 4> shared_selected_value_int8_next(
       shared_bytes + 3 * G::kInt8TileBytes);
   uint32_t *shared_route = reinterpret_cast<uint32_t *>(
-      shared_bytes + G::kRouteStorageOffset);
+      shared_bytes + S::kRouteStorageOffset);
   int *shared_selected_count = reinterpret_cast<int *>(
-      shared_bytes + G::kSelectedStorageOffset);
+      shared_bytes + S::kSelectedStorageOffset);
   uint16_t *shared_selected_blocks = reinterpret_cast<uint16_t *>(
-      shared_bytes + G::kSelectedStorageOffset + sizeof(int));
+      shared_bytes + S::kSelectedStorageOffset + sizeof(int));
+  uint32_t *shared_compaction_scratch = reinterpret_cast<uint32_t *>(
+      shared_bytes + S::kCompactionScratchOffset);
 
   const int query_block = blockIdx.x;
   const int query_head = blockIdx.y;
@@ -1087,7 +1204,7 @@ __global__ void sparse_attention_kernel(
   float query_mean = query_sum / static_cast<float>(query_token_count);
 
   float *reduction_scratch = reinterpret_cast<float *>(
-      shared_bytes + G::kRouteStorageOffset);
+      shared_bytes + S::kRouteStorageOffset);
   if (route_original_basis)
     query_mean = inverse_route_hadamard<HeadDim>(
         query_mean, reduction_scratch);
@@ -1136,26 +1253,87 @@ __global__ void sparse_attention_kernel(
   const int num_residual_summaries =
       (key_length + residual_tokens - 1) / residual_tokens;
   float *shared_proxy_partials = reinterpret_cast<float *>(
-      shared_bytes + G::kRouteStorageOffset + kMaxRouteBytes);
+      shared_bytes + S::kRouteStorageOffset + kMaxRouteBytes);
+  int summary_stage = 0;
   for (int summary_start = 0; summary_start < num_residual_summaries;
        summary_start += kSummaryTileTokens)
   {
-    load_half_tile<HeadDim, kSummaryTileTokens>(
-        key_score_summary_head,
-        HeadDim,
-        summary_start,
-        num_residual_summaries,
-        shared_summary_key);
-    load_half_tile<HeadDim, kSummaryTileTokens>(
-        value_mean_head,
-        HeadDim,
-        summary_start,
-        num_residual_summaries,
-        shared_summary_value);
-    __syncthreads();
+    smem_t<SwizzleMode::k128B, G::kHalfPacks> current_summary_key(
+        summary_stage == 0
+            ? shared_summary_key.base
+            : shared_summary_key_next.base);
+    smem_t<SwizzleMode::k128B, G::kHalfPacks> current_summary_value(
+        summary_stage == 0
+            ? shared_summary_value.base
+            : shared_summary_value_next.base);
+    if constexpr (SparseValuePipeline)
+    {
+      if (summary_start == 0)
+      {
+        load_half_tile_async<HeadDim, kSummaryTileTokens>(
+            key_score_summary_head,
+            HeadDim,
+            summary_start,
+            num_residual_summaries,
+            current_summary_key);
+        load_half_tile_async<HeadDim, kSummaryTileTokens>(
+            value_mean_head,
+            HeadDim,
+            summary_start,
+            num_residual_summaries,
+            current_summary_value);
+        cp_async::commit_group();
+        cp_async::wait_group<0>();
+        __syncthreads();
+      }
+      const int next_summary_start = summary_start + kSummaryTileTokens;
+      if (next_summary_start < num_residual_summaries)
+      {
+        smem_t<SwizzleMode::k128B, G::kHalfPacks> next_summary_key(
+            summary_stage == 0
+                ? shared_summary_key_next.base
+                : shared_summary_key.base);
+        smem_t<SwizzleMode::k128B, G::kHalfPacks> next_summary_value(
+            summary_stage == 0
+                ? shared_summary_value_next.base
+                : shared_summary_value.base);
+        load_half_tile_async<HeadDim, kSummaryTileTokens>(
+            key_score_summary_head,
+            HeadDim,
+            next_summary_start,
+            num_residual_summaries,
+            next_summary_key);
+        load_half_tile_async<HeadDim, kSummaryTileTokens>(
+            value_mean_head,
+            HeadDim,
+            next_summary_start,
+            num_residual_summaries,
+            next_summary_value);
+        cp_async::commit_group();
+      }
+    }
+    else
+    {
+      load_half_tile_async<HeadDim, kSummaryTileTokens>(
+          key_score_summary_head,
+          HeadDim,
+          summary_start,
+          num_residual_summaries,
+          current_summary_key);
+      load_half_tile_async<HeadDim, kSummaryTileTokens>(
+          value_mean_head,
+          HeadDim,
+          summary_start,
+          num_residual_summaries,
+          current_summary_value);
+      cp_async::commit_group();
+      cp_async::wait_group<0>();
+      __syncthreads();
+    }
 
     float score[1][1][8];
-    compute_fp16_qk<HeadDim, 1>(shared_correction_query, shared_summary_key, score);
+    compute_fp16_qk<HeadDim, 1>(
+        shared_correction_query, current_summary_key, score);
 
     float proxy0 = score[0][0][0] + score[0][0][2];
     float proxy1 = score[0][0][1] + score[0][0][3];
@@ -1182,9 +1360,11 @@ __global__ void sparse_attention_kernel(
     __syncthreads();
 
     constexpr int routed_blocks = kSummaryTileTokens / ResidualSubblocks;
-    if (linear_thread < routed_blocks)
+    bool route_block = false;
+    if (threadIdx.y == 0 && threadIdx.x < routed_blocks)
     {
-      const int key_block = summary_start / ResidualSubblocks + linear_thread;
+      const int key_block =
+          summary_start / ResidualSubblocks + threadIdx.x;
       if (key_block < active_key_blocks)
       {
         float proxy_sum = 0.0f;
@@ -1194,7 +1374,7 @@ __global__ void sparse_attention_kernel(
              ++residual_index)
         {
           const int residual_summary =
-              linear_thread * ResidualSubblocks + residual_index;
+              threadIdx.x * ResidualSubblocks + residual_index;
           const int residual_start =
               key_block * kBlockTokens + residual_index * residual_tokens;
           const int residual_count =
@@ -1217,13 +1397,23 @@ __global__ void sparse_attention_kernel(
         const int distance = query_block > key_block
             ? query_block - key_block
             : key_block - query_block;
-        if (!sparse_query || exact_kv_blocks[key_block] ||
-            distance <= 1 || proxy_score > threshold)
-        {
-          atomicOr(
-              shared_route + key_block / kRouteWordBits,
-              1U << (key_block % kRouteWordBits));
-        }
+        route_block = !sparse_query || exact_kv_blocks[key_block] ||
+            distance <= 1 || proxy_score > threshold;
+      }
+    }
+    if (threadIdx.y == 0)
+    {
+      const uint32_t route_bits = __ballot_sync(
+          0xffffffffu, route_block);
+      if (threadIdx.x == 0 && route_bits != 0)
+      {
+        const int first_key_block = summary_start / ResidualSubblocks;
+        // Residual-1 emits aligned 16-bit ranges and residual-2 emits aligned
+        // 8-bit ranges.  The summary loop is CTA-serial with a barrier below,
+        // so exactly one lane owns this word update and no shared-memory
+        // atomic is required.
+        shared_route[first_key_block / kRouteWordBits] |=
+            route_bits << (first_key_block % kRouteWordBits);
       }
     }
     __syncthreads();
@@ -1284,12 +1474,21 @@ __global__ void sparse_attention_kernel(
     uint32_t value_offset = value_mma_offset;
     compute_fp16_sv_permuted<4, 1, 1, 1, G::kValueTiles,
                              SwizzleMode::k128B, G::kHalfPacks, 4>(
-        shared_summary_value,
+        current_summary_value,
         probability,
         output_fragment,
         denominator,
         value_offset);
     __syncthreads();
+    if constexpr (SparseValuePipeline)
+    {
+      if (summary_start + kSummaryTileTokens < num_residual_summaries)
+      {
+        cp_async::wait_group<0>();
+        __syncthreads();
+        summary_stage ^= 1;
+      }
+    }
   }
 
   __syncthreads();
@@ -1303,10 +1502,11 @@ __global__ void sparse_attention_kernel(
   {
     if constexpr (UseW8A8)
     {
-      compact_selected_count = compact_route_words<G::kSelectedCapacity>(
+      compact_selected_count = compact_route_words<S::kSelectedCapacity>(
           shared_route,
           shared_selected_count,
           shared_selected_blocks,
+          shared_compaction_scratch,
           active_key_blocks);
       if (selected_count != nullptr && sparse_query &&
           threadIdx.x == 0 && threadIdx.y == 0)
@@ -1363,7 +1563,7 @@ __global__ void sparse_attention_kernel(
   int selected_position = 0;
   int key_block = !ForceDense && sparse_query
       ? (UseW8A8
-          ? next_compact_route_block<G::kSelectedCapacity>(
+          ? next_compact_route_block<S::kSelectedCapacity>(
               shared_route,
               shared_selected_blocks,
               compact_selected_count,
@@ -1373,7 +1573,8 @@ __global__ void sparse_attention_kernel(
           : next_register_route_block(fp16_route, 0, active_key_blocks))
       : 0;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
-  const bool value_ping_pong = UseW8A8 && (ForceDense || !sparse_query);
+  const bool value_ping_pong = UseW8A8 &&
+      (ForceDense || !sparse_query || SparseValuePipeline);
 #else
   constexpr bool value_ping_pong = false;
 #endif
@@ -1432,7 +1633,7 @@ __global__ void sparse_attention_kernel(
     float (&score)[1][4][8] = score_storage.floating;
     const int next_key_block = !ForceDense && sparse_query
         ? (UseW8A8
-            ? next_compact_route_block<G::kSelectedCapacity>(
+            ? next_compact_route_block<S::kSelectedCapacity>(
                 shared_route,
                 shared_selected_blocks,
                 compact_selected_count,
@@ -1664,10 +1865,37 @@ void check_launch(const char *name)
   TORCH_CHECK(error == cudaSuccess, name, " launch failed: ", cudaGetErrorString(error));
 }
 
+int current_cuda_device_major()
+{
+  int device = 0;
+  const cudaError_t device_error = cudaGetDevice(&device);
+  TORCH_CHECK(
+      device_error == cudaSuccess,
+      "unable to query the current CUDA device: ",
+      cudaGetErrorString(device_error));
+  // Attention dispatch runs repeatedly on the same ComfyUI worker thread.
+  // Cache only the immutable capability, while still observing current-device
+  // changes when a process alternates between its Turing and Ampere cards.
+  static thread_local int cached_device = -1;
+  static thread_local int cached_major = 0;
+  if (device == cached_device)
+    return cached_major;
+  int device_major = 0;
+  const cudaError_t capability_error = cudaDeviceGetAttribute(
+      &device_major, cudaDevAttrComputeCapabilityMajor, device);
+  TORCH_CHECK(
+      capability_error == cudaSuccess,
+      "unable to query the current CUDA capability: ",
+      cudaGetErrorString(capability_error));
+  cached_device = device;
+  cached_major = device_major;
+  return cached_major;
+}
+
 template <int HeadDim, typename T, bool UseW8A8, bool ForceDense,
           bool IsCausal, bool Varlen,
           bool SummariesReady = false, int ResidualSubblocks = 1,
-          int KeyStages = 1>
+          int KeyStages = 1, bool SparseValuePipeline = false>
 void launch_sparse_threshold_attention(
     at::Tensor query_int8,
     at::Tensor key_int8,
@@ -1697,6 +1925,7 @@ void launch_sparse_threshold_attention(
     int route_original_basis)
 {
   using G = AttentionGeometry<HeadDim>;
+  using S = AttentionStorage<HeadDim, SparseValuePipeline>;
   static_assert(
       ResidualSubblocks == 1 || ResidualSubblocks == 2,
       "Sol residual geometry must be 1x64 or 2x32");
@@ -1765,9 +1994,10 @@ void launch_sparse_threshold_attention(
   dim3 attention_block(WARP_SIZE, kWarps);
   auto attention_kernel =
       sparse_attention_kernel<HeadDim, T, UseW8A8, ForceDense, IsCausal,
-                              Varlen, ResidualSubblocks, KeyStages>;
+                              Varlen, ResidualSubblocks, KeyStages, false,
+                              SparseValuePipeline>;
   configure_dynamic_shared_memory(
-      attention_kernel, G::kAttentionSharedBytes, "Sol sparse attention");
+      attention_kernel, S::kAttentionSharedBytes, "Sol sparse attention");
   if (attention_kernel_profile_enabled())
   {
     static std::once_flag profile_once;
@@ -1782,6 +2012,7 @@ void launch_sparse_threshold_attention(
                << ",varlen=" << (Varlen ? 1 : 0)
                << ",residual_subblocks=" << ResidualSubblocks
                << ",key_stages=" << KeyStages
+               << ",sparse_v_pipeline=" << (SparseValuePipeline ? 1 : 0)
                << ",query_tokens=" << query_length
                << ",key_tokens=" << key_length
                << ",query_blocks=" << num_query_blocks
@@ -1792,7 +2023,7 @@ void launch_sparse_threshold_attention(
           "sol_w8a8_attention",
           schedule.str(),
           WARP_SIZE * kWarps,
-          G::kAttentionSharedBytes,
+          S::kAttentionSharedBytes,
           attention_grid.x,
           attention_grid.y,
           attention_grid.z);
@@ -1801,7 +2032,7 @@ void launch_sparse_threshold_attention(
   attention_kernel<<<
       attention_grid,
       attention_block,
-      G::kAttentionSharedBytes,
+      S::kAttentionSharedBytes,
       stream>>>(
       query_int8.data_ptr<int8_t>(),
       key_int8.data_ptr<int8_t>(),
@@ -1884,10 +2115,10 @@ void dispatch_sparse_threshold_attention(
     bool varlen,
     int route_original_basis)
 {
-#define LAUNCH_VARIANT(HEAD_DIM, SCALAR, USE_W8A8, FORCE_DENSE, CAUSAL, VARLEN, READY, RESIDUALS, STAGES) \
+#define LAUNCH_VARIANT(HEAD_DIM, SCALAR, USE_W8A8, FORCE_DENSE, CAUSAL, VARLEN, READY, RESIDUALS, STAGES, PIPELINE) \
   launch_sparse_threshold_attention<HEAD_DIM, SCALAR, USE_W8A8,             \
                                     FORCE_DENSE, CAUSAL, VARLEN, READY,      \
-                                    RESIDUALS, STAGES>(                      \
+                                    RESIDUALS, STAGES, PIPELINE>(            \
       query_int8, key_int8, value, value_int8, value_scale, output,          \
       query_scale, key_scale, key_summary, key_score_summary, value_mean,    \
       key_summary_mean, key_summary_variance, sparse_query_blocks,           \
@@ -1895,56 +2126,62 @@ void dispatch_sparse_threshold_attention(
       value_offsets,                                                        \
       max_seqlen_q, max_seqlen_k, residual_subblocks, threshold_sigma,       \
       softmax_scale, key_tile_tokens, route_original_basis)
+  const bool sparse_value_pipeline =
+      use_w8a8 && !force_dense && !varlen && !is_causal && summaries_ready &&
+      residual_subblocks == 1 && key_tile_tokens == 64 &&
+      current_cuda_device_major() >= 8;
 #define DISPATCH_FORMAT(HEAD_DIM, SCALAR)                                    \
   do                                                                         \
   {                                                                          \
-    if (varlen && is_causal)                                                 \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, true, true, true, 1, 1);  \
+    if (sparse_value_pipeline)                                               \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 1, 1, true); \
+    else if (varlen && is_causal)                                            \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, true, true, true, 1, 1, false); \
     else if (varlen)                                                         \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, false, true, true, 1, 1); \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, false, true, true, 1, 1, false); \
     else if (force_dense && is_causal)                                       \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, true, false, true, 1, 1); \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, true, false, true, 1, 1, false); \
     else if (force_dense)                                                    \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, false, false, true, 1, 1);\
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, false, false, true, 1, 1, false);\
     else if (residual_subblocks == 2)                                        \
     {                                                                        \
       if (use_w8a8 && summaries_ready)                                       \
       {                                                                      \
         if (key_tile_tokens == 128)                                          \
-          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 2, 2); \
+          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 2, 2, false); \
         else                                                                 \
-          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 2, 1); \
+          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 2, 1, false); \
       }                                                                      \
       else if (use_w8a8)                                                     \
       {                                                                      \
         if (key_tile_tokens == 128)                                          \
-          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 2, 2); \
+          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 2, 2, false); \
         else                                                                 \
-          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 2, 1); \
+          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 2, 1, false); \
       }                                                                      \
       else if (key_tile_tokens == 128)                                       \
-        LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 2, 2); \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 2, 2, false); \
       else                                                                   \
-        LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 2, 1); \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 2, 1, false); \
     }                                                                        \
     else if (use_w8a8 && summaries_ready)                                    \
     {                                                                        \
       if (key_tile_tokens == 128)                                            \
-        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 1, 2); \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 1, 2, false); \
       else                                                                   \
-        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 1, 1); \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 1, 1, false); \
     }                                                                        \
     else if (use_w8a8)                                                       \
     {                                                                        \
       if (key_tile_tokens == 128)                                            \
-        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 1, 2); \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 1, 2, false); \
       else                                                                   \
-        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 1, 1); \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 1, 1, false); \
     }                                                                        \
     else if (key_tile_tokens == 128)                                         \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 1, 2); \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 1, 2, false); \
     else                                                                     \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 1, 1); \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 1, 1, false); \
   } while (false)
 
   const int head_dim = query_int8.size(-1);
@@ -1966,7 +2203,8 @@ void dispatch_sparse_threshold_attention(
 #undef LAUNCH_VARIANT
 }
 
-template <int HeadDim, typename T, bool UseW8A8, int KeyStages>
+template <int HeadDim, typename T, bool UseW8A8, int KeyStages,
+          bool SparseValuePipeline = false>
 void launch_sla_attention(
     at::Tensor query_int8,
     at::Tensor key_int8,
@@ -1982,6 +2220,7 @@ void launch_sla_attention(
     float softmax_scale)
 {
   using G = AttentionGeometry<HeadDim>;
+  using S = AttentionStorage<HeadDim, SparseValuePipeline>;
   const int batch_size = query_int8.size(0);
   const int num_query_heads = query_int8.size(1);
   const int num_kv_heads = key_int8.size(1);
@@ -1993,13 +2232,13 @@ void launch_sla_attention(
   dim3 attention_block(WARP_SIZE, kWarps);
   auto attention_kernel =
       sparse_attention_kernel<HeadDim, T, UseW8A8, false, false, false,
-                              1, KeyStages, true>;
+                              1, KeyStages, true, SparseValuePipeline>;
   configure_dynamic_shared_memory(
-      attention_kernel, G::kAttentionSharedBytes, "SLA sparse attention");
+      attention_kernel, S::kAttentionSharedBytes, "SLA sparse attention");
   attention_kernel<<<
       attention_grid,
       attention_block,
-      G::kAttentionSharedBytes,
+      S::kAttentionSharedBytes,
       c10::cuda::getCurrentCUDAStream()>>>(
       query_int8.data_ptr<int8_t>(),
       key_int8.data_ptr<int8_t>(),
@@ -2065,22 +2304,28 @@ void dispatch_sla_attention(
     bool use_w8a8,
     int key_tile_tokens)
 {
-#define LAUNCH_SLA(HEAD_DIM, SCALAR, W8A8, STAGES)                           \
-  launch_sla_attention<HEAD_DIM, SCALAR, W8A8, STAGES>(                     \
+  const bool sparse_value_pipeline =
+      use_w8a8 && current_cuda_device_major() >= 8;
+#define LAUNCH_SLA(HEAD_DIM, SCALAR, W8A8, STAGES, PIPELINE)                 \
+  launch_sla_attention<HEAD_DIM, SCALAR, W8A8, STAGES, PIPELINE>(           \
       query_int8, key_int8, value, value_int8, value_scale, output,          \
       query_scale, key_scale, route_words, sparse_query_blocks,              \
       selected_count, softmax_scale)
 #define DISPATCH_SLA(HEAD_DIM, SCALAR)                                      \
   do                                                                         \
   {                                                                          \
-    if (use_w8a8 && key_tile_tokens == 128)                                  \
-      LAUNCH_SLA(HEAD_DIM, SCALAR, true, 2);                                 \
+    if (sparse_value_pipeline && key_tile_tokens == 128)                     \
+      LAUNCH_SLA(HEAD_DIM, SCALAR, true, 2, true);                           \
+    else if (sparse_value_pipeline)                                          \
+      LAUNCH_SLA(HEAD_DIM, SCALAR, true, 1, true);                           \
+    else if (use_w8a8 && key_tile_tokens == 128)                             \
+      LAUNCH_SLA(HEAD_DIM, SCALAR, true, 2, false);                          \
     else if (use_w8a8)                                                       \
-      LAUNCH_SLA(HEAD_DIM, SCALAR, true, 1);                                 \
+      LAUNCH_SLA(HEAD_DIM, SCALAR, true, 1, false);                          \
     else if (key_tile_tokens == 128)                                         \
-      LAUNCH_SLA(HEAD_DIM, SCALAR, false, 2);                                \
+      LAUNCH_SLA(HEAD_DIM, SCALAR, false, 2, false);                         \
     else                                                                     \
-      LAUNCH_SLA(HEAD_DIM, SCALAR, false, 1);                                \
+      LAUNCH_SLA(HEAD_DIM, SCALAR, false, 1, false);                         \
   } while (false)
   const int head_dim = query_int8.size(-1);
   if (output.scalar_type() == at::ScalarType::Half)

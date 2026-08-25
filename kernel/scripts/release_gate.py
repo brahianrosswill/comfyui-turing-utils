@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = ROOT / "kernel"
 COMFYUI_ROOT = ROOT.parents[1]
-EXPECTED_VERSION = "0.36.0"
+EXPECTED_VERSION = "0.37.0"
 
 
 def _run(command: list[str], *, cwd: Path = ROOT, env=None) -> None:
@@ -60,11 +60,17 @@ def _static_gate() -> None:
         "key_tile_tokens / kBlockTokens",
         "quantize_varlen_value_kernel",
         "build_varlen_value_offsets_kernel",
-        "compact_route_words<G::kSelectedCapacity>",
-        "next_compact_route_block<G::kSelectedCapacity>",
+        "compact_route_words<S::kSelectedCapacity>",
+        "next_compact_route_block<S::kSelectedCapacity>",
         "next_shared_route_block",
         "shared_selected_value_int8_next",
         "value_ping_pong",
+        "kCompactionScratchWords",
+        "__shfl_up_sync",
+        "__ballot_sync",
+        "AttentionStorage<HeadDim, SparseValuePipeline>",
+        "sparse_v_pipeline=",
+        "current_cuda_device_major() >= 8",
         "union ScoreStorage",
         "ResidualSubblocks == 1 || ResidualSubblocks == 2",
         "KeyStages == 1 || KeyStages == 2",

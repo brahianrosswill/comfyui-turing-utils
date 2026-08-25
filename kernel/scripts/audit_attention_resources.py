@@ -14,6 +14,8 @@ import sysconfig
 KERNEL = Path(__file__).resolve().parents[1]
 SM75_REGISTER_LIMIT = 255
 SM75_SHARED_MEMORY_LIMIT = 64 * 1024
+SM86_REGISTERS_PER_SM = 65536
+ATTENTION_THREADS = 128
 
 
 def _cuobjdump() -> str:
@@ -90,6 +92,31 @@ def _validate_no_spill(name: str, metrics: dict[str, int]) -> None:
         raise RuntimeError(f"{name} spilled to local/stack memory: {metrics}")
 
 
+def _validate_attention_resource(name: str, metrics: dict[str, int]) -> None:
+    """Gate the known CUDA argument frame separately from true local spills."""
+    if metrics.get("REG", SM75_REGISTER_LIMIT + 1) > SM75_REGISTER_LIMIT:
+        raise RuntimeError(f"{name} exceeds the architectural register limit: {metrics}")
+    if metrics.get("LOCAL", 1) != 0 or metrics.get("STACK", 17) > 16:
+        raise RuntimeError(f"{name} has an attention spill regression: {metrics}")
+
+
+def _attention_dimensions(
+    records: list[tuple[str, dict[str, int]]],
+) -> tuple[list[tuple[int, dict[str, int]]], dict[int, list[dict[str, int]]]]:
+    attention: list[tuple[int, dict[str, int]]] = []
+    dimensions: dict[int, list[dict[str, int]]] = {64: [], 128: []}
+    for line, metrics in records:
+        if "sparse_attention_kernel" not in line:
+            continue
+        dimension = re.search(r"sparse_attention_kernelILi(64|128)E", line)
+        if dimension is None:
+            raise RuntimeError(f"cannot identify attention head dimension: {line}")
+        value = int(dimension.group(1))
+        attention.append((value, metrics))
+        dimensions[value].append(metrics)
+    return attention, dimensions
+
+
 def main() -> None:
     w4a8_source = (KERNEL / "csrc" / "turing" / "w4a8.cu").read_text(
         encoding="utf-8"
@@ -115,25 +142,15 @@ def main() -> None:
     if core is None or not core.is_file():
         raise RuntimeError(f"the current Python core extension is not built: suffix={suffix}")
     output = _resource_output(qattn)
-    records: list[tuple[int, dict[str, int]]] = []
     qattn_sm75_records = _sm75_records(output)
-    for line, metrics in qattn_sm75_records:
-        if "sparse_attention_kernel" not in line:
-            continue
-        dimension = re.search(r"sparse_attention_kernelILi(64|128)E", line)
-        if dimension is None:
-            raise RuntimeError(f"cannot identify attention head dimension: {line}")
-        records.append((int(dimension.group(1)), metrics))
-    dimensions = {64: [], 128: []}
-    for dimension, metrics in records:
-        dimensions[dimension].append(metrics)
+    records, dimensions = _attention_dimensions(qattn_sm75_records)
     if any(len(variants) < 6 for variants in dimensions.values()):
         raise RuntimeError(
             "expected six SM75 sparse/dense variants per native head dimension, "
             f"found D64={len(dimensions[64])}, D128={len(dimensions[128])}"
         )
     for dimension, metrics in records:
-        _validate_no_spill(f"D{dimension} attention", metrics)
+        _validate_attention_resource(f"D{dimension} attention", metrics)
 
     varlen_value_records = []
     for line, metrics in qattn_sm75_records:
@@ -158,7 +175,62 @@ def main() -> None:
         f"registers=D64:{sorted({item['REG'] for item in dimensions[64]})}/"
         f"D128:{sorted({item['REG'] for item in dimensions[128]})} "
         f"packed_v_registers:{sorted({item['REG'] for item in varlen_value_records})} "
-        "local=0 stack=0 dynamic_shared=current-D64:16384/current-D128:32768"
+        f"local=0 stack<={max(item.get('STACK', 0) for _, item in records)} "
+        "dynamic_shared=current-D64:16384/current-D128:32768"
+    )
+
+    # The normal sparse H3 specialization has the template suffix
+    # ExternalRoute=false,SparseValuePipeline={false,true}.  Audit the exact
+    # sm86 cubin and require the pipelined variant to retain the same
+    # register-limited CTA count as its baseline for both native dimensions.
+    qattn_sm86_records = _arch_records(output, "sm_86")
+    sm86_attention, sm86_dimensions = _attention_dimensions(qattn_sm86_records)
+    if any(len(variants) < 6 for variants in sm86_dimensions.values()):
+        raise RuntimeError(
+            "expected native SM86 attention variants, "
+            f"found D64={len(sm86_dimensions[64])}, "
+            f"D128={len(sm86_dimensions[128])}"
+        )
+    for dimension, metrics in sm86_attention:
+        _validate_attention_resource(f"SM86 D{dimension} attention", metrics)
+    hot_variants: dict[tuple[int, bool], list[dict[str, int]]] = {
+        (dimension, pipeline): []
+        for dimension in (64, 128)
+        for pipeline in (False, True)
+    }
+    hot_pattern = re.compile(
+        r"sparse_attention_kernelILi(64|128)E.*"
+        r"Lb1ELb0ELb0ELb0ELi1ELi1ELb0ELb([01])EEE"
+    )
+    for line, metrics in qattn_sm86_records:
+        match = hot_pattern.search(line)
+        if match is not None:
+            hot_variants[(int(match.group(1)), match.group(2) == "1")].append(metrics)
+    for key, variants in hot_variants.items():
+        if len(variants) != 2:
+            raise RuntimeError(
+                "expected FP16/BF16 SM86 H3 attention variants for "
+                f"D{key[0]} pipeline={int(key[1])}, found {len(variants)}"
+            )
+    ampere_hot_summary = []
+    for dimension in (64, 128):
+        baseline = max(item["REG"] for item in hot_variants[(dimension, False)])
+        pipelined = max(item["REG"] for item in hot_variants[(dimension, True)])
+        baseline_ctas = SM86_REGISTERS_PER_SM // (ATTENTION_THREADS * baseline)
+        pipelined_ctas = SM86_REGISTERS_PER_SM // (ATTENTION_THREADS * pipelined)
+        if pipelined_ctas < baseline_ctas:
+            raise RuntimeError(
+                f"SM86 D{dimension} sparse pipeline loses register residency: "
+                f"baseline=r{baseline}/{baseline_ctas}ctas "
+                f"pipeline=r{pipelined}/{pipelined_ctas}ctas"
+            )
+        ampere_hot_summary.append(
+            f"D{dimension}:r{baseline}->r{pipelined}/{pipelined_ctas}ctas"
+        )
+    print(
+        "Ampere sparse attention pipeline audit passed: "
+        + " ".join(ampere_hot_summary)
+        + " local=0 stack<=16 dynamic_shared=pipeline-D64:20480/pipeline-D128:40960"
     )
 
     preprocessing_output = _resource_output(fused)

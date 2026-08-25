@@ -110,7 +110,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(
             "csrc/turing/sage/overlap_blend.cu", extensions[2].kwargs["sources"]
         )
-        self.assertEqual(setup.call_args.kwargs["version"], "0.36.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.37.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -300,7 +300,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.36.0")
+        self.assertEqual(metadata["project"]["version"], "0.37.0")
 
     def test_overlap_epilogue_is_self_contained_and_deterministic_by_design(self):
         source = (
@@ -349,6 +349,12 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn("UseW8A8", source)
         self.assertIn("ForceDense", source)
         self.assertIn("compute_int8_sv_permuted", source)
+        self.assertIn("kCompactionScratchWords", source)
+        self.assertIn("__shfl_up_sync", source)
+        self.assertIn("__ballot_sync", source)
+        self.assertIn("AttentionStorage<HeadDim, SparseValuePipeline>", source)
+        self.assertIn("sparse_v_pipeline=", source)
+        self.assertIn("current_cuda_device_major() >= 8", source)
 
     def test_attention_launches_use_pytorch_current_cuda_stream(self):
         sage_dir = PLUGIN_ROOT / "kernel" / "csrc" / "turing" / "sage"

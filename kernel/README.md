@@ -1,7 +1,7 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's quantized
-runtime. Version 0.36.0 contains legacy packed W4A8 and grouped-codebook W4A8
+runtime. Version 0.37.0 contains legacy packed W4A8 and grouped-codebook W4A8
 Tensor Core GEMMs, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, lossless single-pass half-width FC1/SwiGLU staging,
@@ -16,6 +16,13 @@ Q-to-K-centroid Tensor Core pass now drives both routing and skipped-block
 online-softmax correction, so no duplicate Q/K centroid scan or full global
 route map is materialized. The local neighborhood is fixed to the official
 +/- one block. Original V means remain dedicated to value approximation.
+Route construction now uses one warp ballot per aligned residual range and a
+stable CTA-parallel prefix compaction, preserving ascending K-block order and
+online-softmax arithmetic. On SM80+, the production precomputed-summary W8A8
+specialization overlaps consecutive summary and selected-V loads with useful
+work through native async copies. The additional shared-memory stage is
+enabled only when it preserves the register-limited resident-CTA count; SM75
+keeps the same route semantics and synchronous-copy fallback.
 It also provides fixed-budget SLA routing: 128-token Query centroids choose a
 Top-K set of 64-token K/V blocks, adjacent Q64 execution CTAs share one compact
 route, and selected blocks use the same FP16-PV or W8A8-PV exact core without a
@@ -97,10 +104,11 @@ exact-sm75 runtime choice; dense W8A8, Sol, and SLA share the bundled sm75+
 prepared-attention path, including protected dense work. The historical `_sm75`
 extension suffix is retained as an ABI name. `7.5+PTX` remains useful for
 compatibility validation, while an `8.6` build enables native Ampere async-copy
-and INT8 MMA instructions. Kernel 0.35 also instantiates CUTLASS SM80 W8A8
-`m16n8k32` contractions and caches the best supported tile for each M/N/K
-shape across process restarts; the sm75 implementation remains the fallback
-behind the same public operator. Both W8 and scaled-SwiGLU operators accept row-strided destination
+and INT8 MMA instructions. Kernel 0.35 also instantiates a fixed CUTLASS SM80
+W8A8 `m16n8k32` contraction for proven wide-output shapes; the fixed SM75
+schedule remains the fallback behind the same public operator. There is no
+online/offline tuner or persistent per-shape policy cache. Both W8 and
+scaled-SwiGLU operators accept row-strided destination
 views, allowing activation shards to write at their final offsets.
 
 ```bash
