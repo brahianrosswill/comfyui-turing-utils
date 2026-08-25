@@ -1,7 +1,4 @@
-from collections import OrderedDict
-from dataclasses import dataclass
 from functools import wraps
-from threading import Lock
 from typing import Any, Optional
 
 import torch
@@ -13,16 +10,20 @@ from .quant import (
     per_warp_int8_hadamard,
     per_warp_int8_varlen,
 )
-
-
-_SOL_POLICY_CACHE_LIMIT = 64
-_SOL_POLICY_CACHE: OrderedDict[
-    tuple, tuple[torch.Tensor, torch.Tensor, int]
-] = OrderedDict()
-_SOL_POLICY_CACHE_LOCK = Lock()
-_KEY_TILE_CACHE: OrderedDict[tuple, int] = OrderedDict()
-_KEY_TILE_CACHE_LOCK = Lock()
-_KEY_TILE_CACHE_LIMIT = 32
+from .records import (
+    PrequantizedQK,
+    PrequantizedSageAttention,
+    PrequantizedSlaAttention,
+    PrequantizedSolAttention,
+)
+from .scheduling import KEY_TILE_CACHE as _KEY_TILE_CACHE
+from .scheduling import automatic_key_tile_tokens
+from .sparse_policy import SOL_POLICY_CACHE as _SOL_POLICY_CACHE
+from .sparse_policy import (
+    normalize_token_ranges,
+    sla_fixed_topk_indices,
+    sol_block_policy,
+)
 
 
 def _automatic_key_tile_tokens(
@@ -32,134 +33,16 @@ def _automatic_key_tile_tokens(
     head_dim: int,
     use_w8a8: bool,
 ) -> int:
-    """Choose the resident Sol schedule from kernel resource pressure.
-
-    Two 64-token stages were originally selected solely from sequence length.
-    On SM80+ the D=128 W8A8 two-stage specialization consumes substantially
-    more registers without increasing CTA-level parallelism; the one-stage
-    kernel therefore wins once its 64-token loop already saturates the GPU.
-    This is capability/resource scheduling, not a product-name branch.
-    """
-    device = torch.device(device)
-    device_index = device.index
-    if device.type == "cuda" and device_index is None:
-        device_index = torch.cuda.current_device()
-    capability = (
-        torch.cuda.get_device_capability(device_index)
-        if device.type == "cuda"
-        else (0, 0)
+    return automatic_key_tile_tokens(
+        device,
+        key_length=key_length,
+        head_dim=head_dim,
+        use_w8a8=use_w8a8,
     )
-    cache_key = (
-        device.type,
-        device_index,
-        capability,
-        int(key_length),
-        int(head_dim),
-        bool(use_w8a8),
-    )
-    with _KEY_TILE_CACHE_LOCK:
-        cached = _KEY_TILE_CACHE.get(cache_key)
-        if cached is not None:
-            _KEY_TILE_CACHE.move_to_end(cache_key)
-            return cached
-
-    if key_length <= 1024:
-        selected = 64
-    elif use_w8a8 and head_dim >= 128 and capability >= (8, 0):
-        selected = 64
-    else:
-        selected = 128
-    with _KEY_TILE_CACHE_LOCK:
-        _KEY_TILE_CACHE[cache_key] = selected
-        while len(_KEY_TILE_CACHE) > _KEY_TILE_CACHE_LIMIT:
-            _KEY_TILE_CACHE.popitem(last=False)
-    return selected
-
-
-@dataclass(frozen=True, slots=True)
-class PrequantizedSageAttention:
-    query_int8: torch.Tensor
-    query_scale: torch.Tensor
-    key_int8: torch.Tensor
-    key_scale: torch.Tensor
-    value: torch.Tensor
-    tensor_layout: str
-    original_head_dim: int
-    is_causal: bool
-    sm_scale: float
-
-
-@dataclass(frozen=True, slots=True)
-class PrequantizedQK:
-    query_int8: torch.Tensor
-    query_scale: torch.Tensor
-    key_int8: torch.Tensor
-    key_scale: torch.Tensor
-    tensor_layout: str
-    input_dtype: torch.dtype
-    original_head_dim: int
-    route_original_basis: bool = False
-
-
-@dataclass(frozen=True, slots=True)
-class PrequantizedSolAttention:
-    query_int8: torch.Tensor
-    query_scale: torch.Tensor
-    key_int8: torch.Tensor
-    key_scale: torch.Tensor
-    value: Optional[torch.Tensor]
-    value_int8: torch.Tensor
-    value_scale: torch.Tensor
-    summaries: tuple[torch.Tensor, ...]
-    sparse_query_blocks: torch.Tensor
-    exact_kv_blocks: torch.Tensor
-    output_dtype: torch.dtype
-    sm_scale: float
-    threshold_sigma: float
-    residual_subblocks: int
-    possible_blocks: int
-    use_w8a8: bool
-    force_dense: bool
-    original_head_dim: int
-    key_tile_tokens: int
-    is_causal: bool
-    route_original_basis: bool
-
-
-@dataclass(frozen=True, slots=True)
-class PrequantizedSlaAttention:
-    query_int8: torch.Tensor
-    query_scale: torch.Tensor
-    key_int8: torch.Tensor
-    key_scale: torch.Tensor
-    value: Optional[torch.Tensor]
-    value_int8: torch.Tensor
-    value_scale: torch.Tensor
-    route_words: torch.Tensor
-    sparse_query_blocks: torch.Tensor
-    output_dtype: torch.dtype
-    sm_scale: float
-    sparsity_ratio: float
-    possible_blocks: int
-    use_w8a8: bool
-    original_head_dim: int
-    key_tile_tokens: int
 
 
 def _normalize_token_ranges(ranges, sequence_length: int) -> tuple[tuple[int, int], ...]:
-    normalized = []
-    for item in ranges or ():
-        if not isinstance(item, (tuple, list)) or len(item) != 2:
-            raise ValueError("Sol policy ranges must contain (start, stop) pairs")
-        start, stop = (int(item[0]), int(item[1]))
-        if start < 0 or stop <= start or stop > sequence_length:
-            raise ValueError("Sol policy range is outside the attention sequence")
-        normalized.append((start, stop))
-    normalized.sort()
-    for previous, current in zip(normalized, normalized[1:]):
-        if current[0] < previous[1]:
-            raise ValueError("Sol policy ranges must not overlap")
-    return tuple(normalized)
+    return normalize_token_ranges(ranges, sequence_length)
 
 
 def _sol_block_policy(
@@ -169,47 +52,13 @@ def _sol_block_policy(
     dense_query_ranges,
     exact_kv_ranges,
 ) -> tuple[torch.Tensor, torch.Tensor, int]:
-    dense_ranges = _normalize_token_ranges(dense_query_ranges, query_length)
-    exact_ranges = _normalize_token_ranges(exact_kv_ranges, key_length)
-    device_index = device.index
-    if device.type == "cuda" and device_index is None:
-        device_index = torch.cuda.current_device()
-    cache_key = (
-        device.type,
-        device_index,
+    return sol_block_policy(
+        device,
         query_length,
         key_length,
-        dense_ranges,
-        exact_ranges,
+        dense_query_ranges,
+        exact_kv_ranges,
     )
-    with _SOL_POLICY_CACHE_LOCK:
-        cached = _SOL_POLICY_CACHE.get(cache_key)
-        if cached is not None:
-            _SOL_POLICY_CACHE.move_to_end(cache_key)
-            return cached
-
-    query_blocks = (query_length + 63) // 64
-    key_blocks = (key_length + 63) // 64
-    sparse_query = torch.ones(query_blocks, dtype=torch.uint8)
-    exact_kv = torch.zeros(key_blocks, dtype=torch.uint8)
-    for start, stop in dense_ranges:
-        sparse_query[start // 64 : (stop + 63) // 64] = 0
-    for start, stop in exact_ranges:
-        exact_kv[start // 64 : (stop + 63) // 64] = 1
-    sparse_count = int(sparse_query.sum().item())
-    policy = (
-        sparse_query.to(device),
-        exact_kv.to(device),
-        sparse_count,
-    )
-    with _SOL_POLICY_CACHE_LOCK:
-        existing = _SOL_POLICY_CACHE.get(cache_key)
-        if existing is not None:
-            return existing
-        _SOL_POLICY_CACHE[cache_key] = policy
-        while len(_SOL_POLICY_CACHE) > _SOL_POLICY_CACHE_LIMIT:
-            _SOL_POLICY_CACHE.popitem(last=False)
-    return policy
 
 
 def _sla_fixed_topk_indices(
@@ -217,50 +66,7 @@ def _sla_fixed_topk_indices(
     key_summary: torch.Tensor,
     sparsity_ratio: float,
 ) -> torch.Tensor:
-    """Select the fixed SLA K budget for every 128-token Query block."""
-    if query_summary.ndim != 4 or key_summary.ndim != 4:
-        raise ValueError("SLA Q/K summaries must be four-dimensional")
-    if query_summary.size(0) != key_summary.size(0):
-        raise ValueError("SLA Q/K summary batch sizes must match")
-    if query_summary.size(-1) != key_summary.size(-1):
-        raise ValueError("SLA Q/K summary head dimensions must match")
-    query_heads = query_summary.size(1)
-    key_heads = key_summary.size(1)
-    if key_heads <= 0 or query_heads % key_heads:
-        raise ValueError("SLA Query heads must be divisible by KV heads")
-    key_blocks = key_summary.size(2)
-    keep_blocks = min(
-        key_blocks,
-        max(1, int((1.0 - float(sparsity_ratio)) * key_blocks)),
-    )
-    groups = query_heads // key_heads
-    grouped_query = query_summary.reshape(
-        query_summary.size(0),
-        key_heads,
-        groups,
-        query_summary.size(2),
-        query_summary.size(3),
-    )
-    # Smooth-K subtracts the same global K mean from every candidate block.
-    # That shifts every score in one Query row by one constant, so Top-K is
-    # exactly invariant; omitting the subtraction saves two tensors and a pass.
-    scores = torch.matmul(
-        grouped_query,
-        key_summary.unsqueeze(2).transpose(-1, -2),
-    ).reshape(
-        query_summary.size(0),
-        query_heads,
-        query_summary.size(2),
-        key_blocks,
-    )
-    indices = torch.topk(
-        scores,
-        keep_blocks,
-        dim=-1,
-        largest=True,
-        sorted=False,
-    ).indices.to(torch.int32)
-    return indices.contiguous()
+    return sla_fixed_topk_indices(query_summary, key_summary, sparsity_ratio)
 
 
 def _on_input_device(function):

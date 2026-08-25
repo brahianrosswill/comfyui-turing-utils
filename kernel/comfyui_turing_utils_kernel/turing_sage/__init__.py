@@ -1,140 +1,24 @@
 from __future__ import annotations
 
-import importlib
-
 import torch
-
-
-def _integer_attention_device(device: torch.device) -> bool:
-    return bool(
-        device.type == "cuda"
-        and torch.cuda.is_available()
-        and torch.cuda.get_device_capability(device) >= (7, 5)
-    )
-
-
-def available() -> bool:
-    try:
-        importlib.import_module("comfyui_turing_utils_kernel._sage_qattn_sm75")
-        importlib.import_module("comfyui_turing_utils_kernel._sage_fused_sm75")
-    except (ImportError, OSError):
-        return False
-    return True
-
-
-def sparse_available() -> bool:
-    if not available():
-        return False
-    try:
-        module = importlib.import_module("comfyui_turing_utils_kernel._sage_qattn_sm75")
-    except (ImportError, OSError):
-        return False
-    return hasattr(module, "sol_sparse_online_int8_f16_attn")
-
-
-def sla_available() -> bool:
-    if not available():
-        return False
-    try:
-        module = importlib.import_module("comfyui_turing_utils_kernel._sage_qattn_sm75")
-    except (ImportError, OSError):
-        return False
-    return all(
-        hasattr(module, name)
-        for name in (
-            "sla_qk_block_summaries",
-            "sla_build_route_words",
-            "sla_sparse_online_attn",
-        )
-    )
-
-
-def w8a8_available() -> bool:
-    # Dense W8A8 is a production backend with its own ABI.  Do not couple its
-    # availability to the Sol entry point merely because both
-    # kernels currently share one extension module.
-    if not available():
-        return False
-    try:
-        module = importlib.import_module("comfyui_turing_utils_kernel._sage_qattn_sm75")
-    except (ImportError, OSError):
-        return False
-    return hasattr(module, "quantize_v_int8_sm75")
-
-
-def w8a8_varlen_available() -> bool:
-    """Return whether the packed variable-length W8A8 ABI is installed."""
-    if not w8a8_available():
-        return False
-    try:
-        module = importlib.import_module("comfyui_turing_utils_kernel._sage_qattn_sm75")
-    except (ImportError, OSError):
-        return False
-    return all(
-        hasattr(module, name)
-        for name in (
-            "quantize_v_int8_varlen_sm75",
-            "qk_int8_sv_int8_varlen_accum_f32_attn",
-        )
-    )
-
-
-def split_prequantization_available() -> bool:
-    if not w8a8_available():
-        return False
-    try:
-        module = importlib.import_module("comfyui_turing_utils_kernel._sage_qattn_sm75")
-    except (ImportError, OSError):
-        return False
-    return all(
-        hasattr(module, name)
-        for name in (
-            "sol_w8a8_precompute_summaries",
-            "sol_sparse_online_w8a8_prequantized_attn",
-        )
-    )
-
-
-def fused_qk_preprocessing_available() -> bool:
-    if not available():
-        return False
-    try:
-        module = importlib.import_module(
-            "comfyui_turing_utils_kernel._sage_fused_sm75"
-        )
-    except (ImportError, OSError):
-        return False
-    return hasattr(module, "quant_qk_rms_rope_int8_cuda")
-
-
-def overlap_blend_available() -> bool:
-    if not available():
-        return False
-    try:
-        module = importlib.import_module(
-            "comfyui_turing_utils_kernel._sage_fused_sm75"
-        )
-    except (ImportError, OSError):
-        return False
-    return hasattr(module, "overlap_blend_cuda")
+from .availability import (
+    available,
+    fused_qk_preprocessing_available,
+    integer_attention_device as _integer_attention_device,
+    overlap_accumulate_available,
+    overlap_blend_available,
+    sla_available,
+    sparse_available,
+    split_prequantization_available,
+    w8a8_available,
+    w8a8_varlen_available,
+)
 
 
 def overlap_blend_compiled(window_values, local_indices, weights):
     from .custom_ops import overlap_blend_op
 
     return overlap_blend_op(window_values, local_indices, weights)
-
-
-def overlap_accumulate_available() -> bool:
-    if not available():
-        return False
-    try:
-        module = importlib.import_module(
-            "comfyui_turing_utils_kernel._sage_fused_sm75"
-        )
-    except (ImportError, OSError):
-        return False
-    return hasattr(module, "overlap_accumulate_cuda")
 
 
 def overlap_accumulate_compiled(

@@ -21,9 +21,8 @@ from .runtime import (
     attention_runtime_config,
     install_attention_runtime,
 )
+from .sparse_runtime import DenseAttentionFallback, SparseSchedule
 from .sparse import (
-    _sparse_dense_layer,
-    _sparse_dense_schedule,
     inspect_sol_attention_call,
     inspect_sla_attention_call,
     prequantize_turing_sla_attention,
@@ -80,6 +79,15 @@ from .stable import (
 
 
 _LOGGED_EXTERNAL_BACKEND_REJECTIONS: set[tuple[str, str]] = set()
+
+
+def _bootstrap_attention_integrations() -> None:
+    # Applying a public patch is an explicit integration action. Keep ordinary
+    # package imports light while preserving direct-API behavior for callers
+    # that do not enter through ComfyUI's plugin root.
+    from ..bootstrap import bootstrap_builtin_integrations
+
+    bootstrap_builtin_integrations()
 
 
 def _profiled(phase: str, function: Callable, /, *args, **kwargs):
@@ -857,19 +865,13 @@ def make_sparse_attention_override(
             raise RuntimeError(
                 "Sol W8A8 requires comfyui-turing-utils-kernel 0.28.0 or newer"
             )
-    schedule_state_key = object()
-    standalone_schedule_state: dict[str, object] = {}
-
-    def schedule_state_for(transformer_options) -> dict[str, object]:
-        if not isinstance(transformer_options, dict):
-            return standalone_schedule_state
-        state = transformer_options.setdefault(schedule_state_key, {})
-        if isinstance(state, dict):
-            return state
-        state = {}
-        transformer_options[schedule_state_key] = state
-        return state
-
+    schedule = SparseSchedule(
+        dense_prefix_steps=dense_prefix_steps,
+        dense_suffix_steps=dense_suffix_steps,
+        dense_prefix_layers=dense_prefix_layers,
+        dense_suffix_layers=dense_suffix_layers,
+    )
+    schedule_state_for = schedule.state_for
     debug_route_keys: set[tuple] = set()
     debug_route_state: dict[tuple, list[tuple[torch.Tensor, int, int]]] = {}
     debug_dense_reasons: set[str] = set()
@@ -880,63 +882,21 @@ def make_sparse_attention_override(
     )
     dense_container = getattr(dense_override, "container_function", None)
     if use_w8a8 and not callable(dense_prepared_executor):
-        # The bundled force-dense W8A8 core has native sm75+ cubins.  Keep the
-        # same prepared path on every supported generation instead of falling
-        # back to a full floating Q/K/V materialization on newer GPUs.
+        # Preserve the native force-dense W8A8 path on every sm75+ target.
         dense_prepared_executor = _make_dense_prepared_executor("w8a8")
         dense_container = _make_dense_container_function("w8a8")
-    dense_streamed_qkv_executor = getattr(
-        dense_prepared_executor,
-        "turing_utils_streamed_qkv_executor",
-        None,
+    dense_fallback = DenseAttentionFallback(
+        dense_override,
+        default_fallback=_default_attention_fallback,
+        prepared_executor=dense_prepared_executor,
+        container=dense_container,
     )
+    dense_streamed_qkv_executor = dense_fallback.streamed_qkv_executor
+    run_dense_prepared = dense_fallback.run_prepared
+    run_dense_container = dense_fallback.run_container
     sparse_capabilities = AttentionBackendCapabilities(
         supports_semantic_sparse=True,
     )
-
-    def run_dense_prepared(request: PreparedAttention) -> AttentionExecutionOutcome:
-        if callable(dense_prepared_executor):
-            return dense_prepared_executor(request)
-        return AttentionExecutionOutcome.unsupported(
-            "the selected dense backend does not expose prepared attention"
-        )
-
-    def run_dense_container(
-        q,
-        k,
-        v,
-        heads,
-        *,
-        mask,
-        attn_precision,
-        skip_reshape,
-        skip_output_reshape,
-        **kwargs,
-    ):
-        if callable(dense_container):
-            return dense_container(
-                q,
-                k,
-                v,
-                heads,
-                mask=mask,
-                attn_precision=attn_precision,
-                skip_reshape=skip_reshape,
-                skip_output_reshape=skip_output_reshape,
-                **kwargs,
-            )
-        return dense_override(
-            _default_attention_fallback(),
-            q.take(),
-            k.take(),
-            v.take(),
-            heads,
-            mask=mask,
-            attn_precision=attn_precision,
-            skip_reshape=skip_reshape,
-            skip_output_reshape=skip_output_reshape,
-            **kwargs,
-        )
 
     def route_debug_context(transformer_options, kernel_key: tuple):
         schedule_state = schedule_state_for(transformer_options)
@@ -1068,16 +1028,7 @@ def make_sparse_attention_override(
         if reason is not None:
             return AttentionExecutionOutcome.unsupported(reason)
         transformer_options = request.transformer_options
-        if _sparse_dense_schedule(
-            transformer_options,
-            dense_prefix_steps,
-            dense_suffix_steps,
-            schedule_state_for(transformer_options),
-        ) or _sparse_dense_layer(
-            transformer_options,
-            dense_prefix_layers,
-            dense_suffix_layers,
-        ):
+        if schedule.is_dense(transformer_options):
             return run_dense_prepared(request)
 
         query_view, key_view, value_view = request.peek_qkv()
@@ -1193,16 +1144,7 @@ def make_sparse_attention_override(
                 transformer_options=transformer_options,
             )
 
-        if _sparse_dense_schedule(
-            transformer_options,
-            dense_prefix_steps,
-            dense_suffix_steps,
-            schedule_state_for(transformer_options),
-        ) or _sparse_dense_layer(
-            transformer_options,
-            dense_prefix_layers,
-            dense_suffix_layers,
-        ):
+        if schedule.is_dense(transformer_options):
             return dense_result()
 
         sol_call, reason = inspect_sol_attention_call(
@@ -1276,17 +1218,8 @@ def make_sparse_attention_override(
         )
         transformer_options = kwargs.get("transformer_options")
         schedule_state = schedule_state_for(transformer_options)
-        dense_schedule = _sparse_dense_schedule(
-            transformer_options,
-            dense_prefix_steps,
-            dense_suffix_steps,
-            schedule_state,
-        )
-        dense_layer = _sparse_dense_layer(
-            transformer_options,
-            dense_prefix_layers,
-            dense_suffix_layers,
-        )
+        dense_schedule = schedule.dense_step(transformer_options)
+        dense_layer = schedule.dense_layer(transformer_options)
         if debug_route_density and dense_schedule:
             debug_key = f"schedule:{schedule_state.get('step')}"
             if debug_key not in debug_dense_reasons:
@@ -1359,16 +1292,7 @@ def make_sparse_attention_override(
             **kwargs,
         ):
             transformer_options = kwargs.get("transformer_options")
-            if _sparse_dense_schedule(
-                transformer_options,
-                dense_prefix_steps,
-                dense_suffix_steps,
-                schedule_state_for(transformer_options),
-            ) or _sparse_dense_layer(
-                transformer_options,
-                dense_prefix_layers,
-                dense_suffix_layers,
-            ):
+            if schedule.is_dense(transformer_options):
                 return run_dense_container(
                     q,
                     k,
@@ -1533,78 +1457,26 @@ def make_sla_attention_override(
     if use_w8a8 and not bundled_w8a8_available():
         raise RuntimeError("SLA W8A8 requires the bundled W8A8 attention ABI")
 
-    schedule_state_key = object()
-    standalone_schedule_state: dict[str, object] = {}
-
-    def schedule_state_for(transformer_options) -> dict[str, object]:
-        if not isinstance(transformer_options, dict):
-            return standalone_schedule_state
-        state = transformer_options.setdefault(schedule_state_key, {})
-        if isinstance(state, dict):
-            return state
-        state = {}
-        transformer_options[schedule_state_key] = state
-        return state
-
+    schedule = SparseSchedule(
+        dense_prefix_steps=dense_prefix_steps,
+        dense_suffix_steps=dense_suffix_steps,
+        dense_prefix_layers=dense_prefix_layers,
+        dense_suffix_layers=dense_suffix_layers,
+    )
+    schedule_state_for = schedule.state_for
     debug_route_keys: set[tuple] = set()
     if dense_override is None:
         dense_override = make_attention_override(dense_backend, device=device)
-    dense_prepared_executor = getattr(
-        dense_override, "prepared_attention_executor", None
+    dense_fallback = DenseAttentionFallback(
+        dense_override,
+        default_fallback=_default_attention_fallback,
     )
-    dense_container = getattr(dense_override, "container_function", None)
-    dense_streamed_qkv_executor = getattr(
-        dense_prepared_executor,
-        "turing_utils_streamed_qkv_executor",
-        None,
-    )
+    dense_streamed_qkv_executor = dense_fallback.streamed_qkv_executor
+    run_dense_prepared = dense_fallback.run_prepared
+    run_dense_container = dense_fallback.run_container
     sparse_capabilities = AttentionBackendCapabilities(
         supports_semantic_sparse=True,
     )
-
-    def run_dense_prepared(request: PreparedAttention) -> AttentionExecutionOutcome:
-        if callable(dense_prepared_executor):
-            return dense_prepared_executor(request)
-        return AttentionExecutionOutcome.unsupported(
-            "the selected dense backend does not expose prepared attention"
-        )
-
-    def run_dense_container(
-        q,
-        k,
-        v,
-        heads,
-        *,
-        mask,
-        attn_precision,
-        skip_reshape,
-        skip_output_reshape,
-        **kwargs,
-    ):
-        if callable(dense_container):
-            return dense_container(
-                q,
-                k,
-                v,
-                heads,
-                mask=mask,
-                attn_precision=attn_precision,
-                skip_reshape=skip_reshape,
-                skip_output_reshape=skip_output_reshape,
-                **kwargs,
-            )
-        return dense_override(
-            _default_attention_fallback(),
-            q.take(),
-            k.take(),
-            v.take(),
-            heads,
-            mask=mask,
-            attn_precision=attn_precision,
-            skip_reshape=skip_reshape,
-            skip_output_reshape=skip_output_reshape,
-            **kwargs,
-        )
 
     def inspect(
         request_q,
@@ -1668,19 +1540,9 @@ def make_sla_attention_override(
         return output
 
     def is_dense(transformer_options) -> bool:
-        return (
-            sparsity_ratio == 0.0
-            or _sparse_dense_schedule(
-                transformer_options,
-                dense_prefix_steps,
-                dense_suffix_steps,
-                schedule_state_for(transformer_options),
-            )
-            or _sparse_dense_layer(
-                transformer_options,
-                dense_prefix_layers,
-                dense_suffix_layers,
-            )
+        return schedule.is_dense(
+            transformer_options,
+            force_dense=sparsity_ratio == 0.0,
         )
 
     def prepared_executor(request: PreparedAttention) -> AttentionExecutionOutcome:
@@ -1960,6 +1822,7 @@ def _attention_base_runtime(
     override when possible, otherwise from SDPA.  ``use_w8a8`` is accepted
     only for legacy node/workflow compatibility.
     """
+    _bootstrap_attention_integrations()
     transformer_options = model.model_options.setdefault("transformer_options", {})
     config = attention_runtime_config(transformer_options)
     if config is not None:
@@ -2162,6 +2025,7 @@ def apply_attention_backend(
     *,
     native_runtime: bool = False,
 ):
+    _bootstrap_attention_integrations()
     option = normalize_attention_backend(option)
     transformer_options = model.model_options.setdefault("transformer_options", {})
     override = make_attention_override(option, device=device)

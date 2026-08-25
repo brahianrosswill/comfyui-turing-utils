@@ -10,82 +10,37 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
-import os
 
 import torch
 
-from ...profiling import WORKFLOW_TIMELINE
-
 from ...hardware import device_capabilities
+from .memory_state import (
+    ActivationRuntimePlan,
+    current_model_is_dynamic as _current_model_is_dynamic,
+    dynamic_vram_reclaimable as _dynamic_vram_reclaimable,
+    dynamic_vbars as _dynamic_vbars,
+    dynamic_weight_prefetch_reserve as _dynamic_weight_prefetch_reserve,
+    log_memory_diagnostics as _log_memory_diagnostics,
+    memory_diagnostics as _memory_diagnostics,
+    planning_available as _planning_available,
+    runtime_memory as _runtime_memory,
+    should_log as _should_log,
+)
+from .memory_state import ensure_dynamic_vram_headroom as _ensure_headroom
+from .policy_config import activation_mode as _mode
+from .policy_config import override_chunk_rows as _override_chunk_rows
+from .policy_config import override_ffn_channels as _override_ffn_channels
+from .policy_config import override_head_group as _override_head_group
 
 
 LOG = logging.getLogger("comfyui-turing-utils")
 _MIB = 1024**2
-_VBAR_PAGE_BYTES = 32 * _MIB
 _ATTENTION_QUERY_TILE_ROWS = 64
 _ATTENTION_TARGET_WAVES = 4
 _ATTENTION_CTAS_PER_SM = 2
 _MAX_BALANCED_SHARDS = 4
 _MIN_SATURATED_ROW_TILES = 4
 _MIN_SATURATED_GEMM_WIDTH = 1024
-_DEFAULT_WEIGHT_PREFETCH_BYTES = 512 * _MIB
-_MAX_WEIGHT_PREFETCH_BYTES = 1024 * _MIB
-_LOGGED_DECISIONS: set[tuple] = set()
-
-
-@dataclasses.dataclass(slots=True)
-class ActivationRuntimePlan:
-    """Mutable policy state owned by one sampler invocation.
-
-    CUDA free memory moves up and down while DynamicVRAM maps weights and while
-    PyTorch retires temporary buffers.  Treating every observation as a fresh
-    budget allowed a later layer to promote itself back to the full path.  The
-    per-operation, per-row-count low-water mark makes automatic decisions
-    monotonic for the lifetime of a sampler without leaking state between
-    queued executions. Attention, QKV, and MLP have different live-buffer
-    boundaries, so sharing one floor between them would unnecessarily force
-    the later MLP onto its streamed path.
-    """
-
-    available_floors: dict[tuple[str, int | None, int, str], int] = (
-        dataclasses.field(default_factory=dict)
-    )
-    reclaim_requests: dict[tuple[str, int | None, int, str], int] = (
-        dataclasses.field(default_factory=dict)
-    )
-    logged_decisions: set[tuple] = dataclasses.field(default_factory=set)
-
-    def observe_available(
-        self,
-        device: torch.device,
-        rows: int,
-        operation: str,
-        available_bytes: int,
-    ) -> int:
-        key = (device.type, device.index, int(rows), str(operation))
-        previous = self.available_floors.get(key)
-        floor = int(available_bytes) if previous is None else min(
-            previous, int(available_bytes)
-        )
-        self.available_floors[key] = floor
-        return floor
-
-    def should_request_reclaim(
-        self,
-        device: torch.device,
-        rows: int,
-        operation: str,
-        deficit_bytes: int,
-    ) -> bool:
-        key = (device.type, device.index, int(rows), str(operation))
-        previous = self.reclaim_requests.get(key, 0)
-        deficit_bytes = int(deficit_bytes)
-        if deficit_bytes <= previous + 64 * _MIB:
-            return False
-        self.reclaim_requests[key] = deficit_bytes
-        return True
-
-
 @dataclasses.dataclass(frozen=True, slots=True)
 class ActivationDecision:
     operation: str
@@ -149,304 +104,6 @@ class FFNChannelDecision:
         return 1 if 0 < self.chunk_rows < self.rows else 0
 
 
-def _mode() -> str:
-    value = os.environ.get(
-        "COMFYUI_TURING_UTILS_H3_ACTIVATION_MODE", "auto"
-    ).strip().lower()
-    aliases = {
-        "speed": "throughput",
-        "fast": "throughput",
-        "safe": "balanced",
-        "memory": "balanced",
-        "lowvram": "balanced",
-    }
-    value = aliases.get(value, value)
-    return value if value in {"auto", "throughput", "balanced"} else "auto"
-
-
-def _override_chunk_rows(operation: str) -> int | None:
-    names = (
-        f"COMFYUI_TURING_UTILS_H3_{operation.upper()}_CHUNK_ROWS",
-        "COMFYUI_TURING_UTILS_H3_ACTIVATION_CHUNK_ROWS",
-    )
-    for name in names:
-        raw = os.environ.get(name)
-        if raw is None:
-            continue
-        try:
-            return max(int(raw), 0)
-        except ValueError:
-            LOG.warning("Ignoring invalid %s=%r", name, raw)
-    return None
-
-
-def _override_head_group() -> int | None:
-    raw = os.environ.get("COMFYUI_TURING_UTILS_H3_HEAD_GROUP")
-    if raw is None:
-        return None
-    try:
-        return max(int(raw), 0)
-    except ValueError:
-        LOG.warning(
-            "Ignoring invalid COMFYUI_TURING_UTILS_H3_HEAD_GROUP=%r", raw
-        )
-        return None
-
-
-def _override_ffn_channels() -> int | None:
-    raw = os.environ.get("COMFYUI_TURING_UTILS_H3_FFN_CHUNK_CHANNELS")
-    if raw is None:
-        return None
-    try:
-        return max(int(raw), 0)
-    except ValueError:
-        LOG.warning(
-            "Ignoring invalid COMFYUI_TURING_UTILS_H3_FFN_CHUNK_CHANNELS=%r",
-            raw,
-        )
-        return None
-
-
-def _dynamic_vbars(
-    base_model,
-    device: torch.device,
-    *,
-    include_current: bool = False,
-) -> tuple[object, ...]:
-    """Return unique inactive DynamicVRAM VBARs on ``device``.
-
-    Evicting the current diffusion VBAR between transformer operations causes
-    the same weight pages to be transferred back immediately. The current
-    VBAR can still be included for read-only diagnostics, but normal headroom
-    requests deliberately target inactive models only.
-    """
-    if base_model is None:
-        return ()
-    device = torch.device(device)
-    current = getattr(base_model, "current_patcher", None)
-    candidates = []
-    try:
-        import comfy.model_management as model_management
-
-        candidates.extend(model_management.loaded_models())
-    except (ImportError, AttributeError, RuntimeError, TypeError):
-        pass
-
-    result = []
-    seen = set()
-
-    def resolve(patcher):
-        try:
-            if not patcher.is_dynamic():
-                return None
-            load_device = torch.device(
-                getattr(
-                    patcher,
-                    "load_device",
-                    device if patcher is current else None,
-                )
-            )
-            if load_device != device:
-                return None
-            return patcher._vbar_get()
-        except (AttributeError, RuntimeError, TypeError, ValueError):
-            return None
-
-    current_vbar = resolve(current) if current is not None else None
-    current_vbar_id = id(current_vbar) if current_vbar is not None else None
-    for patcher in candidates:
-        vbar = resolve(patcher)
-        if vbar is None or id(vbar) == current_vbar_id:
-            continue
-        if id(vbar) in seen:
-            continue
-        seen.add(id(vbar))
-        result.append(vbar)
-    if (
-        include_current
-        and current_vbar is not None
-        and current_vbar_id not in seen
-    ):
-        result.append(current_vbar)
-    return tuple(result)
-
-
-def _current_model_is_dynamic(base_model, device: torch.device) -> bool:
-    if base_model is None:
-        return False
-    try:
-        patcher = base_model.current_patcher
-        return bool(
-            patcher.is_dynamic()
-            and torch.device(patcher.load_device) == torch.device(device)
-        )
-    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
-        return False
-
-
-def _dynamic_weight_prefetch_reserve(base_model, device: torch.device) -> int:
-    """Reserve two average DiT blocks for ComfyUI's two offload streams.
-
-    This is intentionally derived from the active VBAR rather than GPU model
-    names. Once an activation shard reaches its MFU plateau, retaining the
-    current and prefetched block is worth more than growing that shard.
-    """
-    default = _DEFAULT_WEIGHT_PREFETCH_BYTES
-    if not _current_model_is_dynamic(base_model, device):
-        return default
-    try:
-        patcher = base_model.current_patcher
-        vbar = patcher._vbar_get()
-        model_size = getattr(patcher, "model_size", None)
-        model_bytes = int(
-            model_size() if callable(model_size) else vbar.loaded_size()
-        )
-        layers = max(
-            int(getattr(base_model, "_turing_utils_minimax_layer_count", 0)),
-            1,
-        )
-    except (
-        AttributeError,
-        ReferenceError,
-        RuntimeError,
-        TypeError,
-        ValueError,
-    ):
-        return default
-    if model_bytes <= 0 or layers <= 1:
-        return default
-    reserve = math.ceil((2 * model_bytes / layers) / _VBAR_PAGE_BYTES) * _VBAR_PAGE_BYTES
-    return min(max(int(reserve), default), _MAX_WEIGHT_PREFETCH_BYTES)
-
-
-def _vbar_reclaimable_bytes(vbar) -> int:
-    """Count resident, unpinned 32 MiB pages without noisy VBAR analysis."""
-    try:
-        residency = vbar.get_residency()
-        freeable_pages = sum(
-            1 for status in residency if (int(status) & 1) and not (int(status) & 2)
-        )
-        reclaimable = freeable_pages * _VBAR_PAGE_BYTES
-        loaded_size = int(vbar.loaded_size())
-    except (AttributeError, RuntimeError, TypeError, ValueError):
-        return 0
-    return max(min(reclaimable, loaded_size), 0)
-
-
-def _dynamic_vram_reclaimable(
-    base_model,
-    device: torch.device,
-    *,
-    include_current: bool = False,
-) -> int:
-    return sum(
-        _vbar_reclaimable_bytes(vbar)
-        for vbar in _dynamic_vbars(
-            base_model,
-            device,
-            include_current=include_current,
-        )
-    )
-
-
-def _runtime_memory(
-    device: torch.device,
-    base_model=None,
-) -> tuple[int, int, int]:
-    """Return immediately usable bytes, total reserve, and usable ceiling.
-
-    Evictable model pages are intentionally excluded. Counting them here made
-    the policy select a larger attention tier and then evict hot weights to
-    realize that hypothetical budget, trading exact head sharding for PCIe
-    reload churn. Reclaimable inactive pages remain an emergency reserve for
-    ``ensure_dynamic_vram_headroom`` only.
-    """
-    import comfy.model_management as model_management
-
-    total = int(model_management.get_total_memory(device))
-    reserve = int(model_management.extra_reserved_memory())
-    usable = max(total - reserve, 0)
-    allocated = int(torch.cuda.memory_allocated(device))
-    free = int(model_management.get_free_memory(device))
-    # get_free_memory includes unused PyTorch cache.  The second bound is what
-    # makes --reserve-vram a hard ceiling even when the display is temporarily
-    # idle and nvidia-smi reports the memory as free.
-    return max(min(free, usable - allocated), 0), reserve, usable
-
-
-def _planning_available(
-    runtime_plan: ActivationRuntimePlan | None,
-    device: torch.device,
-    rows: int,
-    available: int,
-    mode: str,
-    operation: str,
-) -> int:
-    if runtime_plan is None or mode == "throughput":
-        return available
-    return runtime_plan.observe_available(
-        device,
-        rows,
-        operation,
-        available,
-    )
-
-
-def _should_log(
-    runtime_plan: ActivationRuntimePlan | None,
-    key: tuple,
-) -> bool:
-    logged = (
-        runtime_plan.logged_decisions
-        if runtime_plan is not None
-        else _LOGGED_DECISIONS
-    )
-    if key in logged:
-        return False
-    logged.add(key)
-    return True
-
-
-def _memory_diagnostics(device: torch.device) -> tuple[int, int, int, int]:
-    """Best-effort allocator and DynamicVRAM pressure counters."""
-    allocated = reserved = raw_free = aimdo_usage = 0
-    try:
-        allocated = int(torch.cuda.memory_allocated(device))
-        reserved = int(torch.cuda.memory_reserved(device))
-        raw_free = int(torch.cuda.mem_get_info(device)[0])
-    except (RuntimeError, TypeError):
-        pass
-    try:
-        import comfy.memory_management as memory_management
-        import comfy_aimdo.control as aimdo_control
-
-        if memory_management.aimdo_enabled:
-            # Unlike vbars_analyze(), this is a read-only counter. The analyze
-            # API intentionally reports every currently pinned page as a
-            # warning and must not be called from normal policy telemetry.
-            aimdo_usage = int(aimdo_control.get_total_vram_usage())
-    except (ImportError, AttributeError, RuntimeError, TypeError):
-        pass
-    return allocated, reserved, raw_free, aimdo_usage
-
-
-def _log_memory_diagnostics(device: torch.device, base_model=None) -> str:
-    allocated, reserved, raw_free, aimdo_usage = _memory_diagnostics(device)
-    result = (
-        f"torch_active={allocated / 1024**3:.2f} GiB "
-        f"torch_reserved={reserved / 1024**3:.2f} GiB "
-        f"cuda_free={raw_free / 1024**3:.2f} GiB "
-        f"aimdo_usage={aimdo_usage / 1024**3:.2f} GiB"
-    )
-    if base_model is not None:
-        reclaimable = _dynamic_vram_reclaimable(base_model, device)
-        result += (
-            " inactive_reclaimable="
-            f"{reclaimable / 1024**3:.2f} GiB"
-        )
-    return result
-
-
 def ensure_dynamic_vram_headroom(
     base_model,
     device: torch.device,
@@ -456,58 +113,18 @@ def ensure_dynamic_vram_headroom(
     estimated_peak_bytes: int,
     runtime_plan: ActivationRuntimePlan | None = None,
 ) -> int:
-    """Ask an AIMDO VBAR to release mappings only when a selected tier cannot fit.
-
-    This is deliberately not used to promote a layer to a faster tier.  It is
-    a last-mile handshake that protects the already selected activation plan
-    from weight mappings consuming its irreducible headroom between planning
-    and allocation. Non-DynamicVRAM ComfyUI installations are a no-op.
-    """
-    device = torch.device(device)
-    if base_model is None or device.type != "cuda":
-        return 0
-    try:
-        available, _reserve, usable = _runtime_memory(device)
-    except (ImportError, RuntimeError, TypeError):
-        return 0
-    safety = max(768 * _MIB, int(usable * 0.075))
-    desired = int(estimated_peak_bytes) + safety + 512 * _MIB
-    deficit = max(desired - available, 0)
-    if deficit <= 0:
-        return 0
-    if runtime_plan is not None and not runtime_plan.should_request_reclaim(
-        device, rows, operation, deficit
-    ):
-        return 0
-
-    freed = 0
-    remaining = deficit
-    for vbar in _dynamic_vbars(base_model, device):
-        free_memory = getattr(vbar, "free_memory", None)
-        if not callable(free_memory):
-            continue
-        try:
-            released = max(int(free_memory(remaining) or 0), 0)
-        except (AttributeError, RuntimeError, TypeError, ValueError) as error:
-            LOG.debug("DynamicVRAM headroom request was unavailable: %s", error)
-            continue
-        freed += released
-        remaining = max(remaining - released, 0)
-        if remaining <= 0:
-            break
-    if freed > 0:
-        WORKFLOW_TIMELINE.sample("dynamic_vram_reclaims")
-        WORKFLOW_TIMELINE.sample("dynamic_vram_released_mib", freed / _MIB)
-        LOG.info(
-            "MiniMax H3 DynamicVRAM headroom: op=%s rows=%d requested=%.1f MiB "
-            "released=%.1f MiB %s",
-            operation,
-            rows,
-            deficit / _MIB,
-            freed / _MIB,
-            _log_memory_diagnostics(device, base_model),
-        )
-    return freed
+    """Compatibility facade over the shared DynamicVRAM state service."""
+    return _ensure_headroom(
+        base_model,
+        device,
+        rows=rows,
+        operation=operation,
+        estimated_peak_bytes=estimated_peak_bytes,
+        runtime_plan=runtime_plan,
+        _runtime_memory_fn=_runtime_memory,
+        _dynamic_vbars_fn=_dynamic_vbars,
+        _diagnostics_fn=_log_memory_diagnostics,
+    )
 
 
 def _align_rows(value: int, alignment: int, minimum: int) -> int:

@@ -321,6 +321,15 @@ class KernelSetupTest(unittest.TestCase):
         source = (
             PLUGIN_ROOT / "kernel" / "csrc" / "turing" / "sage" / "sol_sparse_cuda_sm75.cu"
         ).read_text(encoding="utf-8")
+        route_source = (
+            PLUGIN_ROOT
+            / "kernel"
+            / "csrc"
+            / "turing"
+            / "sage"
+            / "sparse"
+            / "route_compaction.cuh"
+        ).read_text(encoding="utf-8")
         self.assertIn('#include "torch_compat.h"', source)
         self.assertNotIn("ATen/cuda/CUDAContext", source)
         self.assertNotIn("CUDAGuard", source)
@@ -350,7 +359,8 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn("ForceDense", source)
         self.assertIn("compute_int8_sv_permuted", source)
         self.assertIn("kCompactionScratchWords", source)
-        self.assertIn("__shfl_up_sync", source)
+        self.assertIn('#include "sparse/route_compaction.cuh"', source)
+        self.assertIn("__shfl_up_sync", route_source)
         self.assertIn("__ballot_sync", source)
         self.assertIn("AttentionStorage<HeadDim, SparseValuePipeline>", source)
         self.assertIn("sparse_v_pipeline=", source)

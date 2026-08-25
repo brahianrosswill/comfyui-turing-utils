@@ -54,6 +54,12 @@ def _static_gate() -> None:
             raise RuntimeError(f"retired SVDInt4 marker remains in {path}")
 
     cuda = (KERNEL / "csrc/turing/sage/sol_sparse_cuda_sm75.cu").read_text(encoding="utf-8")
+    route_compaction = (
+        KERNEL / "csrc/turing/sage/sparse/route_compaction.cuh"
+    ).read_text(encoding="utf-8")
+    if '#include "sparse/route_compaction.cuh"' not in cuda:
+        raise RuntimeError("sparse attention does not include route compaction component")
+    cuda_components = cuda + "\n" + route_compaction
     for marker in (
         "AttentionGeometry<128>::kAttentionSharedBytes <= 64 * 1024",
         "key_tile_tokens == 64 || key_tile_tokens == 128",
@@ -76,7 +82,7 @@ def _static_gate() -> None:
         "KeyStages == 1 || KeyStages == 2",
         "key_tile_tokens / kBlockTokens == KeyStages",
     ):
-        if marker not in cuda:
+        if marker not in cuda_components:
             raise RuntimeError(f"missing SM75 attention resource/ABI gate: {marker}")
     gemm = (KERNEL / "csrc/turing/w4a8.cu").read_text(encoding="utf-8")
     for marker in (

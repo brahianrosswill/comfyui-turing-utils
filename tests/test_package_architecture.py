@@ -84,9 +84,42 @@ class PackageArchitectureTest(unittest.TestCase):
         )
 
     def test_builtin_model_adapters_are_registered_once(self):
+        from comfyui_turing_utils import bootstrap_builtin_integrations
         from comfyui_turing_utils.adapters.registry import registered_model_adapters
 
+        bootstrap_builtin_integrations()
+        bootstrap_builtin_integrations()
         self.assertEqual(registered_model_adapters(), ("minimax_h3", "wan"))
+
+    def test_package_root_uses_explicit_bootstrap(self):
+        source = (ROOT / "comfyui_turing_utils" / "__init__.py").read_text(
+            encoding="utf-8"
+        )
+        entrypoint = (ROOT / "__init__.py").read_text(encoding="utf-8")
+        self.assertNotIn("apply_minimax_adapter", source)
+        self.assertIn("bootstrap_builtin_integrations()", entrypoint)
+
+    def test_minimax_policy_and_memory_services_have_explicit_owners(self):
+        minimax = ROOT / "comfyui_turing_utils" / "adapters" / "minimax"
+        acceleration = (minimax / "acceleration.py").read_text(encoding="utf-8")
+        planning = (minimax / "memory_planning.py").read_text(encoding="utf-8")
+        state = (minimax / "memory_state.py").read_text(encoding="utf-8")
+        policy = (minimax / "activation_policy.py").read_text(encoding="utf-8")
+        self.assertNotIn("class _MiniMaxMemoryShape", acceleration)
+        self.assertIn("class _MiniMaxMemoryShape", planning)
+        self.assertIn("class ActivationRuntimePlan", state)
+        self.assertNotIn("torch.cuda.mem_get_info", policy)
+
+    def test_quantization_and_kernel_attention_are_layered(self):
+        quantization = ROOT / "comfyui_turing_utils" / "quantization"
+        dispatch = (quantization / "dispatch.py").read_text(encoding="utf-8")
+        self.assertIn("from .capabilities import", dispatch)
+        self.assertIn("from .workspace import", dispatch)
+        sage = ROOT / "kernel" / "comfyui_turing_utils_kernel" / "turing_sage"
+        core = (sage / "core.py").read_text(encoding="utf-8")
+        self.assertNotIn("@dataclass", core)
+        self.assertTrue((sage / "records.py").is_file())
+        self.assertTrue((sage / "sparse_policy.py").is_file())
 
     def test_root_contains_only_the_attention_compatibility_facade(self):
         retired_modules = (

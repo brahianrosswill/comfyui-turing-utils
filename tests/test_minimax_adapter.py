@@ -435,7 +435,7 @@ class MiniMaxAdapterTest(unittest.TestCase):
         )
         target_area = 24 * 7 * 8 * 10 + 32 * 2 * 12
         with mock.patch(
-            "comfyui_turing_utils.adapters.minimax.acceleration.turing_int8_workspace_bytes",
+            "comfyui_turing_utils.adapters.minimax.memory_planning.turing_int8_workspace_bytes",
             side_effect=lambda rows, output: rows + output,
         ):
             required = base.memory_required(

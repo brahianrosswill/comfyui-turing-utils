@@ -55,8 +55,10 @@ runtime capabilities / hardware / kernel_api
 ```
 
 Concrete model adapters never belong in the generic attention or quantization
-layers. `comfyui_turing_utils.__init__` is the composition root: it registers
-built-in adapters without importing ComfyUI node definitions.
+layers. `comfyui_turing_utils.bootstrap` is the explicit, idempotent
+composition root. The ComfyUI plugin entry point invokes it before node
+registration; importing an implementation submodule has no registration side
+effects.
 
 ## Python packages
 
@@ -68,14 +70,21 @@ built-in adapters without importing ComfyUI node definitions.
 | `attention/integration.py` | model-neutral projected-QKV handoff and attention-site registry |
 | `attention/orchestration.py` | shared sparse ModelPatcher/layout/executor installation mechanics |
 | `attention/layout.py` | versioned Query/KV modality topology contract and provider registry |
-| `attention/patches.py` | attention overrides and loader-independent ModelPatcher installation |
+| `attention/sparse_runtime.py` | common Sol/SLA schedule state and dense fallback ownership |
+| `attention/patches.py` | thin Sol/SLA strategy composition and loader-independent ModelPatcher installation |
 | `quantization/convrot.py` | ConvRot metadata parsing and loaded-module format inspection |
-| `quantization/dispatch.py` | W8A8/W4A8/W4A4 activation quantization and GEMM dispatch |
+| `quantization/capabilities.py` | independent-kernel symbol and comfy-kitchen backend probes |
+| `quantization/workspace.py` | pure, model-independent workspace formulas |
+| `quantization/dispatch.py` | compatibility facade plus W8A8/W4A8/W4A4 quantization/GEMM dispatch |
 | `quantization/fusions.py` | model-independent fused activation and normalization operations |
 | `loading/convrot.py` | filesystem discovery, Comfy model construction, runtime preparation, and adapter installation |
 | `runtime/capabilities.py` | immutable device facts plus independently versioned kernel feature probes |
 | `adapters/memory.py` | common quantized workspace scan and BaseModel memory-hook installation |
-| `adapters/minimax/` | H3 layout publication, reference services, VAE pipelines, VRAM planning, and block fusions |
+| `adapters/minimax/policy_config.py` | environment/config parsing only; no live CUDA state |
+| `adapters/minimax/memory_state.py` | live allocator/DynamicVRAM observation and bounded reclaim requests |
+| `adapters/minimax/memory_planning.py` | ComfyUI packed-shape and staged-workspace memory hooks |
+| `adapters/minimax/activation_policy.py` | pure tier/chunk/head/channel decisions with compatibility exports |
+| `adapters/minimax/acceleration.py` | H3 attention/MLP hot-path installation and execution |
 | `adapters/wan.py` | Wan/Bernini packed-context planning and supported self-attention preprocessing |
 | `adapters/wan_layout.py` | loader-independent Wan/Bernini self-attention sequence semantics |
 | `adapters/bernini.py` | Bernini context-window and absolute-RoPE integration |
@@ -85,6 +94,13 @@ built-in adapters without importing ComfyUI node definitions.
 facts with operator-level ABI probes without launching CUDA. `kernel_api.py` is the only module
 allowed to import the independently installed kernel package. `registration.py`
 is the only node mapping table.
+
+Inside the kernel package, `turing_sage/records.py` owns immutable prepared
+tensor contracts, `sparse_policy.py` owns cached route construction, and
+`scheduling.py` owns resource-based tile selection. CUDA remains a single
+translation unit for the production sparse kernel; textual `.cuh` components
+under `csrc/turing/sage/sparse/` separate route machinery without changing
+template instantiation, launch ABI, or generated architecture coverage.
 
 ## Compatibility
 

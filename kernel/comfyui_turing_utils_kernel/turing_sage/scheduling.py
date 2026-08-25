@@ -8,10 +8,61 @@ bounded before it is allowed into the runtime path.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
+from threading import Lock
+
+import torch
 
 
 QUERY_TILE_TOKENS = 64
+KEY_TILE_CACHE: OrderedDict[tuple, int] = OrderedDict()
+KEY_TILE_CACHE_LOCK = Lock()
+KEY_TILE_CACHE_LIMIT = 32
+
+
+def automatic_key_tile_tokens(
+    device: torch.device,
+    *,
+    key_length: int,
+    head_dim: int,
+    use_w8a8: bool,
+) -> int:
+    """Choose the resident Sol schedule from capability/resource pressure."""
+    device = torch.device(device)
+    device_index = device.index
+    if device.type == "cuda" and device_index is None:
+        device_index = torch.cuda.current_device()
+    capability = (
+        torch.cuda.get_device_capability(device_index)
+        if device.type == "cuda"
+        else (0, 0)
+    )
+    cache_key = (
+        device.type,
+        device_index,
+        capability,
+        int(key_length),
+        int(head_dim),
+        bool(use_w8a8),
+    )
+    with KEY_TILE_CACHE_LOCK:
+        cached = KEY_TILE_CACHE.get(cache_key)
+        if cached is not None:
+            KEY_TILE_CACHE.move_to_end(cache_key)
+            return cached
+
+    if key_length <= 1024:
+        selected = 64
+    elif use_w8a8 and head_dim >= 128 and capability >= (8, 0):
+        selected = 64
+    else:
+        selected = 128
+    with KEY_TILE_CACHE_LOCK:
+        KEY_TILE_CACHE[cache_key] = selected
+        while len(KEY_TILE_CACHE) > KEY_TILE_CACHE_LIMIT:
+            KEY_TILE_CACHE.popitem(last=False)
+    return selected
 
 
 @dataclass(frozen=True, slots=True)

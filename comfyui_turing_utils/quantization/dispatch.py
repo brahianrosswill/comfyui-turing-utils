@@ -12,11 +12,16 @@ from ..hardware import (
     is_supported_tensor_core_device,
     is_supported_turing_device,
 )
-from ..kernel_api import load_kernel_extension, load_kernel_package
+from .capabilities import (
+    BACKEND_NAME,
+    kernel_available as _kernel_available,
+    kernel_op as _kernel_op,
+    kitchen_backend_available as backend_available,
+)
+from .workspace import codebook_w4a8_workspace_bytes, int8_workspace_bytes
 
 
 LOG = logging.getLogger("comfyui-turing-utils")
-BACKEND_NAME = "turing_utils_sm75"
 KITCHEN_DEFAULT_SHARED_MEMORY_LIMIT = 48 * 1024
 TURING_OPTIN_SHARED_MEMORY_LIMIT = 64 * 1024
 # Above this point a full MxN INT32 accumulator is more expensive than the
@@ -31,15 +36,10 @@ _PREFLIGHTED_KITCHEN: set[tuple[int, bool, bool]] = set()
 
 def turing_int8_workspace_bytes(rows: int, output_channels: int) -> int:
     """Return the global INT32 workspace used by the selected W8A8 path."""
-    if rows <= 0 or output_channels <= 0:
-        return 0
-    requested = int(rows) * int(output_channels) * 4
-    fixed_workspace_compatible = int(output_channels) % 8 == 0
-    return (
-        0
-        if fixed_workspace_compatible
-        and requested >= TURING_INT8_GLOBAL_WORKSPACE_LIMIT
-        else requested
+    return int8_workspace_bytes(
+        rows,
+        output_channels,
+        global_workspace_limit=TURING_INT8_GLOBAL_WORKSPACE_LIMIT,
     )
 
 
@@ -48,20 +48,11 @@ def turing_codebook_w4a8_workspace_bytes(
     output_channels: int,
 ) -> int:
     """Return the bounded decoded-weight workspace used by grouped W4A8."""
-    if input_channels <= 0 or output_channels <= 0:
-        return 0
-    return (
-        min(int(output_channels), TURING_CODEBOOK_W4A8_CHUNK_ROWS)
-        * int(input_channels)
+    return codebook_w4a8_workspace_bytes(
+        input_channels,
+        output_channels,
+        chunk_rows=TURING_CODEBOOK_W4A8_CHUNK_ROWS,
     )
-
-
-def _kernel_available(name: str = "turing_w4a8_linear") -> bool:
-    try:
-        extension = load_kernel_extension("_C")
-    except (ImportError, OSError):
-        return False
-    return hasattr(extension, name)
 
 
 def convrot_swiglu_channel_sharding_available() -> bool:
@@ -80,20 +71,6 @@ def convrot_swiglu_half_width_available() -> bool:
     )
 
 
-def _kernel_op(name: str):
-    try:
-        return getattr(load_kernel_package(), name)
-    except (ImportError, OSError, AttributeError) as exc:
-        raise RuntimeError(f"bundled CUDA operation {name!r} is unavailable") from exc
-
-
-def backend_available() -> bool:
-    try:
-        import comfy_kitchen
-    except ImportError:
-        return False
-    status = comfy_kitchen.list_backends().get(BACKEND_NAME, {})
-    return bool(status.get("available") and not status.get("disabled"))
 
 
 def preflight_w4a8(device: torch.device) -> None:
