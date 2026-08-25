@@ -3,7 +3,7 @@
 Compatibility and performance extensions for CUDA Tensor Core GPUs. The plugin
 currently provides ConvRot W8A8/W4A8/W4A4 support, exact-sm75 BF16 activation
 storage, bundled sm75+ W8A8 attention, exact-sm75 Sage, native sm75+ Sol and
-fixed-Top-K SLA sparse attention, and focused Wan/Bernini utilities.
+fixed-Top-K SLA sparse attention, and focused Krea2/Wan/Bernini utilities.
 
 ## Requirements
 
@@ -46,6 +46,16 @@ only after its CUDA sources or required version change.
 - `Bernini Inpaint Condition` starts sampling from the source-video latent,
   supports local or global repainting, and optionally adds the source as aligned
   context tokens.
+- `Krea2 Identity Edit Conditioning` combines the Identity Edit appearance and
+  Qwen3-VL semantic paths in one node. It accepts one required character image
+  and one optional background/edit canvas, always orders them as
+  `[background, character]`, fits and VAE-encodes both before sampling, and
+  returns the patched model plus one conditioning. Connect the same target
+  latent to this node and KSampler; the latent continues directly to KSampler.
+  Character/background strength defaults remain `4/1`; setting both to `1`
+  disables the extra attention bias and keeps the fastest native attention path.
+  For the recommended Turbo/CFG 1 path, connect the one conditioning output to
+  both positive and negative sockets.
 - `Bernini Context Windows` applies reference-aware Wan context windows with
   selectable absolute or official relative temporal positions.
 - `Wan Video Frames Padding` exposes Wan-compatible frame padding.
@@ -118,6 +128,32 @@ only after its CUDA sources or required version change.
   Existing `Patch Sol/SLA Sparse Attention` node IDs remain registered as
   legacy compatibility nodes so saved positional `use_w8a8` widgets do not
   shift. New workflows should use the `Configure` nodes.
+
+## Krea2 Identity Edit wiring
+
+Apply the compatible Identity Edit LoRA before the node. The target latent is
+an input because reference VAE encoding must finish before KSampler loads the
+DiT, and because mismatched reference aspect ratios need the target grid for
+centered RoPE positions. It is not copied to an output:
+
+```text
+Load Diffusion Model -> Load LoRA -> Krea2 Identity Edit Conditioning.model
+Load CLIP (krea2) ----------------> Krea2 Identity Edit Conditioning.clip
+Load VAE -------------------------> Krea2 Identity Edit Conditioning.vae
+Load Image (character) -----------> Krea2 Identity Edit Conditioning.character_image
+Load Image (background, optional) -> Krea2 Identity Edit Conditioning.background_image
+Empty SD3 Latent -----------------+> Krea2 Identity Edit Conditioning.target_latent
+                                  +> KSampler.latent_image
+
+Krea2 Identity Edit Conditioning.model --------> KSampler.model
+Krea2 Identity Edit Conditioning.conditioning -+> KSampler.positive
+                                                +> KSampler.negative (CFG 1)
+```
+
+When both images are connected, Qwen3-VL and the DiT always receive
+`[background, character]`. The character-only path remains a single-reference
+edit; there are no numbered reference sockets or hidden role changes.
+
 ## MiniMax H3 automatic activation memory
 
 The H3 adapter uses one capability-based path on Turing, Ampere, Ada, Hopper,
