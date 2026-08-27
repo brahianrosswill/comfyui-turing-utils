@@ -183,6 +183,36 @@ def preflight_codebook_w4a8(device: torch.device) -> None:
         output.float(), reference, rtol=0.01, atol=0.02
     ):
         raise RuntimeError("codebook W4A8 numerical self-test failed")
+
+    # Exercise the H3 MLP contract as well as the raw contraction above.  Its
+    # fc2 receives [gate, up] at 2K and therefore exposed a distinct dispatch
+    # path that the original small-K preflight did not cover.
+    h3_k = 14336
+    swiglu_input = (
+        ((torch.arange(m * 2 * h3_k, device=device) % 29) - 14)
+        .reshape(m, 2 * h3_k)
+        .to(torch.bfloat16)
+        / 16
+    )
+    swiglu_output = codebook_w4a8_linear(
+        swiglu_input,
+        torch.zeros((n, h3_k // 2), dtype=torch.int8, device=device),
+        torch.ones(
+            (n, h3_k // group_size),
+            dtype=torch.float8_e4m3fn,
+            device=device,
+        ),
+        torch.ones(n, dtype=torch.float32, device=device),
+        codebook=codebook,
+        group_size=group_size,
+        convrot_groupsize=256,
+        out_dtype=torch.bfloat16,
+        input_act="swiglu",
+    )
+    if swiglu_output.dtype is not torch.bfloat16 or not torch.isfinite(
+        swiglu_output
+    ).all():
+        raise RuntimeError("codebook W4A8 H3 SwiGLU self-test failed")
     _PREFLIGHTED_CODEBOOK_DEVICES.add(index)
 
 
@@ -337,6 +367,8 @@ def _quantize_turing_int8_activation(
 
     if input_act not in (None, "none", "swiglu", "gelu_tanh"):
         raise ValueError(f"unsupported fused INT8 activation: {input_act!r}")
+    if input_act == "swiglu" and x2d.shape[1] % 2:
+        raise ValueError("SwiGLU input width must be even")
     hidden_size = x2d.shape[1] // 2 if input_act == "swiglu" else x2d.shape[1]
     if input_act == "gelu_tanh":
         if x2d.dtype == torch.bfloat16 and _convrot_int8_bf16_rowbuffer_fits(
@@ -893,6 +925,15 @@ def codebook_w4a8_linear(
     from comfy_kitchen.backends import cuda as kitchen_cuda
     from comfy_kitchen.backends._activations import apply_input_act
 
+    # The packed W4 tensor describes the post-activation GEMM input.  SwiGLU
+    # consumes a [gate, up] tensor and halves its last dimension before the
+    # linear operation, so compare the weight against K rather than the
+    # original 2K input.  Using x.shape[-1] directly rejects the native path
+    # for every fused MLP fc2 and sends SM75 to Kitchen's 64-KiB shared-memory
+    # fallback, which the 2080 Ti cannot opt into.
+    linear_input_channels = (
+        x.shape[-1] // 2 if input_act == "swiglu" else x.shape[-1]
+    )
     fast_path = (
         x.dtype is torch.bfloat16
         and out_dtype is torch.bfloat16
@@ -904,7 +945,7 @@ def codebook_w4a8_linear(
         and s_rel.dtype is torch.float8_e4m3fn
         and qdata.ndim == 2
         and qdata.shape[0] % 8 == 0
-        and qdata.shape[1] * 2 == x.shape[-1]
+        and qdata.shape[1] * 2 == linear_input_channels
     )
     if not fast_path:
         x = apply_input_act(x, input_act)

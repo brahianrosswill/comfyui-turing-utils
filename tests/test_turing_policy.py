@@ -441,6 +441,13 @@ class BF16PolicyTest(unittest.TestCase):
         rowbuffer.assert_called_once_with(x, 256, swiglu=True)
         staged_swiglu.assert_not_called()
 
+    def test_int8_swiglu_rejects_odd_input_width_before_cuda_dispatch(self):
+        x = torch.empty((3, 513), dtype=torch.bfloat16)
+        with self.assertRaisesRegex(ValueError, "width must be even"):
+            turing_ops._quantize_turing_int8_activation(
+                x, 256, input_act="swiglu"
+            )
+
     def test_w8a8_uses_shared_staged_quantizer(self):
         x = torch.ones((2, 10752), dtype=torch.bfloat16)
         weight = torch.zeros((8, 5376), dtype=torch.int8)

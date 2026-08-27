@@ -216,6 +216,58 @@ class FusionDispatchTest(unittest.TestCase):
         self.assertEqual(kernel.call_args.kwargs["input_act"], "swiglu")
         uncast.assert_called_once_with(linear, weight, None, offload)
 
+    def test_codebook_w4a8_swiglu_uses_native_turing_path(self):
+        from comfy_kitchen.backends import cuda as kitchen_cuda
+
+        x = torch.zeros((2, 512), dtype=torch.bfloat16)
+        qdata = torch.zeros((8, 128), dtype=torch.int8)
+        s_rel = torch.ones((8, 16), dtype=torch.float8_e4m3fn)
+        s_channel = torch.ones(8, dtype=torch.float32)
+        codebook = torch.linspace(-1, 1, 16, dtype=torch.float32)
+        qactivation = torch.zeros((2, 256), dtype=torch.int8)
+        activation_scale = torch.ones(2, dtype=torch.float32)
+        expected = torch.zeros((2, 8), dtype=torch.bfloat16)
+        native = mock.Mock(return_value=expected)
+
+        with (
+            mock.patch.object(
+                turing_ops, "is_supported_tensor_core_device", return_value=True
+            ),
+            mock.patch.object(
+                turing_ops,
+                "_quantize_turing_int8_activation",
+                return_value=(qactivation, activation_scale),
+            ) as quantize,
+            mock.patch.object(turing_ops, "_kernel_op", return_value=native),
+            mock.patch.object(kitchen_cuda, "w4a8_int8_linear") as fallback,
+        ):
+            result = turing_ops.codebook_w4a8_linear(
+                x,
+                qdata,
+                s_rel,
+                s_channel,
+                codebook=codebook,
+                input_act="swiglu",
+            )
+
+        torch.testing.assert_close(result, expected)
+        self.assertEqual(result.data_ptr(), expected.data_ptr())
+        fallback.assert_not_called()
+        quantize.assert_called_once()
+        self.assertEqual(quantize.call_args.args[0].data_ptr(), x.data_ptr())
+        self.assertEqual(quantize.call_args.args[1], 256)
+        self.assertEqual(quantize.call_args.kwargs["input_act"], "swiglu")
+        native.assert_called_once_with(
+            qactivation,
+            qdata,
+            activation_scale,
+            s_rel,
+            s_channel,
+            codebook,
+            None,
+            16,
+        )
+
     def test_large_w8_gemm_attempts_fixed_workspace_even_when_latency_heuristic_declines(self):
         from comfy_kitchen.backends import cuda as kitchen_cuda
 
