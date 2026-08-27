@@ -153,6 +153,7 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsBerniniContextWindowsCore",
                 "TuringUtilsBerniniInpaintCondition",
                 "TuringUtilsKrea2IdentityEditConditioning",
+                "TuringUtilsIsInputPresent",
                 "TuringUtilsH3ConcatAVLatent",
                 "TuringUtilsH3SeparateAVLatent",
                 "TuringUtilsH3LatentInfo",
