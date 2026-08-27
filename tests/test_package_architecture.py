@@ -154,6 +154,7 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsBerniniInpaintCondition",
                 "TuringUtilsKrea2IdentityEditConditioning",
                 "TuringUtilsIsInputPresent",
+                "TuringUtilsLazyIfElse",
                 "TuringUtilsH3ConcatAVLatent",
                 "TuringUtilsH3SeparateAVLatent",
                 "TuringUtilsH3LatentInfo",

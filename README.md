@@ -66,6 +66,10 @@ only after its CUDA sources or required version change.
   placeholder frame.
 - `Is Input Present` accepts an optional value of any type and reports whether
   it is connected and non-empty; scalar `0` and `false` still count as present.
+  Its second output forwards that value or lazily evaluates an optional fallback.
+- `Lazy If / Else` switches values of any ComfyUI type while lazily evaluating
+  only the selected branch, unless another workflow output also needs the
+  unselected branch.
 - `H3 Concat AV Latent` combines standalone H3 video and audio latents into the
   model's native nested AV latent. `H3 Separate AV Latent` splits the streams
   again; both nodes preserve matching video/audio noise masks.
