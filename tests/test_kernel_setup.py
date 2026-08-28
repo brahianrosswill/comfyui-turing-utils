@@ -110,7 +110,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(
             "csrc/turing/sage/overlap_blend.cu", extensions[2].kwargs["sources"]
         )
-        self.assertEqual(setup.call_args.kwargs["version"], "0.40.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.41.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -300,7 +300,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.40.0")
+        self.assertEqual(metadata["project"]["version"], "0.41.0")
 
     def test_overlap_epilogue_is_self_contained_and_deterministic_by_design(self):
         source = (
@@ -365,6 +365,18 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn("AttentionStorage<HeadDim, SparseValuePipeline>", source)
         self.assertIn("sparse_v_pipeline=", source)
         self.assertIn("current_cuda_device_major() >= 8", source)
+        self.assertIn("load_half_tile_mapped", source)
+        self.assertIn("sol_sparse_online_int8_f16_mapped_attn", source)
+
+    def test_mapped_fp16_sol_abi_is_complete(self):
+        sage_dir = PLUGIN_ROOT / "kernel" / "csrc" / "turing" / "sage"
+        marker = "sol_sparse_online_int8_f16_mapped_attn"
+        for path in (
+            sage_dir / "sol_sparse_cuda_sm75.cu",
+            sage_dir / "attn_cuda_sm75.h",
+            sage_dir / "pybind_sm75.cpp",
+        ):
+            self.assertIn(marker, path.read_text(encoding="utf-8"))
 
     def test_attention_launches_use_pytorch_current_cuda_stream(self):
         sage_dir = PLUGIN_ROOT / "kernel" / "csrc" / "turing" / "sage"

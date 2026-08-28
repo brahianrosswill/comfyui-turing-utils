@@ -119,12 +119,16 @@ only after its CUDA sources or required version change.
   0.39.0, `fast` retains only the two physical BF16 K/V slices, gathers them
   through an exact logical source map, applies all seven real temporal RoPE
   phases, and materializes only the W8A8 INT8 attention containers. It does not
-  average temporal phases. Kernel 0.40.0 adds `residual`: the two physical
+  average temporal phases. Kernel 0.41.0 extends `residual`: the two physical
   latent-time slices and non-video context remain exact, while the five added
   virtual slices use Sol's `2x32` skipped-block residuals in the same online
-  softmax. Sage, SDPA, or an older kernel safely use the exact conservative
-  representation. The node replaces any upstream Sol/SLA strategy; the fast
-  and residual paths require rebuilding the bundled kernel.
+  softmax. W8A8 reads its mapped INT8 V path; inherited Sage or SDPA use the
+  mapped FP16/BF16 Sol path, including mapped summary construction and exact-V
+  tile reads, without materializing seven floating-point K/V slices. Here
+  `sdpa` names the inherited numeric/fallback policy—the residual computation
+  itself still runs in the bundled Sol kernel. Older kernels safely use the
+  exact conservative representation. The node replaces any upstream Sol/SLA
+  strategy; the fast and residual paths require rebuilding the bundled kernel.
 - `Video Motion Contact Sheet (Experimental)` samples an `N x N` chronological
   storyboard from a loaded `VIDEO` or decoded `IMAGE` frame batch. It can use
   uniform or motion-weighted sampling and optionally wraps each panel in

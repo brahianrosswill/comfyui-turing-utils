@@ -78,6 +78,7 @@ class RuntimeCapabilities:
             "asymmetric_qk_rope",
             "mapped_kv",
             "mapped_sparse_kv",
+            "mapped_sparse_fp16_kv",
             "reusable_k_anchor",
             "overlap_accumulate",
             "core_fusions",
@@ -156,12 +157,15 @@ def kernel_capabilities() -> KernelCapabilities:
         features.add("reusable_k_anchor")
     if "fused_qk" in features and qk_preprocess_protocol_schema() >= 2:
         features.add("asymmetric_qk_rope")
-    if (
+    mapped_qk = bool(
         "fused_qk" in features
         and qk_preprocess_protocol_schema() >= 3
         and kernel_extension_has_symbol(
             "quant_qk_rms_rope_int8_mapped_cuda", "_sage_fused_sm75"
         )
+    )
+    if (
+        mapped_qk
         and kernel_extension_has_symbol(
             "gather_value_int8_mapped_cuda", "_sage_fused_sm75"
         )
@@ -174,6 +178,10 @@ def kernel_capabilities() -> KernelCapabilities:
         )
     ):
         features.add("mapped_sparse_kv")
+    if mapped_qk and kernel_extension_has_symbol(
+        "sol_sparse_online_int8_f16_mapped_attn", "_sage_qattn_sm75"
+    ):
+        features.add("mapped_sparse_fp16_kv")
     return KernelCapabilities(True, version, frozenset(features))
 
 

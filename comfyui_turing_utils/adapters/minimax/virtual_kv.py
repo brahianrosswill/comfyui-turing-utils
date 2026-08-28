@@ -18,6 +18,7 @@ from ...attention.patches import attention_base_runtime
 from ...attention.protocol import (
     AttentionExecutionOutcome,
     MAPPED_KV_EXECUTOR_ATTR,
+    MAPPED_RESIDUAL_CAPABILITY_ATTR,
     MAPPED_RESIDUAL_EXECUTOR_ATTR,
     PreparedAttention,
 )
@@ -284,6 +285,11 @@ def make_h3_virtual_kv_override(
         residual_executor = getattr(
             dense_executor, MAPPED_RESIDUAL_EXECUTOR_ATTR, None
         )
+        residual_capability = getattr(
+            residual_executor,
+            MAPPED_RESIDUAL_CAPABILITY_ATTR,
+            "mapped_sparse_kv",
+        )
         mapped_exact = bool(
             mode == "fast"
             and callable(mapped_executor)
@@ -292,7 +298,7 @@ def make_h3_virtual_kv_override(
         mapped_residual = bool(
             mode == "residual"
             and callable(residual_executor)
-            and kernel_capabilities().supports("mapped_sparse_kv").supported
+            and kernel_capabilities().supports(residual_capability).supported
         )
         mapped = mapped_exact or mapped_residual
         if not mapped:
@@ -358,6 +364,21 @@ def make_h3_virtual_kv_override(
 
     prepared_executor.capabilities = getattr(dense_executor, "capabilities", None)
     prepared_executor.turing_utils_h3_virtual_kv_mode = mode
+    residual_executor = getattr(dense_executor, MAPPED_RESIDUAL_EXECUTOR_ATTR, None)
+    prepared_executor.turing_utils_h3_virtual_kv_mapped_capability = (
+        getattr(
+            residual_executor,
+            MAPPED_RESIDUAL_CAPABILITY_ATTR,
+            "mapped_sparse_kv",
+        )
+        if mode == "residual"
+        else "mapped_kv"
+    )
+    prepared_executor.turing_utils_h3_virtual_kv_numeric_backend = getattr(
+        dense_override,
+        "turing_utils_attention_backend",
+        "sdpa",
+    )
     prepared_executor.turing_utils_h3_virtual_kv_mapped_available = bool(
         (
             mode == "fast"
@@ -366,7 +387,7 @@ def make_h3_virtual_kv_override(
         or (
             mode == "residual"
             and callable(
-                getattr(dense_executor, MAPPED_RESIDUAL_EXECUTOR_ATTR, None)
+                residual_executor
             )
         )
     )
@@ -405,14 +426,19 @@ def apply_h3_virtual_kv(model, *, mode: str = "conservative"):
             "H3 fast virtual K/V needs kernel 0.39.0 mapped-K/V support; "
             "using the exact materialized path until the native kernel is rebuilt"
         )
-    if (
-        mode == "residual"
-        and runtime.dense_backend == "w8a8"
-        and not kernel_capabilities().supports("mapped_sparse_kv").supported
-    ):
+    residual_capability = (
+        "mapped_sparse_kv"
+        if runtime.dense_backend == "w8a8"
+        else "mapped_sparse_fp16_kv"
+    )
+    if mode == "residual" and not kernel_capabilities().supports(
+        residual_capability
+    ).supported:
         LOG.warning(
-            "H3 residual virtual K/V needs kernel 0.40.0 mapped-Sol support; "
-            "using the exact materialized path until the native kernel is rebuilt"
+            "H3 residual virtual K/V needs kernel 0.41.0 mapped-Sol support "
+            "for dense backend %s; "
+            "using the exact materialized path until the native kernel is rebuilt",
+            runtime.dense_backend,
         )
     override = make_h3_virtual_kv_override(runtime.dense_override, mode=mode)
     installed = install_attention_strategy(

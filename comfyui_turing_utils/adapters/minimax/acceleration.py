@@ -1099,8 +1099,15 @@ def _make_attention_forward(
         virtual_kv_mode = getattr(
             executor, "turing_utils_h3_virtual_kv_mode", None
         )
-        virtual_kv_capability = (
-            "mapped_sparse_kv" if virtual_kv_mode == "residual" else "mapped_kv"
+        virtual_kv_capability = getattr(
+            executor,
+            "turing_utils_h3_virtual_kv_mapped_capability",
+            "mapped_sparse_kv" if virtual_kv_mode == "residual" else "mapped_kv",
+        )
+        virtual_kv_numeric_backend = getattr(
+            executor,
+            "turing_utils_h3_virtual_kv_numeric_backend",
+            "w8a8",
         )
         mapped_virtual_kv = bool(
             virtual_kv
@@ -1143,7 +1150,8 @@ def _make_attention_forward(
                 ),
                 quantized_input=True,
                 quantized_value=bool(
-                    callable(streamed_executor) or mapped_virtual_kv
+                    callable(streamed_executor)
+                    or (mapped_virtual_kv and virtual_kv_numeric_backend == "w8a8")
                 ),
                 runtime_plan=runtime_plan,
                 base_model=base_model,
@@ -1218,7 +1226,9 @@ def _make_attention_forward(
                 head_group=int(self.heads),
                 compact_qk=False,
                 cache_quantized_input=False,
-                quantized_value=mapped_virtual_kv,
+                quantized_value=bool(
+                    mapped_virtual_kv and virtual_kv_numeric_backend == "w8a8"
+                ),
                 logical_key_rows=logical_key_rows,
                 residual_subblocks=virtual_residual_subblocks,
             )

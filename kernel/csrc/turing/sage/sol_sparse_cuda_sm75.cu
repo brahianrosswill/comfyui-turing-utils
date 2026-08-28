@@ -579,6 +579,40 @@ __device__ __forceinline__ void load_half_tile(
   }
 }
 
+template <int HeadDim, int Rows, typename T>
+__device__ __forceinline__ void load_half_tile_mapped(
+    const T *__restrict__ source,
+    int64_t stride_sequence,
+    const int *__restrict__ source_indices,
+    int row_start,
+    int row_limit,
+    const smem_t<SwizzleMode::k128B, AttentionGeometry<HeadDim>::kHalfPacks> &destination)
+{
+  using G = AttentionGeometry<HeadDim>;
+  const int linear_thread = threadIdx.y * WARP_SIZE + threadIdx.x;
+  static_assert(Rows > 0 && Rows <= kBlockTokens && Rows % 16 == 0);
+  constexpr int tile_packs = Rows * G::kHalfPacks;
+  for (int line = linear_thread; line < tile_packs;
+       line += kWarps * WARP_SIZE)
+  {
+    const int row = line / G::kHalfPacks;
+    const int column = line % G::kHalfPacks;
+    const int logical_row = row_start + row;
+    const uint32_t offset = destination.get_permuted_offset(row, column);
+    if (logical_row < row_limit)
+    {
+      const int physical_row = source_indices[logical_row];
+      destination.base[offset] = pack_to_half(
+          source + static_cast<int64_t>(physical_row) * stride_sequence +
+          column * 8);
+    }
+    else
+    {
+      destination.base[offset] = make_uint4(0, 0, 0, 0);
+    }
+  }
+}
+
 template <int HeadDim, int Rows>
 __device__ __forceinline__ void load_half_tile_async(
     const half *__restrict__ source,
@@ -816,7 +850,8 @@ __device__ __forceinline__ void load_quantized_value_tile_async(
 
 template <int HeadDim, typename T, bool UseW8A8, bool ForceDense,
           bool IsCausal, bool Varlen, int ResidualSubblocks, int KeyStages,
-          bool ExternalRoute = false, bool SparseValuePipeline = false>
+          bool ExternalRoute = false, bool SparseValuePipeline = false,
+          bool MappedValue = false>
 __global__ void sparse_attention_kernel(
     const int8_t *__restrict__ query_int8,
     const int8_t *__restrict__ key_int8,
@@ -837,6 +872,7 @@ __global__ void sparse_attention_kernel(
     const int32_t *__restrict__ cu_seqlens_q,
     const int32_t *__restrict__ cu_seqlens_k,
     const int32_t *__restrict__ value_offsets,
+    const int32_t *__restrict__ value_source_indices,
     int query_length,
     int key_length,
     int num_query_heads,
@@ -872,6 +908,9 @@ __global__ void sparse_attention_kernel(
       "exact attention stages must cover 64 or 128 K tokens");
   static_assert(!ForceDense || KeyStages == 1);
   static_assert(!ExternalRoute || (!ForceDense && !Varlen && !IsCausal));
+  static_assert(
+      !MappedValue || (!UseW8A8 && !ForceDense && !Varlen && !IsCausal),
+      "mapped FP16/BF16 V is scoped to non-causal split Sol");
   static_assert(
       !SparseValuePipeline ||
           (UseW8A8 && !ForceDense && !Varlen && !IsCausal),
@@ -1453,12 +1492,25 @@ __global__ void sparse_attention_kernel(
     else
     {
       cp_async::commit_group();
-      load_half_tile<HeadDim, kBlockTokens>(
-          value_head_ptr,
-          stride_sequence_v,
-          key_block * kBlockTokens,
-          key_length,
-          shared_selected_value);
+      if constexpr (MappedValue)
+      {
+        load_half_tile_mapped<HeadDim, kBlockTokens>(
+            value_head_ptr,
+            stride_sequence_v,
+            value_source_indices,
+            key_block * kBlockTokens,
+            key_length,
+            shared_selected_value);
+      }
+      else
+      {
+        load_half_tile<HeadDim, kBlockTokens>(
+            value_head_ptr,
+            stride_sequence_v,
+            key_block * kBlockTokens,
+            key_length,
+            shared_selected_value);
+      }
     }
     cp_async::wait_group<0>();
     __syncthreads();
@@ -1604,12 +1656,25 @@ __global__ void sparse_attention_kernel(
       }
       else
       {
-        load_half_tile<HeadDim, kBlockTokens>(
-            value_head_ptr,
-            stride_sequence_v,
-            next_key_block * kBlockTokens,
-            key_length,
-            shared_selected_value);
+        if constexpr (MappedValue)
+        {
+          load_half_tile_mapped<HeadDim, kBlockTokens>(
+              value_head_ptr,
+              stride_sequence_v,
+              value_source_indices,
+              next_key_block * kBlockTokens,
+              key_length,
+              shared_selected_value);
+        }
+        else
+        {
+          load_half_tile<HeadDim, kBlockTokens>(
+              value_head_ptr,
+              stride_sequence_v,
+              next_key_block * kBlockTokens,
+              key_length,
+              shared_selected_value);
+        }
       }
       cp_async::wait_group<0>();
       __syncthreads();
@@ -1749,7 +1814,8 @@ int current_cuda_device_major()
 template <int HeadDim, typename T, bool UseW8A8, bool ForceDense,
           bool IsCausal, bool Varlen,
           bool SummariesReady = false, int ResidualSubblocks = 1,
-          int KeyStages = 1, bool SparseValuePipeline = false>
+          int KeyStages = 1, bool SparseValuePipeline = false,
+          bool MappedValue = false>
 void launch_sparse_threshold_attention(
     at::Tensor query_int8,
     at::Tensor key_int8,
@@ -1770,6 +1836,7 @@ void launch_sparse_threshold_attention(
     at::Tensor cu_seqlens_q,
     at::Tensor cu_seqlens_k,
     at::Tensor value_offsets,
+    at::Tensor value_source_indices,
     int max_seqlen_q,
     int max_seqlen_k,
     int residual_subblocks,
@@ -1785,6 +1852,8 @@ void launch_sparse_threshold_attention(
       "Sol residual geometry must be 1x64 or 2x32");
   static_assert(KeyStages == 1 || KeyStages == 2);
   static_assert(!ForceDense || KeyStages == 1);
+  static_assert(
+      !MappedValue || (!UseW8A8 && !ForceDense && !Varlen && !IsCausal));
   TORCH_INTERNAL_ASSERT(
       ForceDense || residual_subblocks == ResidualSubblocks,
       "Sol residual dispatch specialization mismatch");
@@ -1807,13 +1876,13 @@ void launch_sparse_threshold_attention(
   if constexpr (!ForceDense && !SummariesReady)
   {
     dim3 key_summary_grid(num_key_blocks, num_kv_heads, batch_size);
-    kv_block_summary_kernel<HeadDim, T, UseW8A8><<<
+    kv_block_summary_kernel<HeadDim, T, UseW8A8, MappedValue><<<
         key_summary_grid, HeadDim, 0, stream>>>(
         key_int8.data_ptr<int8_t>(),
         key_scale.data_ptr<float>(),
         reinterpret_cast<const T *>(value.data_ptr()),
         UseW8A8 ? value_scale.data_ptr<float>() : nullptr,
-        nullptr,
+        MappedValue ? value_source_indices.data_ptr<int>() : nullptr,
         reinterpret_cast<half *>(key_summary.data_ptr()),
         reinterpret_cast<half *>(key_score_summary.data_ptr()),
         reinterpret_cast<half *>(value_mean.data_ptr()),
@@ -1850,7 +1919,7 @@ void launch_sparse_threshold_attention(
   auto attention_kernel =
       sparse_attention_kernel<HeadDim, T, UseW8A8, ForceDense, IsCausal,
                               Varlen, ResidualSubblocks, KeyStages, false,
-                              SparseValuePipeline>;
+                              SparseValuePipeline, MappedValue>;
   configure_dynamic_shared_memory(
       attention_kernel, S::kAttentionSharedBytes, "Sol sparse attention");
   if (attention_kernel_profile_enabled())
@@ -1868,6 +1937,7 @@ void launch_sparse_threshold_attention(
                << ",residual_subblocks=" << ResidualSubblocks
                << ",key_stages=" << KeyStages
                << ",sparse_v_pipeline=" << (SparseValuePipeline ? 1 : 0)
+               << ",mapped_v=" << (MappedValue ? 1 : 0)
                << ",query_tokens=" << query_length
                << ",key_tokens=" << key_length
                << ",query_blocks=" << num_query_blocks
@@ -1910,6 +1980,7 @@ void launch_sparse_threshold_attention(
       Varlen ? cu_seqlens_q.data_ptr<int32_t>() : nullptr,
       Varlen ? cu_seqlens_k.data_ptr<int32_t>() : nullptr,
       Varlen ? value_offsets.data_ptr<int32_t>() : nullptr,
+      MappedValue ? value_source_indices.data_ptr<int32_t>() : nullptr,
       query_length,
       key_length,
       num_query_heads,
@@ -1957,6 +2028,7 @@ void dispatch_sparse_threshold_attention(
     at::Tensor cu_seqlens_q,
     at::Tensor cu_seqlens_k,
     at::Tensor value_offsets,
+    at::Tensor value_source_indices,
     int max_seqlen_q,
     int max_seqlen_k,
     int residual_subblocks,
@@ -1968,17 +2040,18 @@ void dispatch_sparse_threshold_attention(
     bool summaries_ready,
     bool is_causal,
     bool varlen,
+    bool mapped_value,
     int route_original_basis)
 {
-#define LAUNCH_VARIANT(HEAD_DIM, SCALAR, USE_W8A8, FORCE_DENSE, CAUSAL, VARLEN, READY, RESIDUALS, STAGES, PIPELINE) \
+#define LAUNCH_VARIANT(HEAD_DIM, SCALAR, USE_W8A8, FORCE_DENSE, CAUSAL, VARLEN, READY, RESIDUALS, STAGES, PIPELINE, MAPPED) \
   launch_sparse_threshold_attention<HEAD_DIM, SCALAR, USE_W8A8,             \
                                     FORCE_DENSE, CAUSAL, VARLEN, READY,      \
-                                    RESIDUALS, STAGES, PIPELINE>(            \
+                                    RESIDUALS, STAGES, PIPELINE, MAPPED>(    \
       query_int8, key_int8, value, value_int8, value_scale, output,          \
       query_scale, key_scale, key_summary, key_score_summary, value_mean,    \
       key_summary_mean, key_summary_variance, sparse_query_blocks,           \
       exact_kv_blocks, selected_count, cu_seqlens_q, cu_seqlens_k,          \
-      value_offsets,                                                        \
+      value_offsets, value_source_indices,                                  \
       max_seqlen_q, max_seqlen_k, residual_subblocks, threshold_sigma,       \
       softmax_scale, key_tile_tokens, route_original_basis)
   const bool sparse_value_pipeline =
@@ -1988,55 +2061,69 @@ void dispatch_sparse_threshold_attention(
 #define DISPATCH_FORMAT(HEAD_DIM, SCALAR)                                    \
   do                                                                         \
   {                                                                          \
-    if (sparse_value_pipeline)                                               \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 1, 1, true); \
+    if (mapped_value && residual_subblocks == 2)                             \
+    {                                                                        \
+      if (key_tile_tokens == 128)                                            \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 2, 2, false, true); \
+      else                                                                   \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 2, 1, false, true); \
+    }                                                                        \
+    else if (mapped_value)                                                   \
+    {                                                                        \
+      if (key_tile_tokens == 128)                                            \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 1, 2, false, true); \
+      else                                                                   \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 1, 1, false, true); \
+    }                                                                        \
+    else if (sparse_value_pipeline)                                          \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 1, 1, true, false); \
     else if (varlen && is_causal)                                            \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, true, true, true, 1, 1, false); \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, true, true, true, 1, 1, false, false); \
     else if (varlen)                                                         \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, false, true, true, 1, 1, false); \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, false, true, true, 1, 1, false, false); \
     else if (force_dense && is_causal)                                       \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, true, false, true, 1, 1, false); \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, true, false, true, 1, 1, false, false); \
     else if (force_dense)                                                    \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, false, false, true, 1, 1, false);\
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, true, false, false, true, 1, 1, false, false);\
     else if (residual_subblocks == 2)                                        \
     {                                                                        \
       if (use_w8a8 && summaries_ready)                                       \
       {                                                                      \
         if (key_tile_tokens == 128)                                          \
-          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 2, 2, false); \
+          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 2, 2, false, false); \
         else                                                                 \
-          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 2, 1, false); \
+          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 2, 1, false, false); \
       }                                                                      \
       else if (use_w8a8)                                                     \
       {                                                                      \
         if (key_tile_tokens == 128)                                          \
-          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 2, 2, false); \
+          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 2, 2, false, false); \
         else                                                                 \
-          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 2, 1, false); \
+          LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 2, 1, false, false); \
       }                                                                      \
       else if (key_tile_tokens == 128)                                       \
-        LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 2, 2, false); \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 2, 2, false, false); \
       else                                                                   \
-        LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 2, 1, false); \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 2, 1, false, false); \
     }                                                                        \
     else if (use_w8a8 && summaries_ready)                                    \
     {                                                                        \
       if (key_tile_tokens == 128)                                            \
-        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 1, 2, false); \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 1, 2, false, false); \
       else                                                                   \
-        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 1, 1, false); \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, true, 1, 1, false, false); \
     }                                                                        \
     else if (use_w8a8)                                                       \
     {                                                                        \
       if (key_tile_tokens == 128)                                            \
-        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 1, 2, false); \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 1, 2, false, false); \
       else                                                                   \
-        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 1, 1, false); \
+        LAUNCH_VARIANT(HEAD_DIM, SCALAR, true, false, false, false, false, 1, 1, false, false); \
     }                                                                        \
     else if (key_tile_tokens == 128)                                         \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 1, 2, false); \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 1, 2, false, false); \
     else                                                                     \
-      LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 1, 1, false); \
+      LAUNCH_VARIANT(HEAD_DIM, SCALAR, false, false, false, false, false, 1, 1, false, false); \
   } while (false)
 
   const int head_dim = query_int8.size(-1);
@@ -2113,6 +2200,7 @@ void launch_sla_attention(
       selected_count.numel()
           ? reinterpret_cast<unsigned long long *>(selected_count.data_ptr<int64_t>())
           : nullptr,
+      nullptr,
       nullptr,
       nullptr,
       nullptr,
@@ -2820,16 +2908,17 @@ void qk_int8_sv_int8_varlen_accum_f32_attn(
       query_int8, key_int8, output, value_int8, value_scale, output,
       query_scale, key_scale, half_empty, half_empty, half_empty,
       float_empty, float_empty, policy_empty, policy_empty, selected_empty,
-      cu_seqlens_q, cu_seqlens_k, value_offsets,
+      cu_seqlens_q, cu_seqlens_k, value_offsets, value_offsets,
       max_seqlen_q, max_seqlen_k,
       1, 0.0f, softmax_scale, 64, true, true, true,
-      is_causal, true, 0);
+      is_causal, true, false, 0);
 }
 
-at::Tensor sol_sparse_online_int8_f16_attn(
+static at::Tensor sol_sparse_online_int8_f16_attn_impl(
     at::Tensor query_int8,
     at::Tensor key_int8,
     at::Tensor value,
+    const at::Tensor *value_source_indices,
     at::Tensor value_int8,
     at::Tensor value_scale,
     at::Tensor output,
@@ -2847,6 +2936,7 @@ at::Tensor sol_sparse_online_int8_f16_attn(
     int is_causal,
     int route_original_basis)
 {
+  const bool mapped_value = value_source_indices != nullptr;
   CHECK_CUDA(query_int8);
   CHECK_CUDA(key_int8);
   CHECK_CUDA(value);
@@ -2873,6 +2963,14 @@ at::Tensor sol_sparse_online_int8_f16_attn(
   CHECK_DIMS(key_scale, 3);
   CHECK_DIMS(sparse_query_blocks, 1);
   CHECK_DIMS(exact_kv_blocks, 1);
+  if (mapped_value)
+  {
+    const at::Tensor &mapped_indices = *value_source_indices;
+    CHECK_CUDA(mapped_indices);
+    CHECK_CONTIGUOUS(mapped_indices);
+    CHECK_DIMS(mapped_indices, 1);
+    CHECK_DTYPE(mapped_indices, at::ScalarType::Int);
+  }
   TORCH_CHECK(
       value.scalar_type() == at::ScalarType::Half ||
           value.scalar_type() == at::ScalarType::BFloat16,
@@ -2893,7 +2991,8 @@ at::Tensor sol_sparse_online_int8_f16_attn(
           value.device() == query_scale.device() &&
           value.device() == key_scale.device() &&
           value.device() == sparse_query_blocks.device() &&
-          value.device() == exact_kv_blocks.device(),
+          value.device() == exact_kv_blocks.device() &&
+          (!mapped_value || value.device() == value_source_indices->device()),
       "Sol attention tensors must share one CUDA device");
   TORCH_CHECK(
       query_int8.size(0) == key_int8.size(0) &&
@@ -2901,8 +3000,11 @@ at::Tensor sol_sparse_online_int8_f16_attn(
       "Sol attention batch sizes must match");
   TORCH_CHECK(
       key_int8.size(1) == value.size(1) &&
-          key_int8.size(2) == value.size(2),
+          (mapped_value || key_int8.size(2) == value.size(2)),
       "Sol attention K/V shapes must match");
+  TORCH_CHECK(
+      !mapped_value || value_source_indices->numel() == key_int8.size(2),
+      "mapped Sol source map must match logical K length");
   TORCH_CHECK(
       (query_int8.size(3) == 64 || query_int8.size(3) == 128) &&
           key_int8.size(3) == query_int8.size(3) &&
@@ -2935,6 +3037,9 @@ at::Tensor sol_sparse_online_int8_f16_attn(
       "key_tile_tokens must be 64 or 128");
   TORCH_CHECK(!force_dense || use_w8a8,
               "the specialized dense attention path currently requires W8A8");
+  TORCH_CHECK(
+      !mapped_value || (!use_w8a8 && !force_dense && !is_causal),
+      "mapped FP16/BF16 V requires non-causal split Sol");
 
   const int batch_size = query_int8.size(0);
   const int num_query_heads = query_int8.size(1);
@@ -3022,12 +3127,70 @@ at::Tensor sol_sparse_online_int8_f16_attn(
       query_int8, key_int8, value, value_int8, value_scale, output,
       query_scale, key_scale, key_summary, key_score_summary, value_mean,
       key_summary_mean, key_summary_variance, sparse_query_blocks,
-      exact_kv_blocks, selected_count, empty_cu, empty_cu, empty_cu, 0, 0,
+      exact_kv_blocks, selected_count, empty_cu, empty_cu, empty_cu,
+      mapped_value ? *value_source_indices : empty_cu, 0, 0,
       residual_subblocks, threshold_sigma,
       softmax_scale, key_tile_tokens, use_w8a8, force_dense, false,
-      is_causal, false,
+      is_causal, false, mapped_value,
       route_original_basis);
   return selected_count;
+}
+
+at::Tensor sol_sparse_online_int8_f16_attn(
+    at::Tensor query_int8,
+    at::Tensor key_int8,
+    at::Tensor value,
+    at::Tensor value_int8,
+    at::Tensor value_scale,
+    at::Tensor output,
+    at::Tensor query_scale,
+    at::Tensor key_scale,
+    at::Tensor sparse_query_blocks,
+    at::Tensor exact_kv_blocks,
+    float threshold_sigma,
+    int residual_subblocks,
+    float softmax_scale,
+    int return_stats,
+    int use_w8a8,
+    int force_dense,
+    int key_tile_tokens,
+    int is_causal,
+    int route_original_basis)
+{
+  return sol_sparse_online_int8_f16_attn_impl(
+      query_int8, key_int8, value, nullptr, value_int8, value_scale, output,
+      query_scale, key_scale, sparse_query_blocks, exact_kv_blocks,
+      threshold_sigma, residual_subblocks, softmax_scale, return_stats,
+      use_w8a8, force_dense, key_tile_tokens, is_causal,
+      route_original_basis);
+}
+
+at::Tensor sol_sparse_online_int8_f16_mapped_attn(
+    at::Tensor query_int8,
+    at::Tensor key_int8,
+    at::Tensor value,
+    at::Tensor value_source_indices,
+    at::Tensor output,
+    at::Tensor query_scale,
+    at::Tensor key_scale,
+    at::Tensor sparse_query_blocks,
+    at::Tensor exact_kv_blocks,
+    float threshold_sigma,
+    int residual_subblocks,
+    float softmax_scale,
+    int return_stats,
+    int key_tile_tokens,
+    int route_original_basis)
+{
+  at::Tensor value_int8 = at::empty(
+      {0}, value.options().dtype(at::ScalarType::Char));
+  at::Tensor value_scale = at::empty(
+      {0}, value.options().dtype(at::ScalarType::Float));
+  return sol_sparse_online_int8_f16_attn_impl(
+      query_int8, key_int8, value, &value_source_indices, value_int8,
+      value_scale, output, query_scale, key_scale, sparse_query_blocks,
+      exact_kv_blocks, threshold_sigma, residual_subblocks, softmax_scale,
+      return_stats, 0, 0, key_tile_tokens, 0, route_original_basis);
 }
 
 static std::vector<at::Tensor> sol_w8a8_precompute_summaries_impl(
@@ -3373,9 +3536,10 @@ at::Tensor sol_sparse_online_w8a8_prequantized_attn(
       query_int8, key_int8, output, value_int8, value_scale, output,
       query_scale, key_scale, key_summary, key_score_summary, value_mean,
       key_summary_mean, key_summary_variance, sparse_query_blocks,
-      exact_kv_blocks, selected_count, empty_cu, empty_cu, empty_cu, 0, 0,
+      exact_kv_blocks, selected_count, empty_cu, empty_cu, empty_cu,
+      empty_cu, 0, 0,
       residual_subblocks, threshold_sigma,
       softmax_scale, key_tile_tokens, true, force_dense, true, is_causal,
-      false, route_original_basis);
+      false, false, route_original_basis);
   return selected_count;
 }

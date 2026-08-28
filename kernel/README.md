@@ -1,11 +1,13 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's quantized
-runtime. Version 0.40.0 extends the mapped physical-K/logical-RoPE path with
-mapped Sol V summaries, so a virtual-K/V adapter can keep physical BF16 V while
-using exact context blocks and `2x32` residuals for virtual blocks. The mapped
-INT8-V gather remains available for exact selected tiles. This avoids
-materializing duplicated BF16 K/V rows. It also contains legacy packed W4A8 and grouped-codebook W4A8
+runtime. Version 0.41.0 completes the mapped physical-K/logical-RoPE Sol path
+for both integer and floating V. W8A8 uses mapped summaries plus its INT8-V
+gather, while Sage/SDPA-derived policies keep physical FP16/BF16 V and map both
+summary construction and exact selected-tile loads. A virtual-K/V adapter can
+therefore keep exact context blocks and `2x32` residuals for virtual blocks
+without materializing duplicated floating-point K/V rows. It also contains
+legacy packed W4A8 and grouped-codebook W4A8
 Tensor Core GEMMs, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, lossless single-pass half-width FC1/SwiGLU staging,

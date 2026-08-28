@@ -727,8 +727,6 @@ def prequantize_sol_sageattn_from_qk(
     if value.ndim != 4 or value.stride(-1) != 1:
         raise ValueError("preprocessed Sol V must be four-dimensional with contiguous channels")
     mapped_value = value_source_indices is not None
-    if mapped_value and not use_w8a8:
-        raise ValueError("mapped V preparation requires W8A8 attention")
     if mapped_value:
         if (
             value_source_indices.ndim != 1
@@ -870,6 +868,9 @@ def prequantize_sol_sageattn_from_qk(
         value_int8=value_int8,
         value_scale=value_scale,
         summaries=summaries,
+        value_source_indices=(
+            value_source_indices if mapped_value and not use_w8a8 else None
+        ),
         sparse_query_blocks=sparse_query_blocks,
         exact_kv_blocks=exact_kv_blocks,
         output_dtype=value.dtype,
@@ -1005,27 +1006,46 @@ def sol_sparse_sageattn_from_prequantized(
                 int(quantized.route_original_basis),
             )
         else:
-            selected = _qattn.sol_sparse_online_int8_f16_attn(
-                quantized.query_int8,
-                quantized.key_int8,
-                quantized.value,
-                quantized.value_int8,
-                quantized.value_scale,
-                output,
-                quantized.query_scale,
-                quantized.key_scale,
-                quantized.sparse_query_blocks,
-                quantized.exact_kv_blocks,
-                quantized.threshold_sigma,
-                quantized.residual_subblocks,
-                quantized.sm_scale,
-                int(return_stats),
-                0,
-                0,
-                quantized.key_tile_tokens,
-                int(quantized.is_causal),
-                int(quantized.route_original_basis),
-            )
+            if quantized.value_source_indices is not None:
+                selected = _qattn.sol_sparse_online_int8_f16_mapped_attn(
+                    quantized.query_int8,
+                    quantized.key_int8,
+                    quantized.value,
+                    quantized.value_source_indices,
+                    output,
+                    quantized.query_scale,
+                    quantized.key_scale,
+                    quantized.sparse_query_blocks,
+                    quantized.exact_kv_blocks,
+                    quantized.threshold_sigma,
+                    quantized.residual_subblocks,
+                    quantized.sm_scale,
+                    int(return_stats),
+                    quantized.key_tile_tokens,
+                    int(quantized.route_original_basis),
+                )
+            else:
+                selected = _qattn.sol_sparse_online_int8_f16_attn(
+                    quantized.query_int8,
+                    quantized.key_int8,
+                    quantized.value,
+                    quantized.value_int8,
+                    quantized.value_scale,
+                    output,
+                    quantized.query_scale,
+                    quantized.key_scale,
+                    quantized.sparse_query_blocks,
+                    quantized.exact_kv_blocks,
+                    quantized.threshold_sigma,
+                    quantized.residual_subblocks,
+                    quantized.sm_scale,
+                    int(return_stats),
+                    0,
+                    0,
+                    quantized.key_tile_tokens,
+                    int(quantized.is_causal),
+                    int(quantized.route_original_basis),
+                )
     output = output[..., : quantized.original_head_dim]
     return (output, selected, quantized.possible_blocks) if return_stats else output
 

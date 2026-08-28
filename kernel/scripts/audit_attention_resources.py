@@ -200,7 +200,7 @@ def main() -> None:
     }
     hot_pattern = re.compile(
         r"sparse_attention_kernelILi(64|128)E.*"
-        r"Lb1ELb0ELb0ELb0ELi1ELi1ELb0ELb([01])EEE"
+        r"Lb1ELb0ELb0ELb0ELi1ELi1ELb0ELb([01])ELb0EEE"
     )
     for line, metrics in qattn_sm86_records:
         match = hot_pattern.search(line)
@@ -231,6 +231,38 @@ def main() -> None:
         "Ampere sparse attention pipeline audit passed: "
         + " ".join(ampere_hot_summary)
         + " local=0 stack<=16 dynamic_shared=pipeline-D64:20480/pipeline-D128:40960"
+    )
+
+    mapped_pattern = re.compile(
+        r"sparse_attention_kernelILi(64|128)E.*"
+        r"Lb0ELb0ELb0ELb0ELi([12])ELi([12])ELb0ELb0ELb1EEE"
+    )
+    mapped_summary = []
+    for architecture, arch_records in (
+        ("sm75", qattn_sm75_records),
+        ("sm86", qattn_sm86_records),
+    ):
+        mapped = [
+            (match, metrics)
+            for line, metrics in arch_records
+            if (match := mapped_pattern.search(line)) is not None
+        ]
+        if len(mapped) != 16:
+            raise RuntimeError(
+                f"expected sixteen mapped FP16/BF16 Sol variants for {architecture}, "
+                f"found {len(mapped)}"
+            )
+        for match, metrics in mapped:
+            _validate_attention_resource(
+                f"{architecture} mapped Sol D{match.group(1)}", metrics
+            )
+        mapped_summary.append(
+            f"{architecture}:r{max(metrics['REG'] for _, metrics in mapped)}"
+        )
+    print(
+        "mapped FP16/BF16 Sol resource audit passed: "
+        + " ".join(mapped_summary)
+        + " local=0 stack<=16"
     )
 
     preprocessing_output = _resource_output(fused)

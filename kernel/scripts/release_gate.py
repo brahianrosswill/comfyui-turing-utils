@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = ROOT / "kernel"
 COMFYUI_ROOT = ROOT.parents[1]
-EXPECTED_VERSION = "0.40.0"
+EXPECTED_VERSION = "0.41.0"
 
 
 def _run(command: list[str], *, cwd: Path = ROOT, env=None) -> None:
@@ -100,7 +100,7 @@ def _static_gate() -> None:
     if "__threadfence_block" in fallback or "__syncthreads" in fallback:
         raise RuntimeError("SM75 synchronous-copy fallback contains a duplicate barrier")
     header = (KERNEL / "csrc/turing/sage/attn_cuda_sm75.h").read_text(encoding="utf-8")
-    if header.count("int key_tile_tokens") != 3:
+    if header.count("int key_tile_tokens") != 4:
         raise RuntimeError(
             "C++/pybind attention ABI does not expose all key-tile arguments"
         )
@@ -110,6 +110,11 @@ def _static_gate() -> None:
     mapped_summary = "sol_w8a8_precompute_mapped_summaries"
     if mapped_summary not in header or mapped_summary not in cuda or mapped_summary not in binding:
         raise RuntimeError("mapped Sol summary ABI is incomplete")
+    mapped_fp16 = "sol_sparse_online_int8_f16_mapped_attn"
+    if mapped_fp16 not in header or mapped_fp16 not in cuda or mapped_fp16 not in binding:
+        raise RuntimeError("mapped FP16/BF16 Sol attention ABI is incomplete")
+    if "load_half_tile_mapped" not in cuda:
+        raise RuntimeError("mapped FP16/BF16 exact-V tile load is missing")
     setup_source = (KERNEL / "setup.py").read_text(encoding="utf-8")
     for marker in (
         "CUDA_TOOLKIT_VERSION = _cuda_toolkit_version()",

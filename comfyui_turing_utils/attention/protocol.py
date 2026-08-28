@@ -19,6 +19,7 @@ ATTENTION_PROTOCOL_VERSION = 2
 ATTENTION_EXECUTOR_KEY = "turing_utils_attention_executor_v1"
 MAPPED_KV_EXECUTOR_ATTR = "turing_utils_mapped_kv_executor"
 MAPPED_RESIDUAL_EXECUTOR_ATTR = "turing_utils_mapped_residual_executor"
+MAPPED_RESIDUAL_CAPABILITY_ATTR = "turing_utils_mapped_residual_capability"
 
 
 @runtime_checkable
@@ -370,6 +371,7 @@ __all__ = [
     "ATTENTION_EXECUTOR_KEY",
     "ATTENTION_PROTOCOL_VERSION",
     "MAPPED_KV_EXECUTOR_ATTR",
+    "MAPPED_RESIDUAL_CAPABILITY_ATTR",
     "MAPPED_RESIDUAL_EXECUTOR_ATTR",
     "AttentionBackendCapabilities",
     "AttentionExecutionOutcome",

@@ -747,6 +747,33 @@ def validate_qk_preprocessing(device: torch.device) -> None:
     if not torch.equal(expanded_sparse_output, mapped_sparse_output):
         raise RuntimeError("mapped Sol output differs from exact materialization")
 
+    # Sage/SDPA-backed H3 residual mode keeps physical FP16/BF16 V rather than
+    # a gathered INT8 V container. Both summary construction and selected
+    # exact tiles must read through the same logical-to-physical map.
+    split_policy = dict(sparse_policy)
+    split_policy["use_w8a8"] = False
+    expanded_split = prequantize_sol_sageattn_from_qk(
+        expanded,
+        expanded_value,
+        **split_policy,
+    )
+    mapped_split = prequantize_sol_sageattn_from_qk(
+        mapped,
+        value,
+        value_source_indices=source_indices,
+        **split_policy,
+    )
+    expanded_split_output = sol_sparse_sageattn_from_prequantized(expanded_split)
+    mapped_split_output = sol_sparse_sageattn_from_prequantized(mapped_split)
+    if not torch.equal(expanded_split_output, mapped_split_output):
+        max_delta = (
+            expanded_split_output.float() - mapped_split_output.float()
+        ).abs().max().item()
+        raise RuntimeError(
+            "mapped FP16/BF16 Sol output differs from exact materialization: "
+            f"max_abs={max_delta:.6g}"
+        )
+
 
 def _validate_varlen_batches(
     output: torch.Tensor,

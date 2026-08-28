@@ -16,7 +16,7 @@ class H3StaticVirtualKV:
                     ["conservative", "fast", "residual"],
                     {
                         "default": "conservative",
-                        "tooltip": "Conservative materializes an exact 7-slice virtual K/V context. Fast keeps 2 physical slices and computes all 7 logical slices exactly in bundled W8A8. Residual keeps the two real slices Dense and compresses the five virtual slices into Sol 2x32 residuals. Unsupported backends or stale kernels safely fall back to exact materialization.",
+                        "tooltip": "Conservative materializes an exact 7-slice virtual K/V context. Fast keeps 2 physical slices and computes all 7 logical slices exactly in bundled W8A8. Residual keeps the two real slices Dense and compresses the five virtual slices into Sol 2x32 residuals; kernel 0.41 supports inherited W8A8, Sage, and SDPA numeric paths. Unsupported or stale kernels safely fall back to exact materialization.",
                     },
                 ),
             }

@@ -260,14 +260,14 @@ def estimate_attention_lifecycle_peak(
     destination = 0 if group == heads else output
     input_cache = rows * (hidden_size + 4) if cache_quantized_input else 0
     if not compact_qk:
-        if key_rows != rows and quantized_value:
+        if key_rows != rows and (quantized_value or residual_subblocks):
             qkv_projection = 3 * features * element_size
             qk_scales = (
                 ((rows + 63) // 64) * group * 4 * 4
                 + ((key_rows + 63) // 64) * group * 4
             )
             qk_compact = features + key_features + qk_scales
-            value_int8 = features + key_features
+            value_int8 = features + key_features if quantized_value else 0
             summaries = 0
             if residual_subblocks:
                 key_blocks = (key_rows + 63) // 64
@@ -283,8 +283,14 @@ def estimate_attention_lifecycle_peak(
                     + 2 * group * head_dim * 4
                 )
             preparation_peak = qkv_projection + qk_compact + value_int8 + summaries
+            retained_value = (
+                key_features if quantized_value else features * element_size
+            )
             execution_peak = (
-                qk_compact + key_features + summaries + features * element_size
+                qk_compact
+                + retained_value
+                + summaries
+                + features * element_size
             )
             return destination + max(preparation_peak, execution_peak) + input_cache
         return destination + features * 8 + input_cache
@@ -295,7 +301,7 @@ def estimate_attention_lifecycle_peak(
     compact = features + key_features + features * element_size + qk_scales
     value_int8 = key_features if quantized_value else 0
     padded_blocks = ((key_blocks + 15) // 16) * 16
-    if quantized_value and residual_subblocks:
+    if residual_subblocks:
         residual_tokens = 64 // residual_subblocks
         residual_summary_count = (key_rows + residual_tokens - 1) // residual_tokens
         padded_residual_summaries = (

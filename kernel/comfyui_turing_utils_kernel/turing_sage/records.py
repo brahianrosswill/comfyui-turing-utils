@@ -43,6 +43,7 @@ class PrequantizedSolAttention:
     value_int8: torch.Tensor
     value_scale: torch.Tensor
     summaries: tuple[torch.Tensor, ...]
+    value_source_indices: Optional[torch.Tensor]
     sparse_query_blocks: torch.Tensor
     exact_kv_blocks: torch.Tensor
     output_dtype: torch.dtype

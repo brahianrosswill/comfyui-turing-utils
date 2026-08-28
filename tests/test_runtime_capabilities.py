@@ -143,7 +143,7 @@ class KernelCapabilitiesTest(unittest.TestCase):
                 )
 
     def test_mapped_kv_requires_schema_three_and_both_native_symbols(self):
-        package = SimpleNamespace(__version__="0.40.0")
+        package = SimpleNamespace(__version__="0.41.0")
         sage = SimpleNamespace(fused_qk_preprocessing_available=lambda: True)
         fused = SimpleNamespace(
             qk_preprocess_protocol_schema=3,
@@ -163,7 +163,7 @@ class KernelCapabilitiesTest(unittest.TestCase):
         self.assertTrue(result.supports("mapped_kv").supported)
 
     def test_mapped_sparse_kv_requires_native_summary_symbol(self):
-        package = SimpleNamespace(__version__="0.40.0")
+        package = SimpleNamespace(__version__="0.41.0")
         sage = SimpleNamespace(fused_qk_preprocessing_available=lambda: True)
         fused = SimpleNamespace(
             qk_preprocess_protocol_schema=3,
@@ -185,6 +185,30 @@ class KernelCapabilitiesTest(unittest.TestCase):
             result = capabilities.kernel_capabilities()
 
         self.assertTrue(result.supports("mapped_sparse_kv").supported)
+
+    def test_mapped_sparse_fp16_kv_requires_qk_map_and_native_attention(self):
+        package = SimpleNamespace(__version__="0.41.0")
+        sage = SimpleNamespace(fused_qk_preprocessing_available=lambda: True)
+        fused = SimpleNamespace(
+            qk_preprocess_protocol_schema=3,
+            quant_qk_rms_rope_int8_mapped_cuda=lambda *args: None,
+        )
+        qattn = SimpleNamespace(
+            sol_sparse_online_int8_f16_mapped_attn=lambda *args: None,
+        )
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "comfyui_turing_utils_kernel": package,
+                "comfyui_turing_utils_kernel._sage_fused_sm75": fused,
+                "comfyui_turing_utils_kernel._sage_qattn_sm75": qattn,
+                "comfyui_turing_utils_kernel.turing_sage": sage,
+            },
+        ):
+            result = capabilities.kernel_capabilities()
+
+        self.assertTrue(result.supports("mapped_sparse_fp16_kv").supported)
+        self.assertFalse(result.supports("mapped_sparse_kv").supported)
 
     def test_missing_kernel_package_has_actionable_reason(self):
         with mock.patch(

@@ -251,6 +251,57 @@ class H3VirtualKVTest(unittest.TestCase):
         self.assertEqual(seen["key"].shape[2], prefix + 7 * 4)
         self.assertEqual(seen["key"].shape, seen["value"].shape)
 
+    def test_residual_uses_mapped_fp16_sol_for_sdpa_or_sage_base(self):
+        seen = {}
+
+        def dense_executor(prepared):
+            raise AssertionError("mapped FP16 residual path should bypass materialization")
+
+        def residual_executor(prepared, source_indices, **policy):
+            seen["key_tokens"] = prepared.key_tokens
+            seen["source_indices"] = source_indices
+            seen["policy"] = policy
+            prepared.consume_qkv()
+            return AttentionExecutionOutcome(
+                torch.zeros((1, prepared.query_tokens, 2 * 128))
+            )
+
+        residual_executor.turing_utils_mapped_residual_capability = (
+            "mapped_sparse_fp16_kv"
+        )
+        dense_executor.turing_utils_mapped_residual_executor = residual_executor
+
+        def dense_override(original, *args, **kwargs):
+            return original(*args, **kwargs)
+
+        dense_override.prepared_attention_executor = dense_executor
+        dense_override.turing_utils_attention_backend = "sdpa"
+        prepared, prefix, stop = request()
+        capabilities = SimpleNamespace(
+            supports=lambda feature: SimpleNamespace(
+                supported=feature == "mapped_sparse_fp16_kv"
+            )
+        )
+        with mock.patch(
+            "comfyui_turing_utils.adapters.minimax.virtual_kv.kernel_capabilities",
+            return_value=capabilities,
+        ):
+            override = make_h3_virtual_kv_override(dense_override, mode="residual")
+            outcome = override.prepared_attention_executor(prepared)
+
+        self.assertTrue(outcome.supported)
+        self.assertEqual(seen["key_tokens"], stop)
+        self.assertEqual(seen["source_indices"].numel(), prefix + 7 * 4)
+        self.assertEqual(seen["policy"]["exact_kv_ranges"], ((0, stop),))
+        self.assertEqual(
+            override.prepared_attention_executor.turing_utils_h3_virtual_kv_mapped_capability,
+            "mapped_sparse_fp16_kv",
+        )
+        self.assertEqual(
+            override.prepared_attention_executor.turing_utils_h3_virtual_kv_numeric_backend,
+            "sdpa",
+        )
+
     def test_non_five_frame_target_fails_before_dense_execution(self):
         called = False
 
