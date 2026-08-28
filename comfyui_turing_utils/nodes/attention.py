@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ..adapters.minimax.image_sol import apply_h3_image_sol_attention
 from ..adapters.minimax.virtual_kv import apply_h3_virtual_kv
 from ..attention import apply_sla_attention_patch, apply_sparse_attention_patch
 
@@ -406,6 +407,71 @@ class SolSparseAttentionPatch(LegacySolSparseAttentionPatch):
                 prefix_policy=prefix_policy,
                 manual_prefix_tokens=manual_prefix_tokens,
                 skipped_residual=skipped_residual,
+                sparse_reference_image=sparse_reference_image,
+                sparse_reference_video=sparse_reference_video,
+                sparse_reference_audio=sparse_reference_audio,
+                dense_prefix_steps=dense_prefix_steps,
+                dense_suffix_steps=dense_suffix_steps,
+                dense_prefix_layers=dense_prefix_layers,
+                dense_suffix_layers=dense_suffix_layers,
+                debug_route_density=debug_route_density,
+            ),
+        )
+
+
+class H3ImageSolAttentionPatch:
+    @classmethod
+    def INPUT_TYPES(cls):
+        sol_inputs = SolSparseAttentionPatch.INPUT_TYPES()
+        standard = sol_inputs["required"]
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "temporal_layout": (
+                    ["dense_anchor_grid", "dense_window"],
+                    {
+                        "default": "dense_anchor_grid",
+                        "tooltip": "Dense anchor grid keeps every H3 17-frame chunk anchor plus the first continuation exact. Dense window keeps only the initial 1+4 latent-time window exact.",
+                    },
+                ),
+                "sparse_reference_image": standard["sparse_reference_image"],
+                "sparse_reference_video": standard["sparse_reference_video"],
+                "sparse_reference_audio": standard["sparse_reference_audio"],
+                "dense_prefix_steps": standard["dense_prefix_steps"],
+                "dense_suffix_steps": standard["dense_suffix_steps"],
+                "dense_prefix_layers": standard["dense_prefix_layers"],
+                "dense_suffix_layers": standard["dense_suffix_layers"],
+            },
+            "optional": {
+                "debug_route_density": sol_inputs["optional"][
+                    "debug_route_density"
+                ]
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "patch"
+    CATEGORY = "Turing Utils/patches"
+    TITLE = "Configure H3 Image Sol Attention"
+
+    def patch(
+        self,
+        model,
+        temporal_layout: str = "dense_anchor_grid",
+        sparse_reference_image: bool = False,
+        sparse_reference_video: bool = True,
+        sparse_reference_audio: bool = False,
+        dense_prefix_steps: int = 1,
+        dense_suffix_steps: int = 0,
+        dense_prefix_layers: int = 2,
+        dense_suffix_layers: int = 0,
+        debug_route_density: bool = False,
+    ):
+        return (
+            apply_h3_image_sol_attention(
+                model,
+                temporal_layout=temporal_layout,
                 sparse_reference_image=sparse_reference_image,
                 sparse_reference_video=sparse_reference_video,
                 sparse_reference_audio=sparse_reference_audio,

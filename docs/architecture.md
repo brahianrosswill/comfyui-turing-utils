@@ -85,6 +85,7 @@ effects.
 | `adapters/minimax/memory_planning.py` | ComfyUI packed-shape and staged-workspace memory hooks |
 | `adapters/minimax/activation_policy.py` | pure tier/chunk/head/channel decisions with compatibility exports |
 | `adapters/minimax/acceleration.py` | H3 attention/MLP hot-path installation and execution |
+| `adapters/minimax/image_sol.py` | H3 image-mode static Sol policy and strategy composition |
 | `adapters/minimax/virtual_kv.py` | H3-only five-frame validation, virtual temporal mapping, and strategy composition |
 | `adapters/krea2.py` | Krea2 Identity Edit reference fitting, grounded conditioning and centered reference RoPE patching |
 | `adapters/wan.py` | Wan/Bernini packed-context planning and supported self-attention preprocessing |

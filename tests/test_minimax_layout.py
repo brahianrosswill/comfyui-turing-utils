@@ -224,6 +224,88 @@ class MiniMaxLayoutProviderTest(unittest.TestCase):
             frame_count=None,
         )
 
+    def test_h3_image_sol_dense_slice_patterns(self):
+        self.assertEqual(
+            minimax_layout.h3_image_sol_dense_slices(7, "dense_window"),
+            (0, 1),
+        )
+        self.assertEqual(
+            minimax_layout.h3_image_sol_dense_slices(
+                7, "dense_anchor_grid"
+            ),
+            (0, 1, 5),
+        )
+        self.assertEqual(
+            minimax_layout.h3_image_sol_dense_slices(
+                12, "dense_anchor_grid"
+            ),
+            (0, 1, 5, 10),
+        )
+        self.assertEqual(
+            minimax_layout.h3_image_sol_dense_slices(3, "dense_window"),
+            (0, 1, 2),
+        )
+
+    def test_h3_image_sol_publisher_marks_anchor_grid_exact(self):
+        base = FakeBase()
+        setattr(
+            base,
+            minimax_layout.RUNTIME_CONTEXT_ATTR,
+            {
+                "latent_shapes": [
+                    torch.Size((1, 24, 7, 8, 10)),
+                    torch.Size((1, 32, 2, 12)),
+                ],
+                "packed_layout": SimpleNamespace(
+                    segments=[
+                        (0, 64, "text"),
+                        (64, 88, "audio"),
+                        (88, 228, "video"),
+                    ]
+                ),
+                "refs": [],
+            },
+        )
+        options = {
+            "turing_utils_attention_strategy": "h3_image_sol",
+            minimax_layout.H3_IMAGE_SOL_LAYOUT_KEY: "dense_anchor_grid",
+        }
+
+        self.assertTrue(
+            minimax_layout.publish_minimax_attention_layout(
+                options,
+                [(0, 64, 0), (64, 88, 2), (88, 228, 3)],
+                layer_index=0,
+                layer_count=2,
+                base_model=base,
+                diffusion_model=base.diffusion_model,
+            )
+        )
+
+        semantic = attention_semantic_layout(options)
+        target = [
+            segment
+            for segment in semantic.query_segments
+            if segment.role == "target_video"
+        ]
+        self.assertEqual(len(target), 7)
+        self.assertEqual(
+            tuple(
+                index
+                for index, segment in enumerate(target)
+                if not segment.sparse_query_allowed
+            ),
+            (0, 1, 5),
+        )
+        self.assertEqual(
+            tuple(
+                index
+                for index, segment in enumerate(target)
+                if segment.exact_kv
+            ),
+            (0, 1, 5),
+        )
+
     def test_publisher_drops_stale_topology_when_current_shapes_do_not_validate(self):
         options = {
             minimax_layout.ATTENTION_LAYOUT_KEY: {

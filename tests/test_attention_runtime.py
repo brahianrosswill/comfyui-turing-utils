@@ -41,6 +41,17 @@ class AttentionRuntimeTest(unittest.TestCase):
         )
         self.assertEqual(specialized.strategy, "h3_virtual_kv")
 
+    def test_runtime_accepts_h3_image_sol_strategy(self):
+        dense = lambda original, *args, **kwargs: original(*args, **kwargs)
+        strategy = lambda original, *args, **kwargs: original(*args, **kwargs)
+        config = attention.AttentionRuntimeConfig("sdpa", "test", dense)
+        specialized = config.with_strategy(
+            "h3_image_sol",
+            "test:h3_image_sol",
+            strategy,
+        )
+        self.assertEqual(specialized.strategy, "h3_image_sol")
+
     def test_dense_backend_installs_native_capability_marker(self):
         model = FakePatcher()
         attention.apply_attention_backend(

@@ -129,6 +129,13 @@ only after its CUDA sources or required version change.
   itself still runs in the bundled Sol kernel. Older kernels safely use the
   exact conservative representation. The node replaces any upstream Sol/SLA
   strategy; the fast and residual paths require rebuilding the bundled kernel.
+- `Configure H3 Image Sol Attention` keeps the native H3 frame count and every
+  target-video Q/FFN row, then applies fixed `1x64` Sol residuals outside either
+  the initial `1+4` latent-time window or H3's complete VAE anchor grid. It
+  inherits the standard Sol reference-image/video/audio switches and dense
+  prefix/suffix step/layer controls. Five-frame target attention remains dense;
+  supported longer H3 inputs use their native `5k+2` latent-time layout. The node is
+  Python-only and replaces an upstream Sol/SLA/virtual-KV strategy.
 - `Video Motion Contact Sheet (Experimental)` samples an `N x N` chronological
   storyboard from a loaded `VIDEO` or decoded `IMAGE` frame batch. It can use
   uniform or motion-weighted sampling and optionally wraps each panel in

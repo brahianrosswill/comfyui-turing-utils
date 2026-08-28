@@ -171,6 +171,7 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsSlaSparseAttentionPatch",
                 "TuringUtilsSolAttentionStrategy",
                 "TuringUtilsSlaAttentionStrategy",
+                "TuringUtilsH3ImageSolAttention",
                 "TuringUtilsH3StaticVirtualKV",
                 "TuringUtilsResizeImageIfPresent",
                 "TuringUtilsVideoMotionContactSheet",

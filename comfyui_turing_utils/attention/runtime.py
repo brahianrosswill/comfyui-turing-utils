@@ -47,7 +47,13 @@ class AttentionRuntimeConfig:
         override: Callable | None,
     ) -> "AttentionRuntimeConfig":
         strategy = str(strategy).strip().lower()
-        if strategy not in {"dense", "sol", "sla", "h3_virtual_kv"}:
+        if strategy not in {
+            "dense",
+            "sol",
+            "sla",
+            "h3_virtual_kv",
+            "h3_image_sol",
+        }:
             raise ValueError(f"unsupported attention strategy: {strategy}")
         if strategy == "dense":
             override = None
