@@ -405,6 +405,33 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
             without_v8.estimated_peak_bytes + int(0.7 * _GIB),
         )
 
+    def test_virtual_kv_peak_uses_logical_key_rows(self):
+        physical = activation_policy.estimate_attention_lifecycle_peak(
+            rows=5_996,
+            heads=56,
+            head_dim=128,
+            hidden_size=5_376,
+            element_size=2,
+            head_group=14,
+            compact_qk=False,
+            cache_quantized_input=False,
+            quantized_value=True,
+        )
+        virtual = activation_policy.estimate_attention_lifecycle_peak(
+            rows=5_996,
+            logical_key_rows=16_194,
+            heads=56,
+            head_dim=128,
+            hidden_size=5_376,
+            element_size=2,
+            head_group=14,
+            compact_qk=False,
+            cache_quantized_input=False,
+            quantized_value=True,
+        )
+
+        self.assertGreater(virtual, physical)
+
     def test_quiet_vbar_budget_counts_only_resident_unpinned_pages(self):
         vbar = SimpleNamespace(
             get_residency=mock.Mock(return_value=[1, 3, 0, 1]),

@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -150,12 +152,55 @@ class H3VirtualKVTest(unittest.TestCase):
         self.assertEqual(seen["transform"].freqs.shape[1], 12)
         self.assertEqual(seen["transform"].key_freqs.shape[1], prefix + 7 * 4)
 
-    def test_fast_keeps_two_kv_frames_but_uses_separate_key_rope(self):
+    def test_fast_falls_back_to_exact_materialization_without_mapped_kernel(self):
         seen, _, _ = self._run("fast")
-        self.assertEqual(seen["query"].shape, seen["key"].shape)
+        self.assertEqual(seen["key"].shape[2], 32)
         self.assertEqual(seen["key"].shape, seen["value"].shape)
         self.assertIsNot(seen["transform"].freqs, seen["transform"].key_freqs)
-        self.assertEqual(seen["transform"].key_freqs.shape[1], 12)
+        self.assertEqual(seen["transform"].key_freqs.shape[1], 32)
+
+    def test_fast_uses_physical_kv_with_exact_logical_map(self):
+        seen = {}
+
+        def dense_executor(prepared):
+            raise AssertionError("mapped fast path should bypass materialization")
+
+        def mapped_executor(prepared, source_indices):
+            seen["query"], seen["key"], seen["value"] = prepared.peek_qkv()
+            seen["transform"] = prepared.qk_transform
+            seen["source_indices"] = source_indices
+            prepared.consume_qkv()
+            return AttentionExecutionOutcome(
+                torch.zeros((1, prepared.query_tokens, 2 * 128))
+            )
+
+        dense_executor.turing_utils_mapped_kv_executor = mapped_executor
+
+        def dense_override(original, *args, **kwargs):
+            return original(*args, **kwargs)
+
+        dense_override.prepared_attention_executor = dense_executor
+        prepared, prefix, _ = request()
+        capabilities = SimpleNamespace(
+            supports=lambda feature: SimpleNamespace(supported=feature == "mapped_kv")
+        )
+        with mock.patch(
+            "comfyui_turing_utils.adapters.minimax.virtual_kv.kernel_capabilities",
+            return_value=capabilities,
+        ):
+            outcome = make_h3_virtual_kv_override(
+                dense_override, mode="fast"
+            ).prepared_attention_executor(prepared)
+
+        self.assertTrue(outcome.supported)
+        self.assertEqual(seen["query"].shape, seen["key"].shape)
+        self.assertEqual(seen["key"].shape, seen["value"].shape)
+        self.assertEqual(seen["transform"].key_freqs.shape[1], prefix + 7 * 4)
+        target = seen["source_indices"][prefix:].reshape(7, 4)
+        self.assertEqual(
+            [int(row[0].item() - prefix) // 4 for row in target],
+            list(_SOURCE_FRAMES),
+        )
 
     def test_non_five_frame_target_fails_before_dense_execution(self):
         called = False

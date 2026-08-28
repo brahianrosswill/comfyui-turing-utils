@@ -87,6 +87,7 @@ def prequantize_rms_rope_qk(
     freqs: torch.Tensor | None,
     *,
     key_freqs: torch.Tensor | None = None,
+    key_source_indices: torch.Tensor | None = None,
     epsilon: float,
     rot_dim: int,
     tensor_layout: str = "HND",
@@ -130,7 +131,34 @@ def prequantize_rms_rope_qk(
         key_freqs = freqs
     else:
         key_freqs = key_freqs.to(device=q.device, dtype=q.dtype)
-    if qk_output is not None:
+    if key_source_indices is not None:
+        if qk_output is not None or k_anchor is not None:
+            raise ValueError(
+                "mapped K preprocessing does not support direct outputs or a precomputed anchor"
+            )
+        if norm_scope != "head" or tensor_layout != "HND":
+            raise ValueError(
+                "mapped K preprocessing requires HND layout and per-head RMSNorm"
+            )
+        from .custom_ops import qk_rms_rope_int8_mapped
+
+        q_int8, q_scale, k_int8, k_scale = qk_rms_rope_int8_mapped(
+            q,
+            k,
+            q_norm,
+            k_norm,
+            freqs,
+            key_freqs,
+            key_source_indices.to(device=q.device, dtype=torch.int32).contiguous(),
+            epsilon=float(epsilon),
+            rot_dim=int(rot_dim),
+            tensor_layout=tensor_layout,
+            norm_scope=norm_scope,
+            split_half=bool(split_half),
+            rotate_qk=bool(rotate_qk),
+            stabilize_k=bool(stabilize_k),
+        )
+    elif qk_output is not None:
         if stabilize_k and k_anchor is None:
             raise ValueError(
                 "direct Q/K output with stabilization requires a precomputed anchor"
@@ -687,6 +715,7 @@ def prequantize_sol_sageattn_from_qk(
     force_dense: bool = False,
     key_tile_tokens: int = 0,
     is_causal: bool = False,
+    value_source_indices: torch.Tensor | None = None,
 ) -> PrequantizedSolAttention:
     """Attach V and Sol policy state to an already preprocessed Q/K pair."""
     if qk.tensor_layout != "HND":
@@ -697,10 +726,23 @@ def prequantize_sol_sageattn_from_qk(
         raise ValueError("preprocessed Q/K and V must share one CUDA device")
     if value.ndim != 4 or value.stride(-1) != 1:
         raise ValueError("preprocessed Sol V must be four-dimensional with contiguous channels")
+    mapped_value = value_source_indices is not None
+    if mapped_value and (not use_w8a8 or not force_dense):
+        raise ValueError("mapped V preparation requires dense W8A8 attention")
+    if mapped_value:
+        if (
+            value_source_indices.ndim != 1
+            or value_source_indices.numel() != qk.key_int8.size(2)
+            or value_source_indices.device != value.device
+        ):
+            raise ValueError(
+                "mapped V source indices must match the logical K sequence"
+            )
+        value_source_indices = value_source_indices.to(dtype=torch.int32).contiguous()
     if (
         value.size(0) != qk.key_int8.size(0)
         or value.size(1) != qk.key_int8.size(1)
-        or value.size(2) != qk.key_int8.size(2)
+        or (not mapped_value and value.size(2) != qk.key_int8.size(2))
         or value.size(3) != qk.key_int8.size(3)
     ):
         raise ValueError("preprocessed Q/K and V shapes are incompatible")
@@ -741,9 +783,14 @@ def prequantize_sol_sageattn_from_qk(
         force_dense = True
 
     if use_w8a8:
-        padded_key_length = ((value.size(2) + 63) // 64) * 64
-        value_int8 = torch.empty(
-            (value.size(0), value.size(1), value.size(3), padded_key_length),
+        physical_padded_key_length = ((value.size(2) + 63) // 64) * 64
+        physical_value_int8 = torch.empty(
+            (
+                value.size(0),
+                value.size(1),
+                value.size(3),
+                physical_padded_key_length,
+            ),
             dtype=torch.int8,
             device=value.device,
         )
@@ -752,7 +799,27 @@ def prequantize_sol_sageattn_from_qk(
             dtype=torch.float32,
             device=value.device,
         )
-        _qattn.quantize_v_int8_sm75(value, value_int8, value_scale)
+        _qattn.quantize_v_int8_sm75(value, physical_value_int8, value_scale)
+        if mapped_value:
+            logical_padded_key_length = (
+                (qk.key_int8.size(2) + 63) // 64
+            ) * 64
+            value_int8 = torch.empty(
+                (
+                    value.size(0),
+                    value.size(1),
+                    value.size(3),
+                    logical_padded_key_length,
+                ),
+                dtype=torch.int8,
+                device=value.device,
+            )
+            _fused.gather_value_int8_mapped_cuda(
+                physical_value_int8, value_int8, value_source_indices
+            )
+            del physical_value_int8
+        else:
+            value_int8 = physical_value_int8
         if force_dense:
             half_empty = torch.empty(
                 (0, 0, 0, 0), dtype=torch.float16, device=value.device

@@ -115,10 +115,13 @@ only after its CUDA sources or required version change.
   mode for an H3 target containing exactly five output frames (two latent-time
   slices). Physical Query, attention output, residual, and FFN rows stay at
   two slices. `conservative` presents attention with seven K/V slices using
-  H3's 22-frame temporal positions; `fast` keeps two K/V slices and replaces
-  their temporal RoPE with two representative phases. The node inherits the
-  loader's `w8a8`, `sage`, or `sdpa` dense backend and replaces any upstream
-  Sol/SLA strategy. Bundled Sage/W8A8 require kernel 0.38.0 and a rebuild.
+  H3's 22-frame temporal positions by materializing exact BF16 K/V. With kernel
+  0.39.0, `fast` retains only the two physical BF16 K/V slices, gathers them
+  through an exact logical source map, applies all seven real temporal RoPE
+  phases, and materializes only the W8A8 INT8 attention containers. It does not
+  average temporal phases. Sage, SDPA, or an older kernel safely use the exact
+  conservative representation. The node replaces any upstream Sol/SLA
+  strategy; the 0.39.0 fast path requires rebuilding the bundled kernel.
 - `Video Motion Contact Sheet (Experimental)` samples an `N x N` chronological
   storyboard from a loaded `VIDEO` or decoded `IMAGE` frame batch. It can use
   uniform or motion-weighted sampling and optionally wraps each panel in

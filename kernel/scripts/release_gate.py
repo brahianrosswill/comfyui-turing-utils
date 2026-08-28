@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = ROOT / "kernel"
 COMFYUI_ROOT = ROOT.parents[1]
-EXPECTED_VERSION = "0.38.0"
+EXPECTED_VERSION = "0.39.0"
 
 
 def _run(command: list[str], *, cwd: Path = ROOT, env=None) -> None:
@@ -172,7 +172,17 @@ def _static_gate() -> None:
         (
             KERNEL / "csrc/turing/sage/pybind_fused.cpp",
             fused_binding,
-            'm.attr("qk_preprocess_protocol_schema") = 2',
+            "quant_qk_rms_rope_int8_mapped_cuda",
+        ),
+        (
+            KERNEL / "csrc/turing/sage/pybind_fused.cpp",
+            fused_binding,
+            "gather_value_int8_mapped_cuda",
+        ),
+        (
+            KERNEL / "csrc/turing/sage/pybind_fused.cpp",
+            fused_binding,
+            'm.attr("qk_preprocess_protocol_schema") = 3',
         ),
         (
             KERNEL / "csrc/turing/sage/qk_preprocess.cu",

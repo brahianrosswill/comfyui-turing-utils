@@ -276,7 +276,7 @@ invisibly to `sage` and are not displayed by the loader.
 | `w8a8` on sm75+ | stable-Sage INT8 score domain | optional adaptive K anchor | channel-wise signed INT8 V and unsigned INT8 probabilities, INT32 Tensor Core PV, FP32 online state |
 | `Configure Sol Sparse Attention` | fused 64-token centroid routing; selected tiles reuse stable Sage INT8 QK | input-adaptive `mean + tau * std` threshold | inherited W8A8 exact PV, or FP16 exact V tiles for Sage/SDPA; skipped-block V centroids and FP32 online accumulation |
 | `Configure SLA Sparse Attention` | one route shared by adjacent Q64 CTAs (logical Q128 x K64); selected tiles reuse stable Sage INT8 QK | fixed Top-K budget; Smooth-K-invariant ordering | inherited W8A8 PV or FP16 selected tiles; no skipped-block residual |
-| `Configure H3 Static Virtual KV` | physical Query remains two H3 latent-time slices; conservative mode exposes seven K/V slices, fast mode uses two representative K/V phases | independent Query/Key RoPE tables; no sparse routing | inherited dense W8A8, Sage, or SDPA; Sol/SLA is replaced |
+| `Configure H3 Static Virtual KV` | physical Query remains two H3 latent-time slices; conservative mode materializes seven BF16 K/V slices, while kernel 0.39 fast mode maps two physical slices into the same seven logical INT8 K/V slices | all seven exact temporal RoPE phases; no sparse routing | mapped fast path uses bundled dense W8A8; Sage/SDPA safely materialize the conservative representation; Sol/SLA is replaced |
 
 Integer Q/K MMA accumulates into INT32. The stable facade supports FP16 and
 BF16 Q/K/V, HND/NHD, GQA, causal mode, unequal Q/KV lengths, head dimensions
@@ -388,6 +388,12 @@ different sequence lengths and independent RoPE tables. The CUDA operation has
 no H3 frame arithmetic or duplication policy. MiniMax's adapter supplies the
 H3 target segment and virtual temporal positions; Bernini or another model can
 reuse the same ABI with its own semantic-layout adapter.
+
+Kernel 0.39 adds an optional logical-to-physical source map. The fused Q/K
+preprocessor reads physical K through that map while applying the logical RoPE
+table, and the W8A8 value path gathers the already-quantized channel-major V
+container with its native 16-token permutation. Thus fast virtual K/V avoids
+expanded BF16 storage without changing the seven-slice attention problem.
 
 The compute_75 cubin reports at most 21,128 bytes static shared memory and 76
 registers/thread for D128 preprocessing, or 10,632 bytes and 59

@@ -15,6 +15,7 @@ from comfyui_turing_utils_kernel import turing_sage  # noqa: E402
 from comfyui_turing_utils_kernel.turing_sage import core, quant  # noqa: E402
 from comfyui_turing_utils_kernel.turing_sage.custom_ops import (  # noqa: E402
     qk_rms_rope_int8,
+    qk_rms_rope_int8_mapped,
 )
 
 
@@ -128,6 +129,41 @@ class TuringSageQuantContractTest(unittest.TestCase):
         self.assertEqual(query_scale.shape, (1, 4, 12))
         self.assertEqual(key_int8.shape, key.shape)
         self.assertEqual(key_scale.shape, (1, 2, 3))
+
+    def test_mapped_qk_fake_contract_uses_logical_key_length(self):
+        query = torch.empty((1, 4, 129, 128), dtype=torch.bfloat16, device="meta")
+        key = torch.empty((1, 2, 129, 128), dtype=torch.bfloat16, device="meta")
+        query_norm = torch.empty((128,), dtype=torch.bfloat16, device="meta")
+        key_norm = torch.empty((128,), dtype=torch.bfloat16, device="meta")
+        query_freqs = torch.empty(
+            (1, 129, 1, 64, 2, 2), dtype=torch.bfloat16, device="meta"
+        )
+        key_freqs = torch.empty(
+            (1, 321, 1, 64, 2, 2), dtype=torch.bfloat16, device="meta"
+        )
+        source_indices = torch.empty((321,), dtype=torch.int32, device="meta")
+
+        q_int8, q_scale, k_int8, k_scale = qk_rms_rope_int8_mapped(
+            query,
+            key,
+            query_norm,
+            key_norm,
+            query_freqs,
+            key_freqs,
+            source_indices,
+            1e-6,
+            128,
+            "HND",
+            "head",
+            True,
+            True,
+            True,
+        )
+
+        self.assertEqual(q_int8.shape, query.shape)
+        self.assertEqual(q_scale.shape, (1, 4, 12))
+        self.assertEqual(k_int8.shape, (1, 2, 321, 128))
+        self.assertEqual(k_scale.shape, (1, 2, 6))
 
     def test_compiled_attention_facades_have_fake_tensor_contracts(self):
         q = torch.empty((1, 4, 129, 128), dtype=torch.bfloat16, device="meta")

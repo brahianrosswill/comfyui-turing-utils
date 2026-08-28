@@ -142,6 +142,26 @@ class KernelCapabilitiesTest(unittest.TestCase):
                     expected,
                 )
 
+    def test_mapped_kv_requires_schema_three_and_both_native_symbols(self):
+        package = SimpleNamespace(__version__="0.39.0")
+        sage = SimpleNamespace(fused_qk_preprocessing_available=lambda: True)
+        fused = SimpleNamespace(
+            qk_preprocess_protocol_schema=3,
+            quant_qk_rms_rope_int8_mapped_cuda=lambda *args: None,
+            gather_value_int8_mapped_cuda=lambda *args: None,
+        )
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "comfyui_turing_utils_kernel": package,
+                "comfyui_turing_utils_kernel._sage_fused_sm75": fused,
+                "comfyui_turing_utils_kernel.turing_sage": sage,
+            },
+        ):
+            result = capabilities.kernel_capabilities()
+
+        self.assertTrue(result.supports("mapped_kv").supported)
+
     def test_missing_kernel_package_has_actionable_reason(self):
         with mock.patch(
             "comfyui_turing_utils.runtime.capabilities.load_kernel_package",

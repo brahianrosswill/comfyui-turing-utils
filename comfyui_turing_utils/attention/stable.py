@@ -375,6 +375,7 @@ def prequantize_turing_qk(
     kernel: str,
     k_anchor=None,
     qk_output=None,
+    key_source_indices: torch.Tensor | None = None,
 ):
     if kernel not in {"sage", "w8a8", "sol", "sla"}:
         raise ValueError(f"unsupported fused Q/K target: {kernel}")
@@ -396,6 +397,7 @@ def prequantize_turing_qk(
         stabilize_k=stabilize_k,
         k_anchor=k_anchor,
         qk_output=qk_output,
+        key_source_indices=key_source_indices,
     )
 
 
@@ -407,6 +409,7 @@ def prequantize_turing_attention_from_qk(
     kernel: str,
     scale: float | None,
     is_causal: bool = False,
+    value_source_indices: torch.Tensor | None = None,
 ) -> PrequantizedAttentionCall:
     turing_sage = load_turing_sage()
     if kernel == "sage":
@@ -427,6 +430,7 @@ def prequantize_turing_attention_from_qk(
             force_dense=True,
             key_tile_tokens=0,
             is_causal=bool(is_causal),
+            value_source_indices=value_source_indices,
         )
     else:
         raise ValueError(f"unsupported split Turing attention kernel: {kernel}")

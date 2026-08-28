@@ -17,8 +17,8 @@ from ...attention.orchestration import install_attention_strategy
 from ...attention.patches import attention_base_runtime
 from ...attention.protocol import (
     AttentionExecutionOutcome,
+    MAPPED_KV_EXECUTOR_ATTR,
     PreparedAttention,
-    RotaryEmbeddingSpec,
 )
 from ...attention.stable import LOG
 from ...runtime.capabilities import kernel_capabilities
@@ -100,43 +100,18 @@ def _virtual_target_frequencies(
     stop: int,
     tokens_per_frame: int,
     rot_dim: int,
-    mode: str,
 ) -> torch.Tensor:
     phase0, delta, spatial, _ = _temporal_phase_basis(
         query_freqs, start, tokens_per_frame, rot_dim
     )
-    if mode == "conservative":
-        frames = tuple(
-            _frequency_frame(
-                phase0 + float(units) * delta,
-                spatial,
-                query_freqs.dtype,
-            )
-            for units in _VIRTUAL_TIME_UNITS
+    frames = tuple(
+        _frequency_frame(
+            phase0 + float(units) * delta,
+            spatial,
+            query_freqs.dtype,
         )
-    else:
-        frames = []
-        for source in (0, 1):
-            phases = torch.stack(
-                tuple(
-                    phase0 + float(units) * delta
-                    for units, mapped in zip(_VIRTUAL_TIME_UNITS, _SOURCE_FRAMES)
-                    if mapped == source
-                ),
-                dim=0,
-            )
-            representative = torch.atan2(
-                torch.sin(phases).mean(dim=0),
-                torch.cos(phases).mean(dim=0),
-            )
-            frames.append(
-                _frequency_frame(
-                    representative,
-                    spatial,
-                    query_freqs.dtype,
-                )
-            )
-        frames = tuple(frames)
+        for units in _VIRTUAL_TIME_UNITS
+    )
     target = torch.cat(frames, dim=1)
     return torch.cat(
         (query_freqs[:, :start], target, query_freqs[:, stop:]), dim=1
@@ -193,6 +168,74 @@ def _expand_target(
     return torch.cat((tensor[:, :, :start], target, tensor[:, :, stop:]), dim=2)
 
 
+def _logical_source_indices(
+    physical_tokens: int,
+    start: int,
+    stop: int,
+    tokens_per_frame: int,
+    device: torch.device,
+) -> torch.Tensor:
+    prefix = torch.arange(start, dtype=torch.int32, device=device)
+    target = torch.cat(
+        tuple(
+            torch.arange(
+                start + source * tokens_per_frame,
+                start + (source + 1) * tokens_per_frame,
+                dtype=torch.int32,
+                device=device,
+            )
+            for source in _SOURCE_FRAMES
+        )
+    )
+    suffix = torch.arange(stop, physical_tokens, dtype=torch.int32, device=device)
+    return torch.cat((prefix, target, suffix))
+
+
+def _cached_virtual_inputs(
+    request: PreparedAttention,
+    query_freqs: torch.Tensor,
+    start: int,
+    stop: int,
+    tokens_per_frame: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    options = request.transformer_options
+    key = (
+        int(query_freqs.data_ptr()),
+        tuple(query_freqs.shape),
+        int(getattr(query_freqs, "_version", 0)),
+        start,
+        stop,
+        tokens_per_frame,
+        request.key_tokens,
+        request.qk_transform.rot_dim,
+    )
+    cache = None
+    if isinstance(options, dict):
+        cache = options.setdefault("turing_utils_h3_virtual_kv_cache", {})
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+    key_freqs = _virtual_target_frequencies(
+        query_freqs,
+        start,
+        stop,
+        tokens_per_frame,
+        request.qk_transform.rot_dim,
+    )
+    source_indices = _logical_source_indices(
+        request.key_tokens,
+        start,
+        stop,
+        tokens_per_frame,
+        query_freqs.device,
+    )
+    result = (key_freqs, source_indices)
+    if cache is not None:
+        cache.clear()
+        cache[key] = result
+    return result
+
+
 def make_h3_virtual_kv_override(
     dense_override: Callable,
     *,
@@ -226,18 +269,23 @@ def make_h3_virtual_kv_override(
                 "H3 virtual K/V requires the H3 RoPE table"
             )
         start, stop, tokens_per_frame = geometry
-        query, key, value = request.consume_qkv()
-        if mode == "conservative":
-            key = _expand_target(key, start, stop, tokens_per_frame)
-            value = _expand_target(value, start, stop, tokens_per_frame)
-        key_freqs = _virtual_target_frequencies(
+        key_freqs, source_indices = _cached_virtual_inputs(
+            request,
             query_freqs,
             start,
             stop,
             tokens_per_frame,
-            request.qk_transform.rot_dim,
-            mode,
         )
+        query, key, value = request.consume_qkv()
+        mapped_executor = getattr(dense_executor, MAPPED_KV_EXECUTOR_ATTR, None)
+        mapped = bool(
+            mode == "fast"
+            and callable(mapped_executor)
+            and kernel_capabilities().supports("mapped_kv").supported
+        )
+        if not mapped:
+            key = _expand_target(key, start, stop, tokens_per_frame)
+            value = _expand_target(value, start, stop, tokens_per_frame)
         rotary = dataclasses.replace(
             request.qk_transform.rotary,
             key_freqs=key_freqs,
@@ -257,9 +305,15 @@ def make_h3_virtual_kv_override(
             skip_output_reshape=request.skip_output_reshape,
             observer_requirements=request.observer_requirements,
         )
+        if mapped:
+            return mapped_executor(virtual, source_indices)
         return dense_executor(virtual)
 
     prepared_executor.capabilities = getattr(dense_executor, "capabilities", None)
+    prepared_executor.turing_utils_h3_virtual_kv_mode = mode
+    prepared_executor.turing_utils_h3_virtual_kv_mapped_available = callable(
+        getattr(dense_executor, MAPPED_KV_EXECUTOR_ATTR, None)
+    )
     attention_override.prepared_attention_executor = prepared_executor
     attention_override.turing_utils_attention_backend = H3_VIRTUAL_KV_STRATEGY
     attention_override.turing_utils_attention_implementation = (
@@ -275,6 +329,7 @@ def make_h3_virtual_kv_override(
 
 
 def apply_h3_virtual_kv(model, *, mode: str = "conservative"):
+    mode = str(mode).strip().lower()
     runtime = attention_base_runtime(model, use_w8a8=None)
     if (
         runtime.dense_implementation.startswith("bundled_turing_")
@@ -284,6 +339,15 @@ def apply_h3_virtual_kv(model, *, mode: str = "conservative"):
             "Configure H3 Static Virtual KV with bundled Sage/W8A8 requires "
             "comfyui-turing-utils-kernel 0.38.0 or newer; rebuild the kernel "
             "after updating the repository"
+        )
+    if (
+        mode == "fast"
+        and runtime.dense_backend == "w8a8"
+        and not kernel_capabilities().supports("mapped_kv").supported
+    ):
+        LOG.warning(
+            "H3 fast virtual K/V needs kernel 0.39.0 mapped-K/V support; "
+            "using the exact materialized path until the native kernel is rebuilt"
         )
     override = make_h3_virtual_kv_override(runtime.dense_override, mode=mode)
     installed = install_attention_strategy(

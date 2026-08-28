@@ -402,6 +402,8 @@ def validate_qk_preprocessing(device: torch.device) -> None:
     from comfyui_turing_utils_kernel.turing_sage.core import (
         precompute_rms_rope_k_anchor,
         prequantize_rms_rope_qk,
+        prequantize_sol_sageattn_from_qk,
+        sol_sparse_sageattn_from_prequantized,
     )
     from comfyui_turing_utils_kernel.turing_sage.quant import (
         per_warp_int8,
@@ -603,6 +605,99 @@ def validate_qk_preprocessing(device: torch.device) -> None:
                         f"streamed fused {name} differs from full preprocessing: "
                         f"{dtype=} {head_dim=} {norm_scope=}"
                     )
+
+    # Logical mapped K/V must be bitwise identical to first materializing the
+    # same source map in BF16. This covers RoPE, anchor selection, the native
+    # 16-token V permutation, padding, and final dense W8A8 execution.
+    generator = torch.Generator(device=device).manual_seed(4891)
+    batch, heads, physical_tokens, logical_tokens, head_dim = 1, 4, 129, 321, 128
+    query = torch.randn(
+        (batch, heads, physical_tokens, head_dim),
+        generator=generator,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    key = torch.randn(query.shape, generator=generator, device=device, dtype=query.dtype)
+    value = torch.randn(query.shape, generator=generator, device=device, dtype=query.dtype)
+    query_norm = torch.randn(
+        head_dim, generator=generator, device=device, dtype=query.dtype
+    )
+    key_norm = torch.randn(
+        head_dim, generator=generator, device=device, dtype=query.dtype
+    )
+    query_freqs = torch.randn(
+        (batch, physical_tokens, 1, head_dim // 2, 2, 2),
+        generator=generator,
+        device=device,
+        dtype=query.dtype,
+    )
+    key_freqs = torch.randn(
+        (batch, logical_tokens, 1, head_dim // 2, 2, 2),
+        generator=generator,
+        device=device,
+        dtype=query.dtype,
+    )
+    source_indices = (
+        (torch.arange(logical_tokens, device=device, dtype=torch.int32) * 17 + 5)
+        % physical_tokens
+    ).contiguous()
+    expanded_key = key.index_select(2, source_indices.long())
+    expanded_value = value.index_select(2, source_indices.long())
+    preprocessing = dict(
+        epsilon=1.0e-6,
+        rot_dim=head_dim,
+        norm_scope="head",
+        split_half=True,
+        rotate_qk=True,
+        stabilize_k=True,
+    )
+    expanded = prequantize_rms_rope_qk(
+        query,
+        expanded_key,
+        query_norm,
+        key_norm,
+        query_freqs,
+        key_freqs=key_freqs,
+        **preprocessing,
+    )
+    mapped = prequantize_rms_rope_qk(
+        query,
+        key,
+        query_norm,
+        key_norm,
+        query_freqs,
+        key_freqs=key_freqs,
+        key_source_indices=source_indices,
+        **preprocessing,
+    )
+    for name, expected, actual in (
+        ("mapped query", expanded.query_int8, mapped.query_int8),
+        ("mapped query scale", expanded.query_scale, mapped.query_scale),
+        ("mapped key", expanded.key_int8, mapped.key_int8),
+        ("mapped key scale", expanded.key_scale, mapped.key_scale),
+    ):
+        if not torch.equal(expected, actual):
+            raise RuntimeError(f"{name} differs from exact materialization")
+    expanded_attention = prequantize_sol_sageattn_from_qk(
+        expanded, expanded_value, use_w8a8=True, force_dense=True
+    )
+    mapped_attention = prequantize_sol_sageattn_from_qk(
+        mapped,
+        value,
+        use_w8a8=True,
+        force_dense=True,
+        value_source_indices=source_indices,
+    )
+    for name, expected, actual in (
+        ("mapped value", expanded_attention.value_int8, mapped_attention.value_int8),
+        ("mapped value scale", expanded_attention.value_scale, mapped_attention.value_scale),
+    ):
+        if not torch.equal(expected, actual):
+            raise RuntimeError(f"{name} differs from exact materialization")
+    expanded_output = sol_sparse_sageattn_from_prequantized(expanded_attention)
+    mapped_output = sol_sparse_sageattn_from_prequantized(mapped_attention)
+    if not torch.equal(expanded_output, mapped_output):
+        raise RuntimeError("mapped W8A8 output differs from exact materialization")
 
 
 def _validate_varlen_batches(

@@ -17,6 +17,7 @@ import torch
 
 ATTENTION_PROTOCOL_VERSION = 2
 ATTENTION_EXECUTOR_KEY = "turing_utils_attention_executor_v1"
+MAPPED_KV_EXECUTOR_ATTR = "turing_utils_mapped_kv_executor"
 
 
 @runtime_checkable
@@ -367,6 +368,7 @@ def execute_prepared_attention(
 __all__ = [
     "ATTENTION_EXECUTOR_KEY",
     "ATTENTION_PROTOCOL_VERSION",
+    "MAPPED_KV_EXECUTOR_ATTR",
     "AttentionBackendCapabilities",
     "AttentionExecutionOutcome",
     "AttentionTensorOwner",

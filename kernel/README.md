@@ -1,10 +1,10 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's quantized
-runtime. Version 0.38.0 adds asymmetric Query/Key sequence lengths and
-independent Query/Key RoPE tables to the fused attention preprocessor. This
-model-independent ABI supports virtual-K/V adapters without duplicating Query
-rows. It also contains legacy packed W4A8 and grouped-codebook W4A8
+runtime. Version 0.39.0 adds mapped physical-K reads with logical RoPE and a
+mapped INT8-V gather to the fused attention preprocessor. This lets virtual-K/V
+adapters preserve exact logical attention without materializing duplicated
+BF16 K/V rows. It also contains legacy packed W4A8 and grouped-codebook W4A8
 Tensor Core GEMMs, W8/W4 ConvRot
 activation quantizers with fused SwiGLU/tanh-GELU, BF16 epilogues, fused RMSNorm
 and LayerNorm modulation, lossless single-pass half-width FC1/SwiGLU staging,

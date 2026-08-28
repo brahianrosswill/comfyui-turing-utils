@@ -11,6 +11,7 @@ def rms_rope_per_warp_int8(
     freqs: torch.Tensor | None,
     *,
     key_freqs: torch.Tensor | None = None,
+    key_source_indices: torch.Tensor | None = None,
     epsilon: float,
     rot_dim: int,
     tensor_layout: str,
@@ -36,16 +37,39 @@ def rms_rope_per_warp_int8(
         layout_id = 0
     else:
         raise ValueError(f"Unknown tensor layout: {tensor_layout}")
+    mapped_key = key_source_indices is not None
+    if mapped_key:
+        if tensor_layout != "HND" or norm_scope != "head":
+            raise ValueError(
+                "mapped K preprocessing requires HND layout and per-head RMSNorm"
+            )
+        if (
+            key_source_indices.ndim != 1
+            or key_source_indices.dtype != torch.int32
+            or key_source_indices.device != k.device
+        ):
+            raise ValueError(
+                "mapped K source indices must be a CUDA int32 vector on the K device"
+            )
+        key_source_indices = key_source_indices.contiguous()
+        logical_k_tokens = int(key_source_indices.numel())
+    else:
+        logical_k_tokens = int(k_tokens)
     if head_dim not in (64, 128):
         raise ValueError("fused RMSNorm+RoPE Q/K quantization requires head_dim 64 or 128")
     if norm_scope not in {"head", "row"}:
         raise ValueError("norm_scope must be head or row")
 
     q_scale_shape = (batch, q_heads, ((q_tokens + 63) // 64) * 4)
-    k_scale_shape = (batch, k_heads, (k_tokens + 63) // 64)
+    k_scale_shape = (batch, k_heads, (logical_k_tokens + 63) // 64)
+    logical_k_shape = (
+        (batch, k_heads, logical_k_tokens, head_dim)
+        if tensor_layout == "HND"
+        else (batch, logical_k_tokens, k_heads, head_dim)
+    )
     if output_buffers is None:
         q_int8 = torch.empty(q.shape, dtype=torch.int8, device=q.device)
-        k_int8 = torch.empty(k.shape, dtype=torch.int8, device=k.device)
+        k_int8 = torch.empty(logical_k_shape, dtype=torch.int8, device=k.device)
         q_scale = torch.empty(
             q_scale_shape, dtype=torch.float32, device=q.device
         )
@@ -57,7 +81,7 @@ def rms_rope_per_warp_int8(
         expected = (
             (q_int8, q.shape, torch.int8),
             (q_scale, q_scale_shape, torch.float32),
-            (k_int8, k.shape, torch.int8),
+            (k_int8, logical_k_shape, torch.int8),
             (k_scale, k_scale_shape, torch.float32),
         )
         if any(
@@ -114,7 +138,12 @@ def rms_rope_per_warp_int8(
     if key_freqs is None:
         key_freqs = freqs
 
-    _fused.quant_qk_rms_rope_int8_cuda(
+    native = (
+        _fused.quant_qk_rms_rope_int8_mapped_cuda
+        if mapped_key
+        else _fused.quant_qk_rms_rope_int8_cuda
+    )
+    native_args = [
         q,
         k,
         q_int8,
@@ -125,6 +154,10 @@ def rms_rope_per_warp_int8(
         k_norm,
         freqs,
         key_freqs,
+    ]
+    if mapped_key:
+        native_args.append(key_source_indices)
+    native_args.extend([
         q_rrms,
         k_rrms,
         anchor_indices,
@@ -139,7 +172,8 @@ def rms_rope_per_warp_int8(
         bool(split_half),
         bool(rotate_qk),
         detect_anchor,
-    )
+    ])
+    native(*native_args)
     if return_anchor:
         return q_int8, q_scale, k_int8, k_scale, anchor_indices, anchor_values
     return q_int8, q_scale, k_int8, k_scale

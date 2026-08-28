@@ -110,7 +110,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(
             "csrc/turing/sage/overlap_blend.cu", extensions[2].kwargs["sources"]
         )
-        self.assertEqual(setup.call_args.kwargs["version"], "0.38.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.39.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -300,7 +300,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.38.0")
+        self.assertEqual(metadata["project"]["version"], "0.39.0")
 
     def test_overlap_epilogue_is_self_contained_and_deterministic_by_design(self):
         source = (
@@ -389,7 +389,10 @@ class KernelSetupTest(unittest.TestCase):
         binding = (sage_dir / "pybind_fused.cpp").read_text(encoding="utf-8")
         self.assertIn("at::Tensor query_freqs,", source)
         self.assertIn("at::Tensor key_freqs,", source)
-        self.assertIn('m.attr("qk_preprocess_protocol_schema") = 2', binding)
+        self.assertIn("at::Tensor key_source_indices,", source)
+        self.assertIn("quant_qk_rms_rope_int8_mapped_cuda", binding)
+        self.assertIn("gather_value_int8_mapped_cuda", binding)
+        self.assertIn('m.attr("qk_preprocess_protocol_schema") = 3', binding)
 
     def test_stable_sage_locks_single_k_warp_and_benchmarks_core(self):
         fixed = (

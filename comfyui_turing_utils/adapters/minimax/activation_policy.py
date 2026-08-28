@@ -238,6 +238,7 @@ def estimate_attention_lifecycle_peak(
     compact_qk: bool,
     cache_quantized_input: bool,
     quantized_value: bool,
+    logical_key_rows: int | None = None,
 ) -> int:
     """Estimate the peak across projection, V8 preparation and attention."""
     rows = int(rows)
@@ -246,18 +247,34 @@ def estimate_attention_lifecycle_peak(
     hidden_size = int(hidden_size)
     element_size = int(element_size)
     group = int(head_group)
+    key_rows = rows if logical_key_rows is None else int(logical_key_rows)
+    if key_rows < rows:
+        raise ValueError("logical K rows cannot be shorter than physical Q rows")
     features = rows * group * head_dim
+    key_features = key_rows * group * head_dim
     output = rows * heads * head_dim * element_size
     destination = 0 if group == heads else output
     input_cache = rows * (hidden_size + 4) if cache_quantized_input else 0
     if not compact_qk:
+        if key_rows != rows and quantized_value:
+            qkv_projection = 3 * features * element_size
+            qk_scales = (
+                ((rows + 63) // 64) * group * 4 * 4
+                + ((key_rows + 63) // 64) * group * 4
+            )
+            qk_compact = features + key_features + qk_scales
+            value_int8 = features + key_features
+            preparation_peak = qkv_projection + qk_compact + value_int8
+            execution_peak = qk_compact + key_features + features * element_size
+            return destination + max(preparation_peak, execution_peak) + input_cache
         return destination + features * 8 + input_cache
 
-    qk_blocks = (rows + 63) // 64
-    qk_scales = qk_blocks * group * 5 * 4
-    compact = features * (2 + element_size) + qk_scales
-    value_int8 = features if quantized_value else 0
-    padded_blocks = ((qk_blocks + 15) // 16) * 16
+    query_blocks = (rows + 63) // 64
+    key_blocks = (key_rows + 63) // 64
+    qk_scales = (query_blocks * 4 + key_blocks) * group * 4
+    compact = features + key_features + features * element_size + qk_scales
+    value_int8 = key_features if quantized_value else 0
+    padded_blocks = ((key_blocks + 15) // 16) * 16
     summaries = (
         3 * group * padded_blocks * head_dim * 2
         + 2 * group * head_dim * 4
@@ -446,6 +463,7 @@ def decide_attention_heads(
     quantized_value: bool = False,
     runtime_plan: ActivationRuntimePlan | None = None,
     base_model=None,
+    logical_key_rows: int | None = None,
 ) -> AttentionDecision:
     """Choose a whole-head group without changing global sequence attention."""
     rows = int(x.shape[0])
@@ -490,6 +508,7 @@ def decide_attention_heads(
             compact_qk=compact_qk,
             cache_quantized_input=cache_input and group != heads,
             quantized_value=quantized_value,
+            logical_key_rows=logical_key_rows,
         )
 
     # A cut is legal whenever both sides cover complete ConvRot-256 blocks.

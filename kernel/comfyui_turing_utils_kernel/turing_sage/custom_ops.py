@@ -137,6 +137,85 @@ def _qk_rms_rope_int8_fake(
     )
 
 
+@torch.library.custom_op("turing_utils::qk_rms_rope_int8_mapped", mutates_args=())
+def qk_rms_rope_int8_mapped(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    query_norm: torch.Tensor,
+    key_norm: torch.Tensor,
+    freqs: torch.Tensor,
+    key_freqs: torch.Tensor,
+    key_source_indices: torch.Tensor,
+    epsilon: float,
+    rot_dim: int,
+    tensor_layout: str,
+    norm_scope: str,
+    split_half: bool,
+    rotate_qk: bool,
+    stabilize_k: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    from .quant import rms_rope_per_warp_int8
+
+    return rms_rope_per_warp_int8(
+        query,
+        key,
+        query_norm,
+        key_norm,
+        freqs if freqs.numel() else None,
+        key_freqs=key_freqs if key_freqs.numel() else None,
+        key_source_indices=key_source_indices,
+        epsilon=epsilon,
+        rot_dim=rot_dim,
+        tensor_layout=tensor_layout,
+        norm_scope=norm_scope,
+        split_half=split_half,
+        rotate_qk=rotate_qk,
+        stabilize_k=stabilize_k,
+    )
+
+
+@qk_rms_rope_int8_mapped.register_fake
+def _qk_rms_rope_int8_mapped_fake(
+    query,
+    key,
+    query_norm,
+    key_norm,
+    freqs,
+    key_freqs,
+    key_source_indices,
+    epsilon,
+    rot_dim,
+    tensor_layout,
+    norm_scope,
+    split_half,
+    rotate_qk,
+    stabilize_k,
+):
+    if tensor_layout != "HND":
+        raise ValueError("mapped K preprocessing requires HND layout")
+    batch, query_heads, query_tokens, head_dim = query.shape
+    _, key_heads, _, _ = key.shape
+    key_tokens = key_source_indices.numel()
+    return (
+        torch.empty_like(query, dtype=torch.int8),
+        torch.empty(
+            (batch, query_heads, ((query_tokens + 63) // 64) * 4),
+            dtype=torch.float32,
+            device=query.device,
+        ),
+        torch.empty(
+            (batch, key_heads, key_tokens, head_dim),
+            dtype=torch.int8,
+            device=key.device,
+        ),
+        torch.empty(
+            (batch, key_heads, (key_tokens + 63) // 64),
+            dtype=torch.float32,
+            device=key.device,
+        ),
+    )
+
+
 @torch.library.custom_op("turing_utils::qk_rms_rope_anchor", mutates_args=())
 def qk_rms_rope_anchor(
     key: torch.Tensor,

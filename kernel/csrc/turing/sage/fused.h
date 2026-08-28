@@ -103,6 +103,38 @@ void quant_qk_rms_rope_int8_cuda(
                 bool rotate,
                 bool detect_anchor);
 
+void quant_qk_rms_rope_int8_mapped_cuda(
+                at::Tensor query,
+                at::Tensor key,
+                at::Tensor query_output,
+                at::Tensor key_output,
+                at::Tensor query_scale,
+                at::Tensor key_scale,
+                at::Tensor query_norm,
+                at::Tensor key_norm,
+                at::Tensor query_freqs,
+                at::Tensor key_freqs,
+                at::Tensor key_source_indices,
+                at::Tensor query_rrms,
+                at::Tensor key_rrms,
+                at::Tensor anchor_indices,
+                at::Tensor anchor_values,
+                float epsilon,
+                int rot_dim,
+                int query_block_size,
+                int query_warp_block_size,
+                int key_block_size,
+                int tensor_layout,
+                int norm_scope,
+                bool split_half,
+                bool rotate,
+                bool detect_anchor);
+
+void gather_value_int8_mapped_cuda(
+                at::Tensor value,
+                at::Tensor output,
+                at::Tensor source_indices);
+
 void quant_per_warp_int8_varlen_cuda(
                 at::Tensor input,
                 at::Tensor cu_seqlens,

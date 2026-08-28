@@ -12,6 +12,7 @@
 #include <cuda_fp16.h>
 #include <c10/cuda/CUDAException.h>
 #include <cfloat>
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <type_traits>
@@ -101,6 +102,7 @@ __device__ __forceinline__ float processed_value(
     int batch,
     int head,
     int token,
+    int source_token,
     int channel,
     float rrms,
     int heads,
@@ -119,7 +121,7 @@ __device__ __forceinline__ float processed_value(
     bool global_norm) {
   const int64_t row = static_cast<int64_t>(batch) * stride_batch +
                       static_cast<int64_t>(head) * stride_head +
-                      static_cast<int64_t>(token) * stride_sequence;
+                      static_cast<int64_t>(source_token) * stride_sequence;
   const int norm_index = global_norm ? head * HeadDim + channel : channel;
   const float normalized = to_float(from_float<T>(
       to_float(input[row + channel]) * rrms * to_float(norm[norm_index])));
@@ -253,6 +255,7 @@ __global__ void detect_anchor_kernel(
     const T *__restrict__ key,
     const T *__restrict__ key_norm,
     const T *__restrict__ freqs,
+    const int *__restrict__ source_indices,
     const float *__restrict__ key_rrms,
     int *__restrict__ anchor_indices,
     float *__restrict__ anchor_values,
@@ -288,13 +291,14 @@ __global__ void detect_anchor_kernel(
 
   if (tid < kAnchorSamples) {
     const int token = tid * (sequence - 1) / (kAnchorSamples - 1);
+    const int source_token = source_indices != nullptr ? source_indices[token] : token;
     if (global_norm) {
-      rrms[tid] = key_rrms[batch * sequence + token];
+      rrms[tid] = key_rrms[batch * sequence + source_token];
     } else {
       float sum = 0.0f;
       const int64_t row = static_cast<int64_t>(batch) * stride_batch +
                           static_cast<int64_t>(head) * stride_head +
-                          static_cast<int64_t>(token) * stride_sequence;
+                          static_cast<int64_t>(source_token) * stride_sequence;
 #pragma unroll
       for (int channel = 0; channel < HeadDim; ++channel) {
         const float value = to_float(key[row + channel]);
@@ -309,8 +313,10 @@ __global__ void detect_anchor_kernel(
 #pragma unroll
     for (int sample = 0; sample < kAnchorSamples; ++sample) {
       const int token = sample * (sequence - 1) / (kAnchorSamples - 1);
+      const int source_token = source_indices != nullptr ? source_indices[token] : token;
       samples[sample * HeadDim + tid] = processed_value<T, HeadDim, SplitHalf>(
-          key, key_norm, freqs, batch, head, token, tid, rrms[sample], heads,
+          key, key_norm, freqs, batch, head, token, source_token, tid,
+          rrms[sample], heads,
           sequence, rot_dim, stride_batch, stride_head, stride_sequence,
           freq_stride_batch, freq_stride_sequence, freq_stride_pair,
           freq_stride_row, freq_stride_col, freq_batches, freq_sequence,
@@ -419,6 +425,7 @@ __device__ __forceinline__ void quantize_tile(
     const T *__restrict__ input,
     const T *__restrict__ norm,
     const T *__restrict__ freqs,
+    const int *__restrict__ source_indices,
     const float *__restrict__ row_rrms,
     const int *__restrict__ anchor_indices,
     const float *__restrict__ anchor_values,
@@ -468,9 +475,10 @@ __device__ __forceinline__ void quantize_tile(
     const int channel = index - token_offset * HeadDim;
     const int token = base_token + token_offset;
     if (token < sequence) {
+      const int source_token = source_indices != nullptr ? source_indices[token] : token;
       const int64_t row = static_cast<int64_t>(batch) * stride_batch +
                           static_cast<int64_t>(head) * stride_head +
-                          static_cast<int64_t>(token) * stride_sequence;
+                          static_cast<int64_t>(source_token) * stride_sequence;
       tile_values[index] = input[row + channel];
     } else {
       tile_values[index] = from_float<T>(0.0f);
@@ -571,6 +579,7 @@ __global__ void quantize_qk_kernel(
     const T *__restrict__ key_norm,
     const T *__restrict__ query_freqs,
     const T *__restrict__ key_freqs,
+    const int *__restrict__ key_source_indices,
     const float *__restrict__ query_rrms,
     const float *__restrict__ key_rrms,
     const int *__restrict__ anchor_indices,
@@ -605,7 +614,8 @@ __global__ void quantize_qk_kernel(
     const int head = task / query_scale_length;
     const int tile = task - head * query_scale_length;
     quantize_tile<T, HeadDim, 16, SplitHalf, Rotate, false>(
-        query, query_norm, query_freqs, query_rrms, anchor_indices, anchor_values,
+        query, query_norm, query_freqs, nullptr, query_rrms, anchor_indices,
+        anchor_values,
         query_output, query_scale, tile, head, batch, query_heads, query_length,
         rot_dim, q_stride_batch, q_stride_head, q_stride_sequence,
         qo_stride_batch, qo_stride_head, qo_stride_sequence,
@@ -618,7 +628,8 @@ __global__ void quantize_qk_kernel(
     const int tile = local - head * key_scale_length;
     if (head < key_heads) {
       quantize_tile<T, HeadDim, 64, SplitHalf, Rotate, Stabilize>(
-          key, key_norm, key_freqs, key_rrms, anchor_indices, anchor_values,
+          key, key_norm, key_freqs, key_source_indices, key_rrms,
+          anchor_indices, anchor_values,
           key_output, key_scale, tile, head, batch, key_heads, key_length,
           rot_dim, k_stride_batch, k_stride_head, k_stride_sequence,
           ko_stride_batch, ko_stride_head, ko_stride_sequence,
@@ -629,15 +640,47 @@ __global__ void quantize_qk_kernel(
   }
 }
 
+__device__ __forceinline__ int value_permute_16(int token) {
+  return (token & 1) | (((token >> 3) & 1) << 1) |
+         (((token >> 1) & 1) << 2) | (((token >> 2) & 1) << 3);
+}
+
+__global__ void gather_mapped_value_int8_kernel(
+    const int8_t *__restrict__ input,
+    int8_t *__restrict__ output,
+    const int *__restrict__ source_indices,
+    int batch_size,
+    int heads,
+    int channels,
+    int physical_stride,
+    int logical_tokens,
+    int logical_stride) {
+  const int64_t total = static_cast<int64_t>(batch_size) * heads * channels *
+                        logical_tokens;
+  for (int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < total;
+       index += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+    const int token = index % logical_tokens;
+    const int64_t channel_row = index / logical_tokens;
+    const int source = source_indices[token];
+    const int source_storage =
+        (source & ~15) | value_permute_16(source & 15);
+    const int destination_storage =
+        (token & ~15) | value_permute_16(token & 15);
+    output[channel_row * logical_stride + destination_storage] =
+        input[channel_row * physical_stride + source_storage];
+  }
+}
+
 }  // namespace
 
-void quant_qk_rms_rope_int8_cuda(
+static void quant_qk_rms_rope_int8_impl(
     at::Tensor query, at::Tensor key, at::Tensor query_output,
     at::Tensor key_output, at::Tensor query_scale, at::Tensor key_scale,
     at::Tensor query_norm, at::Tensor key_norm, at::Tensor query_freqs,
     at::Tensor key_freqs,
     at::Tensor query_rrms, at::Tensor key_rrms, at::Tensor anchor_indices,
-    at::Tensor anchor_values, float epsilon, int rot_dim,
+    at::Tensor anchor_values, at::Tensor key_source_indices, float epsilon, int rot_dim,
     int query_block_size, int query_warp_block_size, int key_block_size,
     int tensor_layout, int norm_scope, bool split_half, bool rotate,
     bool detect_anchor) {
@@ -651,23 +694,33 @@ void quant_qk_rms_rope_int8_cuda(
   TORCH_CHECK(query_norm.scalar_type() == query.scalar_type() && key_norm.scalar_type() == query.scalar_type(), "Q/K norm weights must match the input dtype");
   TORCH_CHECK(query_block_size == 64 && query_warp_block_size == 16 && key_block_size == 64, "fused Q/K preprocessing requires the production 64/16/64 quantization contract");
   TORCH_CHECK(norm_scope == 0 || norm_scope == 1, "norm_scope must be 0 (per head) or 1 (whole row)");
+  const bool mapped_key = key_source_indices.defined() && key_source_indices.numel() != 0;
+  if (mapped_key) {
+    CHECK_CUDA(key_source_indices); CHECK_DIMS(key_source_indices, 1);
+    CHECK_DTYPE(key_source_indices, at::ScalarType::Int);
+    TORCH_CHECK(key_source_indices.is_contiguous(), "mapped K source indices must be contiguous");
+    TORCH_CHECK(tensor_layout == 1, "mapped K preprocessing currently requires HND layout");
+    TORCH_CHECK(norm_scope == 0, "mapped K preprocessing currently requires per-head RMSNorm");
+  }
 
   const int head_dim = query.size(3);
   TORCH_CHECK(head_dim == 64 || head_dim == 128, "fused Q/K preprocessing requires head_dim 64 or 128");
   TORCH_CHECK(key.size(3) == head_dim && query.size(0) == key.size(0), "Q/K shapes are incompatible");
-  int query_heads, key_heads, query_length, key_length;
+  int query_heads, key_heads, query_length, key_length, physical_key_length;
   int64_t q_stride_head, q_stride_sequence, k_stride_head, k_stride_sequence;
   int64_t qo_stride_head, qo_stride_sequence, ko_stride_head, ko_stride_sequence;
   if (tensor_layout == 0) {
     query_length = query.size(1); query_heads = query.size(2);
-    key_length = key.size(1); key_heads = key.size(2);
+    physical_key_length = key.size(1); key_heads = key.size(2);
+    key_length = mapped_key ? key_source_indices.numel() : physical_key_length;
     q_stride_sequence = query.stride(1); q_stride_head = query.stride(2);
     k_stride_sequence = key.stride(1); k_stride_head = key.stride(2);
     qo_stride_sequence = query_output.stride(1); qo_stride_head = query_output.stride(2);
     ko_stride_sequence = key_output.stride(1); ko_stride_head = key_output.stride(2);
   } else if (tensor_layout == 1) {
     query_heads = query.size(1); query_length = query.size(2);
-    key_heads = key.size(1); key_length = key.size(2);
+    key_heads = key.size(1); physical_key_length = key.size(2);
+    key_length = mapped_key ? key_source_indices.numel() : physical_key_length;
     q_stride_head = query.stride(1); q_stride_sequence = query.stride(2);
     k_stride_head = key.stride(1); k_stride_sequence = key.stride(2);
     qo_stride_head = query_output.stride(1); qo_stride_sequence = query_output.stride(2);
@@ -679,7 +732,12 @@ void quant_qk_rms_rope_int8_cuda(
   const int expected_norm_q = norm_scope == 0 ? head_dim : query_heads * head_dim;
   const int expected_norm_k = norm_scope == 0 ? head_dim : key_heads * head_dim;
   TORCH_CHECK(query_norm.numel() == expected_norm_q && key_norm.numel() == expected_norm_k, "Q/K norm weight shapes are incompatible");
-  TORCH_CHECK(query_output.sizes() == query.sizes() && key_output.sizes() == key.sizes(), "Q/K output shapes must match inputs");
+  TORCH_CHECK(query_output.sizes() == query.sizes(), "Q output shape must match Q input");
+  if (tensor_layout == 0) {
+    TORCH_CHECK(key_output.sizes() == at::IntArrayRef({key.size(0), key_length, key_heads, head_dim}), "mapped K output shape is incompatible");
+  } else {
+    TORCH_CHECK(key_output.sizes() == at::IntArrayRef({key.size(0), key_heads, key_length, head_dim}), "mapped K output shape is incompatible");
+  }
   const int query_scale_length = ((query_length + 63) / 64) * 4;
   const int key_scale_length = (key_length + 63) / 64;
   TORCH_CHECK(query_scale.sizes() == at::IntArrayRef({query.size(0), query_heads, query_scale_length}), "Q scale shape is incompatible");
@@ -725,7 +783,9 @@ void quant_qk_rms_rope_int8_cuda(
           if (detect_anchor) { \
             detect_anchor_kernel<scalar_t, HEAD_DIM, SPLIT><<<dim3(key_heads, key.size(0)), kAnchorThreads, 0, c10::cuda::getCurrentCUDAStream()>>>( \
                 reinterpret_cast<const scalar_t *>(key.data_ptr()), reinterpret_cast<const scalar_t *>(key_norm.data_ptr()), \
-                reinterpret_cast<const scalar_t *>(key_freqs.data_ptr()), global_norm ? key_rrms.data_ptr<float>() : nullptr, \
+                reinterpret_cast<const scalar_t *>(key_freqs.data_ptr()), \
+                mapped_key ? key_source_indices.data_ptr<int>() : nullptr, \
+                global_norm ? key_rrms.data_ptr<float>() : nullptr, \
                 anchor_indices.data_ptr<int>(), anchor_values.data_ptr<float>(), key.size(0), key_heads, key_length, rot_dim, \
                 key.stride(0), k_stride_head, k_stride_sequence, kfreq_stride_batch, kfreq_stride_sequence, kfreq_stride_pair, \
                 kfreq_stride_row, kfreq_stride_col, kfreq_batches, kfreq_sequence, epsilon, global_norm); \
@@ -736,6 +796,7 @@ void quant_qk_rms_rope_int8_cuda(
             reinterpret_cast<const scalar_t *>(query.data_ptr()), reinterpret_cast<const scalar_t *>(key.data_ptr()), \
             reinterpret_cast<const scalar_t *>(query_norm.data_ptr()), reinterpret_cast<const scalar_t *>(key_norm.data_ptr()), \
             reinterpret_cast<const scalar_t *>(query_freqs.data_ptr()), reinterpret_cast<const scalar_t *>(key_freqs.data_ptr()), \
+            mapped_key ? key_source_indices.data_ptr<int>() : nullptr, \
             global_norm ? query_rrms.data_ptr<float>() : nullptr, \
             global_norm ? key_rrms.data_ptr<float>() : nullptr, STABILIZE ? anchor_indices.data_ptr<int>() : nullptr, \
             STABILIZE ? anchor_values.data_ptr<float>() : nullptr, query_output.data_ptr<int8_t>(), key_output.data_ptr<int8_t>(), \
@@ -770,4 +831,69 @@ void quant_qk_rms_rope_int8_cuda(
   });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 #undef LAUNCH_VARIANT
+}
+
+void quant_qk_rms_rope_int8_cuda(
+    at::Tensor query, at::Tensor key, at::Tensor query_output,
+    at::Tensor key_output, at::Tensor query_scale, at::Tensor key_scale,
+    at::Tensor query_norm, at::Tensor key_norm, at::Tensor query_freqs,
+    at::Tensor key_freqs,
+    at::Tensor query_rrms, at::Tensor key_rrms, at::Tensor anchor_indices,
+    at::Tensor anchor_values, float epsilon, int rot_dim,
+    int query_block_size, int query_warp_block_size, int key_block_size,
+    int tensor_layout, int norm_scope, bool split_half, bool rotate,
+    bool detect_anchor) {
+  quant_qk_rms_rope_int8_impl(
+      query, key, query_output, key_output, query_scale, key_scale,
+      query_norm, key_norm, query_freqs, key_freqs, query_rrms, key_rrms,
+      anchor_indices, anchor_values, at::Tensor(), epsilon, rot_dim,
+      query_block_size, query_warp_block_size, key_block_size, tensor_layout,
+      norm_scope, split_half, rotate, detect_anchor);
+}
+
+void quant_qk_rms_rope_int8_mapped_cuda(
+    at::Tensor query, at::Tensor key, at::Tensor query_output,
+    at::Tensor key_output, at::Tensor query_scale, at::Tensor key_scale,
+    at::Tensor query_norm, at::Tensor key_norm, at::Tensor query_freqs,
+    at::Tensor key_freqs, at::Tensor key_source_indices,
+    at::Tensor query_rrms, at::Tensor key_rrms, at::Tensor anchor_indices,
+    at::Tensor anchor_values, float epsilon, int rot_dim,
+    int query_block_size, int query_warp_block_size, int key_block_size,
+    int tensor_layout, int norm_scope, bool split_half, bool rotate,
+    bool detect_anchor) {
+  quant_qk_rms_rope_int8_impl(
+      query, key, query_output, key_output, query_scale, key_scale,
+      query_norm, key_norm, query_freqs, key_freqs, query_rrms, key_rrms,
+      anchor_indices, anchor_values, key_source_indices, epsilon, rot_dim,
+      query_block_size, query_warp_block_size, key_block_size, tensor_layout,
+      norm_scope, split_half, rotate, detect_anchor);
+}
+
+void gather_value_int8_mapped_cuda(
+    at::Tensor value, at::Tensor output, at::Tensor source_indices) {
+  CHECK_CUDA(value); CHECK_CUDA(output); CHECK_CUDA(source_indices);
+  CHECK_DIMS(value, 4); CHECK_DIMS(output, 4); CHECK_DIMS(source_indices, 1);
+  CHECK_DTYPE(value, at::ScalarType::Char);
+  CHECK_DTYPE(output, at::ScalarType::Char);
+  CHECK_DTYPE(source_indices, at::ScalarType::Int);
+  TORCH_CHECK(value.is_contiguous() && output.is_contiguous() &&
+              source_indices.is_contiguous(),
+              "mapped V gather requires contiguous tensors");
+  TORCH_CHECK(value.size(0) == output.size(0) &&
+              value.size(1) == output.size(1) &&
+              value.size(2) == output.size(2),
+              "mapped V input/output batch, head, and channel shapes must match");
+  TORCH_CHECK(source_indices.numel() <= output.size(3),
+              "mapped V output is shorter than the logical source map");
+  C10_CUDA_CHECK(cudaMemsetAsync(
+      output.data_ptr<int8_t>(), 0, output.numel(),
+      c10::cuda::getCurrentCUDAStream()));
+  const int64_t total = value.size(0) * value.size(1) * value.size(2) *
+                        source_indices.numel();
+  const int blocks = static_cast<int>(std::min<int64_t>((total + 255) / 256, 65535));
+  gather_mapped_value_int8_kernel<<<blocks, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+      value.data_ptr<int8_t>(), output.data_ptr<int8_t>(),
+      source_indices.data_ptr<int>(), value.size(0), value.size(1), value.size(2),
+      value.size(3), source_indices.numel(), output.size(3));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

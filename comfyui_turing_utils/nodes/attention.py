@@ -16,7 +16,7 @@ class H3StaticVirtualKV:
                     ["conservative", "fast"],
                     {
                         "default": "conservative",
-                        "tooltip": "Conservative computes physical 2-slice Query against an exact 7-slice virtual K/V context. Fast keeps 2 K/V slices and collapses the seven temporal RoPE phases to two circular-mean representatives; it is faster but more approximate.",
+                        "tooltip": "Conservative materializes an exact 7-slice virtual K/V context. Fast keeps physical K/V at 2 slices, then uses an exact logical source map with all 7 temporal RoPE phases in bundled W8A8; unsupported or stale kernels safely fall back to conservative materialization.",
                     },
                 ),
             }
