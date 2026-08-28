@@ -86,6 +86,7 @@ def prequantize_rms_rope_qk(
     k_norm: torch.Tensor,
     freqs: torch.Tensor | None,
     *,
+    key_freqs: torch.Tensor | None = None,
     epsilon: float,
     rot_dim: int,
     tensor_layout: str = "HND",
@@ -125,6 +126,10 @@ def prequantize_rms_rope_qk(
         freqs = torch.empty(0, device=q.device, dtype=q.dtype)
     else:
         freqs = freqs.to(device=q.device, dtype=q.dtype)
+    if key_freqs is None:
+        key_freqs = freqs
+    else:
+        key_freqs = key_freqs.to(device=q.device, dtype=q.dtype)
     if qk_output is not None:
         if stabilize_k and k_anchor is None:
             raise ValueError(
@@ -144,6 +149,7 @@ def prequantize_rms_rope_qk(
             q_norm,
             k_norm,
             freqs,
+            key_freqs,
             anchor_indices,
             anchor_values,
             qk_output[0],
@@ -168,6 +174,7 @@ def prequantize_rms_rope_qk(
             q_norm,
             k_norm,
             freqs,
+            key_freqs,
             epsilon=float(epsilon),
             rot_dim=int(rot_dim),
             tensor_layout=tensor_layout,
@@ -189,6 +196,7 @@ def prequantize_rms_rope_qk(
             q_norm,
             k_norm,
             freqs,
+            key_freqs,
             k_anchor[0],
             k_anchor[1],
             epsilon=float(epsilon),

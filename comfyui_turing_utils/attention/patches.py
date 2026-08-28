@@ -10,7 +10,7 @@ import torch
 from ..profiling import CUDA_PHASE_PROFILER
 from .layout import attention_semantic_layout
 from .integration import ensure_prepared_attention_sites
-from .orchestration import install_sparse_attention_override
+from .orchestration import install_attention_strategy
 from .protocol import (
     AttentionBackendCapabilities,
     AttentionExecutionOutcome,
@@ -284,26 +284,22 @@ def _prepared_external_call_reason(request: PreparedAttention) -> str | None:
         return "prepared Q/K/V devices differ"
     if query.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return f"prepared Q/K/V dtype {query.dtype} is unsupported"
-    freqs = request.qk_transform.freqs
-    if torch.is_tensor(freqs):
+    frequency_specs = (
+        ("query", request.qk_transform.freqs, request.query_tokens, request.heads),
+        ("key", request.qk_transform.key_freqs, request.key_tokens, request.kv_heads),
+    )
+    for name, freqs, tokens, heads in frequency_specs:
+        if not torch.is_tensor(freqs):
+            continue
         if freqs.device != query.device:
-            return "prepared RoPE frequencies are on a different device"
+            return f"prepared {name} RoPE frequencies are on a different device"
         if freqs.ndim < 3:
-            return "prepared RoPE frequencies have no token/head axes"
-        frequency_tokens = int(freqs.shape[1])
-        if frequency_tokens not in {
-            1,
-            request.query_tokens,
-            request.key_tokens,
-        }:
-            return "prepared RoPE token count does not match Q or K"
-        if request.query_tokens != request.key_tokens and frequency_tokens != 1:
-            return "one prepared RoPE table cannot describe asymmetric Q/K"
+            return f"prepared {name} RoPE frequencies have no token/head axes"
+        if int(freqs.shape[1]) not in {1, tokens}:
+            return f"prepared {name} RoPE token count does not match {name}"
         frequency_heads = int(freqs.shape[2])
-        if frequency_heads not in {1, request.heads, request.kv_heads}:
-            return "prepared RoPE head count does not match Q or K"
-        if request.heads != request.kv_heads and frequency_heads != 1:
-            return "one prepared RoPE table cannot describe GQA head groups"
+        if frequency_heads not in {1, heads}:
+            return f"prepared {name} RoPE head count does not match {name}"
     return None
 
 
@@ -373,7 +369,8 @@ def _prepared_qk_transform(
     in floating point before receiving the already-projected tensors.
     """
     pairing = spec.rotary.pairing
-    freqs = spec.freqs
+    query_freqs = spec.freqs
+    key_freqs = spec.key_freqs
     if pairing != "none" and spec.query_norm.scope == "head":
         try:
             import comfy.quant_ops
@@ -388,11 +385,15 @@ def _prepared_qk_transform(
             kwargs = {"epsilon": spec.epsilon}
             if pairing == "split_half":
                 kwargs["rot_dim"] = spec.rot_dim
-            if q_nhd.shape == k_nhd.shape and callable(fused):
+            if (
+                q_nhd.shape == k_nhd.shape
+                and key_freqs is query_freqs
+                and callable(fused)
+            ):
                 transformed = fused(
                     q_nhd,
                     k_nhd,
-                    freqs,
+                    query_freqs,
                     q_weight,
                     k_weight,
                     **kwargs,
@@ -400,8 +401,8 @@ def _prepared_qk_transform(
                 return transformed[0].transpose(1, 2), transformed[1].transpose(1, 2)
             if callable(fused_one):
                 return (
-                    fused_one(q_nhd, freqs, q_weight, **kwargs).transpose(1, 2),
-                    fused_one(k_nhd, freqs, k_weight, **kwargs).transpose(1, 2),
+                    fused_one(q_nhd, query_freqs, q_weight, **kwargs).transpose(1, 2),
+                    fused_one(k_nhd, key_freqs, k_weight, **kwargs).transpose(1, 2),
                 )
         except (AttributeError, ImportError, RuntimeError, TypeError):
             # The mathematical fallback below keeps official/older Comfy builds
@@ -415,13 +416,13 @@ def _prepared_qk_transform(
     return (
         _prepared_rope_one(
             query,
-            freqs,
+            query_freqs,
             rot_dim=spec.rot_dim,
             pairing=pairing,
         ),
         _prepared_rope_one(
             key,
-            freqs,
+            key_freqs,
             rot_dim=spec.rot_dim,
             pairing=pairing,
         ),
@@ -1810,7 +1811,7 @@ def make_sla_attention_override(
     return attention_override
 
 
-def _attention_base_runtime(
+def attention_base_runtime(
     model,
     *,
     use_w8a8: bool | None,
@@ -1885,7 +1886,7 @@ def apply_sparse_attention_patch(
     debug_route_density: bool = False,
     use_w8a8: bool | None = None,
 ):
-    runtime = _attention_base_runtime(model, use_w8a8=use_w8a8)
+    runtime = attention_base_runtime(model, use_w8a8=use_w8a8)
     override = make_sparse_attention_override(
         model.load_device,
         min_sequence_tokens=min_sequence_tokens,
@@ -1905,7 +1906,7 @@ def apply_sparse_attention_patch(
         dense_backend=runtime.dense_backend,
         dense_override=runtime.dense_override,
     )
-    patched = install_sparse_attention_override(
+    patched = install_attention_strategy(
         model,
         override,
         strategy="Sol sparse",
@@ -1963,7 +1964,7 @@ def apply_sla_attention_patch(
     debug_route_density: bool = False,
     use_w8a8: bool | None = None,
 ):
-    runtime = _attention_base_runtime(model, use_w8a8=use_w8a8)
+    runtime = attention_base_runtime(model, use_w8a8=use_w8a8)
     override = make_sla_attention_override(
         model.load_device,
         min_sequence_tokens=min_sequence_tokens,
@@ -1982,7 +1983,7 @@ def apply_sla_attention_patch(
         dense_backend=runtime.dense_backend,
         dense_override=runtime.dense_override,
     )
-    patched = install_sparse_attention_override(
+    patched = install_attention_strategy(
         model,
         override,
         strategy="SLA",

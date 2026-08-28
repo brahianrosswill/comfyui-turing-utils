@@ -28,9 +28,9 @@ not skip attention or quantized-kernel preflight.
 | `comfyui_turing_utils/runtime/` | device facts, real compiled-symbol capability resolution, and diagnostics |
 | `comfyui_turing_utils/loading/` | ConvRot discovery, Comfy construction, preflight, and adapter installation |
 | `comfyui_turing_utils/attention/` | prepared-attention protocol, stable Sage, sparse policies, semantic layout, and patches |
-| `comfyui_turing_utils/nodes/attention.py` | model-independent production Sol/SLA patch UI |
+| `comfyui_turing_utils/nodes/attention.py` | thin production attention-strategy node schemas |
 | `comfyui_turing_utils/quantization/` | sm75+ W8/W4 format inspection, dispatch, and generic fusions |
-| `comfyui_turing_utils/adapters/minimax/` | MiniMax layout, packed-sequence planning, and fusions |
+| `comfyui_turing_utils/adapters/minimax/` | MiniMax layout, packed-sequence planning, fusions, and H3 virtual-K/V policy |
 | `comfyui_turing_utils/adapters/wan.py` | Wan/Bernini context-aware planning and Q/K preprocessing hooks |
 | `comfyui_turing_utils/adapters/wan_layout.py` | Wan/Bernini semantic attention-layout provider |
 | `comfyui_turing_utils/kernel_api.py` | sole lazy boundary to the independently installed kernel package |
@@ -276,6 +276,7 @@ invisibly to `sage` and are not displayed by the loader.
 | `w8a8` on sm75+ | stable-Sage INT8 score domain | optional adaptive K anchor | channel-wise signed INT8 V and unsigned INT8 probabilities, INT32 Tensor Core PV, FP32 online state |
 | `Configure Sol Sparse Attention` | fused 64-token centroid routing; selected tiles reuse stable Sage INT8 QK | input-adaptive `mean + tau * std` threshold | inherited W8A8 exact PV, or FP16 exact V tiles for Sage/SDPA; skipped-block V centroids and FP32 online accumulation |
 | `Configure SLA Sparse Attention` | one route shared by adjacent Q64 CTAs (logical Q128 x K64); selected tiles reuse stable Sage INT8 QK | fixed Top-K budget; Smooth-K-invariant ordering | inherited W8A8 PV or FP16 selected tiles; no skipped-block residual |
+| `Configure H3 Static Virtual KV` | physical Query remains two H3 latent-time slices; conservative mode exposes seven K/V slices, fast mode uses two representative K/V phases | independent Query/Key RoPE tables; no sparse routing | inherited dense W8A8, Sage, or SDPA; Sol/SLA is replaced |
 
 Integer Q/K MMA accumulates into INT32. The stable facade supports FP16 and
 BF16 Q/K/V, HND/NHD, GQA, causal mode, unequal Q/KV lengths, head dimensions
@@ -294,7 +295,8 @@ The ConvRot loader installs a stable legacy/container runtime dispatcher and
 records its dense backend as an immutable capability. Each ModelPatcher branch
 binds the resolved prepared executor directly, so fused row/head streaming does
 not depend on a second runtime lookup. Independent `Configure Sol/SLA Sparse
-Attention` nodes change the strategy configuration only; their routing,
+Attention` and model-adapter strategy nodes change the strategy configuration
+only; their routing,
 modality, step, layer, and residual-quality controls do not invalidate the
 large loader node. A model from another loader is bootstrapped from its current
 attention override, with SDPA as the conservative default.
@@ -380,6 +382,12 @@ an explicit Sol patch on an official ComfyUI-loaded H3 or Bernini model can use
 the same fused path as the ConvRot loader. Capability rejection occurs before
 Q/K/V ownership transfers; a rejecting backend is forbidden from consuming a
 tensor and the model safely retains its original attention path.
+
+Kernel 0.38 generalizes that preprocessing ABI so Query and Key may have
+different sequence lengths and independent RoPE tables. The CUDA operation has
+no H3 frame arithmetic or duplication policy. MiniMax's adapter supplies the
+H3 target segment and virtual temporal positions; Bernini or another model can
+reuse the same ABI with its own semantic-layout adapter.
 
 The compute_75 cubin reports at most 21,128 bytes static shared memory and 76
 registers/thread for D128 preprocessing, or 10,632 bytes and 59

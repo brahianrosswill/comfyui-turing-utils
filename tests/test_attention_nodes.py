@@ -29,6 +29,21 @@ class FakePatcher:
 
 
 class SparseAttentionNodeTest(unittest.TestCase):
+    def test_h3_virtual_kv_node_is_explicit_about_modes(self):
+        node = attention_nodes.H3StaticVirtualKV
+        self.assertEqual(node.TITLE, "Configure H3 Static Virtual KV")
+        inputs = node.INPUT_TYPES()["required"]
+        self.assertEqual(tuple(inputs), ("model", "mode"))
+        self.assertEqual(inputs["mode"][0], ["conservative", "fast"])
+        model = object()
+        patched = object()
+        with mock.patch(
+            "comfyui_turing_utils.nodes.attention.apply_h3_virtual_kv",
+            return_value=patched,
+        ) as apply_patch:
+            self.assertEqual(node().patch(model, mode="fast"), (patched,))
+        apply_patch.assert_called_once_with(model, mode="fast")
+
     def test_schema_exposes_tunable_sparse_parameters(self):
         self.assertEqual(
             attention_nodes.SolSparseAttentionPatch.TITLE,

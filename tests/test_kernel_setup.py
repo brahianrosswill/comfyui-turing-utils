@@ -110,7 +110,7 @@ class KernelSetupTest(unittest.TestCase):
         self.assertIn(
             "csrc/turing/sage/overlap_blend.cu", extensions[2].kwargs["sources"]
         )
-        self.assertEqual(setup.call_args.kwargs["version"], "0.37.0")
+        self.assertEqual(setup.call_args.kwargs["version"], "0.38.0")
         self.assertEqual(set(setup.call_args.kwargs["packages"]), {
             "comfyui_turing_utils_kernel",
             "comfyui_turing_utils_kernel.turing_sage",
@@ -300,7 +300,7 @@ class KernelSetupTest(unittest.TestCase):
         metadata = tomllib.loads(
             (PLUGIN_ROOT / "kernel" / "pyproject.toml").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["project"]["version"], "0.37.0")
+        self.assertEqual(metadata["project"]["version"], "0.38.0")
 
     def test_overlap_epilogue_is_self_contained_and_deterministic_by_design(self):
         source = (
@@ -382,6 +382,14 @@ class KernelSetupTest(unittest.TestCase):
         # PyTorch stream explicitly.
         self.assertEqual(fused.count(current_stream), 8)
         self.assertNotIn("<<<grid, block>>>", fused)
+
+    def test_fused_qk_abi_exposes_independent_rope_schema(self):
+        sage_dir = PLUGIN_ROOT / "kernel" / "csrc" / "turing" / "sage"
+        source = (sage_dir / "qk_preprocess.cu").read_text(encoding="utf-8")
+        binding = (sage_dir / "pybind_fused.cpp").read_text(encoding="utf-8")
+        self.assertIn("at::Tensor query_freqs,", source)
+        self.assertIn("at::Tensor key_freqs,", source)
+        self.assertIn('m.attr("qk_preprocess_protocol_schema") = 2', binding)
 
     def test_stable_sage_locks_single_k_warp_and_benchmarks_core(self):
         fixed = (

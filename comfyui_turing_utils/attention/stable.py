@@ -358,7 +358,7 @@ def precompute_turing_k_anchor(
     return load_turing_sage().precompute_rms_rope_k_anchor(
         key,
         spec.key_norm_weight,
-        spec.freqs,
+        spec.key_freqs,
         epsilon=spec.epsilon,
         rot_dim=spec.rot_dim,
         tensor_layout="HND",
@@ -386,6 +386,7 @@ def prequantize_turing_qk(
         spec.query_norm_weight,
         spec.key_norm_weight,
         spec.freqs,
+        key_freqs=spec.key_freqs,
         epsilon=spec.epsilon,
         rot_dim=spec.rot_dim,
         tensor_layout="HND",

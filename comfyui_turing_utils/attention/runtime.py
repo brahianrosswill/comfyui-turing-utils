@@ -1,7 +1,7 @@
-"""Unified dense/sparse attention runtime dispatch.
+"""Unified dense/strategy attention runtime dispatch.
 
-The model-side attention hand-off is installed once.  Subsequent dense, Sol,
-or SLA nodes replace only the immutable runtime configuration carried in
+The model-side attention hand-off is installed once. Subsequent strategy
+nodes replace only the immutable runtime configuration carried in
 ``transformer_options``; the dispatcher and model object patches stay stable.
 """
 
@@ -47,7 +47,7 @@ class AttentionRuntimeConfig:
         override: Callable | None,
     ) -> "AttentionRuntimeConfig":
         strategy = str(strategy).strip().lower()
-        if strategy not in {"dense", "sol", "sla"}:
+        if strategy not in {"dense", "sol", "sla", "h3_virtual_kv"}:
             raise ValueError(f"unsupported attention strategy: {strategy}")
         if strategy == "dense":
             override = None

@@ -15,7 +15,7 @@ from typing import Protocol, runtime_checkable
 import torch
 
 
-ATTENTION_PROTOCOL_VERSION = 1
+ATTENTION_PROTOCOL_VERSION = 2
 ATTENTION_EXECUTOR_KEY = "turing_utils_attention_executor_v1"
 
 
@@ -49,16 +49,22 @@ class RotaryEmbeddingSpec:
     freqs: torch.Tensor | None
     rot_dim: int
     pairing: str
+    key_freqs: torch.Tensor | None = None
 
     def validate(self, head_dim: int) -> str | None:
         if self.pairing not in {"none", "split_half", "interleaved"}:
             return f"RoPE pairing {self.pairing!r} is unsupported"
         if self.pairing == "none":
-            if self.freqs is not None or self.rot_dim != 0:
-                return "RoPE pairing 'none' requires freqs=None and rot_dim=0"
+            if self.freqs is not None or self.key_freqs is not None or self.rot_dim != 0:
+                return (
+                    "RoPE pairing 'none' requires query/key freqs=None and "
+                    "rot_dim=0"
+                )
             return None
         if not torch.is_tensor(self.freqs):
-            return "RoPE frequencies are unavailable"
+            return "query RoPE frequencies are unavailable"
+        if self.key_freqs is not None and not torch.is_tensor(self.key_freqs):
+            return "key RoPE frequencies are invalid"
         if self.rot_dim <= 0 or self.rot_dim > int(head_dim) or self.rot_dim % 2:
             return f"RoPE rot_dim={self.rot_dim} is incompatible with head_dim={head_dim}"
         return None
@@ -98,6 +104,14 @@ class QKTransformSpec:
     @property
     def freqs(self) -> torch.Tensor | None:
         return self.rotary.freqs
+
+    @property
+    def key_freqs(self) -> torch.Tensor | None:
+        return (
+            self.rotary.key_freqs
+            if self.rotary.key_freqs is not None
+            else self.rotary.freqs
+        )
 
     @property
     def epsilon(self) -> float:

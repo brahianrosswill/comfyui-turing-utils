@@ -569,7 +569,8 @@ __global__ void quantize_qk_kernel(
     const T *__restrict__ key,
     const T *__restrict__ query_norm,
     const T *__restrict__ key_norm,
-    const T *__restrict__ freqs,
+    const T *__restrict__ query_freqs,
+    const T *__restrict__ key_freqs,
     const float *__restrict__ query_rrms,
     const float *__restrict__ key_rrms,
     const int *__restrict__ anchor_indices,
@@ -591,9 +592,12 @@ __global__ void quantize_qk_kernel(
     int64_t ko_stride_batch, int64_t ko_stride_head, int64_t ko_stride_sequence,
     int64_t qs_stride_batch, int64_t qs_stride_head,
     int64_t ks_stride_batch, int64_t ks_stride_head,
-    int64_t freq_stride_batch, int64_t freq_stride_sequence,
-    int64_t freq_stride_pair, int64_t freq_stride_row, int64_t freq_stride_col,
-    int freq_batches, int freq_sequence, float epsilon, bool global_norm) {
+    int64_t qfreq_stride_batch, int64_t qfreq_stride_sequence,
+    int64_t qfreq_stride_pair, int64_t qfreq_stride_row, int64_t qfreq_stride_col,
+    int qfreq_batches, int qfreq_sequence,
+    int64_t kfreq_stride_batch, int64_t kfreq_stride_sequence,
+    int64_t kfreq_stride_pair, int64_t kfreq_stride_row, int64_t kfreq_stride_col,
+    int kfreq_batches, int kfreq_sequence, float epsilon, bool global_norm) {
   const int task = blockIdx.x;
   const int batch = blockIdx.y;
   const int query_tasks = query_heads * query_scale_length;
@@ -601,26 +605,26 @@ __global__ void quantize_qk_kernel(
     const int head = task / query_scale_length;
     const int tile = task - head * query_scale_length;
     quantize_tile<T, HeadDim, 16, SplitHalf, Rotate, false>(
-        query, query_norm, freqs, query_rrms, anchor_indices, anchor_values,
+        query, query_norm, query_freqs, query_rrms, anchor_indices, anchor_values,
         query_output, query_scale, tile, head, batch, query_heads, query_length,
         rot_dim, q_stride_batch, q_stride_head, q_stride_sequence,
         qo_stride_batch, qo_stride_head, qo_stride_sequence,
-        qs_stride_batch, qs_stride_head, freq_stride_batch, freq_stride_sequence,
-        freq_stride_pair, freq_stride_row, freq_stride_col, freq_batches,
-        freq_sequence, epsilon, global_norm);
+        qs_stride_batch, qs_stride_head, qfreq_stride_batch, qfreq_stride_sequence,
+        qfreq_stride_pair, qfreq_stride_row, qfreq_stride_col, qfreq_batches,
+        qfreq_sequence, epsilon, global_norm);
   } else {
     const int local = task - query_tasks;
     const int head = local / key_scale_length;
     const int tile = local - head * key_scale_length;
     if (head < key_heads) {
       quantize_tile<T, HeadDim, 64, SplitHalf, Rotate, Stabilize>(
-          key, key_norm, freqs, key_rrms, anchor_indices, anchor_values,
+          key, key_norm, key_freqs, key_rrms, anchor_indices, anchor_values,
           key_output, key_scale, tile, head, batch, key_heads, key_length,
           rot_dim, k_stride_batch, k_stride_head, k_stride_sequence,
           ko_stride_batch, ko_stride_head, ko_stride_sequence,
-          ks_stride_batch, ks_stride_head, freq_stride_batch, freq_stride_sequence,
-          freq_stride_pair, freq_stride_row, freq_stride_col, freq_batches,
-          freq_sequence, epsilon, global_norm);
+          ks_stride_batch, ks_stride_head, kfreq_stride_batch, kfreq_stride_sequence,
+          kfreq_stride_pair, kfreq_stride_row, kfreq_stride_col, kfreq_batches,
+          kfreq_sequence, epsilon, global_norm);
     }
   }
 }
@@ -630,7 +634,8 @@ __global__ void quantize_qk_kernel(
 void quant_qk_rms_rope_int8_cuda(
     at::Tensor query, at::Tensor key, at::Tensor query_output,
     at::Tensor key_output, at::Tensor query_scale, at::Tensor key_scale,
-    at::Tensor query_norm, at::Tensor key_norm, at::Tensor freqs,
+    at::Tensor query_norm, at::Tensor key_norm, at::Tensor query_freqs,
+    at::Tensor key_freqs,
     at::Tensor query_rrms, at::Tensor key_rrms, at::Tensor anchor_indices,
     at::Tensor anchor_values, float epsilon, int rot_dim,
     int query_block_size, int query_warp_block_size, int key_block_size,
@@ -680,16 +685,24 @@ void quant_qk_rms_rope_int8_cuda(
   TORCH_CHECK(query_scale.sizes() == at::IntArrayRef({query.size(0), query_heads, query_scale_length}), "Q scale shape is incompatible");
   TORCH_CHECK(key_scale.sizes() == at::IntArrayRef({key.size(0), key_heads, key_scale_length}), "K scale shape is incompatible");
 
-  int64_t freq_stride_batch = 0, freq_stride_sequence = 0, freq_stride_pair = 0, freq_stride_row = 0, freq_stride_col = 0;
-  int freq_batches = 1, freq_sequence = 1;
+  int64_t qfreq_stride_batch = 0, qfreq_stride_sequence = 0, qfreq_stride_pair = 0, qfreq_stride_row = 0, qfreq_stride_col = 0;
+  int64_t kfreq_stride_batch = 0, kfreq_stride_sequence = 0, kfreq_stride_pair = 0, kfreq_stride_row = 0, kfreq_stride_col = 0;
+  int qfreq_batches = 1, qfreq_sequence = 1;
+  int kfreq_batches = 1, kfreq_sequence = 1;
   if (rot_dim > 0) {
-    CHECK_CUDA(freqs); CHECK_DIMS(freqs, 6);
-    TORCH_CHECK(freqs.scalar_type() == query.scalar_type(), "RoPE frequencies must match Q/K dtype");
-    TORCH_CHECK(freqs.size(2) == 1 && freqs.size(3) == rot_dim / 2 && freqs.size(4) == 2 && freqs.size(5) == 2, "RoPE frequency shape is incompatible");
-    freq_batches = freqs.size(0); freq_sequence = freqs.size(1);
-    TORCH_CHECK((freq_batches == 1 || freq_batches == query.size(0)) && (freq_sequence == 1 || (freq_sequence == query_length && query_length == key_length)), "RoPE batch/sequence broadcasting is incompatible");
-    freq_stride_batch = freqs.stride(0); freq_stride_sequence = freqs.stride(1);
-    freq_stride_pair = freqs.stride(3); freq_stride_row = freqs.stride(4); freq_stride_col = freqs.stride(5);
+    CHECK_CUDA(query_freqs); CHECK_DIMS(query_freqs, 6);
+    CHECK_CUDA(key_freqs); CHECK_DIMS(key_freqs, 6);
+    TORCH_CHECK(query_freqs.scalar_type() == query.scalar_type() && key_freqs.scalar_type() == query.scalar_type(), "RoPE frequencies must match Q/K dtype");
+    TORCH_CHECK(query_freqs.size(2) == 1 && query_freqs.size(3) == rot_dim / 2 && query_freqs.size(4) == 2 && query_freqs.size(5) == 2, "query RoPE frequency shape is incompatible");
+    TORCH_CHECK(key_freqs.size(2) == 1 && key_freqs.size(3) == rot_dim / 2 && key_freqs.size(4) == 2 && key_freqs.size(5) == 2, "key RoPE frequency shape is incompatible");
+    qfreq_batches = query_freqs.size(0); qfreq_sequence = query_freqs.size(1);
+    kfreq_batches = key_freqs.size(0); kfreq_sequence = key_freqs.size(1);
+    TORCH_CHECK((qfreq_batches == 1 || qfreq_batches == query.size(0)) && (qfreq_sequence == 1 || qfreq_sequence == query_length), "query RoPE batch/sequence broadcasting is incompatible");
+    TORCH_CHECK((kfreq_batches == 1 || kfreq_batches == key.size(0)) && (kfreq_sequence == 1 || kfreq_sequence == key_length), "key RoPE batch/sequence broadcasting is incompatible");
+    qfreq_stride_batch = query_freqs.stride(0); qfreq_stride_sequence = query_freqs.stride(1);
+    qfreq_stride_pair = query_freqs.stride(3); qfreq_stride_row = query_freqs.stride(4); qfreq_stride_col = query_freqs.stride(5);
+    kfreq_stride_batch = key_freqs.stride(0); kfreq_stride_sequence = key_freqs.stride(1);
+    kfreq_stride_pair = key_freqs.stride(3); kfreq_stride_row = key_freqs.stride(4); kfreq_stride_col = key_freqs.stride(5);
   }
 
   const bool global_norm = norm_scope == 1;
@@ -712,25 +725,27 @@ void quant_qk_rms_rope_int8_cuda(
           if (detect_anchor) { \
             detect_anchor_kernel<scalar_t, HEAD_DIM, SPLIT><<<dim3(key_heads, key.size(0)), kAnchorThreads, 0, c10::cuda::getCurrentCUDAStream()>>>( \
                 reinterpret_cast<const scalar_t *>(key.data_ptr()), reinterpret_cast<const scalar_t *>(key_norm.data_ptr()), \
-                reinterpret_cast<const scalar_t *>(freqs.data_ptr()), global_norm ? key_rrms.data_ptr<float>() : nullptr, \
+                reinterpret_cast<const scalar_t *>(key_freqs.data_ptr()), global_norm ? key_rrms.data_ptr<float>() : nullptr, \
                 anchor_indices.data_ptr<int>(), anchor_values.data_ptr<float>(), key.size(0), key_heads, key_length, rot_dim, \
-                key.stride(0), k_stride_head, k_stride_sequence, freq_stride_batch, freq_stride_sequence, freq_stride_pair, \
-                freq_stride_row, freq_stride_col, freq_batches, freq_sequence, epsilon, global_norm); \
+                key.stride(0), k_stride_head, k_stride_sequence, kfreq_stride_batch, kfreq_stride_sequence, kfreq_stride_pair, \
+                kfreq_stride_row, kfreq_stride_col, kfreq_batches, kfreq_sequence, epsilon, global_norm); \
           } \
         } \
         const int tasks = query_heads * query_scale_length + key_heads * key_scale_length; \
         quantize_qk_kernel<scalar_t, HEAD_DIM, SPLIT, ROTATE, STABILIZE><<<dim3(tasks, query.size(0)), kThreads, 0, c10::cuda::getCurrentCUDAStream()>>>( \
             reinterpret_cast<const scalar_t *>(query.data_ptr()), reinterpret_cast<const scalar_t *>(key.data_ptr()), \
             reinterpret_cast<const scalar_t *>(query_norm.data_ptr()), reinterpret_cast<const scalar_t *>(key_norm.data_ptr()), \
-            reinterpret_cast<const scalar_t *>(freqs.data_ptr()), global_norm ? query_rrms.data_ptr<float>() : nullptr, \
+            reinterpret_cast<const scalar_t *>(query_freqs.data_ptr()), reinterpret_cast<const scalar_t *>(key_freqs.data_ptr()), \
+            global_norm ? query_rrms.data_ptr<float>() : nullptr, \
             global_norm ? key_rrms.data_ptr<float>() : nullptr, STABILIZE ? anchor_indices.data_ptr<int>() : nullptr, \
             STABILIZE ? anchor_values.data_ptr<float>() : nullptr, query_output.data_ptr<int8_t>(), key_output.data_ptr<int8_t>(), \
             query_scale.data_ptr<float>(), key_scale.data_ptr<float>(), query_heads, key_heads, query_length, key_length, \
             query_scale_length, key_scale_length, rot_dim, query.stride(0), q_stride_head, q_stride_sequence, \
             key.stride(0), k_stride_head, k_stride_sequence, query_output.stride(0), qo_stride_head, qo_stride_sequence, \
             key_output.stride(0), ko_stride_head, ko_stride_sequence, query_scale.stride(0), query_scale.stride(1), \
-            key_scale.stride(0), key_scale.stride(1), freq_stride_batch, freq_stride_sequence, freq_stride_pair, \
-            freq_stride_row, freq_stride_col, freq_batches, freq_sequence, epsilon, global_norm); \
+            key_scale.stride(0), key_scale.stride(1), qfreq_stride_batch, qfreq_stride_sequence, qfreq_stride_pair, \
+            qfreq_stride_row, qfreq_stride_col, qfreq_batches, qfreq_sequence, kfreq_stride_batch, kfreq_stride_sequence, \
+            kfreq_stride_pair, kfreq_stride_row, kfreq_stride_col, kfreq_batches, kfreq_sequence, epsilon, global_norm); \
       } while (0)
 
   const auto dtype = query.scalar_type();

@@ -45,6 +45,16 @@ def kernel_version(default: str = "0.0.0") -> str:
     return str(getattr(package, "__version__", default))
 
 
+def qk_preprocess_protocol_schema() -> int:
+    """Return the fused Q/K native ABI schema, not the Python package version."""
+    try:
+        extension = load_kernel_extension("_sage_fused_sm75")
+    except (ImportError, OSError):
+        return 0
+    value = getattr(extension, "qk_preprocess_protocol_schema", 0)
+    return int(value) if isinstance(value, int) else 0
+
+
 def attention_kernel_architectures() -> tuple[str, ...]:
     """Return architectures embedded in the installed attention extension.
 
@@ -82,4 +92,5 @@ __all__ = [
     "load_kernel_extension",
     "load_kernel_package",
     "load_turing_sage",
+    "qk_preprocess_protocol_schema",
 ]

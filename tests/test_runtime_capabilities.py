@@ -120,6 +120,28 @@ class KernelCapabilitiesTest(unittest.TestCase):
         self.assertFalse(result.supports("ffn_channel_sharding").supported)
         self.assertFalse(result.supports("ffn_half_width").supported)
 
+    def test_asymmetric_qk_rope_requires_native_schema_two(self):
+        package = SimpleNamespace(__version__="0.38.0")
+        sage = SimpleNamespace(
+            fused_qk_preprocessing_available=lambda: True,
+        )
+        for schema, expected in ((0, False), (2, True)):
+            with self.subTest(schema=schema), mock.patch.dict(
+                sys.modules,
+                {
+                    "comfyui_turing_utils_kernel": package,
+                    "comfyui_turing_utils_kernel._sage_fused_sm75": SimpleNamespace(
+                        qk_preprocess_protocol_schema=schema
+                    ),
+                    "comfyui_turing_utils_kernel.turing_sage": sage,
+                },
+            ):
+                result = capabilities.kernel_capabilities()
+                self.assertEqual(
+                    result.supports("asymmetric_qk_rope").supported,
+                    expected,
+                )
+
     def test_missing_kernel_package_has_actionable_reason(self):
         with mock.patch(
             "comfyui_turing_utils.runtime.capabilities.load_kernel_package",

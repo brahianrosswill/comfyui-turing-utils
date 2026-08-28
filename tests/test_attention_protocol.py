@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import sys
 import unittest
 from pathlib import Path
@@ -12,7 +13,11 @@ COMFY_ROOT = PLUGIN_ROOT.parents[1]
 sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
-from comfyui_turing_utils.attention.patches import _make_dense_prepared_executor  # noqa: E402
+from comfyui_turing_utils.attention.patches import (  # noqa: E402
+    _make_dense_prepared_executor,
+    _prepared_external_call_reason,
+    _prepared_qk_transform,
+)
 from comfyui_turing_utils.attention.layout import (  # noqa: E402
     ATTENTION_LAYOUT_KEY,
     AttentionSegment,
@@ -105,6 +110,55 @@ class AttentionProtocolTest(unittest.TestCase):
             supports_asymmetric_qk=False,
         ).unsupported_reason(request)
         self.assertEqual(reason, "asymmetric Q/K lengths are unsupported")
+
+    def test_asymmetric_qk_accepts_independent_rope_tables(self):
+        query_tokens = 6
+        key_tokens = 9
+        identity = torch.eye(2, dtype=torch.float32).reshape(1, 1, 1, 1, 2, 2)
+        query_freqs = identity.expand(1, query_tokens, 1, 32, 2, 2).clone()
+        key_freqs = identity.expand(1, key_tokens, 1, 32, 2, 2).clone()
+        spec = QKTransformSpec(
+            RMSNormSpec(torch.ones(64), 1e-6, "head"),
+            RMSNormSpec(torch.ones(64), 1e-6, "head"),
+            RotaryEmbeddingSpec(
+                query_freqs,
+                64,
+                "split_half",
+                key_freqs=key_freqs,
+            ),
+        )
+        query = Owner(torch.randn((1, 2, query_tokens, 64)))
+        key = Owner(torch.randn((1, 2, key_tokens, 64)))
+        value = Owner(torch.randn((1, 2, key_tokens, 64)))
+        request = PreparedAttention.from_hnd(
+            query,
+            key,
+            value,
+            heads=2,
+            qk_transform=spec,
+        )
+        self.assertIsNone(_prepared_external_call_reason(request))
+        transformed_query, transformed_key = _prepared_qk_transform(
+            query.peek(), key.peek(), spec
+        )
+        self.assertEqual(transformed_query.shape[2], query_tokens)
+        self.assertEqual(transformed_key.shape[2], key_tokens)
+
+        invalid_spec = dataclasses.replace(
+            spec,
+            rotary=dataclasses.replace(spec.rotary, key_freqs=query_freqs),
+        )
+        invalid = PreparedAttention.from_hnd(
+            query,
+            key,
+            value,
+            heads=2,
+            qk_transform=invalid_spec,
+        )
+        self.assertEqual(
+            _prepared_external_call_reason(invalid),
+            "prepared key RoPE token count does not match key",
+        )
 
     def test_observer_requirement_fails_closed(self):
         request, owners = self.request(

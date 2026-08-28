@@ -30,6 +30,17 @@ class FakePatcher:
 
 
 class AttentionRuntimeTest(unittest.TestCase):
+    def test_runtime_accepts_h3_virtual_kv_strategy(self):
+        dense = lambda original, *args, **kwargs: original(*args, **kwargs)
+        strategy = lambda original, *args, **kwargs: original(*args, **kwargs)
+        config = attention.AttentionRuntimeConfig("sdpa", "test", dense)
+        specialized = config.with_strategy(
+            "h3_virtual_kv",
+            "test:h3_virtual_kv",
+            strategy,
+        )
+        self.assertEqual(specialized.strategy, "h3_virtual_kv")
+
     def test_dense_backend_installs_native_capability_marker(self):
         model = FakePatcher()
         attention.apply_attention_backend(

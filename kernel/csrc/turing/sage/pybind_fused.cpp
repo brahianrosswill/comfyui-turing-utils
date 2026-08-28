@@ -20,6 +20,7 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
+  m.attr("qk_preprocess_protocol_schema") = 2;
   m.def("quant_per_block_int8_cuda", py::overload_cast<at::Tensor, at::Tensor, at::Tensor, int, int>(&quant_per_block_int8_cuda), "quant_per_block_int8_cuda");
   m.def("quant_per_warp_int8_cuda", py::overload_cast<at::Tensor, at::Tensor, at::Tensor, int, int, int>(&quant_per_warp_int8_cuda), "quant_per_warp_int8_cuda");
   m.def("quant_qk_per_warp_int8_cuda", &quant_qk_per_warp_int8_cuda, "quant_qk_per_warp_int8_cuda");

@@ -1034,6 +1034,10 @@ def _make_attention_forward(
             )
 
         transform = _qk_transform(self, x, rope_freqs)
+        virtual_kv = (
+            transformer_options.get("turing_utils_attention_strategy")
+            == "h3_virtual_kv"
+        )
         streamed_executor = (
             getattr(executor, _STREAMED_QKV_EXECUTOR_ATTR, None)
             if executor is not None
@@ -1046,7 +1050,11 @@ def _make_attention_forward(
         qkv_is_w8 = convrot_weight_kind(self.qkv_proj.weight) == "w8a8"
         runtime_plan = _runtime_activation_plan(base_model)
         head_decision = None
-        if qkv_is_w8:
+        # Virtual K/V needs raw projected physical K before applying seven
+        # distinct temporal RoPE phases. The ordinary head/row streaming paths
+        # prequantize physical K too early, so this strategy deliberately uses
+        # the full projected hand-off and lets its prepared executor expand K/V.
+        if qkv_is_w8 and not virtual_kv:
             head_decision = decide_attention_heads(
                 x,
                 heads=int(self.heads),

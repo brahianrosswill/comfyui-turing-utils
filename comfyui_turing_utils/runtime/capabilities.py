@@ -12,6 +12,7 @@ from ..kernel_api import (
     kernel_version,
     load_kernel_package,
     load_turing_sage,
+    qk_preprocess_protocol_schema,
 )
 
 
@@ -74,6 +75,7 @@ class RuntimeCapabilities:
             "sol",
             "sla",
             "fused_qk",
+            "asymmetric_qk_rope",
             "reusable_k_anchor",
             "overlap_accumulate",
             "core_fusions",
@@ -150,6 +152,8 @@ def kernel_capabilities() -> KernelCapabilities:
         and callable(getattr(sage, "precompute_rms_rope_k_anchor", None))
     ):
         features.add("reusable_k_anchor")
+    if "fused_qk" in features and qk_preprocess_protocol_schema() >= 2:
+        features.add("asymmetric_qk_rope")
     return KernelCapabilities(True, version, frozenset(features))
 
 

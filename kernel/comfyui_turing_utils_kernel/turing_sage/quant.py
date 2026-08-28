@@ -10,6 +10,7 @@ def rms_rope_per_warp_int8(
     k_norm: torch.Tensor,
     freqs: torch.Tensor | None,
     *,
+    key_freqs: torch.Tensor | None = None,
     epsilon: float,
     rot_dim: int,
     tensor_layout: str,
@@ -110,6 +111,8 @@ def rms_rope_per_warp_int8(
         anchor_values = torch.empty(0, dtype=torch.float32, device=k.device)
     if freqs is None:
         freqs = torch.empty(0, dtype=q.dtype, device=q.device)
+    if key_freqs is None:
+        key_freqs = freqs
 
     _fused.quant_qk_rms_rope_int8_cuda(
         q,
@@ -121,6 +124,7 @@ def rms_rope_per_warp_int8(
         q_norm,
         k_norm,
         freqs,
+        key_freqs,
         q_rrms,
         k_rrms,
         anchor_indices,

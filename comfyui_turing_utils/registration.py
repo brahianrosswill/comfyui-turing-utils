@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .adapters.minimax.conditioning import install_combined_minimax_conditioning_support
 from .nodes.attention import (
+    H3StaticVirtualKV,
     LegacySlaSparseAttentionPatch,
     LegacySolSparseAttentionPatch,
     SlaSparseAttentionPatch,
@@ -67,6 +68,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsSlaSparseAttentionPatch": LegacySlaSparseAttentionPatch,
     "TuringUtilsSolAttentionStrategy": SolSparseAttentionPatch,
     "TuringUtilsSlaAttentionStrategy": SlaSparseAttentionPatch,
+    "TuringUtilsH3StaticVirtualKV": H3StaticVirtualKV,
     "TuringUtilsResizeImageIfPresent": ResizeImageIfPresent,
     "TuringUtilsVideoMotionContactSheet": VideoMotionContactSheet,
     "TuringUtilsMiniMaxH3VideoVAEDecode": MiniMaxH3VideoVAEDecode,
@@ -99,6 +101,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsSlaSparseAttentionPatch": "Patch SLA Sparse Attention",
     "TuringUtilsSolAttentionStrategy": "Configure Sol Sparse Attention",
     "TuringUtilsSlaAttentionStrategy": "Configure SLA Sparse Attention",
+    "TuringUtilsH3StaticVirtualKV": "Configure H3 Static Virtual KV",
     "TuringUtilsResizeImageIfPresent": "Resize Image If Present",
     "TuringUtilsVideoMotionContactSheet": "Video Motion Contact Sheet (Experimental)",
     "TuringUtilsMiniMaxH3VideoVAEDecode": "MiniMax H3 Video VAE Decode",

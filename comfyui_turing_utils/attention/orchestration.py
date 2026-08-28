@@ -1,4 +1,4 @@
-"""Shared installation mechanics for sparse attention strategies."""
+"""Shared installation mechanics for attention strategies."""
 
 from __future__ import annotations
 
@@ -16,13 +16,13 @@ from .stable import LOG
 
 
 @dataclass(frozen=True, slots=True)
-class SparsePatchInstallation:
+class AttentionStrategyInstallation:
     model: object
     layout: LayoutProviderStatus
     attention_sites: AttentionSiteStatus | None
 
 
-def install_sparse_attention_override(
+def install_attention_strategy(
     model,
     override,
     *,
@@ -30,8 +30,8 @@ def install_sparse_attention_override(
     backend: str,
     implementation: str,
     runtime_config: AttentionRuntimeConfig | None = None,
-) -> SparsePatchInstallation:
-    """Clone and install one sparse strategy without owning its algorithm."""
+) -> AttentionStrategyInstallation:
+    """Clone and install one strategy without owning its algorithm."""
     patched = model.clone()
     transformer_options = patched.model_options.setdefault("transformer_options", {})
     existing_requirement = transformer_options.get(ATTENTION_LAYOUT_REQUIREMENT_KEY)
@@ -88,7 +88,18 @@ def install_sparse_attention_override(
     if runtime_config is None:
         transformer_options["turing_utils_attention_backend"] = backend
         transformer_options["turing_utils_attention_implementation"] = implementation
-    return SparsePatchInstallation(patched, layout_status, site_status)
+    return AttentionStrategyInstallation(patched, layout_status, site_status)
 
 
-__all__ = ["SparsePatchInstallation", "install_sparse_attention_override"]
+# Compatibility aliases for integrations written before orchestration became
+# useful to non-sparse strategies such as virtual K/V expansion.
+SparsePatchInstallation = AttentionStrategyInstallation
+install_sparse_attention_override = install_attention_strategy
+
+
+__all__ = [
+    "AttentionStrategyInstallation",
+    "SparsePatchInstallation",
+    "install_attention_strategy",
+    "install_sparse_attention_override",
+]

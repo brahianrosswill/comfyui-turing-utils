@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = ROOT / "kernel"
 COMFYUI_ROOT = ROOT.parents[1]
-EXPECTED_VERSION = "0.37.0"
+EXPECTED_VERSION = "0.38.0"
 
 
 def _run(command: list[str], *, cwd: Path = ROOT, env=None) -> None:
@@ -150,6 +150,9 @@ def _static_gate() -> None:
     fused_binding = (KERNEL / "csrc/turing/sage/pybind_fused.cpp").read_text(
         encoding="utf-8"
     )
+    qk_preprocess = (
+        KERNEL / "csrc/turing/sage/qk_preprocess.cu"
+    ).read_text(encoding="utf-8")
     overlap_source = (KERNEL / "csrc/turing/sage/overlap_blend.cu").read_text(
         encoding="utf-8"
     )
@@ -165,6 +168,21 @@ def _static_gate() -> None:
             KERNEL / "csrc/turing/sage/pybind_fused.cpp",
             fused_binding,
             "quant_qk_rms_rope_int8_cuda",
+        ),
+        (
+            KERNEL / "csrc/turing/sage/pybind_fused.cpp",
+            fused_binding,
+            'm.attr("qk_preprocess_protocol_schema") = 2',
+        ),
+        (
+            KERNEL / "csrc/turing/sage/qk_preprocess.cu",
+            qk_preprocess,
+            "at::Tensor query_freqs,",
+        ),
+        (
+            KERNEL / "csrc/turing/sage/qk_preprocess.cu",
+            qk_preprocess,
+            "at::Tensor key_freqs,",
         ),
         (
             KERNEL / "csrc/turing/sage/fused.h",

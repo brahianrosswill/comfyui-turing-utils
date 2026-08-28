@@ -2,10 +2,34 @@
 
 from __future__ import annotations
 
-from ..attention import (
-    apply_sla_attention_patch,
-    apply_sparse_attention_patch,
-)
+from ..adapters.minimax.virtual_kv import apply_h3_virtual_kv
+from ..attention import apply_sla_attention_patch, apply_sparse_attention_patch
+
+
+class H3StaticVirtualKV:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "mode": (
+                    ["conservative", "fast"],
+                    {
+                        "default": "conservative",
+                        "tooltip": "Conservative computes physical 2-slice Query against an exact 7-slice virtual K/V context. Fast keeps 2 K/V slices and collapses the seven temporal RoPE phases to two circular-mean representatives; it is faster but more approximate.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "patch"
+    CATEGORY = "Turing Utils/patches"
+    TITLE = "Configure H3 Static Virtual KV"
+
+    def patch(self, model, mode: str = "conservative"):
+        return (apply_h3_virtual_kv(model, mode=mode),)
 
 
 class LegacySolSparseAttentionPatch:

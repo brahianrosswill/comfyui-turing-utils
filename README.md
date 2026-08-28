@@ -111,6 +111,14 @@ only after its CUDA sources or required version change.
   only blocks that actually execute, and follows ComfyUI's Dynamic VRAM and
   pinned-memory lifecycle. It is a Python-only patch and does not require
   rebuilding the CUDA package.
+- `Configure H3 Static Virtual KV` is an experimental static-image execution
+  mode for an H3 target containing exactly five output frames (two latent-time
+  slices). Physical Query, attention output, residual, and FFN rows stay at
+  two slices. `conservative` presents attention with seven K/V slices using
+  H3's 22-frame temporal positions; `fast` keeps two K/V slices and replaces
+  their temporal RoPE with two representative phases. The node inherits the
+  loader's `w8a8`, `sage`, or `sdpa` dense backend and replaces any upstream
+  Sol/SLA strategy. Bundled Sage/W8A8 require kernel 0.38.0 and a rebuild.
 - `Video Motion Contact Sheet (Experimental)` samples an `N x N` chronological
   storyboard from a loaded `VIDEO` or decoded `IMAGE` frame batch. It can use
   uniform or motion-weighted sampling and optionally wraps each panel in
@@ -134,6 +142,11 @@ only after its CUDA sources or required version change.
   Existing `Patch Sol/SLA Sparse Attention` node IDs remain registered as
   legacy compatibility nodes so saved positional `use_w8a8` widgets do not
   shift. New workflows should use the `Configure` nodes.
+
+The asymmetric-Q/K and independent-Q/K-RoPE protocol underneath virtual K/V is
+model-independent. The five-frame validation and temporal source mapping are
+owned by the MiniMax adapter; a future Bernini mode can reuse the same kernel
+ABI by supplying Bernini-specific physical/virtual layout metadata.
 
 ## Krea2 Identity Edit wiring
 

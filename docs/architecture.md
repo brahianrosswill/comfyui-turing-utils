@@ -68,7 +68,7 @@ effects.
 | `attention/sparse.py` | production Sol policy, exact modality protection, and W8A8/FP16 PV dispatch |
 | `attention/protocol.py` | versioned tensor ownership, transform, capability, and execution contract |
 | `attention/integration.py` | model-neutral projected-QKV handoff and attention-site registry |
-| `attention/orchestration.py` | shared sparse ModelPatcher/layout/executor installation mechanics |
+| `attention/orchestration.py` | shared ModelPatcher/layout/executor strategy installation mechanics |
 | `attention/layout.py` | versioned Query/KV modality topology contract and provider registry |
 | `attention/sparse_runtime.py` | common Sol/SLA schedule state and dense fallback ownership |
 | `attention/patches.py` | thin Sol/SLA strategy composition and loader-independent ModelPatcher installation |
@@ -85,6 +85,7 @@ effects.
 | `adapters/minimax/memory_planning.py` | ComfyUI packed-shape and staged-workspace memory hooks |
 | `adapters/minimax/activation_policy.py` | pure tier/chunk/head/channel decisions with compatibility exports |
 | `adapters/minimax/acceleration.py` | H3 attention/MLP hot-path installation and execution |
+| `adapters/minimax/virtual_kv.py` | H3-only five-frame validation, virtual temporal mapping, and strategy composition |
 | `adapters/krea2.py` | Krea2 Identity Edit reference fitting, grounded conditioning and centered reference RoPE patching |
 | `adapters/wan.py` | Wan/Bernini packed-context planning and supported self-attention preprocessing |
 | `adapters/wan_layout.py` | loader-independent Wan/Bernini self-attention sequence semantics |
