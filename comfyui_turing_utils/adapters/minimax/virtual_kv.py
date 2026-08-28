@@ -203,10 +203,20 @@ def _cached_virtual_inputs(
     tokens_per_frame: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     options = request.transformer_options
+    try:
+        # Ordinary tensors expose a mutation counter, but reading ``_version``
+        # from a tensor created in inference mode raises at runtime.
+        version = int(query_freqs._version)
+    except RuntimeError:
+        version = None
     key = (
+        id(query_freqs),
         int(query_freqs.data_ptr()),
         tuple(query_freqs.shape),
-        int(getattr(query_freqs, "_version", 0)),
+        tuple(query_freqs.stride()),
+        query_freqs.dtype,
+        query_freqs.device,
+        version,
         start,
         stop,
         tokens_per_frame,
@@ -217,8 +227,8 @@ def _cached_virtual_inputs(
     if isinstance(options, dict):
         cache = options.setdefault("turing_utils_h3_virtual_kv_cache", {})
         cached = cache.get(key)
-        if cached is not None:
-            return cached
+        if cached is not None and cached[0] is query_freqs:
+            return cached[1]
     key_freqs = _virtual_target_frequencies(
         query_freqs,
         start,
@@ -236,7 +246,11 @@ def _cached_virtual_inputs(
     result = (key_freqs, source_indices)
     if cache is not None:
         cache.clear()
-        cache[key] = result
+        # Keep the source tensor alive with the cached derivatives so neither
+        # its Python identity nor its storage address can be recycled into a
+        # false cache hit. Inference tensors are immutable by convention here:
+        # ComfyUI reuses one RoPE table across all transformer blocks in a pass.
+        cache[key] = (query_freqs, result)
     return result
 
 

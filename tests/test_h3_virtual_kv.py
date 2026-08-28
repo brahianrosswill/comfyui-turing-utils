@@ -16,6 +16,7 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 
 from comfyui_turing_utils.adapters.minimax.virtual_kv import (  # noqa: E402
     _SOURCE_FRAMES,
+    _cached_virtual_inputs,
     make_h3_virtual_kv_override,
 )
 from comfyui_turing_utils.attention.layout import (  # noqa: E402
@@ -158,6 +159,22 @@ class H3VirtualKVTest(unittest.TestCase):
         self.assertEqual(seen["key"].shape, seen["value"].shape)
         self.assertIsNot(seen["transform"].freqs, seen["transform"].key_freqs)
         self.assertEqual(seen["transform"].key_freqs.shape[1], 32)
+
+    def test_virtual_input_cache_accepts_inference_tensors(self):
+        with torch.inference_mode():
+            prepared, prefix, stop = request()
+            query_freqs = prepared.qk_transform.freqs
+            with self.assertRaisesRegex(RuntimeError, "version counter"):
+                _ = query_freqs._version
+            first = _cached_virtual_inputs(
+                prepared, query_freqs, prefix, stop, tokens_per_frame=4
+            )
+            second = _cached_virtual_inputs(
+                prepared, query_freqs, prefix, stop, tokens_per_frame=4
+            )
+
+        self.assertIs(first[0], second[0])
+        self.assertIs(first[1], second[1])
 
     def test_fast_uses_physical_kv_with_exact_logical_map(self):
         seen = {}
