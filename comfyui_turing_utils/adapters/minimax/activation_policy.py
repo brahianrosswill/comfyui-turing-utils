@@ -239,6 +239,7 @@ def estimate_attention_lifecycle_peak(
     cache_quantized_input: bool,
     quantized_value: bool,
     logical_key_rows: int | None = None,
+    residual_subblocks: int = 0,
 ) -> int:
     """Estimate the peak across projection, V8 preparation and attention."""
     rows = int(rows)
@@ -248,6 +249,9 @@ def estimate_attention_lifecycle_peak(
     element_size = int(element_size)
     group = int(head_group)
     key_rows = rows if logical_key_rows is None else int(logical_key_rows)
+    residual_subblocks = int(residual_subblocks)
+    if residual_subblocks not in (0, 1, 2):
+        raise ValueError("residual_subblocks must be 0, 1, or 2")
     if key_rows < rows:
         raise ValueError("logical K rows cannot be shorter than physical Q rows")
     features = rows * group * head_dim
@@ -264,8 +268,24 @@ def estimate_attention_lifecycle_peak(
             )
             qk_compact = features + key_features + qk_scales
             value_int8 = features + key_features
-            preparation_peak = qkv_projection + qk_compact + value_int8
-            execution_peak = qk_compact + key_features + features * element_size
+            summaries = 0
+            if residual_subblocks:
+                key_blocks = (key_rows + 63) // 64
+                padded_key_blocks = ((key_blocks + 15) // 16) * 16
+                residual_tokens = 64 // residual_subblocks
+                residual_summaries = (key_rows + residual_tokens - 1) // residual_tokens
+                padded_residual_summaries = (
+                    (residual_summaries + 15) // 16
+                ) * 16
+                summaries = (
+                    group * padded_key_blocks * head_dim * 2
+                    + 2 * group * padded_residual_summaries * head_dim * 2
+                    + 2 * group * head_dim * 4
+                )
+            preparation_peak = qkv_projection + qk_compact + value_int8 + summaries
+            execution_peak = (
+                qk_compact + key_features + summaries + features * element_size
+            )
             return destination + max(preparation_peak, execution_peak) + input_cache
         return destination + features * 8 + input_cache
 
@@ -275,10 +295,22 @@ def estimate_attention_lifecycle_peak(
     compact = features + key_features + features * element_size + qk_scales
     value_int8 = key_features if quantized_value else 0
     padded_blocks = ((key_blocks + 15) // 16) * 16
-    summaries = (
-        3 * group * padded_blocks * head_dim * 2
-        + 2 * group * head_dim * 4
-    ) if quantized_value else 0
+    if quantized_value and residual_subblocks:
+        residual_tokens = 64 // residual_subblocks
+        residual_summary_count = (key_rows + residual_tokens - 1) // residual_tokens
+        padded_residual_summaries = (
+            (residual_summary_count + 15) // 16
+        ) * 16
+        summaries = (
+            group * padded_blocks * head_dim * 2
+            + 2 * group * padded_residual_summaries * head_dim * 2
+            + 2 * group * head_dim * 4
+        )
+    else:
+        summaries = (
+            3 * group * padded_blocks * head_dim * 2
+            + 2 * group * head_dim * 4
+        ) if quantized_value else 0
     result = features * element_size
     execution_peak = compact + value_int8 + summaries + result
     tile_rows = min(rows, 16_384)
@@ -464,6 +496,7 @@ def decide_attention_heads(
     runtime_plan: ActivationRuntimePlan | None = None,
     base_model=None,
     logical_key_rows: int | None = None,
+    residual_subblocks: int = 0,
 ) -> AttentionDecision:
     """Choose a whole-head group without changing global sequence attention."""
     rows = int(x.shape[0])
@@ -509,6 +542,7 @@ def decide_attention_heads(
             cache_quantized_input=cache_input and group != heads,
             quantized_value=quantized_value,
             logical_key_rows=logical_key_rows,
+            residual_subblocks=residual_subblocks,
         )
 
     # A cut is legal whenever both sides cover complete ConvRot-256 blocks.

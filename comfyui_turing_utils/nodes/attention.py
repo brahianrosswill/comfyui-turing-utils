@@ -13,10 +13,10 @@ class H3StaticVirtualKV:
             "required": {
                 "model": ("MODEL",),
                 "mode": (
-                    ["conservative", "fast"],
+                    ["conservative", "fast", "residual"],
                     {
                         "default": "conservative",
-                        "tooltip": "Conservative materializes an exact 7-slice virtual K/V context. Fast keeps physical K/V at 2 slices, then uses an exact logical source map with all 7 temporal RoPE phases in bundled W8A8; unsupported or stale kernels safely fall back to conservative materialization.",
+                        "tooltip": "Conservative materializes an exact 7-slice virtual K/V context. Fast keeps 2 physical slices and computes all 7 logical slices exactly in bundled W8A8. Residual keeps the two real slices Dense and compresses the five virtual slices into Sol 2x32 residuals. Unsupported backends or stale kernels safely fall back to exact materialization.",
                     },
                 ),
             }

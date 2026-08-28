@@ -208,12 +208,13 @@ __device__ __forceinline__ b128_t pack_to_half<nv_bfloat16>(const nv_bfloat16 *s
   return bf16_pack_to_half(source);
 }
 
-template <int HeadDim, typename T, bool NormalizeValue>
+template <int HeadDim, typename T, bool NormalizeValue, bool MappedValue = false>
 __global__ void kv_block_summary_kernel(
     const int8_t *__restrict__ key_int8,
     const float *__restrict__ key_scale,
     const T *__restrict__ value,
     const float *__restrict__ value_scale,
+    const int *__restrict__ value_source_indices,
     half *__restrict__ key_summary,
     half *__restrict__ key_score_summary,
     half *__restrict__ value_mean,
@@ -249,11 +250,15 @@ __global__ void kv_block_summary_kernel(
   const T *head_value = value + batch * stride_batch_v + head * stride_head_v;
   for (int token = 0; token < token_count; ++token)
   {
+    const int logical_token = token_start + token;
+    const int value_token = MappedValue
+        ? value_source_indices[logical_token]
+        : logical_token;
     const int residual_index = token / (kBlockTokens / residual_subblocks);
     quantized_key_sum[residual_index] += static_cast<int>(
-        head_key_int8[(token_start + token) * stride_sequence_k_int8 + dimension]);
+        head_key_int8[logical_token * stride_sequence_k_int8 + dimension]);
     value_sum[residual_index] += scalar_to_float(
-        head_value[(token_start + token) * stride_sequence_v + dimension]);
+        head_value[value_token * stride_sequence_v + dimension]);
   }
   const int64_t output_index =
       ((static_cast<int64_t>(batch) * num_heads + head) * padded_blocks + block_index) *
@@ -1808,6 +1813,7 @@ void launch_sparse_threshold_attention(
         key_scale.data_ptr<float>(),
         reinterpret_cast<const T *>(value.data_ptr()),
         UseW8A8 ? value_scale.data_ptr<float>() : nullptr,
+        nullptr,
         reinterpret_cast<half *>(key_summary.data_ptr()),
         reinterpret_cast<half *>(key_score_summary.data_ptr()),
         reinterpret_cast<half *>(value_mean.data_ptr()),
@@ -3024,11 +3030,12 @@ at::Tensor sol_sparse_online_int8_f16_attn(
   return selected_count;
 }
 
-std::vector<at::Tensor> sol_w8a8_precompute_summaries(
+static std::vector<at::Tensor> sol_w8a8_precompute_summaries_impl(
     at::Tensor key_int8,
     at::Tensor key_scale,
     at::Tensor value,
     at::Tensor value_scale,
+    const at::Tensor *value_source_indices,
     int residual_subblocks,
     int route_original_basis)
 {
@@ -3047,6 +3054,15 @@ std::vector<at::Tensor> sol_w8a8_precompute_summaries(
   CHECK_DTYPE(key_int8, at::ScalarType::Char);
   CHECK_DTYPE(key_scale, at::ScalarType::Float);
   CHECK_DTYPE(value_scale, at::ScalarType::Float);
+  const bool mapped_value = value_source_indices != nullptr;
+  if (mapped_value)
+  {
+    const at::Tensor &source_indices = *value_source_indices;
+    CHECK_CUDA(source_indices);
+    CHECK_CONTIGUOUS(source_indices);
+    CHECK_DIMS(source_indices, 1);
+    CHECK_DTYPE(source_indices, at::ScalarType::Int);
+  }
   TORCH_CHECK(
       value.scalar_type() == at::ScalarType::Half ||
           value.scalar_type() == at::ScalarType::BFloat16,
@@ -3054,15 +3070,19 @@ std::vector<at::Tensor> sol_w8a8_precompute_summaries(
   TORCH_CHECK(
       key_int8.device() == key_scale.device() &&
           key_int8.device() == value.device() &&
-          key_int8.device() == value_scale.device(),
+          key_int8.device() == value_scale.device() &&
+          (!mapped_value || key_int8.device() == value_source_indices->device()),
       "Sol W8A8 summary tensors must share one CUDA device");
   TORCH_CHECK(
       key_int8.size(0) == value.size(0) &&
           key_int8.size(1) == value.size(1) &&
-          key_int8.size(2) == value.size(2) &&
+          (mapped_value || key_int8.size(2) == value.size(2)) &&
           (key_int8.size(3) == 64 || key_int8.size(3) == 128) &&
           value.size(3) == key_int8.size(3),
       "Sol W8A8 summary K/V shapes are incompatible");
+  TORCH_CHECK(
+      !mapped_value || value_source_indices->numel() == key_int8.size(2),
+      "mapped Sol W8A8 summary source map must match logical K length");
   TORCH_CHECK(
       residual_subblocks == 1 || residual_subblocks == 2,
       "Sol residual_subblocks must be 1 or 2");
@@ -3102,13 +3122,14 @@ std::vector<at::Tensor> sol_w8a8_precompute_summaries(
 
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   dim3 summary_grid(num_key_blocks, num_kv_heads, batch_size);
-#define LAUNCH_SUMMARY(HEAD_DIM, SCALAR)                                     \
-    kv_block_summary_kernel<HEAD_DIM, SCALAR, true><<<                       \
+#define LAUNCH_SUMMARY(HEAD_DIM, SCALAR, MAPPED)                             \
+    kv_block_summary_kernel<HEAD_DIM, SCALAR, true, MAPPED><<<               \
         summary_grid, HEAD_DIM, 0, stream>>>(                                \
         key_int8.data_ptr<int8_t>(),                                         \
         key_scale.data_ptr<float>(),                                         \
         reinterpret_cast<const SCALAR *>(value.data_ptr()),                  \
         value_scale.data_ptr<float>(),                                       \
+        mapped_value ? value_source_indices->data_ptr<int>() : nullptr,       \
         reinterpret_cast<half *>(key_summary.data_ptr()),                    \
         reinterpret_cast<half *>(key_score_summary.data_ptr()),              \
         reinterpret_cast<half *>(value_mean.data_ptr()),                     \
@@ -3121,16 +3142,28 @@ std::vector<at::Tensor> sol_w8a8_precompute_summaries(
   if (value.scalar_type() == at::ScalarType::Half)
   {
     if (head_dim == 64)
-      LAUNCH_SUMMARY(64, half);
+    {
+      if (mapped_value) LAUNCH_SUMMARY(64, half, true);
+      else LAUNCH_SUMMARY(64, half, false);
+    }
     else
-      LAUNCH_SUMMARY(128, half);
+    {
+      if (mapped_value) LAUNCH_SUMMARY(128, half, true);
+      else LAUNCH_SUMMARY(128, half, false);
+    }
   }
   else
   {
     if (head_dim == 64)
-      LAUNCH_SUMMARY(64, nv_bfloat16);
+    {
+      if (mapped_value) LAUNCH_SUMMARY(64, nv_bfloat16, true);
+      else LAUNCH_SUMMARY(64, nv_bfloat16, false);
+    }
     else
-      LAUNCH_SUMMARY(128, nv_bfloat16);
+    {
+      if (mapped_value) LAUNCH_SUMMARY(128, nv_bfloat16, true);
+      else LAUNCH_SUMMARY(128, nv_bfloat16, false);
+    }
   }
 #undef LAUNCH_SUMMARY
   check_launch("sparse K/V summary");
@@ -3151,6 +3184,33 @@ std::vector<at::Tensor> sol_w8a8_precompute_summaries(
       value_mean,
       key_summary_mean,
       key_summary_variance};
+}
+
+std::vector<at::Tensor> sol_w8a8_precompute_summaries(
+    at::Tensor key_int8,
+    at::Tensor key_scale,
+    at::Tensor value,
+    at::Tensor value_scale,
+    int residual_subblocks,
+    int route_original_basis)
+{
+  return sol_w8a8_precompute_summaries_impl(
+      key_int8, key_scale, value, value_scale, nullptr,
+      residual_subblocks, route_original_basis);
+}
+
+std::vector<at::Tensor> sol_w8a8_precompute_mapped_summaries(
+    at::Tensor key_int8,
+    at::Tensor key_scale,
+    at::Tensor value,
+    at::Tensor value_scale,
+    at::Tensor value_source_indices,
+    int residual_subblocks,
+    int route_original_basis)
+{
+  return sol_w8a8_precompute_summaries_impl(
+      key_int8, key_scale, value, value_scale, &value_source_indices,
+      residual_subblocks, route_original_basis);
 }
 
 at::Tensor sol_sparse_online_w8a8_prequantized_attn(

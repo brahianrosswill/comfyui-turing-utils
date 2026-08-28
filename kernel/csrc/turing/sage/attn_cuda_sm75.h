@@ -58,6 +58,15 @@ std::vector<at::Tensor> sol_w8a8_precompute_summaries(
                     int residual_subblocks,
                     int route_original_basis);
 
+std::vector<at::Tensor> sol_w8a8_precompute_mapped_summaries(
+                    at::Tensor key_int8,
+                    at::Tensor key_scale,
+                    at::Tensor value,
+                    at::Tensor value_scale,
+                    at::Tensor value_source_indices,
+                    int residual_subblocks,
+                    int route_original_basis);
+
 at::Tensor sol_sparse_online_w8a8_prequantized_attn(
                     at::Tensor query_int8,
                     at::Tensor key_int8,

@@ -699,6 +699,54 @@ def validate_qk_preprocessing(device: torch.device) -> None:
     if not torch.equal(expanded_output, mapped_output):
         raise RuntimeError("mapped W8A8 output differs from exact materialization")
 
+    # The residual path must derive the same K/V summaries directly from the
+    # physical V and source map. This avoids retaining a logical BF16 V while
+    # preserving Sol's route and online-softmax correction exactly.
+    sparse_policy = dict(
+        use_w8a8=True,
+        force_dense=False,
+        dense_query_ranges=(),
+        exact_kv_ranges=((0, physical_tokens),),
+        threshold_sigma=1_000_000.0,
+        residual_subblocks=2,
+    )
+    expanded_sparse = prequantize_sol_sageattn_from_qk(
+        expanded,
+        expanded_value,
+        **sparse_policy,
+    )
+    mapped_sparse = prequantize_sol_sageattn_from_qk(
+        mapped,
+        value,
+        value_source_indices=source_indices,
+        **sparse_policy,
+    )
+    valid_summary_lengths = (
+        (logical_tokens + 63) // 64,
+        (logical_tokens + 31) // 32,
+        (logical_tokens + 31) // 32,
+        None,
+        None,
+    )
+    for index, (expected, actual, valid_length) in enumerate(
+        zip(
+            expanded_sparse.summaries,
+            mapped_sparse.summaries,
+            valid_summary_lengths,
+        )
+    ):
+        if valid_length is not None:
+            expected = expected[:, :, :valid_length]
+            actual = actual[:, :, :valid_length]
+        if not torch.equal(expected, actual):
+            raise RuntimeError(
+                f"mapped Sol summary {index} differs from exact materialization"
+            )
+    expanded_sparse_output = sol_sparse_sageattn_from_prequantized(expanded_sparse)
+    mapped_sparse_output = sol_sparse_sageattn_from_prequantized(mapped_sparse)
+    if not torch.equal(expanded_sparse_output, mapped_sparse_output):
+        raise RuntimeError("mapped Sol output differs from exact materialization")
+
 
 def _validate_varlen_batches(
     output: torch.Tensor,

@@ -1096,17 +1096,25 @@ def _make_attention_forward(
             if virtual_kv
             else None
         )
+        virtual_kv_mode = getattr(
+            executor, "turing_utils_h3_virtual_kv_mode", None
+        )
+        virtual_kv_capability = (
+            "mapped_sparse_kv" if virtual_kv_mode == "residual" else "mapped_kv"
+        )
         mapped_virtual_kv = bool(
             virtual_kv
             and logical_key_rows is not None
-            and getattr(executor, "turing_utils_h3_virtual_kv_mode", None)
-            == "fast"
+            and virtual_kv_mode in {"fast", "residual"}
             and getattr(
                 executor,
                 "turing_utils_h3_virtual_kv_mapped_available",
                 False,
             )
-            and kernel_capabilities().supports("mapped_kv").supported
+            and kernel_capabilities().supports(virtual_kv_capability).supported
+        )
+        virtual_residual_subblocks = (
+            2 if mapped_virtual_kv and virtual_kv_mode == "residual" else 0
         )
         streamed_executor = (
             getattr(executor, _STREAMED_QKV_EXECUTOR_ATTR, None)
@@ -1140,6 +1148,7 @@ def _make_attention_forward(
                 runtime_plan=runtime_plan,
                 base_model=base_model,
                 logical_key_rows=logical_key_rows,
+                residual_subblocks=virtual_residual_subblocks,
             )
             if head_decision.sharded:
                 profile_shape = (1, self.heads, x.shape[0], self.head_dim)
@@ -1211,6 +1220,7 @@ def _make_attention_forward(
                 cache_quantized_input=False,
                 quantized_value=mapped_virtual_kv,
                 logical_key_rows=logical_key_rows,
+                residual_subblocks=virtual_residual_subblocks,
             )
             if not mapped_virtual_kv:
                 # Exact fallback materializes logical BF16 K and V before the

@@ -727,8 +727,8 @@ def prequantize_sol_sageattn_from_qk(
     if value.ndim != 4 or value.stride(-1) != 1:
         raise ValueError("preprocessed Sol V must be four-dimensional with contiguous channels")
     mapped_value = value_source_indices is not None
-    if mapped_value and (not use_w8a8 or not force_dense):
-        raise ValueError("mapped V preparation requires dense W8A8 attention")
+    if mapped_value and not use_w8a8:
+        raise ValueError("mapped V preparation requires W8A8 attention")
     if mapped_value:
         if (
             value_source_indices.ndim != 1
@@ -829,15 +829,25 @@ def prequantize_sol_sageattn_from_qk(
             )
             summaries = (half_empty, half_empty, half_empty, float_empty, float_empty)
         else:
+            summary_function = (
+                _qattn.sol_w8a8_precompute_mapped_summaries
+                if mapped_value
+                else _qattn.sol_w8a8_precompute_summaries
+            )
+            summary_args = (
+                qk.key_int8,
+                qk.key_scale,
+                value,
+                value_scale,
+            )
+            if mapped_value:
+                summary_args += (value_source_indices,)
+            summary_args += (
+                residual_subblocks,
+                int(qk.route_original_basis),
+            )
             summaries = tuple(
-                _qattn.sol_w8a8_precompute_summaries(
-                    qk.key_int8,
-                    qk.key_scale,
-                    value,
-                    value_scale,
-                    residual_subblocks,
-                    int(qk.route_original_basis),
-                )
+                summary_function(*summary_args)
             )
         retained_value = None
     else:

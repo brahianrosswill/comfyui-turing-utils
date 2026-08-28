@@ -14,7 +14,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 KERNEL = ROOT / "kernel"
 COMFYUI_ROOT = ROOT.parents[1]
-EXPECTED_VERSION = "0.39.0"
+EXPECTED_VERSION = "0.40.0"
 
 
 def _run(command: list[str], *, cwd: Path = ROOT, env=None) -> None:
@@ -104,6 +104,12 @@ def _static_gate() -> None:
         raise RuntimeError(
             "C++/pybind attention ABI does not expose all key-tile arguments"
         )
+    binding = (KERNEL / "csrc/turing/sage/pybind_sm75.cpp").read_text(
+        encoding="utf-8"
+    )
+    mapped_summary = "sol_w8a8_precompute_mapped_summaries"
+    if mapped_summary not in header or mapped_summary not in cuda or mapped_summary not in binding:
+        raise RuntimeError("mapped Sol summary ABI is incomplete")
     setup_source = (KERNEL / "setup.py").read_text(encoding="utf-8")
     for marker in (
         "CUDA_TOOLKIT_VERSION = _cuda_toolkit_version()",

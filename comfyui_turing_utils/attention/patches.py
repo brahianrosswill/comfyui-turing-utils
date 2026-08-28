@@ -15,6 +15,7 @@ from .protocol import (
     AttentionBackendCapabilities,
     AttentionExecutionOutcome,
     MAPPED_KV_EXECUTOR_ATTR,
+    MAPPED_RESIDUAL_EXECUTOR_ATTR,
     PreparedAttention,
 )
 from .runtime import (
@@ -24,6 +25,7 @@ from .runtime import (
 )
 from .sparse_runtime import DenseAttentionFallback, SparseSchedule
 from .sparse import (
+    SolAttentionCall,
     inspect_sol_attention_call,
     inspect_sla_attention_call,
     prequantize_turing_sla_attention,
@@ -223,31 +225,25 @@ def _make_dense_prepared_executor(kernel: str) -> Callable:
     executor.capabilities = capabilities
     if kernel == "w8a8":
 
-        def mapped_kv_executor(
+        def mapped_attention_call(
             request: PreparedAttention,
             key_source_indices: torch.Tensor,
-        ) -> AttentionExecutionOutcome:
+        ):
             reason = capabilities.unsupported_reason(request)
             if reason is not None:
-                return AttentionExecutionOutcome.unsupported(reason)
+                return None, reason
             if (
                 not torch.is_tensor(key_source_indices)
                 or key_source_indices.ndim != 1
                 or key_source_indices.dtype != torch.int32
             ):
-                return AttentionExecutionOutcome.unsupported(
-                    "mapped K/V requires a one-dimensional int32 source map"
-                )
+                return None, "mapped K/V requires a one-dimensional int32 source map"
             query_view, key_view, value_view = request.peek_qkv()
             if key_source_indices.device != key_view.device:
-                return AttentionExecutionOutcome.unsupported(
-                    "mapped K/V source map is on a different device"
-                )
+                return None, "mapped K/V source map is on a different device"
             logical_tokens = int(key_source_indices.numel())
             if logical_tokens < 64:
-                return AttentionExecutionOutcome.unsupported(
-                    "mapped K/V requires at least 64 logical tokens"
-                )
+                return None, "mapped K/V requires at least 64 logical tokens"
             logical_key = key_view[:, :, :1, :].expand(
                 key_view.shape[0], key_view.shape[1], logical_tokens, key_view.shape[3]
             )
@@ -266,18 +262,23 @@ def _make_dense_prepared_executor(kernel: str) -> Callable:
                 kernel="w8a8",
                 require_long_sequence=True,
             )
-            if reason is not None:
-                return AttentionExecutionOutcome.unsupported(reason)
-            if (
+            if reason is None and (
                 call.heads != request.heads
                 or call.kv_heads != request.kv_heads
                 or call.head_dim != request.head_dim
                 or call.query_tokens != request.query_tokens
             ):
-                return AttentionExecutionOutcome.unsupported(
-                    "mapped prepared-attention metadata does not match Q/K/V"
-                )
+                reason = "mapped prepared-attention metadata does not match Q/K/V"
             del query_view, key_view, value_view, logical_key, logical_value
+            return call, reason
+
+        def mapped_kv_executor(
+            request: PreparedAttention,
+            key_source_indices: torch.Tensor,
+        ) -> AttentionExecutionOutcome:
+            call, reason = mapped_attention_call(request, key_source_indices)
+            if reason is not None:
+                return AttentionExecutionOutcome.unsupported(reason)
             query, key, value = request.consume_qkv()
             qk = _profiled(
                 "attention.qk_norm_rope_quant",
@@ -311,6 +312,63 @@ def _make_dense_prepared_executor(kernel: str) -> Callable:
             )
 
         setattr(executor, MAPPED_KV_EXECUTOR_ATTR, mapped_kv_executor)
+
+        def mapped_residual_executor(
+            request: PreparedAttention,
+            key_source_indices: torch.Tensor,
+            *,
+            exact_kv_ranges: tuple[tuple[int, int], ...],
+            residual_subblocks: int = 2,
+            routing_threshold: float = 1_000_000.0,
+        ) -> AttentionExecutionOutcome:
+            call, reason = mapped_attention_call(request, key_source_indices)
+            if reason is not None:
+                return AttentionExecutionOutcome.unsupported(reason)
+            sol_call = SolAttentionCall(
+                attention=call,
+                effective_min_sequence=64,
+                dense_query_ranges=(),
+                exact_kv_ranges=tuple(exact_kv_ranges),
+                residual_subblocks=int(residual_subblocks),
+            )
+            query, key, value = request.consume_qkv()
+            qk = _profiled(
+                "attention.qk_norm_rope_quant",
+                prequantize_turing_qk,
+                query,
+                key,
+                request.qk_transform,
+                kernel="sol",
+                key_source_indices=key_source_indices,
+            )
+            del query, key
+            quantized = _profiled(
+                "attention.value_route_prepare",
+                prequantize_turing_sol_attention_from_qk,
+                qk,
+                value,
+                sol_call,
+                routing_threshold=float(routing_threshold),
+                scale=request.scale,
+                use_w8a8=True,
+                value_source_indices=key_source_indices,
+            )
+            del qk, value
+            collect_stats = CUDA_PHASE_PROFILER.enabled
+            result = _profiled(
+                "attention.execute",
+                turing_sol_attention_from_prequantized,
+                quantized,
+                return_stats=collect_stats,
+            )
+            if collect_stats:
+                output, selected, possible_blocks = result
+                _profile_route_stats(selected, possible_blocks)
+            else:
+                output = result
+            return AttentionExecutionOutcome(output)
+
+        setattr(executor, MAPPED_RESIDUAL_EXECUTOR_ATTR, mapped_residual_executor)
 
         def streamed_qkv_executor(
             qk,

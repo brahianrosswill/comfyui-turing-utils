@@ -276,7 +276,7 @@ invisibly to `sage` and are not displayed by the loader.
 | `w8a8` on sm75+ | stable-Sage INT8 score domain | optional adaptive K anchor | channel-wise signed INT8 V and unsigned INT8 probabilities, INT32 Tensor Core PV, FP32 online state |
 | `Configure Sol Sparse Attention` | fused 64-token centroid routing; selected tiles reuse stable Sage INT8 QK | input-adaptive `mean + tau * std` threshold | inherited W8A8 exact PV, or FP16 exact V tiles for Sage/SDPA; skipped-block V centroids and FP32 online accumulation |
 | `Configure SLA Sparse Attention` | one route shared by adjacent Q64 CTAs (logical Q128 x K64); selected tiles reuse stable Sage INT8 QK | fixed Top-K budget; Smooth-K-invariant ordering | inherited W8A8 PV or FP16 selected tiles; no skipped-block residual |
-| `Configure H3 Static Virtual KV` | physical Query remains two H3 latent-time slices; conservative mode materializes seven BF16 K/V slices, while kernel 0.39 fast mode maps two physical slices into the same seven logical INT8 K/V slices | all seven exact temporal RoPE phases; no sparse routing | mapped fast path uses bundled dense W8A8; Sage/SDPA safely materialize the conservative representation; Sol/SLA is replaced |
+| `Configure H3 Static Virtual KV` | physical Query remains two H3 latent-time slices; conservative materializes seven BF16 K/V slices, kernel 0.39 fast maps two physical slices into seven exact logical INT8 K/V slices, and kernel 0.40 residual keeps the first two slices exact while routing the five virtual slices as Sol residuals | all seven real temporal RoPE phases; residual uses 2x32 summaries with exact physical-context ranges | mapped fast/residual paths use bundled W8A8; Sage/SDPA safely materialize the conservative representation; an upstream Sol/SLA strategy is replaced |
 
 Integer Q/K MMA accumulates into INT32. The stable facade supports FP16 and
 BF16 Q/K/V, HND/NHD, GQA, causal mode, unequal Q/KV lengths, head dimensions
@@ -394,6 +394,14 @@ preprocessor reads physical K through that map while applying the logical RoPE
 table, and the W8A8 value path gathers the already-quantized channel-major V
 container with its native 16-token permutation. Thus fast virtual K/V avoids
 expanded BF16 storage without changing the seven-slice attention problem.
+
+Kernel 0.40 extends Sol's K/V summary pass with the same logical-to-physical V
+map. H3's `residual` mode marks the prefix, both physical target slices, and
+any suffix/reference context exact. The remaining five virtual target slices
+are represented by two 32-token residuals per skipped K block and merged into
+the exact blocks by Sol's existing online softmax. The route still retains its
+one-block local safety neighborhood; there is no post-attention averaging or
+separate dense-plus-residual output blend.
 
 The compute_75 cubin reports at most 21,128 bytes static shared memory and 76
 registers/thread for D128 preprocessing, or 10,632 bytes and 59

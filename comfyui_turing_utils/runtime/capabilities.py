@@ -77,6 +77,7 @@ class RuntimeCapabilities:
             "fused_qk",
             "asymmetric_qk_rope",
             "mapped_kv",
+            "mapped_sparse_kv",
             "reusable_k_anchor",
             "overlap_accumulate",
             "core_fusions",
@@ -166,6 +167,13 @@ def kernel_capabilities() -> KernelCapabilities:
         )
     ):
         features.add("mapped_kv")
+    if (
+        "mapped_kv" in features
+        and kernel_extension_has_symbol(
+            "sol_w8a8_precompute_mapped_summaries", "_sage_qattn_sm75"
+        )
+    ):
+        features.add("mapped_sparse_kv")
     return KernelCapabilities(True, version, frozenset(features))
 
 

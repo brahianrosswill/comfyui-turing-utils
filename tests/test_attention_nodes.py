@@ -34,7 +34,9 @@ class SparseAttentionNodeTest(unittest.TestCase):
         self.assertEqual(node.TITLE, "Configure H3 Static Virtual KV")
         inputs = node.INPUT_TYPES()["required"]
         self.assertEqual(tuple(inputs), ("model", "mode"))
-        self.assertEqual(inputs["mode"][0], ["conservative", "fast"])
+        self.assertEqual(
+            inputs["mode"][0], ["conservative", "fast", "residual"]
+        )
         model = object()
         patched = object()
         with mock.patch(

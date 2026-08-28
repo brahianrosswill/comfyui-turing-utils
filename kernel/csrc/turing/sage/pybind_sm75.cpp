@@ -66,6 +66,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("qk_int8_sv_f16_varlen_accum_f32_attn", &qk_int8_sv_f16_varlen_accum_f32_attn, "Varlen QK int8 sv f16 accum f32 attn per warp");
   m.def("sol_sparse_online_int8_f16_attn", &sol_sparse_online_int8_f16_attn, "Sol online-routed sparse attention with INT8 QK and FP16/BF16 V for sm75+");
   m.def("sol_w8a8_precompute_summaries", &sol_w8a8_precompute_summaries, "Precompute Sol W8A8 correction summaries before releasing floating-point V");
+  m.def("sol_w8a8_precompute_mapped_summaries", &sol_w8a8_precompute_mapped_summaries, "Precompute Sol W8A8 correction summaries from a logical-to-physical V map");
   m.def("sol_sparse_online_w8a8_prequantized_attn", &sol_sparse_online_w8a8_prequantized_attn, "Sol W8A8 attention from prequantized Q/K/V and correction summaries");
   m.def("sla_qk_block_summaries", &sla_qk_block_summaries, "SLA 128x64 Q/K block summaries from quantized Sage tensors");
   m.def("sla_build_route_words", &sla_build_route_words, "Pack SLA fixed-Top-K and exact-KV policy into route words");

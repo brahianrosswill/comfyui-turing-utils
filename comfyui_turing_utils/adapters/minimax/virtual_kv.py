@@ -18,6 +18,7 @@ from ...attention.patches import attention_base_runtime
 from ...attention.protocol import (
     AttentionExecutionOutcome,
     MAPPED_KV_EXECUTOR_ATTR,
+    MAPPED_RESIDUAL_EXECUTOR_ATTR,
     PreparedAttention,
 )
 from ...attention.stable import LOG
@@ -25,7 +26,9 @@ from ...runtime.capabilities import kernel_capabilities
 
 
 H3_VIRTUAL_KV_STRATEGY = "h3_virtual_kv"
-H3_VIRTUAL_KV_MODES = ("conservative", "fast")
+H3_VIRTUAL_KV_MODES = ("conservative", "fast", "residual")
+H3_VIRTUAL_KV_RESIDUAL_SUBBLOCKS = 2
+H3_VIRTUAL_KV_RESIDUAL_THRESHOLD = 1_000_000.0
 _SOURCE_FRAMES = (0, 1, 1, 1, 1, 0, 1)
 # H3's latent-time positions use spans [1, 4, 4, 4, 4] * 5/3.
 # Expressing every position in units of the first span avoids depending on a
@@ -278,11 +281,20 @@ def make_h3_virtual_kv_override(
         )
         query, key, value = request.consume_qkv()
         mapped_executor = getattr(dense_executor, MAPPED_KV_EXECUTOR_ATTR, None)
-        mapped = bool(
+        residual_executor = getattr(
+            dense_executor, MAPPED_RESIDUAL_EXECUTOR_ATTR, None
+        )
+        mapped_exact = bool(
             mode == "fast"
             and callable(mapped_executor)
             and kernel_capabilities().supports("mapped_kv").supported
         )
+        mapped_residual = bool(
+            mode == "residual"
+            and callable(residual_executor)
+            and kernel_capabilities().supports("mapped_sparse_kv").supported
+        )
+        mapped = mapped_exact or mapped_residual
         if not mapped:
             key = _expand_target(key, start, stop, tokens_per_frame)
             value = _expand_target(value, start, stop, tokens_per_frame)
@@ -305,14 +317,58 @@ def make_h3_virtual_kv_override(
             skip_output_reshape=request.skip_output_reshape,
             observer_requirements=request.observer_requirements,
         )
-        if mapped:
+        if mapped_exact:
             return mapped_executor(virtual, source_indices)
+        if mapped_residual:
+            logical_target_stop = start + 7 * tokens_per_frame
+            exact_kv_ranges = [(0, start + 2 * tokens_per_frame)]
+            if logical_target_stop < int(source_indices.numel()):
+                exact_kv_ranges.append(
+                    (logical_target_stop, int(source_indices.numel()))
+                )
+            outcome = residual_executor(
+                virtual,
+                source_indices,
+                exact_kv_ranges=tuple(exact_kv_ranges),
+                residual_subblocks=H3_VIRTUAL_KV_RESIDUAL_SUBBLOCKS,
+                routing_threshold=H3_VIRTUAL_KV_RESIDUAL_THRESHOLD,
+            )
+            if outcome.supported:
+                return outcome
+            # Prepared executors must reject before consuming. Preserve exact
+            # behavior if an otherwise capable runtime declines this shape.
+            query, key, value = virtual.consume_qkv()
+            key = _expand_target(key, start, stop, tokens_per_frame)
+            value = _expand_target(value, start, stop, tokens_per_frame)
+            virtual = PreparedAttention.from_hnd(
+                _TensorOwner(query),
+                _TensorOwner(key),
+                _TensorOwner(value),
+                heads=request.heads,
+                qk_transform=transform,
+                transformer_options=request.transformer_options,
+                scale=request.scale,
+                mask=None,
+                is_causal=False,
+                low_precision_attention=request.low_precision_attention,
+                skip_output_reshape=request.skip_output_reshape,
+                observer_requirements=request.observer_requirements,
+            )
         return dense_executor(virtual)
 
     prepared_executor.capabilities = getattr(dense_executor, "capabilities", None)
     prepared_executor.turing_utils_h3_virtual_kv_mode = mode
-    prepared_executor.turing_utils_h3_virtual_kv_mapped_available = callable(
-        getattr(dense_executor, MAPPED_KV_EXECUTOR_ATTR, None)
+    prepared_executor.turing_utils_h3_virtual_kv_mapped_available = bool(
+        (
+            mode == "fast"
+            and callable(getattr(dense_executor, MAPPED_KV_EXECUTOR_ATTR, None))
+        )
+        or (
+            mode == "residual"
+            and callable(
+                getattr(dense_executor, MAPPED_RESIDUAL_EXECUTOR_ATTR, None)
+            )
+        )
     )
     attention_override.prepared_attention_executor = prepared_executor
     attention_override.turing_utils_attention_backend = H3_VIRTUAL_KV_STRATEGY
@@ -349,6 +405,15 @@ def apply_h3_virtual_kv(model, *, mode: str = "conservative"):
             "H3 fast virtual K/V needs kernel 0.39.0 mapped-K/V support; "
             "using the exact materialized path until the native kernel is rebuilt"
         )
+    if (
+        mode == "residual"
+        and runtime.dense_backend == "w8a8"
+        and not kernel_capabilities().supports("mapped_sparse_kv").supported
+    ):
+        LOG.warning(
+            "H3 residual virtual K/V needs kernel 0.40.0 mapped-Sol support; "
+            "using the exact materialized path until the native kernel is rebuilt"
+        )
     override = make_h3_virtual_kv_override(runtime.dense_override, mode=mode)
     installed = install_attention_strategy(
         model,
@@ -361,15 +426,18 @@ def apply_h3_virtual_kv(model, *, mode: str = "conservative"):
     LOG.info(
         "H3 static virtual K/V enabled: mode=%s physical_frames=5 "
         "physical_latent_t=2 virtual_frames=22 virtual_latent_t=7 "
-        "dense_backend=%s sparse_attention=disabled",
+        "dense_backend=%s residual_virtual_groups=%s",
         mode,
         runtime.dense_backend,
+        5 if mode == "residual" else 0,
     )
     return installed.model
 
 
 __all__ = [
     "H3_VIRTUAL_KV_MODES",
+    "H3_VIRTUAL_KV_RESIDUAL_SUBBLOCKS",
+    "H3_VIRTUAL_KV_RESIDUAL_THRESHOLD",
     "H3_VIRTUAL_KV_STRATEGY",
     "apply_h3_virtual_kv",
     "make_h3_virtual_kv_override",

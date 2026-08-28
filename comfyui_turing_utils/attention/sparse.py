@@ -534,6 +534,7 @@ def prequantize_turing_sol_attention_from_qk(
     routing_threshold: float,
     scale: float | None,
     use_w8a8: bool,
+    value_source_indices: torch.Tensor | None = None,
 ) -> PrequantizedAttentionCall:
     state = load_turing_sage().prequantize_sol_sageattn_from_qk(
         qk,
@@ -545,6 +546,7 @@ def prequantize_turing_sol_attention_from_qk(
         residual_subblocks=call.residual_subblocks,
         use_w8a8=bool(use_w8a8),
         key_tile_tokens=0,
+        value_source_indices=value_source_indices,
     )
     return PrequantizedAttentionCall(state, call.attention)
 

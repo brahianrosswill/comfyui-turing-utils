@@ -202,6 +202,55 @@ class H3VirtualKVTest(unittest.TestCase):
             list(_SOURCE_FRAMES),
         )
 
+    def test_residual_keeps_real_kv_physical_and_protects_two_real_slices(self):
+        seen = {}
+
+        def dense_executor(prepared):
+            raise AssertionError("mapped residual path should bypass materialization")
+
+        def residual_executor(prepared, source_indices, **policy):
+            seen["query"], seen["key"], seen["value"] = prepared.peek_qkv()
+            seen["transform"] = prepared.qk_transform
+            seen["source_indices"] = source_indices
+            seen["policy"] = policy
+            prepared.consume_qkv()
+            return AttentionExecutionOutcome(
+                torch.zeros((1, prepared.query_tokens, 2 * 128))
+            )
+
+        dense_executor.turing_utils_mapped_residual_executor = residual_executor
+
+        def dense_override(original, *args, **kwargs):
+            return original(*args, **kwargs)
+
+        dense_override.prepared_attention_executor = dense_executor
+        prepared, prefix, stop = request()
+        capabilities = SimpleNamespace(
+            supports=lambda feature: SimpleNamespace(
+                supported=feature == "mapped_sparse_kv"
+            )
+        )
+        with mock.patch(
+            "comfyui_turing_utils.adapters.minimax.virtual_kv.kernel_capabilities",
+            return_value=capabilities,
+        ):
+            outcome = make_h3_virtual_kv_override(
+                dense_override, mode="residual"
+            ).prepared_attention_executor(prepared)
+
+        self.assertTrue(outcome.supported)
+        self.assertEqual(seen["key"].shape[2], stop)
+        self.assertEqual(seen["value"].shape[2], stop)
+        self.assertEqual(seen["transform"].key_freqs.shape[1], prefix + 7 * 4)
+        self.assertEqual(seen["policy"]["exact_kv_ranges"], ((0, stop),))
+        self.assertEqual(seen["policy"]["residual_subblocks"], 2)
+        self.assertEqual(seen["policy"]["routing_threshold"], 1_000_000.0)
+
+    def test_residual_falls_back_to_exact_materialization_without_new_kernel(self):
+        seen, prefix, _ = self._run("residual")
+        self.assertEqual(seen["key"].shape[2], prefix + 7 * 4)
+        self.assertEqual(seen["key"].shape, seen["value"].shape)
+
     def test_non_five_frame_target_fails_before_dense_execution(self):
         called = False
 
