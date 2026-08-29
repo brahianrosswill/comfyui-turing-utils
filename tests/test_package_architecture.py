@@ -16,6 +16,7 @@ class PackageArchitectureTest(unittest.TestCase):
         source = (ROOT / "__init__.py").read_text(encoding="utf-8")
         self.assertIn('WEB_DIRECTORY = "./web"', source)
         self.assertTrue((ROOT / "web" / "keyframe_outputs.js").is_file())
+        self.assertTrue((ROOT / "web" / "stage_barrier_outputs.js").is_file())
 
     def test_kernel_package_is_accessed_only_through_facade(self):
         package = ROOT / "comfyui_turing_utils"
@@ -155,6 +156,7 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsKrea2IdentityEditConditioning",
                 "TuringUtilsIsInputPresent",
                 "TuringUtilsLazyIfElse",
+                "TuringUtilsStageBarrier",
                 "TuringUtilsH3ConcatAVLatent",
                 "TuringUtilsH3SeparateAVLatent",
                 "TuringUtilsH3LatentInfo",

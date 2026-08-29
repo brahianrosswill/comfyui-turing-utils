@@ -12,7 +12,7 @@ from .nodes.attention import (
 from .nodes.bernini import BerniniContextWindowsCore, BerniniInpaintCondition
 from .nodes.krea2 import Krea2IdentityEditConditioning
 from .nodes.loaders import ConvRotCLIPLoader, ConvRotDiffusionModelLoader
-from .nodes.logic import IsInputPresent, LazyIfElse
+from .nodes.logic import IsInputPresent, LazyIfElse, StageBarrier
 from .nodes.media import ResizeImageIfPresent, VideoMotionContactSheet
 from .nodes.minimax import (
     H3ConcatAVLatent,
@@ -51,6 +51,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsKrea2IdentityEditConditioning": Krea2IdentityEditConditioning,
     "TuringUtilsIsInputPresent": IsInputPresent,
     "TuringUtilsLazyIfElse": LazyIfElse,
+    "TuringUtilsStageBarrier": StageBarrier,
     "TuringUtilsH3ConcatAVLatent": H3ConcatAVLatent,
     "TuringUtilsH3SeparateAVLatent": H3SeparateAVLatent,
     "TuringUtilsH3LatentInfo": H3LatentInfo,
@@ -87,6 +88,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsKrea2IdentityEditConditioning": "Krea2 Identity Edit Conditioning",
     "TuringUtilsIsInputPresent": "Is Input Present",
     "TuringUtilsLazyIfElse": "Lazy If / Else",
+    "TuringUtilsStageBarrier": "Stage Barrier",
     "TuringUtilsH3ConcatAVLatent": "H3 Concat AV Latent",
     "TuringUtilsH3SeparateAVLatent": "H3 Separate AV Latent",
     "TuringUtilsH3LatentInfo": "H3 Latent Info",

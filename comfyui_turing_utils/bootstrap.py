@@ -31,6 +31,7 @@ def bootstrap_builtin_integrations() -> None:
         from .adapters.wan_layout import ensure_wan_attention_layout_provider
         from .attention.integration import register_attention_site_installer
         from .attention.layout import register_attention_layout_provider
+        from .runtime.stage_barrier import install_stage_barrier_scheduler
 
         register_attention_layout_provider(ensure_minimax_attention_layout_provider)
         register_attention_layout_provider(ensure_wan_attention_layout_provider)
@@ -38,6 +39,7 @@ def bootstrap_builtin_integrations() -> None:
         register_attention_site_installer(install_wan_attention_sites)
         register_model_adapter(ModelAdapter("minimax_h3", apply_minimax_adapter))
         register_model_adapter(ModelAdapter("wan", apply_wan_adapter))
+        install_stage_barrier_scheduler()
         _BOOTSTRAPPED = True
 
 

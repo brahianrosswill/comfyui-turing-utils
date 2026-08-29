@@ -15,6 +15,7 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 from comfyui_turing_utils.nodes.logic import (  # noqa: E402
     IsInputPresent,
     LazyIfElse,
+    StageBarrier,
     is_value_present,
 )
 
@@ -135,6 +136,36 @@ class LazyIfElseTest(unittest.TestCase):
             LazyIfElse.execute(False, true_value, false_value).result[0],
             false_value,
         )
+
+
+class StageBarrierTest(unittest.TestCase):
+    def test_schema_exposes_widget_stage_and_dynamic_any_passthroughs(self):
+        schema = StageBarrier.define_schema()
+        self.assertEqual(schema.node_id, "TuringUtilsStageBarrier")
+        self.assertEqual(schema.inputs[0].id, "stage")
+        self.assertEqual(schema.inputs[0].min, 0)
+        self.assertTrue(schema.inputs[0].socketless)
+        self.assertEqual(schema.inputs[1].id, "values")
+        self.assertTrue(schema.inputs[1].optional)
+        self.assertEqual(schema.inputs[1].template.input.io_type, "*")
+        self.assertEqual(len(schema.outputs), 100)
+        self.assertTrue(all(output.io_type == "*" for output in schema.outputs))
+
+    def test_execute_preserves_dynamic_slot_indices_and_object_identity(self):
+        first = torch.zeros(1)
+        third = {"samples": torch.ones(1)}
+        output = StageBarrier.execute(
+            3,
+            {"value_2": third, "value_0": first},
+        ).result
+        self.assertEqual(len(output), 100)
+        self.assertIs(output[0], first)
+        self.assertIsNone(output[1])
+        self.assertIs(output[2], third)
+
+    def test_execute_rejects_negative_stage_even_outside_ui_validation(self):
+        with self.assertRaisesRegex(ValueError, "greater than or equal to zero"):
+            StageBarrier.execute(-1)
 
 
 if __name__ == "__main__":

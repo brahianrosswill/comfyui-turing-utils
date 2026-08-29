@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+import logging
+import re
+
 import torch
 from comfy_api.latest import io
 
+from ..runtime.stage_barrier import STAGE_BARRIER_NODE_ID
+
 
 _MISSING = object()
+_MAX_STAGE_BARRIER_VALUES = 100
+_DYNAMIC_VALUE_SUFFIX = re.compile(r"(\d+)$")
 
 
 def is_value_present(value=None) -> bool:
@@ -130,3 +137,79 @@ class LazyIfElse(io.ComfyNode):
     ) -> io.NodeOutput:
         selected = on_true if condition else on_false
         return io.NodeOutput(None if selected is _MISSING else selected)
+
+
+class StageBarrier(io.ComfyNode):
+    """Cacheable arbitrary-value rendezvous with stage-aware scheduling."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id=STAGE_BARRIER_NODE_ID,
+            display_name="Stage Barrier",
+            category="Turing Utils/logic",
+            description=(
+                "Pass through a dynamic set of arbitrary values after every reachable "
+                "barrier with a smaller stage has completed. Barriers at the same "
+                "stage rendezvous before downstream work is released. A higher-stage "
+                "barrier required by a lower-stage barrier temporarily inherits the "
+                "lower priority, preventing dependency-order deadlocks."
+            ),
+            search_aliases=["barrier", "stage", "rendezvous", "execution order"],
+            inputs=[
+                io.Int.Input(
+                    "stage",
+                    default=0,
+                    min=0,
+                    max=2**31 - 1,
+                    step=1,
+                    socketless=True,
+                    tooltip=(
+                        "Global ordering key for Stage Barrier nodes in this workflow. "
+                        "Keep this as a widget so the scheduler can read it before "
+                        "executing upstream nodes."
+                    ),
+                ),
+                io.Autogrow.Input(
+                    "values",
+                    optional=True,
+                    template=io.Autogrow.TemplatePrefix(
+                        input=io.AnyType.Input("value"),
+                        prefix="value_",
+                        min=0,
+                        max=_MAX_STAGE_BARRIER_VALUES,
+                    ),
+                    tooltip=(
+                        "Connect any number and mixture of ComfyUI values. Each input "
+                        "is forwarded to the matching output without copying it."
+                    ),
+                ),
+            ],
+            outputs=[
+                io.AnyType.Output(f"value_{index}")
+                for index in range(_MAX_STAGE_BARRIER_VALUES)
+            ],
+        )
+
+    @classmethod
+    def execute(cls, stage, values=None) -> io.NodeOutput:
+        stage = int(stage)
+        if stage < 0:
+            raise ValueError("Stage Barrier stage must be greater than or equal to zero")
+
+        outputs = [None] * _MAX_STAGE_BARRIER_VALUES
+        connected = 0
+        for name, value in (values or {}).items():
+            match = _DYNAMIC_VALUE_SUFFIX.search(str(name))
+            if match is None:
+                raise ValueError(f"Invalid Stage Barrier dynamic input name: {name}")
+            index = int(match.group(1))
+            if index >= _MAX_STAGE_BARRIER_VALUES:
+                raise ValueError(
+                    f"Stage Barrier supports at most {_MAX_STAGE_BARRIER_VALUES} values"
+                )
+            outputs[index] = value
+            connected += 1
+
+        logging.info("Stage Barrier reached: stage=%d values=%d", stage, connected)
+        return io.NodeOutput(*outputs)
