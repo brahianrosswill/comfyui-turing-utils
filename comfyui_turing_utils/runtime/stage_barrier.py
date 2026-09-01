@@ -1,20 +1,34 @@
-"""Stage-aware ComfyUI execution ordering.
+"""Dependency-first Stage Barrier scheduling for ComfyUI.
 
-Stage barriers are ordinary data-flow nodes.  This module only changes which
-*ready* node ComfyUI picks next; it never bypasses a graph dependency and never
-blocks the executor thread.  Barrier dependencies therefore remain the source
-of truth, including the dependency-inversion case where a low-numbered barrier
-needs the output of a higher-numbered one.
+Stage Barrier values are phase labels, not unconditional global priorities.
+The planner collapses the active execution graph to a barrier-only DAG and
+assigns every barrier an internal ``(round, stage)`` key. A dependency whose
+stage label decreases starts a new round; otherwise it stays in the same
+round. This keeps repeated stage sequences intuitive without ever overriding
+ComfyUI's real data dependencies.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Iterable, Mapping
+from collections import Counter, deque
+from typing import Iterable, Mapping, NamedTuple
 
 
 STAGE_BARRIER_NODE_ID = "TuringUtilsStageBarrier"
 _PATCH_MARKER = "_turing_utils_stage_barrier_scheduler"
+_PLANNER_ATTRIBUTE = "_turing_utils_stage_barrier_planner"
+
+
+class BarrierPhase(NamedTuple):
+    """The automatically inferred scheduling key for one barrier."""
+
+    round: int
+    stage: int
+
+
+class BarrierPlanError(RuntimeError):
+    """Raised when the active barrier dependency graph cannot be planned."""
 
 
 def _barrier_stage(dynprompt, node_id: str) -> int | None:
@@ -27,8 +41,9 @@ def _barrier_stage(dynprompt, node_id: str) -> int | None:
     try:
         return max(0, int(node.get("inputs", {}).get("stage", 0)))
     except (TypeError, ValueError):
-        # ComfyUI validates the widget before execution.  Keeping malformed
-        # workflows in stage zero here avoids breaking scheduler diagnostics.
+        # ComfyUI validates the widget before execution. Keeping malformed
+        # workflows in stage zero here preserves a useful execution error at
+        # the node instead of failing inside the scheduler.
         return 0
 
 
@@ -43,24 +58,84 @@ def _graph_predecessors(
     return predecessors
 
 
-def _reachable_barriers(
-    source: str,
+def _nearest_barrier_predecessors(
+    target: str,
     barriers: set[str],
-    pending: set[str],
-    blocking: Mapping[str, Mapping[str, object]],
+    predecessors: Mapping[str, set[str]],
 ) -> set[str]:
+    """Find the first barrier encountered on every upstream path.
+
+    Stopping at the first barrier produces the direct barrier DAG. Counting
+    every transitive barrier as an edge would over-count stage resets on long
+    dependency chains.
+    """
+
     found = set()
-    visited = {source}
-    stack = list(blocking.get(source, {}))
+    visited = {target}
+    stack = list(predecessors.get(target, ()))
     while stack:
         node_id = stack.pop()
-        if node_id in visited or node_id not in pending:
+        if node_id in visited:
             continue
         visited.add(node_id)
         if node_id in barriers:
             found.add(node_id)
-        stack.extend(blocking.get(node_id, {}))
+            continue
+        stack.extend(predecessors.get(node_id, ()))
     return found
+
+
+def _barrier_predecessors(
+    barriers: set[str],
+    predecessors: Mapping[str, set[str]],
+) -> dict[str, set[str]]:
+    return {
+        node_id: _nearest_barrier_predecessors(
+            node_id, barriers, predecessors
+        )
+        for node_id in barriers
+    }
+
+
+def _barrier_topological_order(
+    barrier_predecessors: Mapping[str, set[str]],
+) -> list[str]:
+    successors = {node_id: set() for node_id in barrier_predecessors}
+    indegree = {
+        node_id: len(sources)
+        for node_id, sources in barrier_predecessors.items()
+    }
+    for target, sources in barrier_predecessors.items():
+        for source in sources:
+            successors[source].add(target)
+
+    ready = deque(
+        sorted(
+            (node_id for node_id, degree in indegree.items() if degree == 0),
+            key=str,
+        )
+    )
+    order = []
+    while ready:
+        node_id = ready.popleft()
+        order.append(node_id)
+        newly_ready = []
+        for target in successors[node_id]:
+            indegree[target] -= 1
+            if indegree[target] == 0:
+                newly_ready.append(target)
+        ready.extend(sorted(newly_ready, key=str))
+
+    if len(order) != len(barrier_predecessors):
+        cyclic = sorted(
+            (node_id for node_id, degree in indegree.items() if degree > 0),
+            key=str,
+        )
+        raise BarrierPlanError(
+            "Stage Barrier dependency cycle detected among nodes: "
+            + ", ".join(map(str, cyclic))
+        )
+    return order
 
 
 def _ancestors(
@@ -77,67 +152,182 @@ def _ancestors(
     return required
 
 
+class BarrierPlanner:
+    """Persistent, prompt-local barrier plan.
+
+    The plan survives individual node completions, so a newly exposed
+    lower-stage descendant cannot jump ahead of peers in the phase that is
+    already rendezvousing. Newly materialized lazy or dynamic barriers are
+    incorporated without moving any pending barrier backwards in time.
+    """
+
+    def __init__(self, dynprompt):
+        self.dynprompt = dynprompt
+        self._phases: dict[str, BarrierPhase] = {}
+        self._visible_barriers: set[str] = set()
+        self._floor: BarrierPhase | None = None
+        self._logged_initial_plan = False
+        self._warned_unavailable_phase: BarrierPhase | None = None
+
+    @property
+    def floor(self) -> BarrierPhase | None:
+        return self._floor
+
+    def phase_for(self, node_id: str) -> BarrierPhase | None:
+        """Return the assigned phase, including completed barriers."""
+
+        return self._phases.get(node_id)
+
+    def _record_completed(self, current_barriers: set[str]) -> None:
+        disappeared = self._visible_barriers - current_barriers
+        completed = [
+            self._phases[node_id]
+            for node_id in disappeared
+            if node_id in self._phases
+        ]
+        if completed:
+            latest = max(completed)
+            if self._floor is None or latest > self._floor:
+                self._floor = latest
+        self._visible_barriers = set(current_barriers)
+
+    def _minimum_round(self, stage: int) -> int:
+        if self._floor is None:
+            return 0
+        return self._floor.round + int(stage < self._floor.stage)
+
+    def _assign_phases(
+        self,
+        stages: Mapping[str, int],
+        predecessors: Mapping[str, set[str]],
+        *,
+        dynamic_refresh: bool,
+    ) -> None:
+        barrier_ids = set(stages)
+        direct_predecessors = _barrier_predecessors(
+            barrier_ids, predecessors
+        )
+        order = _barrier_topological_order(direct_predecessors)
+        assigned: dict[str, BarrierPhase] = {}
+
+        for node_id in order:
+            stage = stages[node_id]
+            round_id = self._minimum_round(stage)
+            old_phase = self._phases.get(node_id)
+            if old_phase is not None:
+                # Incremental lazy/dynamic discovery may move work later, but
+                # it must never reopen an already passed phase.
+                round_id = max(round_id, old_phase.round)
+            for source in direct_predecessors[node_id]:
+                source_phase = assigned[source]
+                round_id = max(
+                    round_id,
+                    source_phase.round
+                    + int(stage < source_phase.stage),
+                )
+            assigned[node_id] = BarrierPhase(round_id, stage)
+
+        self._phases.update(assigned)
+        phase_counts = Counter(assigned.values())
+        summary = ",".join(
+            f"r{phase.round}/s{phase.stage}:{count}"
+            for phase, count in sorted(phase_counts.items())
+        )
+        if not self._logged_initial_plan or dynamic_refresh:
+            logging.info(
+                "Stage Barrier plan%s: barriers=%d phases=[%s]",
+                " refreshed" if dynamic_refresh else "",
+                len(assigned),
+                summary,
+            )
+            self._logged_initial_plan = True
+
+    def candidates(
+        self,
+        pending_nodes: Iterable[str],
+        blocking: Mapping[str, Mapping[str, object]],
+        available_nodes: Iterable[str],
+    ) -> list[str]:
+        """Return ready nodes allowed to advance the earliest active phase."""
+
+        available = list(available_nodes)
+        pending = set(pending_nodes)
+        stages = {
+            node_id: stage
+            for node_id in pending
+            if (
+                stage := _barrier_stage(self.dynprompt, node_id)
+            )
+            is not None
+        }
+        barrier_ids = set(stages)
+        self._record_completed(barrier_ids)
+        if not barrier_ids:
+            return available
+
+        predecessors = _graph_predecessors(pending, blocking)
+        new_barriers = barrier_ids - set(self._phases)
+        stale_phases = {
+            node_id
+            for node_id in barrier_ids
+            if self._phases.get(node_id, BarrierPhase(-1, -1)).stage
+            != stages[node_id]
+            or self._phases.get(node_id, BarrierPhase(-1, -1))
+            < BarrierPhase(
+                self._minimum_round(stages[node_id]), stages[node_id]
+            )
+        }
+        if new_barriers or stale_phases or not self._logged_initial_plan:
+            self._assign_phases(
+                stages,
+                predecessors,
+                dynamic_refresh=self._logged_initial_plan,
+            )
+
+        active_phase = min(self._phases[node_id] for node_id in barrier_ids)
+        targets = [
+            node_id
+            for node_id in barrier_ids
+            if self._phases[node_id] == active_phase
+        ]
+        required = _ancestors(targets, predecessors)
+        candidates = [
+            node_id for node_id in available if node_id in required
+        ]
+        if candidates:
+            self._warned_unavailable_phase = None
+            return candidates
+
+        # External async blockers or newly materializing lazy inputs can make
+        # the selected phase temporarily unable to advance while unrelated
+        # work is ready. Preserve liveness, but never hide the loss of strict
+        # rendezvous ordering.
+        if self._warned_unavailable_phase != active_phase:
+            logging.warning(
+                "Stage Barrier phase r%d/s%d has no ready ancestor; "
+                "temporarily deferring to ComfyUI scheduling",
+                active_phase.round,
+                active_phase.stage,
+            )
+            self._warned_unavailable_phase = active_phase
+        return available
+
+
 def stage_barrier_candidates(
     dynprompt,
     pending_nodes: Iterable[str],
     blocking: Mapping[str, Mapping[str, object]],
     available_nodes: Iterable[str],
 ) -> list[str]:
-    """Return the ready nodes allowed to advance the current barrier phase.
+    """Plan one scheduler decision without retaining prompt-local state.
 
-    A barrier's effective priority is the smallest stage of any downstream
-    barrier that depends on it.  This is priority inheritance: a stage-4
-    barrier feeding a stage-1 barrier is temporarily treated as stage 1, so the
-    dependency inversion cannot deadlock stage ordering.  Independent stage-1
-    barriers retain the same priority and continue synchronizing normally.
+    Runtime integration uses :class:`BarrierPlanner` directly. This function
+    remains as a convenient compatibility surface for diagnostics and tests.
     """
 
-    available = list(available_nodes)
-    pending = set(pending_nodes)
-    stages = {
-        node_id: stage
-        for node_id in pending
-        if (stage := _barrier_stage(dynprompt, node_id)) is not None
-    }
-    if not stages:
-        return available
-
-    barrier_ids = set(stages)
-    predecessors = _graph_predecessors(pending, blocking)
-    barrier_predecessors = {node_id: set() for node_id in barrier_ids}
-    effective_stage = dict(stages)
-
-    for source in barrier_ids:
-        descendants = _reachable_barriers(
-            source, barrier_ids, pending, blocking
-        )
-        if descendants:
-            effective_stage[source] = min(
-                stages[source], *(stages[target] for target in descendants)
-            )
-        for target in descendants:
-            barrier_predecessors[target].add(source)
-
-    # Only barrier roots can run without violating real data dependencies.
-    # An actual graph cycle has no roots; falling back lets ComfyUI emit its
-    # normal dependency-cycle diagnostic instead of hiding it here.
-    roots = [
-        node_id
-        for node_id in barrier_ids
-        if not barrier_predecessors[node_id]
-    ]
-    if not roots:
-        return available
-
-    priority = min(effective_stage[node_id] for node_id in roots)
-    targets = [
-        node_id
-        for node_id in roots
-        if effective_stage[node_id] == priority
-    ]
-    required = _ancestors(targets, predecessors)
-    candidates = [node_id for node_id in available if node_id in required]
-    return candidates or available
+    return BarrierPlanner(dynprompt).candidates(
+        pending_nodes, blocking, available_nodes
+    )
 
 
 def install_stage_barrier_scheduler() -> bool:
@@ -163,8 +353,11 @@ def install_stage_barrier_scheduler() -> bool:
         return True
 
     def stage_aware_pick_node(self, node_list):
-        candidates = stage_barrier_candidates(
-            self.dynprompt,
+        planner = getattr(self, _PLANNER_ATTRIBUTE, None)
+        if planner is None or planner.dynprompt is not self.dynprompt:
+            planner = BarrierPlanner(self.dynprompt)
+            setattr(self, _PLANNER_ATTRIBUTE, planner)
+        candidates = planner.candidates(
             self.pendingNodes,
             self.blocking,
             node_list,
@@ -174,11 +367,14 @@ def install_stage_barrier_scheduler() -> bool:
     setattr(stage_aware_pick_node, _PATCH_MARKER, True)
     setattr(stage_aware_pick_node, "_turing_utils_original", original)
     ExecutionList.ux_friendly_pick_node = stage_aware_pick_node
-    logging.info("Enabled stage-aware workflow barrier scheduling")
+    logging.info("Enabled dependency-first Stage Barrier scheduling")
     return True
 
 
 __all__ = [
+    "BarrierPhase",
+    "BarrierPlanError",
+    "BarrierPlanner",
     "STAGE_BARRIER_NODE_ID",
     "install_stage_barrier_scheduler",
     "stage_barrier_candidates",

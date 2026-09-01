@@ -70,15 +70,14 @@ only after its CUDA sources or required version change.
 - `Lazy If / Else` switches values of any ComfyUI type while lazily evaluating
   only the selected branch, unless another workflow output also needs the
   unselected branch.
-- `Stage Barrier` forwards a dynamic set of arbitrary values and globally
-  orders reachable barriers by their non-negative `stage` widget. Barriers at
-  the same stage rendezvous before downstream work is released. If a low-stage
-  barrier depends on a higher-stage one, the prerequisite temporarily inherits
-  the lower priority, so independent low-stage barriers still synchronize and
-  the workflow cannot deadlock merely because stage order opposes data flow.
-  Use shared stage 0 barriers after reference/VAE preparation, stage 1 after
-  semantic conditioning, and stage 2 after sampling to keep model-heavy H3
-  branches grouped by residency phase.
+- `Stage Barrier` forwards a dynamic set of arbitrary values and treats its
+  non-negative `stage` widget as a reusable phase label. The scheduler derives
+  dependency rounds automatically: increasing or equal labels stay in the
+  current round, while a dependency whose label decreases starts the next
+  round. Barriers with the same inferred `(round, stage)` rendezvous before
+  downstream work is released. Use stage 0 after reference/VAE preparation,
+  stage 1 after semantic conditioning or sampling, and stage 2 after decode;
+  dependent branches may reuse the same labels without manual renumbering.
 - `H3 Concat AV Latent` combines standalone H3 video and audio latents into the
   model's native nested AV latent. `H3 Separate AV Latent` splits the streams
   again; both nodes preserve matching video/audio noise masks.

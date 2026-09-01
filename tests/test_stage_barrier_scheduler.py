@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
-from pathlib import Path
-import sys
+import random
 import unittest
+from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +16,9 @@ SPEC = importlib.util.spec_from_file_location(
 stage_barrier_module = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(stage_barrier_module)
+BarrierPhase = stage_barrier_module.BarrierPhase
+BarrierPlanError = stage_barrier_module.BarrierPlanError
+BarrierPlanner = stage_barrier_module.BarrierPlanner
 STAGE_BARRIER_NODE_ID = stage_barrier_module.STAGE_BARRIER_NODE_ID
 stage_barrier_candidates = stage_barrier_module.stage_barrier_candidates
 
@@ -46,8 +49,33 @@ def _blocking(nodes, edges):
     return result
 
 
+def _ready_nodes(pending, edges):
+    blocked = {
+        target
+        for source, target in edges
+        if source in pending and target in pending
+    }
+    return [node_id for node_id in pending if node_id not in blocked]
+
+
+def _schedule(prompt, nodes, edges):
+    pending = list(nodes)
+    blocking = _blocking(nodes, edges)
+    planner = BarrierPlanner(prompt)
+    order = []
+    while pending:
+        available = _ready_nodes(pending, edges)
+        candidates = planner.candidates(pending, blocking, available)
+        if not candidates:
+            raise AssertionError("scheduler returned no candidate")
+        selected = candidates[0]
+        order.append(selected)
+        pending.remove(selected)
+    return order, planner
+
+
 class StageBarrierSchedulerTest(unittest.TestCase):
-    def test_lower_stage_upstream_is_selected_before_higher_stage(self):
+    def test_lower_stage_is_selected_first_when_dependencies_allow_it(self):
         nodes = {
             "low_work": _normal(),
             "low": _barrier(0),
@@ -65,7 +93,7 @@ class StageBarrierSchedulerTest(unittest.TestCase):
         )
         self.assertEqual(candidates, ["low_work"])
 
-    def test_same_stage_barriers_hold_unrelated_downstream_work(self):
+    def test_same_phase_barriers_hold_unrelated_downstream_work(self):
         nodes = {
             "ready_barrier": _barrier(0),
             "other_work": _normal(),
@@ -80,61 +108,211 @@ class StageBarrierSchedulerTest(unittest.TestCase):
         )
         self.assertEqual(candidates, ["ready_barrier", "other_work"])
 
-    def test_higher_dependency_inherits_lower_stage_priority(self):
+    def test_stage_reset_creates_a_new_round(self):
+        nodes = {
+            "a_work": _normal(),
+            "a_stage_1": _barrier(1),
+            "next_work": _normal(),
+            "next_stage_0": _barrier(0),
+            "b_work": _normal(),
+            "b_stage_1": _barrier(1),
+        }
+        edges = (
+            ("a_work", "a_stage_1"),
+            ("a_stage_1", "next_work"),
+            ("next_work", "next_stage_0"),
+            ("b_work", "b_stage_1"),
+        )
+        order, planner = _schedule(_Prompt(nodes), nodes, edges)
+
+        self.assertEqual(
+            planner.phase_for("a_stage_1"), BarrierPhase(0, 1)
+        )
+        self.assertEqual(
+            planner.phase_for("b_stage_1"), BarrierPhase(0, 1)
+        )
+        self.assertEqual(
+            planner.phase_for("next_stage_0"), BarrierPhase(1, 0)
+        )
+        self.assertLess(order.index("a_stage_1"), order.index("next_stage_0"))
+        self.assertLess(order.index("b_stage_1"), order.index("next_stage_0"))
+
+    def test_repeated_workflow_stages_are_grouped_by_automatic_round(self):
+        nodes = {
+            "a0": _barrier(0),
+            "a1": _barrier(1),
+            "a2": _barrier(2),
+            "b0": _barrier(0),
+            "b1": _barrier(1),
+            "b2": _barrier(2),
+            "c0": _barrier(0),
+            "c1": _barrier(1),
+            "c2": _barrier(2),
+        }
+        edges = (
+            ("a0", "a1"),
+            ("a1", "a2"),
+            ("b0", "b1"),
+            ("b1", "b2"),
+            ("a2", "c0"),
+            ("c0", "c1"),
+            ("c1", "c2"),
+        )
+        order, planner = _schedule(_Prompt(nodes), nodes, edges)
+
+        for prefix in ("a", "b"):
+            for stage in range(3):
+                self.assertEqual(
+                    planner.phase_for(f"{prefix}{stage}"),
+                    BarrierPhase(0, stage),
+                )
+        for stage in range(3):
+            self.assertEqual(
+                planner.phase_for(f"c{stage}"), BarrierPhase(1, stage)
+            )
+        self.assertLess(order.index("b2"), order.index("c0"))
+
+    def test_downstream_low_stage_does_not_promote_its_prerequisite(self):
         nodes = {
             "high_work": _normal(),
             "high_dependency": _barrier(4),
             "deferred_low": _barrier(0),
             "independent_mid": _barrier(1),
         }
-        candidates = stage_barrier_candidates(
-            _Prompt(nodes),
+        edges = (
+            ("high_work", "high_dependency"),
+            ("high_dependency", "deferred_low"),
+        )
+        planner = BarrierPlanner(_Prompt(nodes))
+        candidates = planner.candidates(
             nodes,
-            _blocking(
-                nodes,
-                (
-                    ("high_work", "high_dependency"),
-                    ("high_dependency", "deferred_low"),
-                ),
-            ),
+            _blocking(nodes, edges),
             ["independent_mid", "high_work"],
         )
-        self.assertEqual(candidates, ["high_work"])
 
-    def test_independent_low_barrier_is_not_blocked_by_inverted_dependency(self):
+        self.assertEqual(candidates, ["independent_mid"])
+        self.assertEqual(
+            planner.phase_for("high_dependency"), BarrierPhase(0, 4)
+        )
+        self.assertEqual(
+            planner.phase_for("deferred_low"), BarrierPhase(1, 0)
+        )
+
+    def test_equal_stage_dependency_remains_in_the_same_phase(self):
         nodes = {
-            "high_work": _normal(),
-            "high_dependency": _barrier(4),
-            "deferred_low": _barrier(0),
-            "independent_low": _barrier(0),
+            "first": _barrier(1),
+            "dependent": _barrier(1),
+            "peer": _barrier(1),
+            "later": _barrier(2),
         }
-        candidates = stage_barrier_candidates(
-            _Prompt(nodes),
-            nodes,
-            _blocking(
-                nodes,
-                (
-                    ("high_work", "high_dependency"),
-                    ("high_dependency", "deferred_low"),
-                ),
+        edges = (("first", "dependent"), ("first", "later"))
+        order, planner = _schedule(_Prompt(nodes), nodes, edges)
+
+        self.assertEqual(
+            planner.phase_for("first"), BarrierPhase(0, 1)
+        )
+        self.assertEqual(
+            planner.phase_for("dependent"), BarrierPhase(0, 1)
+        )
+        self.assertLess(order.index("dependent"), order.index("later"))
+        self.assertLess(order.index("peer"), order.index("later"))
+
+    def test_late_lower_stage_cannot_reopen_a_completed_phase(self):
+        nodes = {"first": _barrier(1), "later": _barrier(2)}
+        prompt = _Prompt(nodes)
+        planner = BarrierPlanner(prompt)
+        blocking = _blocking(nodes, ())
+
+        self.assertEqual(
+            planner.candidates(nodes, blocking, ["first", "later"]),
+            ["first"],
+        )
+        self.assertEqual(
+            planner.candidates(["later"], blocking, ["later"]),
+            ["later"],
+        )
+
+        nodes["late"] = _barrier(0)
+        blocking["late"] = {}
+        self.assertEqual(
+            planner.candidates(
+                ["later", "late"], blocking, ["late", "later"]
             ),
-            ["high_work", "independent_low"],
+            ["later"],
         )
-        self.assertEqual(candidates, ["high_work", "independent_low"])
+        self.assertEqual(planner.phase_for("late"), BarrierPhase(1, 0))
 
-    def test_real_graph_cycle_falls_back_to_comfyui_diagnostics(self):
-        nodes = {
-            "first": _barrier(0),
-            "second": _barrier(1),
-            "free": _normal(),
-        }
-        candidates = stage_barrier_candidates(
-            _Prompt(nodes),
-            nodes,
-            _blocking(nodes, (("first", "second"), ("second", "first"))),
-            ["free"],
+    def test_late_upstream_barrier_can_move_pending_work_later(self):
+        nodes = {"target": _barrier(1)}
+        prompt = _Prompt(nodes)
+        planner = BarrierPlanner(prompt)
+        blocking = _blocking(nodes, ())
+        planner.candidates(["target"], blocking, ["target"])
+
+        nodes["prerequisite"] = _barrier(2)
+        blocking["prerequisite"] = {"target": {}}
+        candidates = planner.candidates(
+            ["prerequisite", "target"],
+            blocking,
+            ["prerequisite"],
         )
-        self.assertEqual(candidates, ["free"])
+
+        self.assertEqual(candidates, ["prerequisite"])
+        self.assertEqual(
+            planner.phase_for("prerequisite"), BarrierPhase(0, 2)
+        )
+        self.assertEqual(planner.phase_for("target"), BarrierPhase(1, 1))
+
+    def test_no_barriers_preserves_comfyui_candidate_order(self):
+        nodes = {"first": _normal(), "second": _normal()}
+        candidates = stage_barrier_candidates(
+            _Prompt(nodes), nodes, _blocking(nodes, ()), ["second", "first"]
+        )
+        self.assertEqual(candidates, ["second", "first"])
+
+    def test_real_graph_cycle_has_an_explicit_barrier_error(self):
+        nodes = {"first": _barrier(0), "second": _barrier(1)}
+        with self.assertRaisesRegex(BarrierPlanError, "dependency cycle"):
+            stage_barrier_candidates(
+                _Prompt(nodes),
+                nodes,
+                _blocking(
+                    nodes, (("first", "second"), ("second", "first"))
+                ),
+                [],
+            )
+
+    def test_random_dags_preserve_dependencies_and_monotonic_phases(self):
+        randomizer = random.Random(20260830)
+        for _ in range(40):
+            nodes = {
+                f"barrier_{index}": _barrier(randomizer.randrange(4))
+                for index in range(10)
+            }
+            edges = tuple(
+                (f"barrier_{source}", f"barrier_{target}")
+                for source in range(10)
+                for target in range(source + 1, 10)
+                if randomizer.random() < 0.18
+            )
+            order, planner = _schedule(_Prompt(nodes), nodes, edges)
+            positions = {
+                node_id: index for index, node_id in enumerate(order)
+            }
+
+            for source, target in edges:
+                self.assertLess(positions[source], positions[target])
+                source_phase = planner.phase_for(source)
+                target_phase = planner.phase_for(target)
+                self.assertIsNotNone(source_phase)
+                self.assertIsNotNone(target_phase)
+                self.assertLessEqual(source_phase, target_phase)
+                source_stage = nodes[source]["inputs"]["stage"]
+                target_stage = nodes[target]["inputs"]["stage"]
+                if target_stage < source_stage:
+                    self.assertGreater(
+                        target_phase.round, source_phase.round
+                    )
 
 
 if __name__ == "__main__":

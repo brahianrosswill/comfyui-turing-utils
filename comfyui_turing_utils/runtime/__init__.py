@@ -9,6 +9,9 @@ from .capabilities import (
 )
 from .diagnostics import FEATURES, runtime_diagnostics
 from .stage_barrier import (
+    BarrierPhase,
+    BarrierPlanError,
+    BarrierPlanner,
     STAGE_BARRIER_NODE_ID,
     install_stage_barrier_scheduler,
     stage_barrier_candidates,
@@ -22,6 +25,9 @@ __all__ = [
     "runtime_capabilities",
     "FEATURES",
     "runtime_diagnostics",
+    "BarrierPhase",
+    "BarrierPlanError",
+    "BarrierPlanner",
     "STAGE_BARRIER_NODE_ID",
     "install_stage_barrier_scheduler",
     "stage_barrier_candidates",

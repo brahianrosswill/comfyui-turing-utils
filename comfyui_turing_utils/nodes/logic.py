@@ -140,7 +140,7 @@ class LazyIfElse(io.ComfyNode):
 
 
 class StageBarrier(io.ComfyNode):
-    """Cacheable arbitrary-value rendezvous with stage-aware scheduling."""
+    """Cacheable arbitrary-value rendezvous with dependency-first scheduling."""
 
     @classmethod
     def define_schema(cls):
@@ -149,11 +149,10 @@ class StageBarrier(io.ComfyNode):
             display_name="Stage Barrier",
             category="Turing Utils/logic",
             description=(
-                "Pass through a dynamic set of arbitrary values after every reachable "
-                "barrier with a smaller stage has completed. Barriers at the same "
-                "stage rendezvous before downstream work is released. A higher-stage "
-                "barrier required by a lower-stage barrier temporarily inherits the "
-                "lower priority, preventing dependency-order deadlocks."
+                "Pass through arbitrary values using dependency-first phase ordering. "
+                "Stage is a reusable phase label: barriers with the same inferred "
+                "round and stage rendezvous before downstream work is released, and "
+                "a dependency whose stage decreases automatically starts a new round."
             ),
             search_aliases=["barrier", "stage", "rendezvous", "execution order"],
             inputs=[
@@ -165,9 +164,10 @@ class StageBarrier(io.ComfyNode):
                     step=1,
                     socketless=True,
                     tooltip=(
-                        "Global ordering key for Stage Barrier nodes in this workflow. "
-                        "Keep this as a widget so the scheduler can read it before "
-                        "executing upstream nodes."
+                        "Phase label within an automatically inferred dependency round. "
+                        "Use values such as 0=prepare, 1=sample, 2=decode and reuse "
+                        "them in dependent rounds. This must remain a widget so the "
+                        "scheduler can plan it before executing upstream nodes."
                     ),
                 ),
                 io.Autogrow.Input(

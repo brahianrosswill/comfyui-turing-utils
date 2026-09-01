@@ -79,7 +79,7 @@ effects.
 | `quantization/fusions.py` | model-independent fused activation and normalization operations |
 | `loading/convrot.py` | filesystem discovery, Comfy model construction, runtime preparation, and adapter installation |
 | `runtime/capabilities.py` | immutable device facts plus independently versioned kernel feature probes |
-| `runtime/stage_barrier.py` | stage-aware ready-node selection, same-stage rendezvous and dependency-inversion priority inheritance |
+| `runtime/stage_barrier.py` | prompt-local dependency rounds, phase-label rendezvous and incremental lazy/dynamic barrier planning |
 | `adapters/memory.py` | common quantized workspace scan and BaseModel memory-hook installation |
 | `adapters/minimax/policy_config.py` | environment/config parsing only; no live CUDA state |
 | `adapters/minimax/memory_state.py` | live allocator/DynamicVRAM observation and bounded reclaim requests |
