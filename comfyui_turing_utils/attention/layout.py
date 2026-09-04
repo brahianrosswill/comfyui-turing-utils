@@ -18,6 +18,7 @@ ATTENTION_SEGMENT_ROLES = frozenset(
         "reference_audio",
         "target_audio",
         "target_video",
+        "pose_video",
         "context_video",
     }
 )
@@ -31,6 +32,7 @@ _ROLE_DEFAULTS = {
     "reference_audio": (False, False, True),
     "target_audio": (False, False, True),
     "target_video": (True, True, False),
+    "pose_video": (False, False, True),
     "context_video": (True, True, False),
 }
 

@@ -1,4 +1,4 @@
-"""Semantic self-attention layout publication for Wan and Bernini models.
+"""Semantic self-attention layout publication for Wan model families.
 
 The provider describes only the flattened self-attention sequence.  It does
 not depend on quantization or a Turing device, so sparse attention can use it
@@ -25,6 +25,7 @@ from ..attention.layout import (
 
 LOG = logging.getLogger("comfyui-turing-utils")
 WAN_LAYOUT_KIND = "wan_self_attention"
+SCAIL_LAYOUT_KIND = "scail_self_attention"
 _FORWARD_ORIG_PATCH_KEY = "diffusion_model.forward_orig"
 _FORWARD_PROVIDER_ATTR = "_turing_utils_wan_layout_forward"
 _FORWARD_ORIG_PARAMETERS = (
@@ -58,18 +59,22 @@ def _root_and_diffusion_model(model):
     return root, getattr(root, "diffusion_model", None)
 
 
-def _is_supported_wan_model(diffusion_model) -> bool:
+def _supported_layout_kind(diffusion_model) -> str | None:
     if diffusion_model is None:
-        return False
+        return None
     try:
-        from comfy.ldm.wan.model import WanModel
+        from comfy.ldm.wan.model import SCAILWanModel, WanModel
     except ImportError:
-        return False
-    # Several Wan subclasses use a materially different token order.  Inheriting
-    # the base implementation is the compatibility boundary used by Bernini.
-    return isinstance(diffusion_model, WanModel) and (
+        return None
+    if isinstance(diffusion_model, SCAILWanModel) and (
+        type(diffusion_model).forward_orig is SCAILWanModel.forward_orig
+    ):
+        return SCAIL_LAYOUT_KIND
+    if isinstance(diffusion_model, WanModel) and (
         type(diffusion_model).forward_orig is WanModel.forward_orig
-    )
+    ):
+        return WAN_LAYOUT_KIND
+    return None
 
 
 def _compatible_forward_orig(forward) -> bool:
@@ -247,20 +252,130 @@ def build_wan_attention_layout(
     return layout if layout.validate(cursor, cursor) is None else None
 
 
-def publish_wan_attention_layout(
+def build_scail_attention_layout(
     diffusion_model,
     x,
     transformer_options,
     kwargs,
+) -> AttentionSemanticLayout | None:
+    """Build the reference, target, pose order used by SCAIL self-attention."""
+    patch_size = tuple(int(value) for value in diffusion_model.patch_size)
+    target_grid = _grid_from_video(x, patch_size)
+    if target_grid is None:
+        return None
+
+    segments: list[AttentionSegment] = []
+    topologies: list[AttentionTopology] = []
+    cursor = 0
+
+    reference = kwargs.get("reference_latent")
+    if reference is not None:
+        reference_grid = _grid_from_video(reference, patch_size)
+        if reference_grid is None:
+            return None
+        ref_frames, ref_height, ref_width = reference_grid
+        ref_frame_tokens = ref_height * ref_width
+        ref_stop = cursor + ref_frames * ref_frame_tokens
+        segments.append(
+            AttentionSegment.for_role(
+                cursor,
+                ref_stop,
+                "reference_image",
+                topology_id="reference_images",
+            )
+        )
+        topologies.append(
+            AttentionTopology(
+                "reference_images",
+                "video_grid",
+                cursor,
+                ref_stop,
+                ref_frame_tokens,
+                ref_height,
+                ref_width,
+            )
+        )
+        cursor = ref_stop
+
+    frames, height, width = target_grid
+    frame_tokens = height * width
+    target_stop = cursor + frames * frame_tokens
+    segments.append(
+        AttentionSegment.for_role(
+            cursor,
+            target_stop,
+            "target_video",
+            topology_id="target_video",
+        )
+    )
+    topologies.append(
+        AttentionTopology(
+            "target_video",
+            "video_grid",
+            cursor,
+            target_stop,
+            frame_tokens,
+            height,
+            width,
+        )
+    )
+    cursor = target_stop
+
+    pose = kwargs.get("pose_latents")
+    if pose is not None:
+        pose_grid = _grid_from_video(pose, patch_size)
+        if pose_grid is None:
+            return None
+        pose_frames, pose_height, pose_width = pose_grid
+        pose_frame_tokens = pose_height * pose_width
+        pose_stop = cursor + pose_frames * pose_frame_tokens
+        segments.append(
+            AttentionSegment.for_role(
+                cursor,
+                pose_stop,
+                "pose_video",
+                topology_id="pose_video",
+            )
+        )
+        topologies.append(
+            AttentionTopology(
+                "pose_video",
+                "video_grid",
+                cursor,
+                pose_stop,
+                pose_frame_tokens,
+                pose_height,
+                pose_width,
+            )
+        )
+        cursor = pose_stop
+
+    layer_count = len(getattr(diffusion_model, "blocks", ()))
+    if layer_count <= 0:
+        return None
+    layout = AttentionSemanticLayout(
+        provider=SCAIL_LAYOUT_KIND,
+        query_segments=tuple(segments),
+        key_segments=tuple(segments),
+        topologies=tuple(topologies),
+        layer_index=0,
+        layer_count=layer_count,
+    )
+    return layout if layout.validate(cursor, cursor) is None else None
+
+
+def _publish_attention_layout(
+    diffusion_model,
+    x,
+    transformer_options,
+    kwargs,
+    *,
+    provider: str,
+    builder,
 ) -> bool:
     if not isinstance(transformer_options, dict):
         return False
-    semantic = build_wan_attention_layout(
-        diffusion_model,
-        x,
-        transformer_options,
-        kwargs,
-    )
+    semantic = builder(diffusion_model, x, transformer_options, kwargs)
     previous = transformer_options.get(ATTENTION_LAYOUT_KEY)
     preserved = (
         {key: value for key, value in previous.items() if key not in _LAYOUT_FIELDS}
@@ -268,11 +383,9 @@ def publish_wan_attention_layout(
         else {}
     )
     if semantic is None:
-        # An incomplete sequence description must never inherit a valid layout
-        # from an earlier prompt or context window.
         transformer_options[ATTENTION_LAYOUT_KEY] = {
             **preserved,
-            "provider": WAN_LAYOUT_KIND,
+            "provider": provider,
         }
         return False
     transformer_options[ATTENTION_LAYOUT_KEY] = semantic.to_wire(
@@ -281,12 +394,44 @@ def publish_wan_attention_layout(
     return True
 
 
+def publish_wan_attention_layout(
+    diffusion_model,
+    x,
+    transformer_options,
+    kwargs,
+) -> bool:
+    return _publish_attention_layout(
+        diffusion_model,
+        x,
+        transformer_options,
+        kwargs,
+        provider=WAN_LAYOUT_KIND,
+        builder=build_wan_attention_layout,
+    )
+
+
+def publish_scail_attention_layout(
+    diffusion_model,
+    x,
+    transformer_options,
+    kwargs,
+) -> bool:
+    return _publish_attention_layout(
+        diffusion_model,
+        x,
+        transformer_options,
+        kwargs,
+        provider=SCAIL_LAYOUT_KIND,
+        builder=build_scail_attention_layout,
+    )
+
+
 def _forward_has_provider(forward) -> bool:
     function = getattr(forward, "__func__", forward)
     return bool(getattr(function, _FORWARD_PROVIDER_ATTR, False))
 
 
-def _make_layout_forward(diffusion_model, original):
+def _make_layout_forward(diffusion_model, original, publisher):
     original = OriginalMethod.capture(original, diffusion_model)
 
     def forward_orig(
@@ -299,7 +444,7 @@ def _make_layout_forward(diffusion_model, original):
         transformer_options={},
         **kwargs,
     ):
-        publish_wan_attention_layout(
+        publisher(
             self,
             x,
             transformer_options,
@@ -321,19 +466,20 @@ def _make_layout_forward(diffusion_model, original):
 
 
 def ensure_wan_attention_layout_provider(model) -> LayoutProviderStatus:
-    """Install a loader-independent layout provider for base Wan/Bernini."""
+    """Install a loader-independent layout provider for Wan model families."""
     _, diffusion_model = _root_and_diffusion_model(model)
-    if not _is_supported_wan_model(diffusion_model):
+    layout_kind = _supported_layout_kind(diffusion_model)
+    if layout_kind is None:
         return LayoutProviderStatus(None, False, "not_compatible_wan")
     if not callable(getattr(model, "add_object_patch", None)):
         return LayoutProviderStatus(
-            WAN_LAYOUT_KIND,
+            layout_kind,
             False,
             "model_patcher_api_unavailable",
         )
     if not _compatible_forward_orig(diffusion_model.forward_orig):
         return LayoutProviderStatus(
-            WAN_LAYOUT_KIND,
+            layout_kind,
             False,
             "forward_orig_contract_changed",
         )
@@ -343,17 +489,25 @@ def ensure_wan_attention_layout_provider(model) -> LayoutProviderStatus:
         diffusion_model.forward_orig,
     )
     if not _forward_has_provider(current):
+        publisher = (
+            publish_scail_attention_layout
+            if layout_kind == SCAIL_LAYOUT_KIND
+            else publish_wan_attention_layout
+        )
         model.add_object_patch(
             _FORWARD_ORIG_PATCH_KEY,
-            _make_layout_forward(diffusion_model, current),
+            _make_layout_forward(diffusion_model, current, publisher),
         )
-    LOG.info("Enabled loader-independent Wan/Bernini attention layout provider")
-    return LayoutProviderStatus(WAN_LAYOUT_KIND, True)
+    LOG.info("Enabled loader-independent %s attention layout provider", layout_kind)
+    return LayoutProviderStatus(layout_kind, True)
 
 
 __all__ = [
+    "SCAIL_LAYOUT_KIND",
     "WAN_LAYOUT_KIND",
+    "build_scail_attention_layout",
     "build_wan_attention_layout",
     "ensure_wan_attention_layout_provider",
+    "publish_scail_attention_layout",
     "publish_wan_attention_layout",
 ]

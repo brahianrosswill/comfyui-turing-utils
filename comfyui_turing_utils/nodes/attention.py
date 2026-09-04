@@ -85,7 +85,7 @@ class LegacySolSparseAttentionPatch:
                     "BOOLEAN",
                     {
                         "default": True,
-                        "tooltip": "Allow long reference-video Query/KV interactions to use Sol routing instead of protecting the complete reference video.",
+                        "tooltip": "Allow long reference-video and pose/control-video Query/KV interactions to use Sol routing instead of protecting the complete control sequence.",
                     },
                 ),
                 "sparse_reference_audio": (

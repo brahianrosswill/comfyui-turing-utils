@@ -147,7 +147,7 @@ def _sparse_protected_ranges(
         reference_override = None
         if segment.role in {"reference_image", "reference_video_anchor"}:
             reference_override = sparse_reference_image
-        elif segment.role in {"reference_video", "context_video"}:
+        elif segment.role in {"reference_video", "context_video", "pose_video"}:
             reference_override = sparse_reference_video
         elif segment.role == "reference_audio":
             reference_override = sparse_reference_audio
