@@ -55,7 +55,6 @@ class ChatOptions:
     max_retries: int = 2
     retry_backoff: float = 1.5
     extra_body_json: str = "{}"
-    cache_buster: int = 0
 
 
 DEFAULT_CHAT_OPTIONS = ChatOptions()
@@ -394,15 +393,6 @@ class MultimodalChatOptions(io.ComfyNode):
                 io.Int.Input("max_retries", default=DEFAULT_CHAT_OPTIONS.max_retries, min=0, max=5, step=1),
                 io.Float.Input("retry_backoff", default=DEFAULT_CHAT_OPTIONS.retry_backoff, min=0.0, max=30.0, step=0.1),
                 io.String.Input("extra_body_json", multiline=True, default=DEFAULT_CHAT_OPTIONS.extra_body_json),
-                io.Int.Input(
-                    "cache_buster",
-                    default=DEFAULT_CHAT_OPTIONS.cache_buster,
-                    min=0,
-                    max=2**31 - 1,
-                    step=1,
-                    control_after_generate=True,
-                    tooltip="Change this value to make ComfyUI issue a fresh request for otherwise identical inputs.",
-                ),
             ],
             outputs=[ChatOptionsType.Output("options")],
         )
@@ -424,7 +414,6 @@ class MultimodalChatOptions(io.ComfyNode):
         max_retries: int = DEFAULT_CHAT_OPTIONS.max_retries,
         retry_backoff: float = DEFAULT_CHAT_OPTIONS.retry_backoff,
         extra_body_json: str = DEFAULT_CHAT_OPTIONS.extra_body_json,
-        cache_buster: int = DEFAULT_CHAT_OPTIONS.cache_buster,
     ) -> io.NodeOutput:
         return io.NodeOutput(
             ChatOptions(
@@ -442,7 +431,6 @@ class MultimodalChatOptions(io.ComfyNode):
                 max_retries=int(max_retries),
                 retry_backoff=float(retry_backoff),
                 extra_body_json=extra_body_json,
-                cache_buster=int(cache_buster),
             )
         )
 
@@ -473,6 +461,15 @@ class MultimodalPromptChat(io.ComfyNode):
                     "api_key",
                     default="",
                     tooltip="Literal key, $NAME, or ${NAME}. Empty sends the placeholder key 'not-needed'. Literal keys are stored in the workflow.",
+                ),
+                io.Int.Input(
+                    "cache_buster",
+                    default=0,
+                    min=0,
+                    max=2**31 - 1,
+                    step=1,
+                    control_after_generate=True,
+                    tooltip="Change this value to make ComfyUI issue a fresh request for otherwise identical inputs.",
                 ),
                 ChatOptionsType.Input(
                     "options",
@@ -516,6 +513,7 @@ class MultimodalPromptChat(io.ComfyNode):
         base_url: str,
         model: str,
         api_key: str,
+        cache_buster: int = 0,
         options: ChatOptions | None = None,
         images=None,
         videos=None,
@@ -563,7 +561,7 @@ class MultimodalPromptChat(io.ComfyNode):
             "usage": response.get("usage", {}),
             "media": media,
             "thinking_disabled": options.disable_thinking,
-            "cache_buster": options.cache_buster,
+            "cache_buster": int(cache_buster),
             "elapsed_seconds": round(time.monotonic() - started, 3),
         }
         return io.NodeOutput(text, json.dumps(metadata, ensure_ascii=False, indent=2))

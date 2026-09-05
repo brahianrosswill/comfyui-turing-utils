@@ -40,6 +40,9 @@ class MultimodalPromptChatTest(unittest.TestCase):
             ["prompt", "system_prompt", "base_url", "model", "api_key"],
         )
         inputs = {item.id: item for item in schema.inputs}
+        self.assertEqual(schema.inputs[5].id, "cache_buster")
+        self.assertEqual(inputs["cache_buster"].default, 0)
+        self.assertTrue(inputs["cache_buster"].control_after_generate)
         self.assertEqual(inputs["images"].template.input.io_type, "IMAGE")
         self.assertEqual(inputs["videos"].template.input.io_type, "VIDEO")
         self.assertTrue(inputs["images"].optional)
@@ -55,6 +58,7 @@ class MultimodalPromptChatTest(unittest.TestCase):
         inputs = {item.id: item for item in schema.inputs}
         self.assertTrue(inputs["disable_thinking"].default)
         self.assertEqual(inputs["max_output_tokens"].default, 8192)
+        self.assertNotIn("cache_buster", inputs)
         self.assertEqual(MultimodalChatOptions.execute().result[0], DEFAULT_CHAT_OPTIONS)
 
     def test_unconnected_and_connected_default_options_build_identical_requests(self):
