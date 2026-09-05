@@ -8,7 +8,7 @@ import re
 import torch
 from comfy_api.latest import io
 
-from ..runtime.stage_barrier import STAGE_BARRIER_NODE_ID
+from ..runtime.stage_barrier import STAGE_BARRIER_NODE_ID, STAGE_PATH_NODE_ID
 
 
 _MISSING = object()
@@ -149,7 +149,9 @@ class StageBarrier(io.ComfyNode):
             display_name="Stage Barrier",
             category="Turing Utils/logic",
             description=(
-                "Pass through arbitrary values using dependency-first phase ordering. "
+                "Tag independent arbitrary-value paths for dependency-first phase "
+                "ordering. Each visual input/output pair is compiled into its own "
+                "cache and execution unit, so unselected lazy branches stay skipped. "
                 "Stage is a reusable phase label: barriers with the same inferred "
                 "round and stage rendezvous before downstream work is released, and "
                 "a dependency whose stage decreases automatically starts a new round."
@@ -213,3 +215,40 @@ class StageBarrier(io.ComfyNode):
 
         logging.info("Stage Barrier reached: stage=%d values=%d", stage, connected)
         return io.NodeOutput(*outputs)
+
+
+class StagePath(io.ComfyNode):
+    """Private unary execution unit produced by the Stage Barrier compiler."""
+
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id=STAGE_PATH_NODE_ID,
+            display_name="Stage Path (Internal)",
+            category="Turing Utils/internal",
+            description=(
+                "Internal one-input/one-output Stage Barrier route. The server "
+                "creates this node while compiling a submitted workflow."
+            ),
+            is_dev_only=True,
+            inputs=[
+                io.Int.Input(
+                    "stage",
+                    default=0,
+                    min=0,
+                    max=2**31 - 1,
+                    step=1,
+                    socketless=True,
+                ),
+                io.AnyType.Input("value", optional=True),
+            ],
+            outputs=[io.AnyType.Output(display_name="value")],
+        )
+
+    @classmethod
+    def execute(cls, stage, value=None) -> io.NodeOutput:
+        stage = int(stage)
+        if stage < 0:
+            raise ValueError("Stage Path stage must be greater than or equal to zero")
+        logging.info("Stage Barrier path reached: stage=%d", stage)
+        return io.NodeOutput(value)

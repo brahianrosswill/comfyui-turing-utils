@@ -16,6 +16,10 @@ from typing import Iterable, Mapping, NamedTuple
 
 
 STAGE_BARRIER_NODE_ID = "TuringUtilsStageBarrier"
+STAGE_PATH_NODE_ID = "TuringUtilsStagePath"
+STAGE_SCHEDULING_NODE_IDS = frozenset(
+    (STAGE_BARRIER_NODE_ID, STAGE_PATH_NODE_ID)
+)
 _PATCH_MARKER = "_turing_utils_stage_barrier_scheduler"
 _PLANNER_ATTRIBUTE = "_turing_utils_stage_barrier_planner"
 
@@ -36,7 +40,7 @@ def _barrier_stage(dynprompt, node_id: str) -> int | None:
         node = dynprompt.get_node(node_id)
     except (KeyError, TypeError, AttributeError):
         return None
-    if node.get("class_type") != STAGE_BARRIER_NODE_ID:
+    if node.get("class_type") not in STAGE_SCHEDULING_NODE_IDS:
         return None
     try:
         return max(0, int(node.get("inputs", {}).get("stage", 0)))
@@ -152,6 +156,39 @@ def _ancestors(
     return required
 
 
+def _direct_hidden_stage_inputs(
+    dynprompt,
+    pending: set[str],
+) -> dict[str, set[int]]:
+    """Find stage paths currently hidden behind lazy or cached inputs.
+
+    Lazy inputs are deliberately absent from ComfyUI's active topological
+    graph until their consumer runs ``check_lazy_status``.  Scheduling that
+    cheap decision point is necessary before a hidden low-stage path can join
+    the rendezvous.  A cached Stage Path looks the same here and is harmless:
+    its consumer simply completes without rematerializing the path.
+    """
+
+    consumers: dict[str, set[int]] = {}
+    for node_id in pending:
+        try:
+            inputs = dynprompt.get_node(node_id).get("inputs", {})
+        except (KeyError, TypeError, AttributeError):
+            continue
+        if not isinstance(inputs, Mapping):
+            continue
+        for value in inputs.values():
+            if not isinstance(value, (list, tuple)) or len(value) != 2:
+                continue
+            source = value[0]
+            if source in pending:
+                continue
+            stage = _barrier_stage(dynprompt, source)
+            if stage is not None:
+                consumers.setdefault(node_id, set()).add(stage)
+    return consumers
+
+
 class BarrierPlanner:
     """Persistent, prompt-local barrier plan.
 
@@ -262,10 +299,34 @@ class BarrierPlanner:
         }
         barrier_ids = set(stages)
         self._record_completed(barrier_ids)
+        predecessors = _graph_predecessors(pending, blocking)
+        hidden_consumers = _direct_hidden_stage_inputs(
+            self.dynprompt, pending
+        )
+        hidden_phases = {
+            node_id: min(
+                BarrierPhase(self._minimum_round(stage), stage)
+                for stage in hidden_stages
+            )
+            for node_id, hidden_stages in hidden_consumers.items()
+        }
+
         if not barrier_ids:
+            if hidden_phases:
+                discovery_phase = min(hidden_phases.values())
+                discovery_targets = [
+                    node_id
+                    for node_id, phase in hidden_phases.items()
+                    if phase == discovery_phase
+                ]
+                required = _ancestors(discovery_targets, predecessors)
+                candidates = [
+                    node_id for node_id in available if node_id in required
+                ]
+                if candidates:
+                    return candidates
             return available
 
-        predecessors = _graph_predecessors(pending, blocking)
         new_barriers = barrier_ids - set(self._phases)
         stale_phases = {
             node_id
@@ -285,6 +346,27 @@ class BarrierPlanner:
             )
 
         active_phase = min(self._phases[node_id] for node_id in barrier_ids)
+        discoverable = [
+            node_id
+            for node_id, phase in hidden_phases.items()
+            if phase <= active_phase
+        ]
+        if discoverable:
+            discovery_phase = min(
+                hidden_phases[node_id] for node_id in discoverable
+            )
+            discovery_targets = [
+                node_id
+                for node_id in discoverable
+                if hidden_phases[node_id] == discovery_phase
+            ]
+            required = _ancestors(discovery_targets, predecessors)
+            candidates = [
+                node_id for node_id in available if node_id in required
+            ]
+            if candidates:
+                return candidates
+
         targets = [
             node_id
             for node_id in barrier_ids
@@ -376,6 +458,8 @@ __all__ = [
     "BarrierPlanError",
     "BarrierPlanner",
     "STAGE_BARRIER_NODE_ID",
+    "STAGE_PATH_NODE_ID",
+    "STAGE_SCHEDULING_NODE_IDS",
     "install_stage_barrier_scheduler",
     "stage_barrier_candidates",
 ]

@@ -20,6 +20,7 @@ BarrierPhase = stage_barrier_module.BarrierPhase
 BarrierPlanError = stage_barrier_module.BarrierPlanError
 BarrierPlanner = stage_barrier_module.BarrierPlanner
 STAGE_BARRIER_NODE_ID = stage_barrier_module.STAGE_BARRIER_NODE_ID
+STAGE_PATH_NODE_ID = stage_barrier_module.STAGE_PATH_NODE_ID
 stage_barrier_candidates = stage_barrier_module.stage_barrier_candidates
 
 
@@ -40,6 +41,13 @@ def _barrier(stage):
         "class_type": STAGE_BARRIER_NODE_ID,
         "inputs": {"stage": stage},
     }
+
+
+def _path(stage, value=None):
+    inputs = {"stage": stage}
+    if value is not None:
+        inputs["value"] = value
+    return {"class_type": STAGE_PATH_NODE_ID, "inputs": inputs}
 
 
 def _blocking(nodes, edges):
@@ -75,6 +83,90 @@ def _schedule(prompt, nodes, edges):
 
 
 class StageBarrierSchedulerTest(unittest.TestCase):
+    def test_compiled_stage_paths_participate_in_phase_ordering(self):
+        nodes = {
+            "low_work": _normal(),
+            "low": _path(0, ["low_work", 0]),
+            "high_work": _normal(),
+            "high": _path(1, ["high_work", 0]),
+        }
+        candidates = stage_barrier_candidates(
+            _Prompt(nodes),
+            nodes,
+            _blocking(
+                nodes,
+                (("low_work", "low"), ("high_work", "high")),
+            ),
+            ["high_work", "low_work"],
+        )
+        self.assertEqual(candidates, ["low_work"])
+
+    def test_hidden_low_stage_path_prioritizes_lazy_branch_decision(self):
+        nodes = {
+            "condition": _normal(),
+            "selected_work": _normal(),
+            "hidden_low": _path(0, ["selected_work", 0]),
+            "switch": {
+                "class_type": "LazySwitch",
+                "inputs": {
+                    "condition": ["condition", 0],
+                    "on_true": ["hidden_low", 0],
+                },
+            },
+            "high_work": _normal(),
+            "visible_high": _path(1, ["high_work", 0]),
+        }
+        pending = {"condition", "switch", "high_work", "visible_high"}
+        edges = (("condition", "switch"), ("high_work", "visible_high"))
+        planner = BarrierPlanner(_Prompt(nodes))
+
+        self.assertEqual(
+            planner.candidates(
+                pending,
+                _blocking(pending, edges),
+                ["high_work", "condition"],
+            ),
+            ["condition"],
+        )
+        self.assertEqual(
+            planner.candidates(
+                pending - {"condition"},
+                _blocking(
+                    pending - {"condition"},
+                    (("high_work", "visible_high"),),
+                ),
+                ["high_work", "switch"],
+            ),
+            ["switch"],
+        )
+
+    def test_hidden_branch_discovery_never_schedules_its_upstream(self):
+        nodes = {
+            "condition": _normal(),
+            "unselected_work": _normal(),
+            "hidden": _path(0, ["unselected_work", 0]),
+            "switch": {
+                "class_type": "LazySwitch",
+                "inputs": {
+                    "condition": ["condition", 0],
+                    "on_false": ["hidden", 0],
+                },
+            },
+            "unrelated": _normal(),
+        }
+        pending = {"condition", "switch", "unrelated"}
+        edges = (("condition", "switch"),)
+
+        candidates = stage_barrier_candidates(
+            _Prompt(nodes),
+            pending,
+            _blocking(pending, edges),
+            ["unrelated", "condition"],
+        )
+
+        self.assertEqual(candidates, ["condition"])
+        self.assertNotIn("unselected_work", candidates)
+
     def test_lower_stage_is_selected_first_when_dependencies_allow_it(self):
         nodes = {
             "low_work": _normal(),

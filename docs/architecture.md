@@ -80,6 +80,7 @@ effects.
 | `loading/convrot.py` | filesystem discovery, Comfy model construction, runtime preparation, and adapter installation |
 | `runtime/capabilities.py` | immutable device facts plus independently versioned kernel feature probes |
 | `runtime/stage_barrier.py` | prompt-local dependency rounds, phase-label rendezvous and incremental lazy/dynamic barrier planning |
+| `runtime/stage_barrier_prompt.py` | pre-validation expansion of visual multi-port barriers into independent unary cache/execution paths |
 | `adapters/memory.py` | common quantized workspace scan and BaseModel memory-hook installation |
 | `adapters/minimax/policy_config.py` | environment/config parsing only; no live CUDA state |
 | `adapters/minimax/memory_state.py` | live allocator/DynamicVRAM observation and bounded reclaim requests |

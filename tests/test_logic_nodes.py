@@ -16,6 +16,7 @@ from comfyui_turing_utils.nodes.logic import (  # noqa: E402
     IsInputPresent,
     LazyIfElse,
     StageBarrier,
+    StagePath,
     is_value_present,
 )
 
@@ -166,6 +167,20 @@ class StageBarrierTest(unittest.TestCase):
     def test_execute_rejects_negative_stage_even_outside_ui_validation(self):
         with self.assertRaisesRegex(ValueError, "greater than or equal to zero"):
             StageBarrier.execute(-1)
+
+    def test_internal_stage_path_is_unary_cacheable_passthrough(self):
+        schema = StagePath.define_schema()
+        self.assertEqual(schema.node_id, "TuringUtilsStagePath")
+        self.assertTrue(schema.is_dev_only)
+        self.assertEqual([item.id for item in schema.inputs], ["stage", "value"])
+        self.assertTrue(schema.inputs[1].optional)
+        value = {"samples": torch.ones(1)}
+        self.assertIs(StagePath.execute(2, value).result[0], value)
+        self.assertEqual(StagePath.execute(2).result, (None,))
+
+    def test_internal_stage_path_rejects_negative_stage(self):
+        with self.assertRaisesRegex(ValueError, "greater than or equal to zero"):
+            StagePath.execute(-1)
 
 
 if __name__ == "__main__":

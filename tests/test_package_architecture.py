@@ -157,6 +157,7 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsIsInputPresent",
                 "TuringUtilsLazyIfElse",
                 "TuringUtilsStageBarrier",
+                "TuringUtilsStagePath",
                 "TuringUtilsH3ConcatAVLatent",
                 "TuringUtilsH3SeparateAVLatent",
                 "TuringUtilsH3LatentInfo",

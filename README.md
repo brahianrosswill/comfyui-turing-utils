@@ -75,9 +75,12 @@ only after its CUDA sources or required version change.
   dependency rounds automatically: increasing or equal labels stay in the
   current round, while a dependency whose label decreases starts the next
   round. Barriers with the same inferred `(round, stage)` rendezvous before
-  downstream work is released. Use stage 0 after reference/VAE preparation,
-  stage 1 after semantic conditioning or sampling, and stage 2 after decode;
-  dependent branches may reuse the same labels without manual renumbering.
+  downstream work is released. Each visual input/output pair is compiled into
+  an independent cache and execution path, so several Lazy If / Else branches
+  can share one Barrier without evaluating the unselected branches. Use stage
+  0 after reference/VAE preparation, stage 1 after semantic conditioning or
+  sampling, and stage 2 after decode; dependent branches may reuse the same
+  labels without manual renumbering.
 - `H3 Concat AV Latent` combines standalone H3 video and audio latents into the
   model's native nested AV latent. `H3 Separate AV Latent` splits the streams
   again; both nodes preserve matching video/audio noise masks.
