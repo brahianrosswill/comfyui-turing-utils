@@ -147,6 +147,14 @@ only after its CUDA sources or required version change.
   prefix/suffix step/layer controls. Five-frame target attention remains dense;
   supported longer H3 inputs use their native `5k+2` latent-time layout. The node is
   Python-only and replaces an upstream Sol/SLA/virtual-KV strategy.
+- `Multimodal Prompt Chat` sends one non-streaming system/user turn to an
+  OpenAI-compatible Chat Completions endpoint using only Python's standard HTTP
+  client. Dynamic images are labeled `<Picture N>`; dynamic videos are sampled
+  into timestamped `<Video N>` frames. A root URL automatically gains
+  `/v1/chat/completions`, while versioned and complete endpoint URLs are kept.
+  API keys may be literal, empty for a local placeholder, or `$NAME`/`${NAME}`
+  environment references. The optional thinking switch emits
+  `chat_template_kwargs.enable_thinking=false`.
 - `Video Motion Contact Sheet (Experimental)` samples an `N x N` chronological
   storyboard from a loaded `VIDEO` or decoded `IMAGE` frame batch. It can use
   uniform or motion-weighted sampling and optionally wraps each panel in
