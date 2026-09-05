@@ -178,6 +178,7 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsH3StaticVirtualKV",
                 "TuringUtilsResizeImageIfPresent",
                 "TuringUtilsVideoMotionContactSheet",
+                "TuringUtilsMultimodalChatOptions",
                 "TuringUtilsMultimodalPromptChat",
                 "TuringUtilsMiniMaxH3VideoVAEDecode",
                 "TuringUtilsMiniMaxH3VideoVAEEncode",

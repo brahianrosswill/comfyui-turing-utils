@@ -153,7 +153,9 @@ only after its CUDA sources or required version change.
   into timestamped `<Video N>` frames. A root URL automatically gains
   `/v1/chat/completions`, while versioned and complete endpoint URLs are kept.
   API keys may be literal, empty for a local placeholder, or `$NAME`/`${NAME}`
-  environment references. The optional thinking switch emits
+  environment references. The optional `Multimodal Chat Options` node owns
+  thinking, sampling, media, retry, and cache controls; leaving it disconnected
+  uses identical built-in defaults, including an 8192-token output limit and
   `chat_template_kwargs.enable_thinking=false`.
 - `Video Motion Contact Sheet (Experimental)` samples an `N x N` chronological
   storyboard from a loaded `VIDEO` or decoded `IMAGE` frame batch. It can use

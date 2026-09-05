@@ -17,6 +17,9 @@ sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
 from comfyui_turing_utils.nodes.multimodal_chat import (  # noqa: E402
+    ChatOptions,
+    DEFAULT_CHAT_OPTIONS,
+    MultimodalChatOptions,
     MultimodalPromptChat,
     build_chat_request,
     build_user_content,
@@ -32,12 +35,34 @@ class MultimodalPromptChatTest(unittest.TestCase):
         self.assertEqual(schema.node_id, "TuringUtilsMultimodalPromptChat")
         self.assertEqual(schema.outputs[0].id, "enhanced_prompt")
         self.assertEqual(schema.outputs[1].id, "metadata_json")
+        self.assertEqual(
+            [item.id for item in schema.inputs[:5]],
+            ["prompt", "system_prompt", "base_url", "model", "api_key"],
+        )
         inputs = {item.id: item for item in schema.inputs}
         self.assertEqual(inputs["images"].template.input.io_type, "IMAGE")
         self.assertEqual(inputs["videos"].template.input.io_type, "VIDEO")
         self.assertTrue(inputs["images"].optional)
         self.assertTrue(inputs["videos"].optional)
+        self.assertTrue(inputs["options"].optional)
+        self.assertEqual(inputs["options"].io_type, "TURING_UTILS_CHAT_OPTIONS")
+        self.assertNotIn("disable_thinking", inputs)
+
+    def test_options_node_owns_advanced_parameters_and_defaults_to_8k(self):
+        schema = MultimodalChatOptions.define_schema()
+        self.assertEqual(schema.node_id, "TuringUtilsMultimodalChatOptions")
+        self.assertEqual(schema.outputs[0].io_type, "TURING_UTILS_CHAT_OPTIONS")
+        inputs = {item.id: item for item in schema.inputs}
         self.assertTrue(inputs["disable_thinking"].default)
+        self.assertEqual(inputs["max_output_tokens"].default, 8192)
+        self.assertEqual(MultimodalChatOptions.execute().result[0], DEFAULT_CHAT_OPTIONS)
+
+    def test_unconnected_and_connected_default_options_build_identical_requests(self):
+        connected = MultimodalChatOptions.execute().result[0]
+        implicit = build_chat_request("model", "system", "user", DEFAULT_CHAT_OPTIONS)
+        explicit = build_chat_request("model", "system", "user", connected)
+        self.assertEqual(implicit, explicit)
+        self.assertEqual(implicit["max_tokens"], 8192)
 
     def test_endpoint_accepts_root_version_and_complete_urls(self):
         expected = "http://127.0.0.1:9200/v1/chat/completions"
@@ -78,10 +103,10 @@ class MultimodalPromptChatTest(unittest.TestCase):
             "model",
             "system",
             "user",
-            512,
-            -1.0,
-            True,
-            '{"top_p":0.9,"chat_template_kwargs":{"custom":1}}',
+            ChatOptions(
+                max_output_tokens=512,
+                extra_body_json='{"top_p":0.9,"chat_template_kwargs":{"custom":1}}',
+            ),
         )
         self.assertFalse(request["stream"])
         self.assertNotIn("temperature", request)
@@ -92,7 +117,12 @@ class MultimodalPromptChatTest(unittest.TestCase):
 
     def test_extra_body_cannot_replace_core_request_fields(self):
         with self.assertRaisesRegex(ValueError, "must not override"):
-            build_chat_request("model", "", "user", 32, 0.2, False, '{"messages":[]}')
+            build_chat_request(
+                "model",
+                "",
+                "user",
+                ChatOptions(extra_body_json='{"messages":[]}'),
+            )
 
     def test_images_are_naturally_ordered_and_labeled_for_h3_prompts(self):
         red = torch.zeros((1, 8, 8, 3))
@@ -103,13 +133,7 @@ class MultimodalPromptChatTest(unittest.TestCase):
             "edit",
             {"image_10": blue, "image_2": red},
             None,
-            "auto",
-            "jpeg",
-            90,
-            256,
-            2.0,
-            16,
-            256,
+            ChatOptions(max_image_edge=256, video_max_edge=256),
         )
         labels = [item["text"] for item in content if item["type"] == "text"]
         self.assertEqual(labels[1:3], ["<Picture 1>", "<Picture 2>"])
@@ -122,13 +146,7 @@ class MultimodalPromptChatTest(unittest.TestCase):
                 "edit",
                 {"image_0": torch.zeros((2, 8, 8, 3))},
                 None,
-                "auto",
-                "jpeg",
-                90,
-                256,
-                2.0,
-                16,
-                256,
+                ChatOptions(max_image_edge=256, video_max_edge=256),
             )
 
     def test_video_is_sampled_and_labeled_with_timestamps(self):
@@ -141,13 +159,7 @@ class MultimodalPromptChatTest(unittest.TestCase):
             "describe motion",
             None,
             {"video_0": video},
-            "auto",
-            "jpeg",
-            90,
-            256,
-            2.0,
-            16,
-            256,
+            ChatOptions(max_image_edge=256, video_max_edge=256),
         )
         labels = [item["text"] for item in content if item["type"] == "text"]
         self.assertTrue(labels[1].startswith("<Video 1>, frame at 0.000s"))

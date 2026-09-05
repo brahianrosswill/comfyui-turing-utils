@@ -14,7 +14,7 @@ from .nodes.krea2 import Krea2IdentityEditConditioning
 from .nodes.loaders import ConvRotCLIPLoader, ConvRotDiffusionModelLoader
 from .nodes.logic import IsInputPresent, LazyIfElse, StageBarrier, StagePath
 from .nodes.media import ResizeImageIfPresent, VideoMotionContactSheet
-from .nodes.multimodal_chat import MultimodalPromptChat
+from .nodes.multimodal_chat import MultimodalChatOptions, MultimodalPromptChat
 from .nodes.minimax import (
     H3ConcatAVLatent,
     H3SeparateAVLatent,
@@ -76,6 +76,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsH3StaticVirtualKV": H3StaticVirtualKV,
     "TuringUtilsResizeImageIfPresent": ResizeImageIfPresent,
     "TuringUtilsVideoMotionContactSheet": VideoMotionContactSheet,
+    "TuringUtilsMultimodalChatOptions": MultimodalChatOptions,
     "TuringUtilsMultimodalPromptChat": MultimodalPromptChat,
     "TuringUtilsMiniMaxH3VideoVAEDecode": MiniMaxH3VideoVAEDecode,
     "TuringUtilsMiniMaxH3VideoVAEEncode": MiniMaxH3VideoVAEEncode,
@@ -113,6 +114,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsH3StaticVirtualKV": "Configure H3 Static Virtual KV",
     "TuringUtilsResizeImageIfPresent": "Resize Image If Present",
     "TuringUtilsVideoMotionContactSheet": "Video Motion Contact Sheet (Experimental)",
+    "TuringUtilsMultimodalChatOptions": "Multimodal Chat Options",
     "TuringUtilsMultimodalPromptChat": "Multimodal Prompt Chat",
     "TuringUtilsMiniMaxH3VideoVAEDecode": "MiniMax H3 Video VAE Decode",
     "TuringUtilsMiniMaxH3VideoVAEEncode": "MiniMax H3 Video VAE Encode",

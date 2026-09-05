@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from dataclasses import dataclass
 import io as stdlib_io
 import json
 import math
@@ -36,6 +37,29 @@ _VERSION_SEGMENT = re.compile(r"v\d+(?:[a-z]+\d*)?", re.IGNORECASE)
 _DYNAMIC_SUFFIX = re.compile(r"(\d+)$")
 _MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 _RESERVED_BODY_FIELDS = {"model", "messages", "stream", "max_tokens", "temperature"}
+
+
+@dataclass(frozen=True)
+class ChatOptions:
+    disable_thinking: bool = True
+    temperature: float = -1.0
+    max_output_tokens: int = 8192
+    image_detail: str = "auto"
+    image_format: str = "jpeg"
+    jpeg_quality: int = 92
+    max_image_edge: int = 2048
+    video_sample_fps: float = 2.0
+    video_max_frames: int = 16
+    video_max_edge: int = 1536
+    timeout_seconds: int = 120
+    max_retries: int = 2
+    retry_backoff: float = 1.5
+    extra_body_json: str = "{}"
+    cache_buster: int = 0
+
+
+DEFAULT_CHAT_OPTIONS = ChatOptions()
+ChatOptionsType = io.Custom("TURING_UTILS_CHAT_OPTIONS")
 
 
 def normalize_chat_endpoint(base_url: str) -> str:
@@ -153,13 +177,7 @@ def build_user_content(
     prompt: str,
     images,
     videos,
-    image_detail: str,
-    image_format: str,
-    jpeg_quality: int,
-    max_image_edge: int,
-    video_sample_fps: float,
-    video_max_frames: int,
-    video_max_edge: int,
+    options: ChatOptions,
 ) -> tuple[str | list[dict], dict]:
     image_entries = _natural_entries(images)
     video_entries = _natural_entries(videos)
@@ -176,21 +194,21 @@ def build_user_content(
         }
     ]
     for index, (name, tensor) in enumerate(image_entries, start=1):
-        picture = _resize_image(_tensor_image(tensor, name), max_image_edge)
+        picture = _resize_image(_tensor_image(tensor, name), options.max_image_edge)
         content.append({"type": "text", "text": f"<Picture {index}>"})
-        content.append(_image_block(_image_data_url(picture, image_format, jpeg_quality), image_detail))
+        content.append(_image_block(_image_data_url(picture, options.image_format, options.jpeg_quality), options.image_detail))
 
     video_timestamps = []
     for index, (name, video) in enumerate(video_entries, start=1):
-        sample_count = _sample_count(video, video_sample_fps, video_max_frames)
+        sample_count = _sample_count(video, options.video_sample_fps, options.video_max_frames)
         frames, timestamps = _sample_video(video, sample_count, "uniform")
         times = []
         for frame, timestamp in zip(frames, timestamps):
             seconds = float(timestamp)
             times.append(round(seconds, 6))
-            picture = _resize_image(_tensor_image(frame.unsqueeze(0), f"{name} frame"), video_max_edge)
+            picture = _resize_image(_tensor_image(frame.unsqueeze(0), f"{name} frame"), options.video_max_edge)
             content.append({"type": "text", "text": f"<Video {index}>, frame at {seconds:.3f}s"})
-            content.append(_image_block(_image_data_url(picture, image_format, jpeg_quality), image_detail))
+            content.append(_image_block(_image_data_url(picture, options.image_format, options.jpeg_quality), options.image_detail))
         video_timestamps.append(times)
 
     content.append({"type": "text", "text": f"User request:\n{prompt}"})
@@ -206,13 +224,10 @@ def build_chat_request(
     model: str,
     system_prompt: str,
     user_content: str | list[dict],
-    max_output_tokens: int,
-    temperature: float,
-    disable_thinking: bool,
-    extra_body_json: str,
+    options: ChatOptions,
 ) -> dict:
     try:
-        body = json.loads(extra_body_json.strip() or "{}")
+        body = json.loads(options.extra_body_json.strip() or "{}")
     except json.JSONDecodeError as error:
         raise ValueError(f"extra_body_json is not valid JSON: {error.msg}") from error
     if not isinstance(body, dict):
@@ -230,12 +245,12 @@ def build_chat_request(
             "model": model,
             "messages": messages,
             "stream": False,
-            "max_tokens": int(max_output_tokens),
+            "max_tokens": options.max_output_tokens,
         }
     )
-    if temperature >= 0.0:
-        body["temperature"] = float(temperature)
-    if disable_thinking:
+    if options.temperature >= 0.0:
+        body["temperature"] = options.temperature
+    if options.disable_thinking:
         template_options = body.get("chat_template_kwargs", {})
         if not isinstance(template_options, dict):
             raise ValueError("extra_body_json.chat_template_kwargs must be an object")
@@ -348,6 +363,90 @@ def extract_chat_text(response: dict) -> tuple[str, dict]:
     return text, choice
 
 
+class MultimodalChatOptions(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="TuringUtilsMultimodalChatOptions",
+            display_name="Multimodal Chat Options",
+            category="Turing Utils/prompting",
+            description=(
+                "Optional generation, media, retry, and cache settings for "
+                "Multimodal Prompt Chat. Leaving it disconnected uses these defaults."
+            ),
+            search_aliases=["LLM options", "chat parameters", "prompt chat settings"],
+            inputs=[
+                io.Boolean.Input(
+                    "disable_thinking",
+                    default=DEFAULT_CHAT_OPTIONS.disable_thinking,
+                    tooltip="Send chat_template_kwargs.enable_thinking=false. Disable this option if the server rejects that extension.",
+                ),
+                io.Float.Input("temperature", default=DEFAULT_CHAT_OPTIONS.temperature, min=-1.0, max=2.0, step=0.05, tooltip="-1 omits temperature and uses the server default."),
+                io.Int.Input("max_output_tokens", default=DEFAULT_CHAT_OPTIONS.max_output_tokens, min=1, max=131072, step=1),
+                io.Combo.Input("image_detail", options=["auto", "low", "high"], default=DEFAULT_CHAT_OPTIONS.image_detail),
+                io.Combo.Input("image_format", options=["jpeg", "png"], default=DEFAULT_CHAT_OPTIONS.image_format),
+                io.Int.Input("jpeg_quality", default=DEFAULT_CHAT_OPTIONS.jpeg_quality, min=40, max=100, step=1),
+                io.Int.Input("max_image_edge", default=DEFAULT_CHAT_OPTIONS.max_image_edge, min=256, max=8192, step=64),
+                io.Float.Input("video_sample_fps", default=DEFAULT_CHAT_OPTIONS.video_sample_fps, min=0.1, max=24.0, step=0.1),
+                io.Int.Input("video_max_frames", default=DEFAULT_CHAT_OPTIONS.video_max_frames, min=1, max=64, step=1),
+                io.Int.Input("video_max_edge", default=DEFAULT_CHAT_OPTIONS.video_max_edge, min=256, max=4096, step=64),
+                io.Int.Input("timeout_seconds", default=DEFAULT_CHAT_OPTIONS.timeout_seconds, min=1, max=3600, step=1),
+                io.Int.Input("max_retries", default=DEFAULT_CHAT_OPTIONS.max_retries, min=0, max=5, step=1),
+                io.Float.Input("retry_backoff", default=DEFAULT_CHAT_OPTIONS.retry_backoff, min=0.0, max=30.0, step=0.1),
+                io.String.Input("extra_body_json", multiline=True, default=DEFAULT_CHAT_OPTIONS.extra_body_json),
+                io.Int.Input(
+                    "cache_buster",
+                    default=DEFAULT_CHAT_OPTIONS.cache_buster,
+                    min=0,
+                    max=2**31 - 1,
+                    step=1,
+                    control_after_generate=True,
+                    tooltip="Change this value to make ComfyUI issue a fresh request for otherwise identical inputs.",
+                ),
+            ],
+            outputs=[ChatOptionsType.Output("options")],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        disable_thinking: bool = DEFAULT_CHAT_OPTIONS.disable_thinking,
+        temperature: float = DEFAULT_CHAT_OPTIONS.temperature,
+        max_output_tokens: int = DEFAULT_CHAT_OPTIONS.max_output_tokens,
+        image_detail: str = DEFAULT_CHAT_OPTIONS.image_detail,
+        image_format: str = DEFAULT_CHAT_OPTIONS.image_format,
+        jpeg_quality: int = DEFAULT_CHAT_OPTIONS.jpeg_quality,
+        max_image_edge: int = DEFAULT_CHAT_OPTIONS.max_image_edge,
+        video_sample_fps: float = DEFAULT_CHAT_OPTIONS.video_sample_fps,
+        video_max_frames: int = DEFAULT_CHAT_OPTIONS.video_max_frames,
+        video_max_edge: int = DEFAULT_CHAT_OPTIONS.video_max_edge,
+        timeout_seconds: int = DEFAULT_CHAT_OPTIONS.timeout_seconds,
+        max_retries: int = DEFAULT_CHAT_OPTIONS.max_retries,
+        retry_backoff: float = DEFAULT_CHAT_OPTIONS.retry_backoff,
+        extra_body_json: str = DEFAULT_CHAT_OPTIONS.extra_body_json,
+        cache_buster: int = DEFAULT_CHAT_OPTIONS.cache_buster,
+    ) -> io.NodeOutput:
+        return io.NodeOutput(
+            ChatOptions(
+                disable_thinking=bool(disable_thinking),
+                temperature=float(temperature),
+                max_output_tokens=int(max_output_tokens),
+                image_detail=image_detail,
+                image_format=image_format,
+                jpeg_quality=int(jpeg_quality),
+                max_image_edge=int(max_image_edge),
+                video_sample_fps=float(video_sample_fps),
+                video_max_frames=int(video_max_frames),
+                video_max_edge=int(video_max_edge),
+                timeout_seconds=int(timeout_seconds),
+                max_retries=int(max_retries),
+                retry_backoff=float(retry_backoff),
+                extra_body_json=extra_body_json,
+                cache_buster=int(cache_buster),
+            )
+        )
+
+
 class MultimodalPromptChat(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -375,10 +474,10 @@ class MultimodalPromptChat(io.ComfyNode):
                     default="",
                     tooltip="Literal key, $NAME, or ${NAME}. Empty sends the placeholder key 'not-needed'. Literal keys are stored in the workflow.",
                 ),
-                io.Boolean.Input(
-                    "disable_thinking",
-                    default=True,
-                    tooltip="Send chat_template_kwargs.enable_thinking=false. Disable this option if the server rejects that extension.",
+                ChatOptionsType.Input(
+                    "options",
+                    optional=True,
+                    tooltip="Optional Multimodal Chat Options. Unconnected uses the documented defaults, including an 8K output limit.",
                 ),
                 io.Autogrow.Input(
                     "images",
@@ -402,29 +501,6 @@ class MultimodalPromptChat(io.ComfyNode):
                     ),
                     tooltip="Optional videos, uniformly sampled and labeled <Video 1> onward.",
                 ),
-                io.Float.Input("temperature", default=-1.0, min=-1.0, max=2.0, step=0.05, advanced=True, tooltip="-1 omits temperature and uses the server default."),
-                io.Int.Input("max_output_tokens", default=2048, min=1, max=131072, step=1, advanced=True),
-                io.Combo.Input("image_detail", options=["auto", "low", "high"], default="auto", advanced=True),
-                io.Combo.Input("image_format", options=["jpeg", "png"], default="jpeg", advanced=True),
-                io.Int.Input("jpeg_quality", default=92, min=40, max=100, step=1, advanced=True),
-                io.Int.Input("max_image_edge", default=2048, min=256, max=8192, step=64, advanced=True),
-                io.Float.Input("video_sample_fps", default=2.0, min=0.1, max=24.0, step=0.1, advanced=True),
-                io.Int.Input("video_max_frames", default=16, min=1, max=64, step=1, advanced=True),
-                io.Int.Input("video_max_edge", default=1536, min=256, max=4096, step=64, advanced=True),
-                io.Int.Input("timeout_seconds", default=120, min=1, max=3600, step=1, advanced=True),
-                io.Int.Input("max_retries", default=2, min=0, max=5, step=1, advanced=True),
-                io.Float.Input("retry_backoff", default=1.5, min=0.0, max=30.0, step=0.1, advanced=True),
-                io.String.Input("extra_body_json", multiline=True, default="{}", advanced=True),
-                io.Int.Input(
-                    "cache_buster",
-                    default=0,
-                    min=0,
-                    max=2**31 - 1,
-                    step=1,
-                    control_after_generate=True,
-                    advanced=True,
-                    tooltip="Change this value to make ComfyUI issue a fresh request for otherwise identical inputs.",
-                ),
             ],
             outputs=[
                 io.String.Output("enhanced_prompt"),
@@ -440,21 +516,7 @@ class MultimodalPromptChat(io.ComfyNode):
         base_url: str,
         model: str,
         api_key: str,
-        disable_thinking: bool,
-        temperature: float,
-        max_output_tokens: int,
-        image_detail: str,
-        image_format: str,
-        jpeg_quality: int,
-        max_image_edge: int,
-        video_sample_fps: float,
-        video_max_frames: int,
-        video_max_edge: int,
-        timeout_seconds: int,
-        max_retries: int,
-        retry_backoff: float,
-        extra_body_json: str,
-        cache_buster: int,
+        options: ChatOptions | None = None,
         images=None,
         videos=None,
     ) -> io.NodeOutput:
@@ -463,6 +525,10 @@ class MultimodalPromptChat(io.ComfyNode):
         model = model.strip()
         if not model:
             raise ValueError("model must not be empty")
+        if options is None:
+            options = DEFAULT_CHAT_OPTIONS
+        elif not isinstance(options, ChatOptions):
+            raise ValueError("options must come from a Multimodal Chat Options node")
 
         endpoint = normalize_chat_endpoint(base_url)
         key = resolve_api_key(api_key)
@@ -472,31 +538,22 @@ class MultimodalPromptChat(io.ComfyNode):
             prompt,
             images,
             videos,
-            image_detail,
-            image_format,
-            int(jpeg_quality),
-            int(max_image_edge),
-            float(video_sample_fps),
-            int(video_max_frames),
-            int(video_max_edge),
+            options,
         )
         body = build_chat_request(
             model,
             system_prompt,
             user_content,
-            int(max_output_tokens),
-            float(temperature),
-            bool(disable_thinking),
-            extra_body_json,
+            options,
         )
         response = await asyncio.to_thread(
             request_chat_completion,
             endpoint,
             key,
             body,
-            int(timeout_seconds),
-            int(max_retries),
-            float(retry_backoff),
+            options.timeout_seconds,
+            options.max_retries,
+            options.retry_backoff,
         )
         text, choice = extract_chat_text(response)
         metadata = {
@@ -505,8 +562,8 @@ class MultimodalPromptChat(io.ComfyNode):
             "finish_reason": choice.get("finish_reason"),
             "usage": response.get("usage", {}),
             "media": media,
-            "thinking_disabled": bool(disable_thinking),
-            "cache_buster": int(cache_buster),
+            "thinking_disabled": options.disable_thinking,
+            "cache_buster": options.cache_buster,
             "elapsed_seconds": round(time.monotonic() - started, 3),
         }
         return io.NodeOutput(text, json.dumps(metadata, ensure_ascii=False, indent=2))
