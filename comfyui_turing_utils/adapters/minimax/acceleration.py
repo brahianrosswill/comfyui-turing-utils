@@ -2064,6 +2064,9 @@ def _make_block_forward(
             diffusion_model=diffusion_model,
         )
         blocker = _block_fusion_blocker(x, t_emb, device_index)
+        if blocker is None and any(isinstance(row, torch.Tensor) for _, _, row in mod_segments):
+            # Masked H3 tokens may select different AdaLN rows within one segment.
+            blocker = "per_token_modulation"
         audit.record("block", blocker is None, x, blocker)
         if blocker is not None:
             kwargs = {"transformer_options": transformer_options}

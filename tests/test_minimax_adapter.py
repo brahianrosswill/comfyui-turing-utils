@@ -321,6 +321,92 @@ class MiniMaxAdapterTest(unittest.TestCase):
             },
         )
 
+    def _check_masked_block_matches_native(self, device, dtype):
+        from comfy.ldm.minimax.model import DiTBlock, _mod_gate
+
+        torch.manual_seed(321)
+        block = DiTBlock(
+            hidden=128, heads=1, head_dim=128, ffn=64, t_dim=32,
+            eps=1e-5, qk_eps=1e-6, dtype=dtype, device=device,
+            operations=SimpleNamespace(Linear=torch.nn.Linear, RMSNorm=torch.nn.RMSNorm),
+        )
+        x = torch.randn(27, 128, device=device, dtype=dtype)
+        t_emb = torch.randn(3, 32, device=device, dtype=dtype)
+        audio_rows = torch.tensor([2, 5, 8, 2, 8, 5, 2, 8], device=device)
+        video_rows = torch.tensor([0, 3, 6, 0] * 4, device=device)
+        cases = {
+            "video": (2, video_rows),
+            "audio": (audio_rows, 0),
+            "both": (audio_rows, video_rows),
+            "constant_tensor": (2, torch.zeros_like(video_rows)),
+        }
+        for name, (audio_row, video_row) in cases.items():
+            with self.subTest(device=device, dtype=dtype, mask=name):
+                segments = [(0, 3, 1), (3, 11, audio_row), (11, 27, video_row)]
+                options = {}
+                audit = mock.Mock()
+                patched = minimax_adapter._make_block_forward(block, 0, _mod_gate, audit)
+                # Verify fallback preserves the attention override and MLP calls.
+                attention = mock.Mock(wraps=block.attn.forward)
+                with (
+                    torch.inference_mode(),
+                    mock.patch.object(block.mlp, "forward", wraps=block.mlp.forward) as mlp,
+                ):
+                    expected = block.forward(
+                        x.clone(), t_emb, segments, None,
+                        transformer_options=options, attention=attention,
+                    )
+                    mlp.reset_mock()
+                    attention.reset_mock()
+                    with (
+                        mock.patch.object(minimax_adapter, "_block_fusion_blocker", return_value=None),
+                        mock.patch.object(minimax_adapter, "segmented_rms_adaln") as fused_norm,
+                        mock.patch.object(minimax_adapter, "segmented_mod_gate_rms_adaln") as fused_gate_norm,
+                        mock.patch.object(minimax_adapter, "segmented_mod_gate") as fused_gate,
+                    ):
+                        actual = patched(
+                            x.clone(), t_emb, segments, None,
+                            transformer_options=options, attention=attention,
+                        )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                attention.assert_called_once()
+                mlp.assert_called_once()
+                self.assertIs(attention.call_args.kwargs["transformer_options"], options)
+                fused_norm.assert_not_called()
+                fused_gate_norm.assert_not_called()
+                fused_gate.assert_not_called()
+                self.assertFalse(audit.record.call_args.args[1])
+                self.assertEqual(audit.record.call_args.args[3], "per_token_modulation")
+
+    def test_masked_block_matches_native(self):
+        self._check_masked_block_matches_native(torch.device("cpu"), torch.float32)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_cuda_masked_block_matches_native(self):
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            self._check_masked_block_matches_native(torch.device("cuda", 0), dtype)
+
+    def test_scalar_segments_keep_block_fusions(self):
+        FakeBlock, _ = self._types("w8a8")
+        block = FakeBlock()
+        block.adaln_proj.forward = mock.Mock(return_value=(torch.zeros(1, 256),) * 6)
+        block.attn.forward = mock.Mock(return_value=torch.zeros(4, 256))
+        x = torch.zeros(4, 256)
+        audit = mock.Mock()
+        patched = minimax_adapter._make_block_forward(block, 0, mock.Mock(), audit)
+        with (
+            mock.patch.object(minimax_adapter, "_block_fusion_blocker", return_value=None),
+            mock.patch.object(minimax_adapter, "segmented_rms_adaln", return_value=x) as norm,
+            mock.patch.object(minimax_adapter, "segmented_mod_gate_rms_adaln", return_value=(x, x)) as gate_norm,
+            mock.patch.object(minimax_adapter, "segmented_mod_gate", return_value=x) as gate,
+        ):
+            result = patched(x, x, [(0, 4, 0)], None)
+        self.assertIs(result, x)
+        norm.assert_called_once()
+        gate_norm.assert_called_once()
+        gate.assert_called_once()
+        self.assertTrue(audit.record.call_args.args[1])
+
     def test_memory_rows_match_packed_layout_for_multimodal_references(self):
         from comfy.ldm.minimax.model import PackedLayout
 

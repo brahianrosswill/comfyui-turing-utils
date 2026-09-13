@@ -15,7 +15,7 @@ COMFY_ROOT = PLUGIN_ROOT.parents[1]
 sys.path.insert(0, str(COMFY_ROOT))
 sys.path.insert(0, str(PLUGIN_ROOT))
 
-from comfyui_turing_utils.adapters.minimax import block_cache  # noqa: E402
+from comfyui_turing_utils.adapters.minimax import acceleration, block_cache  # noqa: E402
 from comfyui_turing_utils.adapters.minimax.block_cache import (  # noqa: E402
     MiniMaxH3BlockCache,
     MiniMaxH3BlockCacheGroup,
@@ -392,6 +392,9 @@ class MiniMaxH3BlockCacheTest(unittest.TestCase):
                     torch.nn.init.normal_(parameter, std=0.02)
                 else:
                     parameter.zero_()
+            for module in model.modules():
+                if isinstance(module, torch.nn.RMSNorm):
+                    module.weight.fill_(1.0)
             model.rope.inv_freq.fill_(0.01)
 
         video = torch.randn(1, 2, 1, 4, 2)
@@ -419,6 +422,9 @@ class MiniMaxH3BlockCacheTest(unittest.TestCase):
                 denoise_mask=denoise_mask,
                 audio_denoise_mask=audio_denoise_mask,
             )
+            for output in expected:
+                self.assertTrue(torch.isfinite(output).all())
+                self.assertGreater(torch.count_nonzero(output).item(), 0)
             options = dict(base_options)
             options[block_cache.CACHE_KEY] = MiniMaxH3BlockCacheGroup(
                 "standard", "gpu", 2
@@ -432,6 +438,32 @@ class MiniMaxH3BlockCacheTest(unittest.TestCase):
                 denoise_mask=denoise_mask,
                 audio_denoise_mask=audio_denoise_mask,
             )
+
+            audit = mock.Mock()
+            for block in model.blocks:
+                block.forward = acceleration._make_block_forward(
+                    block, 0, block_cache.minimax_model._mod_gate, audit,
+                )
+            with mock.patch.object(acceleration, "_block_fusion_blocker", return_value=None):
+                for cached in (False, True):
+                    options = dict(base_options)
+                    if cached:
+                        options[block_cache.CACHE_KEY] = MiniMaxH3BlockCacheGroup("standard", "gpu", 2)
+                        run = lambda: block_cache._cached_forward(
+                            model, [video, audio], timestep, context, transformer_options=options,
+                            denoise_mask=denoise_mask, audio_denoise_mask=audio_denoise_mask,
+                        )
+                    else:
+                        run = lambda: model._forward(
+                            [video, audio], timestep, context, transformer_options=options,
+                            denoise_mask=denoise_mask, audio_denoise_mask=audio_denoise_mask,
+                        )
+                    for native, patched in zip(expected, run()):
+                        torch.testing.assert_close(patched, native, rtol=0, atol=0)
+            self.assertEqual(audit.record.call_count, 4)
+            for call in audit.record.call_args_list:
+                self.assertFalse(call.args[1])
+                self.assertEqual(call.args[3], "per_token_modulation")
 
         for native, cached in zip(expected, actual):
             self.assertTrue(torch.equal(native, cached))
