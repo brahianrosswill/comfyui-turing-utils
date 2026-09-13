@@ -115,9 +115,12 @@ only after its CUDA sources or required version change.
   Video reference inputs must be resampled to 24 FPS by their upstream loaders.
 - `H3 Semantic Reference` performs the Qwen3-VL presentation encode once from
   the prompt and reference objects. `H3 Build Conditioning` combines that
-  reusable semantic result with structure-equivalent VAE references and an H3
-  target latent. This permits low-resolution semantic images and separately
-  encoded high-resolution DiT keyframes without rerunning Qwen.
+  reusable semantic result with independently selected VAE references and an
+  H3 target latent. Build references may be omitted, added, or replaced without
+  rerunning Qwen or matching the semantic reference counts/modalities. Connected
+  first/last keyframes must still be single-frame latents matching the target
+  spatial grid. Semantic embeddings and their token tags are kept unchanged;
+  reference meaning and ordering are controlled by the workflow.
 - `Load MiniMax H3 Latent Upscaler` loads the attention-free 3D learned latent
   upscaler through ComfyUI's normal offload lifecycle. Place compatible weights
   from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)

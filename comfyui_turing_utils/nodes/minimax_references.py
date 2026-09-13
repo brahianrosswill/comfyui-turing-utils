@@ -385,8 +385,8 @@ class H3SemanticReference(io.ComfyNode):
             category="Turing Utils/conditioning/minimax",
             description=(
                 "Run one exact Qwen3-VL multimodal encode over the prompt and selected "
-                "H3 references. The resulting semantic reference can be reused with "
-                "structure-equivalent DiT references at another resolution."
+                "H3 references. Reuse the semantic result independently of the "
+                "reference selection and resolution in H3 Build Conditioning."
             ),
             inputs=[
                 io.Clip.Input("clip"),
@@ -440,7 +440,9 @@ class H3BuildConditioning(io.ComfyNode):
             category="Turing Utils/conditioning/minimax",
             description=(
                 "Combine a reusable Qwen semantic reference with current-resolution "
-                "first-last-frame, image, video, and audio VAE references."
+                "first-last-frame, image, video, and audio VAE references. These "
+                "may differ from the semantic encoder's references; only connected "
+                "keyframes must match the target latent's spatial grid."
             ),
             inputs=[
                 H3SemanticReferenceType.Input("semantic_reference"),
@@ -469,19 +471,6 @@ class H3BuildConditioning(io.ComfyNode):
             raise ValueError("semantic_reference must come from H3 Semantic Reference")
         first_frame = _keyframe_reference(first_frame, "first_frame")
         last_frame = _keyframe_reference(last_frame, "last_frame")
-        manifest = _manifest(
-            first_frame,
-            last_frame,
-            image_reference,
-            video_reference,
-            audio_reference,
-        )
-        if manifest != semantic_reference.manifest:
-            raise ValueError(
-                "Semantic and DiT H3 reference structures differ: "
-                f"semantic={semantic_reference.manifest}, dit={manifest}"
-            )
-
         target_video = _video_latent(latent)
         frame_count = _frame_count_from_latent_t(int(target_video.shape[2]))
         keyframes = []
