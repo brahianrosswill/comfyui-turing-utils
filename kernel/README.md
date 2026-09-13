@@ -1,7 +1,19 @@
 # comfyui-turing-utils-kernel
 
 Separately installed CUDA/PyTorch extension for the ComfyUI plugin's quantized
-runtime. Version 0.42.0 adds FP16 row quantization and an FP16 W8A8 epilogue
+runtime. Version 0.43.0 adds per-token H3 modulation indices to all three
+segmented AdaLN/gated-residual ops. The indexed path preserves native dtype
+boundaries and uses a block-local int64 row vector, without expanded parameter
+matrices or persistent mask caches. Older native binaries retain the plugin's
+masked-block fallback; rebuild the kernel to enable indexed fusion.
+`scripts/benchmark_indexed_modulation.py` measures the two RMSNorm/AdaLN and
+two gated-residual stages, including index packing. On A40/cu128 at
+20,000 x 5376 it measured about 3.2x (FP16/BF16) and 3.0x (FP32), with roughly
+40% lower extra peak allocation. This excludes attention/MLP and is not an
+end-to-end video speedup. RMS reduction order can change last-bit rounding;
+the indexed gated residual matches the tested native PyTorch output exactly.
+
+Version 0.42.0 adds FP16 row quantization and an FP16 W8A8 epilogue
 for the H3 video VAE, preserving native activation/rotation and original INT8 weight
 layout and the existing BF16 APIs. It does not force BF16 VAE execution.
 Version 0.41.0 completed the mapped physical-K/logical-RoPE Sol path

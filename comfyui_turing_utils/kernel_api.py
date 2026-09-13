@@ -45,6 +45,14 @@ def kernel_version(default: str = "0.0.0") -> str:
     return str(getattr(package, "__version__", default))
 
 
+def segmented_modulation_schema() -> int:
+    try:
+        extension = load_kernel_extension("_C")
+    except (ImportError, OSError):
+        return 0
+    return int(getattr(extension, "segmented_modulation_schema", 0))
+
+
 def qk_preprocess_protocol_schema() -> int:
     """Return the fused Q/K native ABI schema, not the Python package version."""
     try:
@@ -93,4 +101,5 @@ __all__ = [
     "load_kernel_package",
     "load_turing_sage",
     "qk_preprocess_protocol_schema",
+    "segmented_modulation_schema",
 ]

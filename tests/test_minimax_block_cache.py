@@ -363,9 +363,17 @@ class MiniMaxH3BlockCacheTest(unittest.TestCase):
         )
 
     def test_current_comfy_full_cache_pass_matches_native_masked_forward(self):
+        self._check_native_masked_forward("cpu", 0)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+    def test_cuda_indexed_fusions_match_native_masked_forward_with_cache(self):
+        self.assertGreaterEqual(acceleration.segmented_modulation_schema(), 2)
+        self._check_native_masked_forward("cuda", 2)
+
+    def _check_native_masked_forward(self, device, schema):
         operations = SimpleNamespace(
             Linear=torch.nn.Linear,
-            RMSNorm=torch.nn.RMSNorm,
+            RMSNorm=block_cache.comfy.ops.disable_weight_init.RMSNorm,
         )
         torch.manual_seed(123)
         model = block_cache.minimax_model.MiniMaxH3Model(
@@ -385,7 +393,7 @@ class MiniMaxH3BlockCacheTest(unittest.TestCase):
             rope_inv_freq_len=16,
             dtype=torch.float32,
             operations=operations,
-        ).eval()
+        ).to(device).eval()
         with torch.no_grad():
             for parameter in model.parameters():
                 if parameter.ndim > 1:
@@ -397,17 +405,17 @@ class MiniMaxH3BlockCacheTest(unittest.TestCase):
                     module.weight.fill_(1.0)
             model.rope.inv_freq.fill_(0.01)
 
-        video = torch.randn(1, 2, 1, 4, 2)
-        audio = torch.randn(1, 4, 2, 2)
-        context = torch.randn(1, 3, 128)
-        timestep = torch.tensor([700.0])
+        video = torch.randn(1, 2, 1, 4, 2, device=device)
+        audio = torch.randn(1, 4, 2, 2, device=device)
+        context = torch.randn(1, 3, 128, device=device)
+        timestep = torch.tensor([700.0], device=device)
         denoise_mask = torch.tensor(
-            [[[[[0.5, 0.5], [0.5, 0.5], [1.0, 1.0], [1.0, 1.0]]]]]
+            [[[[[0.5, 0.5], [0.5, 0.5], [1.0, 1.0], [1.0, 1.0]]]]], device=device,
         )
-        audio_denoise_mask = torch.tensor([[[[0.5, 1.0], [0.25, 1.0]]]])
+        audio_denoise_mask = torch.tensor([[[[0.0, 1.0], [0.25, 1.0]]]], device=device)
         base_options = {
-            "sample_sigmas": torch.tensor([0.7, 0.4, 0.0]),
-            "sigmas": torch.tensor([0.7]),
+            "sample_sigmas": torch.tensor([0.7, 0.4, 0.0], device=device),
+            "sigmas": torch.tensor([0.7], device=device),
         }
 
         with (
@@ -440,10 +448,11 @@ class MiniMaxH3BlockCacheTest(unittest.TestCase):
             )
 
             audit = mock.Mock()
-            for block in model.blocks:
-                block.forward = acceleration._make_block_forward(
-                    block, 0, block_cache.minimax_model._mod_gate, audit,
-                )
+            with mock.patch.object(acceleration, "segmented_modulation_schema", return_value=schema):
+                for block in model.blocks:
+                    block.forward = acceleration._make_block_forward(
+                        block, 0, block_cache.minimax_model._mod_gate, audit,
+                    )
             with mock.patch.object(acceleration, "_block_fusion_blocker", return_value=None):
                 for cached in (False, True):
                     options = dict(base_options)
@@ -459,11 +468,12 @@ class MiniMaxH3BlockCacheTest(unittest.TestCase):
                             denoise_mask=denoise_mask, audio_denoise_mask=audio_denoise_mask,
                         )
                     for native, patched in zip(expected, run()):
-                        torch.testing.assert_close(patched, native, rtol=0, atol=0)
+                        tolerance = 3e-6 if schema >= 2 else 0
+                        torch.testing.assert_close(patched, native, rtol=tolerance, atol=tolerance)
             self.assertEqual(audit.record.call_count, 4)
             for call in audit.record.call_args_list:
-                self.assertFalse(call.args[1])
-                self.assertEqual(call.args[3], "per_token_modulation")
+                self.assertEqual(call.args[1], schema >= 2)
+                self.assertEqual(call.args[3], None if schema >= 2 else "per_token_modulation")
 
         for native, cached in zip(expected, actual):
             self.assertTrue(torch.equal(native, cached))

@@ -345,7 +345,8 @@ class MiniMaxAdapterTest(unittest.TestCase):
                 segments = [(0, 3, 1), (3, 11, audio_row), (11, 27, video_row)]
                 options = {}
                 audit = mock.Mock()
-                patched = minimax_adapter._make_block_forward(block, 0, _mod_gate, audit)
+                with mock.patch.object(minimax_adapter, "segmented_modulation_schema", return_value=0):
+                    patched = minimax_adapter._make_block_forward(block, 0, _mod_gate, audit)
                 # Verify fallback preserves the attention override and MLP calls.
                 attention = mock.Mock(wraps=block.attn.forward)
                 with (

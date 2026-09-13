@@ -972,6 +972,15 @@ std::tuple<at::Tensor, at::Tensor> turing_bf16_gelu_int4_convrot_quantize(
     return turing_bf16_gelu_convrot_quantize(std::move(input), group_size, true);
 }
 
+void check_modulation_segments(const at::Tensor &segments, int64_t rows) {
+    TORCH_CHECK(segments.is_cuda() && segments.is_contiguous(),
+                "modulation indices must be contiguous on CUDA");
+    TORCH_CHECK((segments.dim() == 2 && segments.scalar_type() == at::kInt && segments.size(1) == 3) ||
+                    (segments.dim() == 1 && segments.scalar_type() == at::kLong && segments.size(0) == rows),
+                "segments must be int32 [S, 3] triples or int64 [M] per-token indices");
+    TORCH_CHECK(segments.size(0) > 0, "modulation indices must not be empty");
+}
+
 at::Tensor turing_segmented_rms_adaln(at::Tensor input,
                                        at::Tensor weight,
                                        at::Tensor scale,
@@ -989,10 +998,7 @@ at::Tensor turing_segmented_rms_adaln(at::Tensor input,
                 "scale must be a CUDA matrix with contiguous rows");
     TORCH_CHECK(shift.is_cuda() && shift.dim() == 2 && shift.stride(1) == 1,
                 "shift must be a CUDA matrix with contiguous rows");
-    TORCH_CHECK(segments.is_cuda() && segments.dim() == 2 && segments.is_contiguous(),
-                "segments must be a contiguous 2D CUDA tensor");
-    TORCH_CHECK(segments.scalar_type() == at::kInt && segments.size(1) == 3,
-                "segments must be int32 [start, stop, modulation_row] triples");
+    check_modulation_segments(segments, input.size(0));
     TORCH_CHECK(input.device() == weight.device() &&
                     input.device() == scale.device() &&
                     input.device() == shift.device() &&
@@ -1052,9 +1058,7 @@ void turing_segmented_mod_gate(at::Tensor input,
                 "gate must be a CUDA matrix with contiguous rows");
     TORCH_CHECK(residual.is_cuda() && residual.dim() == 2 && residual.is_contiguous(),
                 "residual must be a contiguous 2D CUDA tensor");
-    TORCH_CHECK(segments.is_cuda() && segments.dim() == 2 && segments.is_contiguous() &&
-                    segments.scalar_type() == at::kInt && segments.size(1) == 3,
-                "segments must be contiguous int32 triples on CUDA");
+    check_modulation_segments(segments, input.size(0));
     TORCH_CHECK(input.device() == gate.device() && input.device() == residual.device() &&
                     input.device() == segments.device(),
                 "all segmented mod-gate tensors must use the same CUDA device");
@@ -1089,9 +1093,7 @@ at::Tensor turing_segmented_mod_gate_rms_adaln(at::Tensor input,
     TORCH_CHECK(gate.is_cuda() && gate.dim() == 2 && gate.stride(1) == 1 &&
                     residual.is_cuda() && residual.dim() == 2 && residual.is_contiguous(),
                 "gate and residual must be CUDA matrices with contiguous rows");
-    TORCH_CHECK(segments.is_cuda() && segments.dim() == 2 && segments.is_contiguous() &&
-                    segments.scalar_type() == at::kInt && segments.size(1) == 3,
-                "segments must be contiguous int32 triples on CUDA");
+    check_modulation_segments(segments, input.size(0));
     TORCH_CHECK(input.device() == gate.device() && input.device() == residual.device() &&
                     input.device() == segments.device(),
                 "all fused segmented tensors must use the same CUDA device");
@@ -1115,6 +1117,9 @@ at::Tensor turing_segmented_mod_gate_rms_adaln(at::Tensor input,
                 "normalization parameters must use the input CUDA device");
     TORCH_CHECK(std::isfinite(epsilon) && epsilon > 0.0,
                 "RMSNorm epsilon must be finite and positive");
+    TORCH_CHECK(input.size(0) > 0 && input.size(1) > 0 && scale.size(0) > 0 &&
+                    gate.sizes() == scale.sizes(), "gate and scale must have matching positive dimensions");
+    const at::cuda::CUDAGuard device_guard(input.device());
     at::Tensor output = at::empty_like(input);
     TorchOpContext ctx;
     comfyui_turing_utils::kernels::turing_segmented_mod_gate_rms_adaln(
@@ -1173,6 +1178,7 @@ at::Tensor turing_layer_norm_adaln(at::Tensor input,
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.attr("segmented_modulation_schema") = 2;
     m.def("turing_w4a8_linear",
           &turing_w4a8_linear,
           pybind11::arg("activation"),

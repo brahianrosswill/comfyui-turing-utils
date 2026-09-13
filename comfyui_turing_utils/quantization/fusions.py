@@ -244,14 +244,42 @@ def _cached_segment_table(flat: tuple[int, ...], device_index: int) -> torch.Ten
 
 
 def _segment_table(
-    segments: Sequence[tuple[int, int, int]],
+    segments: Sequence[tuple[int, int, int | torch.Tensor]] | torch.Tensor,
     rows: int,
     parameter_rows: int,
     device: torch.device,
 ) -> torch.Tensor:
+    if isinstance(segments, torch.Tensor):
+        return segments
+    if any(isinstance(row, torch.Tensor) for _, _, row in segments):
+        return indexed_modulation_rows(segments, rows, parameter_rows, device)
     flat = _normalized_segments(segments, rows, parameter_rows)
     index = device.index if device.index is not None else torch.cuda.current_device()
     return _cached_segment_table(flat, index)
+
+
+def indexed_modulation_rows(
+    segments: Sequence[tuple[int, int, int | torch.Tensor]],
+    rows: int,
+    parameter_rows: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Pack GPU row indices once per block, shared by its three fused ops."""
+    _normalized_segments(
+        [(a, b, 0 if isinstance(row, torch.Tensor) else row) for a, b, row in segments],
+        rows, parameter_rows,
+    )
+    parts = []
+    for start, stop, row in segments:
+        if isinstance(row, torch.Tensor):
+            if row.dtype not in (torch.int32, torch.int64):
+                raise ValueError("per-token modulation indices must be int32 or int64")
+            if row.ndim > 1 or row.numel() not in (1, stop - start):
+                raise ValueError("per-token modulation indices must match their segment length")
+            parts.append(row.to(device=device, dtype=torch.int64).expand(stop - start))
+        else:
+            parts.append(torch.full((stop - start,), row, device=device, dtype=torch.int64))
+    return torch.cat(parts)
 
 
 def segmented_rms_adaln(
@@ -259,7 +287,7 @@ def segmented_rms_adaln(
     x: torch.Tensor,
     shift: torch.Tensor,
     scale: torch.Tensor,
-    segments: Sequence[tuple[int, int, int]],
+    segments: Sequence[tuple[int, int, int | torch.Tensor]] | torch.Tensor,
 ) -> torch.Tensor:
     """Run the bundled affine RMSNorm plus segmented AdaLN operator."""
     import comfy.ops
@@ -291,7 +319,7 @@ def segmented_mod_gate(
     x: torch.Tensor,
     gate: torch.Tensor,
     residual: torch.Tensor,
-    segments: Sequence[tuple[int, int, int]],
+    segments: Sequence[tuple[int, int, int | torch.Tensor]] | torch.Tensor,
 ) -> torch.Tensor:
     """Apply MiniMax's segmented gated residual in-place with one CUDA launch."""
     table = _segment_table(segments, x.shape[0], gate.shape[0], x.device)
@@ -312,7 +340,7 @@ def segmented_mod_gate_rms_adaln(
     residual: torch.Tensor,
     shift: torch.Tensor,
     scale: torch.Tensor,
-    segments: Sequence[tuple[int, int, int]],
+    segments: Sequence[tuple[int, int, int | torch.Tensor]] | torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Update ``x`` and normalize the dtype-rounded result in one CUDA kernel."""
     import comfy.ops

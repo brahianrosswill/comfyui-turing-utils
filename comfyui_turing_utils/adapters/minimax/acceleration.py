@@ -28,7 +28,7 @@ from ...attention.stable import (
     reusable_k_anchor_available,
 )
 from ...hardware import is_supported_attention_device
-from ...kernel_api import kernel_extension_has_symbol, load_kernel_package
+from ...kernel_api import kernel_extension_has_symbol, load_kernel_package, segmented_modulation_schema
 from ...profiling import CUDA_PHASE_PROFILER
 from .activation_policy import (
     decide_activation_chunks,
@@ -54,6 +54,7 @@ from ...quantization.fusions import (
     convrot_weight_kind,
     fused_convrot_linear_input_act,
     is_turing_convrot_linear,
+    indexed_modulation_rows,
     segmented_mod_gate,
     segmented_mod_gate_rms_adaln,
     segmented_rms_adaln,
@@ -2041,6 +2042,7 @@ def _make_block_forward(
     supports_attention = "attention" in inspect.signature(
         original.function
     ).parameters
+    supports_indexed_modulation = segmented_modulation_schema() >= 2
     if base_model is not None:
         base_model = weakref.proxy(base_model)
     if diffusion_model is not None:
@@ -2064,8 +2066,8 @@ def _make_block_forward(
             diffusion_model=diffusion_model,
         )
         blocker = _block_fusion_blocker(x, t_emb, device_index)
-        if blocker is None and any(isinstance(row, torch.Tensor) for _, _, row in mod_segments):
-            # Masked H3 tokens may select different AdaLN rows within one segment.
+        indexed = any(isinstance(row, torch.Tensor) for _, _, row in mod_segments)
+        if blocker is None and indexed and not supports_indexed_modulation:
             blocker = "per_token_modulation"
         audit.record("block", blocker is None, x, blocker)
         if blocker is not None:
@@ -2075,6 +2077,8 @@ def _make_block_forward(
             return original(self, x, t_emb, mod_segments, rope_freqs, **kwargs)
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaln_proj(t_emb)
+        if indexed:
+            mod_segments = indexed_modulation_rows(mod_segments, x.shape[0], scale_msa.shape[0], x.device)
         h = segmented_rms_adaln(self.norm1, x, shift_msa, scale_msa, mod_segments)
         attention_impl = self.attn if attention is None else attention
         x, h = segmented_mod_gate_rms_adaln(

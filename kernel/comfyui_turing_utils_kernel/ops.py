@@ -543,7 +543,7 @@ def turing_segmented_rms_adaln(
     segments: torch.Tensor,
     epsilon: float = 1.0e-5,
 ) -> torch.Tensor:
-    """Fused affine RMSNorm and segmented AdaLN modulation."""
+    """Fused affine RMSNorm/AdaLN; int32 [S,3] segments or int64 [M] row indices."""
     if x.device.type != "cuda":
         raise RuntimeError("Segmented RMSNorm+AdaLN requires CUDA tensors")
     if torch.cuda.get_device_capability(x.device) < (7, 5):
@@ -561,8 +561,8 @@ def turing_segmented_rms_adaln(
         scale = scale.contiguous()
     if shift.stride(-1) != 1:
         shift = shift.contiguous()
-    if segments.device != x.device or segments.dtype != torch.int32:
-        raise ValueError("segments must be an int32 tensor on the input device")
+    if segments.device != x.device or segments.dtype not in (torch.int32, torch.int64):
+        raise ValueError("segments must be an integer tensor on the input device")
     return _C.turing_segmented_rms_adaln(
         x.contiguous(),
         weight,
@@ -594,8 +594,8 @@ def _prepare_segmented_modulation(
     gate = gate.to(device=x.device, dtype=x.dtype)
     if gate.stride(-1) != 1:
         gate = gate.contiguous()
-    if segments.device != x.device or segments.dtype != torch.int32:
-        raise ValueError("segments must be int32 on the input device")
+    if segments.device != x.device or segments.dtype not in (torch.int32, torch.int64):
+        raise ValueError("segments must be an integer tensor on the input device")
     return gate, residual, segments.contiguous()
 
 

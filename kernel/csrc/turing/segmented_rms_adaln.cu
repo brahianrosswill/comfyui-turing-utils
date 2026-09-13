@@ -10,6 +10,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <c10/macros/Macros.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -114,7 +115,12 @@ __device__ __forceinline__ WelfordData warp_reduce_welford(WelfordData value) {
 }
 
 __device__ __forceinline__ int find_modulation_row(
-    const int *__restrict__ segments, int segment_count, int token_row) {
+    const int *__restrict__ segments, int segment_count, int token_row, int parameter_rows) {
+    if (segment_count == 0) {
+        int64_t row = reinterpret_cast<const int64_t *>(segments)[token_row];
+        CUDA_KERNEL_ASSERT(row >= -static_cast<int64_t>(parameter_rows) && row < parameter_rows);
+        return static_cast<int>(row < 0 ? row + parameter_rows : row);
+    }
     int low = 0;
     int high = segment_count;
     while (low < high) {
@@ -129,6 +135,19 @@ __device__ __forceinline__ int find_modulation_row(
         return -1;
     }
     return segments[low * 3 + 2];
+}
+
+template <typename T>
+__device__ __forceinline__ T modulate_normalized(
+    float normalized, T weight, T scale, T shift, bool indexed) {
+    if (indexed) {
+        // Native H3 exposes RMSNorm, mul_, and add_ dtype boundaries.
+        const T norm = from_float<T>(__fmul_rn(normalized, to_float(weight)));
+        const T multiplier = from_float<T>(1.0f + to_float(scale));
+        const T scaled = from_float<T>(__fmul_rn(to_float(norm), to_float(multiplier)));
+        return from_float<T>(__fadd_rn(to_float(scaled), to_float(shift)));
+    }
+    return from_float<T>(normalized * to_float(weight) * (1.0f + to_float(scale)) + to_float(shift));
 }
 
 template <typename T>
@@ -157,7 +176,7 @@ __global__ void segmented_rms_adaln_kernel(
     const T *input_row = input + row_offset;
 
     if (tid == 0) {
-        const int mapped = find_modulation_row(segments, segment_count, row);
+        const int mapped = find_modulation_row(segments, segment_count, row, parameter_rows);
         modulation_row = mapped >= 0 && mapped < parameter_rows ? mapped : 0;
     }
 
@@ -215,22 +234,26 @@ __global__ void segmented_rms_adaln_kernel(
 #pragma unroll
             for (int item = 0; item < kWidth; ++item) {
                 const float normalized = to_float(inputs.values[item]) * inverse_rms;
-                const float result = normalized * to_float(weights.values[item]) *
-                                         (1.0f + to_float(scales.values[item])) +
-                                     to_float(shifts.values[item]);
-                outputs.values[item] = from_float<T>(result);
+                outputs.values[item] = modulate_normalized(
+                    normalized, weights.values[item], scales.values[item], shifts.values[item], segment_count == 0);
             }
             output_vectors[index] = outputs;
         }
     } else {
         for (int col = tid; col < hidden; col += kNormThreads) {
             const float normalized = to_float(input_row[col]) * inverse_rms;
-            const float result = normalized * to_float(weight[col]) *
-                                     (1.0f + to_float(scale_row[col])) +
-                                 to_float(shift_row[col]);
-            output_row[col] = from_float<T>(result);
+            output_row[col] = modulate_normalized(
+                normalized, weight[col], scale_row[col], shift_row[col], segment_count == 0);
         }
     }
+}
+
+template <typename T>
+__device__ __forceinline__ T gated_residual(T input, T residual, T gate, bool indexed) {
+    if (indexed) {
+        return from_float<T>(__fadd_rn(to_float(input), __fmul_rn(to_float(residual), to_float(gate))));
+    }
+    return from_float<T>(to_float(input) + to_float(residual) * to_float(gate));
 }
 
 template <typename T>
@@ -244,15 +267,13 @@ __global__ void segmented_mod_gate_kernel(
     int gate_stride,
     int segment_count) {
     const int row = static_cast<int>(blockIdx.x);
-    const int mapped = find_modulation_row(segments, segment_count, row);
+    const int mapped = find_modulation_row(segments, segment_count, row, parameter_rows);
     const int modulation_row = mapped >= 0 && mapped < parameter_rows ? mapped : 0;
     const int64_t row_offset = static_cast<int64_t>(row) * hidden;
     const T *gate_row = gate + static_cast<int64_t>(modulation_row) * gate_stride;
     for (int col = threadIdx.x; col < hidden; col += blockDim.x) {
-        const float updated = to_float(input[row_offset + col]) +
-                              to_float(residual[row_offset + col]) *
-                                  to_float(gate_row[col]);
-        input[row_offset + col] = from_float<T>(updated);
+        input[row_offset + col] = gated_residual(
+            input[row_offset + col], residual[row_offset + col], gate_row[col], segment_count == 0);
     }
 }
 
@@ -282,7 +303,7 @@ __global__ void segmented_mod_gate_rms_adaln_kernel(
     const int lane = tid & (kWarpThreads - 1);
     const int warp = tid / kWarpThreads;
     if (tid == 0) {
-        const int mapped = find_modulation_row(segments, segment_count, row);
+        const int mapped = find_modulation_row(segments, segment_count, row, parameter_rows);
         modulation_row = mapped >= 0 && mapped < parameter_rows ? mapped : 0;
     }
     __syncthreads();
@@ -306,9 +327,8 @@ __global__ void segmented_mod_gate_rms_adaln_kernel(
             const Vec<T> gates = gate_vectors[index];
 #pragma unroll
             for (int item = 0; item < kWidth; ++item) {
-                const T updated = from_float<T>(
-                    to_float(inputs.values[item]) +
-                    to_float(residuals.values[item]) * to_float(gates.values[item]));
+                const T updated = gated_residual(
+                    inputs.values[item], residuals.values[item], gates.values[item], segment_count == 0);
                 inputs.values[item] = updated;
                 const float value = to_float(updated);
                 square_sum += value * value;
@@ -317,9 +337,8 @@ __global__ void segmented_mod_gate_rms_adaln_kernel(
         }
     } else {
         for (int col = tid; col < hidden; col += kNormThreads) {
-            const T updated = from_float<T>(
-                to_float(input[row_offset + col]) +
-                to_float(residual[row_offset + col]) * to_float(gate_row[col]));
+            const T updated = gated_residual(
+                input[row_offset + col], residual[row_offset + col], gate_row[col], segment_count == 0);
             input[row_offset + col] = updated;
             const float value = to_float(updated);
             square_sum += value * value;
@@ -353,20 +372,16 @@ __global__ void segmented_mod_gate_rms_adaln_kernel(
 #pragma unroll
             for (int item = 0; item < kWidth; ++item) {
                 const float normalized = to_float(inputs.values[item]) * inverse_rms;
-                const float result = normalized * to_float(weights.values[item]) *
-                                         (1.0f + to_float(scales.values[item])) +
-                                     to_float(shifts.values[item]);
-                outputs.values[item] = from_float<T>(result);
+                outputs.values[item] = modulate_normalized(
+                    normalized, weights.values[item], scales.values[item], shifts.values[item], segment_count == 0);
             }
             output_vectors[index] = outputs;
         }
     } else {
         for (int col = tid; col < hidden; col += kNormThreads) {
             const float normalized = to_float(input[row_offset + col]) * inverse_rms;
-            const float result = normalized * to_float(weight[col]) *
-                                     (1.0f + to_float(scale_row[col])) +
-                                 to_float(shift_row[col]);
-            output[row_offset + col] = from_float<T>(result);
+            output[row_offset + col] = modulate_normalized(
+                normalized, weight[col], scale_row[col], shift_row[col], segment_count == 0);
         }
     }
 }
@@ -455,7 +470,7 @@ void launch_segmented_rms_adaln(Tensor input,
     const int parameter_rows = scale.size(0);
     const int scale_stride = static_cast<int>(scale.shape.stride(0));
     const int shift_stride = static_cast<int>(shift.shape.stride(0));
-    const int segment_count = segments.size(0);
+    const int segment_count = segments.ndims() == 1 ? 0 : segments.size(0);
     constexpr int kWidth = VecWidth<T>::value;
     const auto aligned = [](const void *pointer) {
         return (reinterpret_cast<std::uintptr_t>(pointer) & 15U) == 0;
@@ -519,7 +534,7 @@ void launch_segmented_mod_gate(Tensor input,
         input.size(1),
         gate.size(0),
         static_cast<int>(gate.shape.stride(0)),
-        segments.size(0));
+        segments.ndims() == 1 ? 0 : segments.size(0));
     checkCUDA(cudaGetLastError());
 }
 
@@ -574,7 +589,7 @@ void launch_segmented_mod_gate_rms_adaln(Tensor input,
         static_cast<int>(gate.shape.stride(0)),
         static_cast<int>(scale.shape.stride(0)),
         static_cast<int>(shift.shape.stride(0)),
-        segments.size(0),
+        segments.ndims() == 1 ? 0 : segments.size(0),
         epsilon,
         vectorized);
     checkCUDA(cudaGetLastError());
