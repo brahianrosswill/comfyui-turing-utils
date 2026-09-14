@@ -173,6 +173,7 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsConvRotCLIPLoader",
                 "TuringUtilsWanVideoFramesPadding",
                 "TuringUtilsMiniMaxH3VideoFramesPadding",
+                "TuringUtilsSetVideoLatentNoiseMask",
                 "TuringUtilsBerniniContextWindowsCore",
                 "TuringUtilsBerniniInpaintCondition",
                 "TuringUtilsKrea2IdentityEditConditioning",

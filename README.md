@@ -60,6 +60,25 @@ only after its CUDA sources or required version change.
   selectable absolute or official relative temporal positions.
 - `Wan Video Frames Padding` exposes Wan-compatible frame padding.
 - `MiniMax H3 Video Frames Padding` pads to H3's `17*n+5` frame grid.
+- `Set Video Latent Noise Mask` accepts image-frame masks for a standalone
+  video latent. Its `type` choices follow CLIP Loader: `wan`, `minimax`
+  (H3 video only, default), `ltxv` (LTX-Video/LTX-2 video), `hunyuan_video`,
+  `hunyuan_video_15`, and `mochi`. Equal mask/latent time counts map directly.
+  Otherwise Wan and HunyuanVideo keep the first frame separate and merge
+  subsequent groups of 4 frames; LTX uses groups of 8 and Mochi groups of 6.
+  H3 instead merges `[1,4,4,4,4]*n+[1,4]` into latent positions. Temporal
+  groups and spatial resize bins use maximum/union, preserving small masked
+  regions and soft-mask strengths. For a 124-frame H3 video, 124 masks with
+  the first five black become 37 masks with the first two black. Black
+  preserves and white redraws. Other frame counts fail without interpolation,
+  padding, or truncation; a single mask is not broadcast across time.
+  Input masks are `[frames,H,W]` (shared across video batches) or
+  `[B,frames,H,W]`; output `noise_mask` is `[B,1,T,H_lat,W_lat]`. Existing
+  noise masks are replaced; samples and other metadata stay unchanged.
+  Only native unpacked `[B,C,T,H,W]` video latents are supported. Separate AV
+  latents (including LTX-2) before this node and concatenate afterward. This maps
+  temporal groups, not the VAE's full receptive field, and does not guarantee
+  pixel-identical decoded boundaries or make H3 Add Noise mask-aware.
 - `Resize Image If Present` resizes, crops, or pads an optional image and mask.
   With no image connected it returns no image, so one graph can safely feed
   optional first- or last-frame conditioning sockets without making a black
