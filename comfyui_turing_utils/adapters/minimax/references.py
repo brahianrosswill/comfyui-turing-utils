@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import math
 import re
@@ -195,11 +196,11 @@ def _encode_visual(vae, pixels: torch.Tensor, name: str) -> torch.Tensor:
 
 def _encode_audio(audio_vae, audio, name: str) -> torch.Tensor:
     if (
-        not isinstance(audio, dict)
+        not isinstance(audio, Mapping)
         or "waveform" not in audio
         or "sample_rate" not in audio
     ):
-        raise ValueError(f"{name} must be an AUDIO dictionary")
+        raise ValueError(f"{name} must be an AUDIO mapping with waveform and sample_rate")
     waveform = audio["waveform"]
     if not torch.is_tensor(waveform) or waveform.ndim != 3:
         shape = (

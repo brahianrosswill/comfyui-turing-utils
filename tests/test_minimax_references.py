@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import sys
 import unittest
 from pathlib import Path
@@ -19,6 +20,7 @@ from comfyui_turing_utils.adapters.minimax.conditioning import (  # noqa: E402
 )
 from comfyui_turing_utils.nodes.minimax_references import (  # noqa: E402
     H3BuildConditioning,
+    H3AudioReference,
     H3AudioReferenceData,
     H3_MAX_KEYFRAME_REFERENCES,
     H3KeyframeReference,
@@ -103,6 +105,28 @@ class _FakeAudioVAE:
     def encode(self, waveform):
         self.inputs.append(waveform)
         return torch.zeros(1, 32, 2, 10)
+
+
+class _LazyAudioMap(Mapping):
+    """VHS-style AUDIO mapping that extracts the waveform on first access."""
+
+    def __init__(self, loader):
+        self.loader = loader
+        self._audio = None
+
+    def _load(self):
+        if self._audio is None:
+            self._audio = self.loader()
+        return self._audio
+
+    def __getitem__(self, key):
+        return self._load()[key]
+
+    def __iter__(self):
+        return iter(self._load())
+
+    def __len__(self):
+        return len(self._load())
 
 
 class _PayloadHolder:
@@ -284,6 +308,65 @@ class MiniMaxH3ReferencesTest(unittest.TestCase):
 
         self.assertEqual(tuple(reference.items[0]["image"].shape), (1, 96, 96, 3))
         self.assertEqual(tuple(reference.items[0]["latent"].shape), (1, 24, 1, 6, 6))
+
+    def test_audio_reference_accepts_dict_and_lazy_mapping(self):
+        waveform = torch.rand(1, 2, 320)
+        data = {"waveform": waveform, "sample_rate": 32000}
+        loader = mock.Mock(return_value=data)
+        lazy_audio = _LazyAudioMap(loader)
+        loader.assert_not_called()
+        self.assertNotIsInstance(lazy_audio, dict)
+
+        for audio in (data, lazy_audio):
+            with self.subTest(audio_type=type(audio).__name__):
+                vae = _FakeAudioVAE()
+                reference = H3AudioReference.execute(
+                    vae, audios={"audio_0": audio}
+                ).result[0]
+                torch.testing.assert_close(vae.inputs[0], waveform.movedim(1, -1))
+                self.assertEqual(tuple(reference.items[0]["audio_latent"].shape), (1, 32, 2, 10))
+        loader.assert_called_once_with()
+
+    def test_audio_reference_resamples_lazy_mapping(self):
+        loader = mock.Mock(return_value={
+            "waveform": torch.rand(1, 2, 160), "sample_rate": 16000,
+        })
+        vae = _FakeAudioVAE()
+        H3AudioReference.execute(vae, audios={"audio_0": _LazyAudioMap(loader)})
+        self.assertEqual(tuple(vae.inputs[0].shape), (1, 320, 2))
+        loader.assert_called_once_with()
+
+    def test_audio_reference_rejects_invalid_audio_before_encoding(self):
+        waveform = torch.rand(1, 2, 320)
+        cases = [
+            [], waveform, {"samples": waveform}, {},
+            {"waveform": waveform}, {"sample_rate": 32000},
+            {"waveform": waveform[0], "sample_rate": 32000},
+        ]
+        for index, data in enumerate(cases):
+            inputs = [data]
+            if isinstance(data, dict):
+                inputs.append(_LazyAudioMap(mock.Mock(return_value=data)))
+            for audio in inputs:
+                with self.subTest(case=index, audio_type=type(audio).__name__):
+                    vae = _FakeAudioVAE()
+                    with self.assertRaisesRegex(ValueError, "audio_0"):
+                        H3AudioReference.execute(vae, audios={"audio_0": audio})
+                    self.assertEqual(vae.inputs, [])
+
+    def test_video_reference_accepts_lazy_soundtrack(self):
+        waveform = torch.rand(1, 2, 320)
+        loader = mock.Mock(return_value={"waveform": waveform, "sample_rate": 32000})
+        audio_vae = _FakeAudioVAE()
+        reference = H3VideoReference.execute(
+            _FakeVideoVAE(),
+            audio_vae=audio_vae,
+            videos={"video_2": torch.rand(22, 64, 96, 3)},
+            video_audios={"video_audio_2": _LazyAudioMap(loader)},
+        ).result[0]
+        torch.testing.assert_close(audio_vae.inputs[0], waveform.movedim(1, -1))
+        self.assertEqual(tuple(reference.items[0]["audio_latent"].shape), (1, 32, 2, 10))
+        loader.assert_called_once_with()
 
     def test_video_reference_accepts_24_fps_and_pairs_audio_by_index(self):
         video_vae = _FakeVideoVAE()
