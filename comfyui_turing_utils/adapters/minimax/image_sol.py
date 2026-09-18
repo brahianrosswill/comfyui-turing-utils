@@ -21,7 +21,7 @@ H3_IMAGE_SOL_SKIPPED_RESIDUAL = "1x64"
 def apply_h3_image_sol_attention(
     model,
     *,
-    temporal_layout: str = "dense_anchor_grid",
+    temporal_layout: str = "dense_start_window",
     sparse_reference_image: bool = False,
     sparse_reference_video: bool = True,
     sparse_reference_audio: bool = False,
@@ -34,7 +34,7 @@ def apply_h3_image_sol_attention(
     temporal_layout = str(temporal_layout).strip().lower()
     if temporal_layout not in H3_IMAGE_SOL_LAYOUTS:
         raise ValueError(
-            "temporal_layout must be dense_window or dense_anchor_grid"
+            "temporal_layout must be dense_start_window or dense_end_window"
         )
     if not is_minimax_h3_model(model):
         raise ValueError("Configure H3 Image Sol Attention requires MiniMax H3")

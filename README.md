@@ -182,11 +182,15 @@ only after its CUDA sources or required version change.
   strategy; the fast and residual paths require rebuilding the bundled kernel.
 - `Configure H3 Image Sol Attention` keeps the native H3 frame count and every
   target-video Q/FFN row, then applies fixed `1x64` Sol residuals outside either
-  the initial `1+4` latent-time window or H3's complete VAE anchor grid. It
-  inherits the standard Sol reference-image/video/audio switches and dense
+  the opening or closing `1+4` frame group: `dense_start_window` (default)
+  protects latent slices `0, 1`; `dense_end_window` protects `T-2, T-1`.
+  It inherits the standard Sol reference-image/video/audio switches and dense
   prefix/suffix step/layer controls. Five-frame target attention remains dense;
-  supported longer H3 inputs use their native `5k+2` latent-time layout. The node is
-  Python-only and replaces an upstream Sol/SLA/virtual-KV strategy.
+  supported longer H3 inputs use their native `5k+2` latent-time layout, and
+  other latent lengths keep all target slices dense. The node is Python-only
+  and replaces an upstream Sol/SLA/virtual-KV strategy. Old workflows must
+  reselect the layout: `dense_window` is renamed to `dense_start_window`, and
+  `dense_anchor_grid` is removed without an automatic replacement.
 - `Multimodal Prompt Chat` sends one non-streaming system/user turn to an
   OpenAI-compatible Chat Completions endpoint using only Python's standard HTTP
   client. Either `prompt` or `system_prompt` may be empty, but not both.

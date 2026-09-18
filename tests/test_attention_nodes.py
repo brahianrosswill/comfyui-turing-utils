@@ -68,7 +68,10 @@ class SparseAttentionNodeTest(unittest.TestCase):
         )
         self.assertEqual(
             inputs["temporal_layout"][0],
-            ["dense_anchor_grid", "dense_window"],
+            ["dense_start_window", "dense_end_window"],
+        )
+        self.assertEqual(
+            inputs["temporal_layout"][1]["default"], "dense_start_window"
         )
         self.assertFalse(inputs["sparse_reference_image"][1]["default"])
         self.assertTrue(inputs["sparse_reference_video"][1]["default"])
@@ -90,7 +93,7 @@ class SparseAttentionNodeTest(unittest.TestCase):
         ) as apply_patch:
             output = attention_nodes.H3ImageSolAttentionPatch().patch(
                 model,
-                temporal_layout="dense_window",
+                temporal_layout="dense_end_window",
                 sparse_reference_image=True,
                 sparse_reference_video=False,
                 sparse_reference_audio=True,
@@ -103,7 +106,7 @@ class SparseAttentionNodeTest(unittest.TestCase):
         self.assertEqual(output, (patched,))
         apply_patch.assert_called_once_with(
             model,
-            temporal_layout="dense_window",
+            temporal_layout="dense_end_window",
             sparse_reference_image=True,
             sparse_reference_video=False,
             sparse_reference_audio=True,
@@ -112,6 +115,18 @@ class SparseAttentionNodeTest(unittest.TestCase):
             dense_prefix_layers=3,
             dense_suffix_layers=4,
             debug_route_density=True,
+        )
+
+    def test_h3_image_sol_node_defaults_to_start_window(self):
+        model = object()
+        patched = object()
+        with mock.patch.object(
+            attention_nodes, "apply_h3_image_sol_attention", return_value=patched
+        ) as apply_patch:
+            output = attention_nodes.H3ImageSolAttentionPatch().patch(model)
+        self.assertEqual(output, (patched,))
+        self.assertEqual(
+            apply_patch.call_args.kwargs["temporal_layout"], "dense_start_window"
         )
 
     def test_h3_image_sol_uses_fixed_sol_policy(self):
@@ -142,7 +157,7 @@ class SparseAttentionNodeTest(unittest.TestCase):
         ) as install:
             result = image_sol.apply_h3_image_sol_attention(
                 model,
-                temporal_layout="dense_window",
+                temporal_layout="dense_end_window",
                 sparse_reference_image=True,
                 sparse_reference_video=False,
                 sparse_reference_audio=True,
@@ -177,15 +192,27 @@ class SparseAttentionNodeTest(unittest.TestCase):
             override,
             strategy="H3 image Sol",
             backend="h3_image_sol",
-            implementation="h3_image_sol:dense_window",
+            implementation="h3_image_sol:dense_end_window",
             runtime_config=runtime,
         )
         self.assertEqual(
             installed_model.model_options["transformer_options"][
                 "turing_utils_h3_image_sol_temporal_layout"
             ],
-            "dense_window",
+            "dense_end_window",
         )
+
+    def test_h3_image_sol_rejects_removed_layouts_before_backend_setup(self):
+        with mock.patch.object(image_sol, "attention_base_runtime") as runtime:
+            for layout in ("dense_window", "dense_anchor_grid", "invalid"):
+                with self.subTest(layout=layout):
+                    with self.assertRaisesRegex(
+                        ValueError, "dense_start_window or dense_end_window"
+                    ):
+                        image_sol.apply_h3_image_sol_attention(
+                            FakePatcher(), temporal_layout=layout
+                        )
+        runtime.assert_not_called()
 
     def test_h3_image_sol_rejects_other_models_before_backend_setup(self):
         with mock.patch.object(

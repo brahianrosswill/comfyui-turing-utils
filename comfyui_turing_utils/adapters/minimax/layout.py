@@ -30,7 +30,7 @@ LOG = get_logger("minimax.layout")
 MINIMAX_H3_LAYOUT_KIND = "minimax_h3"
 H3_IMAGE_SOL_STRATEGY = "h3_image_sol"
 H3_IMAGE_SOL_LAYOUT_KEY = "turing_utils_h3_image_sol_temporal_layout"
-H3_IMAGE_SOL_LAYOUTS = ("dense_window", "dense_anchor_grid")
+H3_IMAGE_SOL_LAYOUTS = ("dense_start_window", "dense_end_window")
 RUNTIME_CONTEXT_ATTR = "_turing_utils_minimax_runtime_context"
 RUNTIME_PROVIDER_ATTR = "_turing_utils_minimax_layout_provider"
 RUNTIME_OUTER_WRAPPER_KEY = "turing_utils_minimax_runtime_layout"
@@ -304,15 +304,14 @@ def h3_image_sol_dense_slices(latent_frames: int, temporal_layout: str):
     temporal_layout = str(temporal_layout).strip().lower()
     if temporal_layout not in H3_IMAGE_SOL_LAYOUTS:
         raise ValueError(
-            "H3 image Sol temporal_layout must be dense_window or "
-            "dense_anchor_grid"
+            "H3 image Sol temporal_layout must be dense_start_window or "
+            "dense_end_window"
         )
     if latent_frames < 2 or (latent_frames - 2) % 5:
         return tuple(range(max(latent_frames, 0)))
-    dense = {0, 1}
-    if temporal_layout == "dense_anchor_grid":
-        dense.update(range(0, latent_frames, 5))
-    return tuple(sorted(dense))
+    if temporal_layout == "dense_end_window":
+        return (latent_frames - 2, latent_frames - 1)
+    return (0, 1)
 
 
 def _minimax_semantic_segments(raw_segments, topology, temporal_layout):

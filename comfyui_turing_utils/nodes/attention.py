@@ -343,10 +343,10 @@ class H3ImageSolAttentionPatch:
             "required": {
                 "model": ("MODEL",),
                 "temporal_layout": (
-                    ["dense_anchor_grid", "dense_window"],
+                    ["dense_start_window", "dense_end_window"],
                     {
-                        "default": "dense_anchor_grid",
-                        "tooltip": "Dense anchor grid keeps every H3 17-frame chunk anchor plus the first continuation exact. Dense window keeps only the initial 1+4 latent-time window exact.",
+                        "default": "dense_start_window",
+                        "tooltip": "Dense start window keeps the opening 1+4 frame group exact (latent slices 0 and 1). Dense end window keeps the closing 1+4 frame group exact (the last two latent slices). Other target slices use Sol residuals outside protected/local ranges. Non-5k+2 latent lengths stay dense.",
                     },
                 ),
                 "sparse_reference_image": standard["sparse_reference_image"],
@@ -373,7 +373,7 @@ class H3ImageSolAttentionPatch:
     def patch(
         self,
         model,
-        temporal_layout: str = "dense_anchor_grid",
+        temporal_layout: str = "dense_start_window",
         sparse_reference_image: bool = False,
         sparse_reference_video: bool = True,
         sparse_reference_audio: bool = False,
