@@ -174,6 +174,7 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsWanVideoFramesPadding",
                 "TuringUtilsMiniMaxH3VideoFramesPadding",
                 "TuringUtilsSetVideoLatentNoiseMask",
+                "TuringUtilsVideoLatentCompositeMasked",
                 "TuringUtilsBerniniContextWindowsCore",
                 "TuringUtilsBerniniInpaintCondition",
                 "TuringUtilsKrea2IdentityEditConditioning",

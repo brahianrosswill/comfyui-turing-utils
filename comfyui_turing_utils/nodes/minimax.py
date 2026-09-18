@@ -361,7 +361,8 @@ class MiniMaxH3LatentUpscale(io.ComfyNode):
             description=(
                 "Learned spatial pixel-count upscale for MiniMax H3 AV latents. The video stream and "
                 "optional FL2AV keyframe latents are enlarged together; audio and Ref2AV "
-                "references remain unchanged."
+                "references remain unchanged. Video noise_mask uses conservative spatial maximum "
+                "coverage; time and audio masks are preserved."
             ),
             inputs=[
                 H3LatentUpscaleModel.Input("upscale_model"),

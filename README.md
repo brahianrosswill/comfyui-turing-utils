@@ -79,6 +79,22 @@ only after its CUDA sources or required version change.
   latents (including LTX-2) before this node and concatenate afterward. This maps
   temporal groups, not the VAE's full receptive field, and does not guarantee
   pixel-identical decoded boundaries or make H3 Add Noise mask-aware.
+- `Video Latent Composite Masked` takes matching standalone `[B,C,T,H,W]`
+  `original_latent` (clean original high-resolution video) and
+  `replacement_latent` (e.g. upscaled first-pass `denoised_output`). It unions
+  the replacement's inherited `noise_mask` with an optional image/latent-frame
+  `mask`, using the same `type` profiles and conservative mapping as Set Video
+  Latent Noise Mask. Every positive mask value means full replacement, not
+  opacity; threshold noisy/soft input masks upstream if needed. The exact same
+  binary region selects replacement samples and becomes the output `noise_mask`.
+  Outside it, original samples are retained exactly. With neither mask, the
+  whole video is replaced. The original's metadata is kept but its mask is
+  ignored. Inherited masks must match the replacement T/H/W and have batch 1/B
+  and channels 1/C (channel coverage is unioned). There is no latent resizing,
+  retiming, or feathering. Align frame sequences/crops as well as tensor shapes.
+  For masked second-pass sampling, use the clean composite with native
+  RandomNoise and the remaining sigmas; the existing H3 Add Noise is not made
+  mask-aware by this node. Decoded boundaries need not be pixel-identical.
 - `Resize Image If Present` resizes, crops, or pads an optional image and mask.
   With no image connected it returns no image, so one graph can safely feed
   optional first- or last-frame conditioning sockets without making a black
@@ -149,7 +165,13 @@ only after its CUDA sources or required version change.
   `CONDITIONING` input enlarges FL2AV first/last keyframe latents with the same
   learned model, while Ref2AV image/video/audio references retain their
   independent geometry. Without it, only the AV latent is processed. No text
-  or VAE conditioning stage is rerun.
+  or VAE conditioning stage is rerun. Existing video noise masks are enlarged
+  with conservative spatial maximum coverage, not nearest interpolation:
+  every intersecting source cell contributes, keeping binary masks binary and
+  retaining soft maxima. Time and audio masks are unchanged; absent masks stay
+  absent. This covers grid footprints, not the learned upscaler's full receptive
+  field. Composite onto the original high-resolution latent to restore the
+  area outside the inherited mask; do not overwrite the union with Set Mask.
 - `MiniMax H3 Video VAE Decode/Encode` call the official ComfyUI VAE entry points,
   retaining scoped fused operators, decoder attention selection, and lightweight
   tqdm counts of submitted tiles. ComfyUI owns tiling, batching, dtype, transfers,

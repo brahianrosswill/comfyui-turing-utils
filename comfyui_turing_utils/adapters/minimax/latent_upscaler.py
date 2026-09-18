@@ -582,11 +582,10 @@ def _resize_video_mask(mask: torch.Tensor, target_height: int, target_width: int
         raise ValueError(f"H3 video noise_mask must be 5D, got {shape}")
     original_dtype = mask.dtype
     source = mask if mask.is_floating_point() else mask.to(torch.float32)
-    resized = F.interpolate(
-        source,
-        size=(int(mask.shape[2]), target_height, target_width),
-        mode="nearest",
-    )
+    # Every overlapping low-resolution cell contributes, including fractional boundaries.
+    resized = F.adaptive_max_pool2d(
+        source.reshape(-1, 1, *source.shape[-2:]), (target_height, target_width)
+    ).reshape(*mask.shape[:-2], target_height, target_width)
     return resized.to(original_dtype)
 
 

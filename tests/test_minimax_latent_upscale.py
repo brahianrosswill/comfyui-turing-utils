@@ -20,9 +20,11 @@ import comfy.nested_tensor  # noqa: E402
 
 from comfyui_turing_utils.adapters.minimax.latent_upscaler import (  # noqa: E402
     H3LatentResizer3D,
+    _resize_video_mask,
     detect_h3_latent_upscaler_architecture,
     load_h3_latent_upscaler,
 )
+from comfyui_turing_utils.nodes.latent import SetVideoLatentNoiseMask, VideoLatentCompositeMasked  # noqa: E402
 from comfyui_turing_utils.nodes.minimax import (  # noqa: E402
     MiniMaxH3LatentUpscale,
     MiniMaxH3LatentUpscaleModelLoader,
@@ -51,6 +53,56 @@ class _FakePatcher:
 
 
 class MiniMaxH3LatentUpscaleTest(unittest.TestCase):
+    def test_mask_resize_matches_positive_area_intersections(self):
+        for source_size, target_size in (((2, 6), (4, 10)), ((3, 5), (2, 2)), ((4, 6), (6, 8)), ((2, 3), (4, 6))):
+            sh, sw = source_size
+            th, tw = target_size
+            for sy in range(sh):
+                for sx in range(sw):
+                    with self.subTest(source=source_size, target=target_size, cell=(sy, sx)):
+                        mask = torch.zeros(1, 1, 2, sh, sw)
+                        mask[0, 0, 1, sy, sx] = 1
+                        actual = _resize_video_mask(mask, th, tw)
+                        expected = torch.zeros(1, 1, 2, th, tw)
+                        for dy in range(th):
+                            for dx in range(tw):
+                                overlaps = sy * th < (dy + 1) * sh and (sy + 1) * th > dy * sh and sx * tw < (dx + 1) * sw and (sx + 1) * tw > dx * sw
+                                expected[0, 0, 1, dy, dx] = overlaps
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_mask_resize_retains_soft_maxima_dtype_and_batch_time(self):
+        for device in (["cpu", "cuda"] if torch.cuda.is_available() else ["cpu"]):
+            for dtype in (torch.bool, torch.float16, torch.bfloat16, torch.float32, torch.float64):
+                with self.subTest(device=device, dtype=dtype):
+                    mask = torch.zeros(2, 1, 2, 2, 6, dtype=dtype, device=device)
+                    mask[1, 0, 1, 1, 2] = True if dtype == torch.bool else 0.25
+                    actual = _resize_video_mask(mask, 4, 10)
+                    expected = torch.zeros(2, 1, 2, 4, 10, dtype=dtype, device=device)
+                    expected[1, 0, 1, 2:4, 3:5] = mask[1, 0, 1, 1, 2]
+                    self.assertEqual(actual.dtype, dtype)
+                    self.assertEqual(actual.device, mask.device)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    @mock.patch("comfy.model_management.load_models_gpu")
+    def test_low_resolution_mask_upscale_composite_pipeline(self, _load_models_gpu):
+        low = {"samples": torch.randn(1, 24, 2, 2, 6)}
+        input_mask = torch.zeros(5, 4, 12)
+        input_mask[4, 3, 4] = 0.25
+        low = SetVideoLatentNoiseMask.execute(low, input_mask, "minimax").result[0]
+        replacement = MiniMaxH3LatentUpscale.execute(_FakePatcher(), low, scale=2.5).result[0]
+        self.assertEqual(replacement["samples"].shape, (1, 24, 2, 4, 10))
+        original = {"samples": torch.randn_like(replacement["samples"]), "noise_mask": torch.ones(1, 1, 2, 4, 10)}
+        additional = torch.zeros(5, 8, 20)
+        additional[0, 0, 0] = 1
+        output = VideoLatentCompositeMasked.execute(original, replacement, mask=additional).result[0]
+        expected = torch.zeros(1, 1, 2, 4, 10)
+        expected[0, 0, 0, 0, 0] = 1
+        expected[0, 0, 1, 2:4, 3:5] = 1
+        torch.testing.assert_close(output["noise_mask"], expected, rtol=0, atol=0)
+        torch.testing.assert_close(output["samples"], torch.where(expected.bool(), replacement["samples"], original["samples"]), rtol=0, atol=0)
+        self.assertTrue(torch.all(original["noise_mask"] == 1))
+        self.assertEqual(low["noise_mask"].count_nonzero().item(), 1)
+
     @staticmethod
     def _tiny_model():
         model = H3LatentResizer3D(

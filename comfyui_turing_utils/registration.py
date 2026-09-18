@@ -9,7 +9,7 @@ from .nodes.attention import (
 )
 from .nodes.bernini import BerniniContextWindowsCore, BerniniInpaintCondition
 from .nodes.krea2 import Krea2IdentityEditConditioning
-from .nodes.latent import SetVideoLatentNoiseMask
+from .nodes.latent import SetVideoLatentNoiseMask, VideoLatentCompositeMasked
 from .nodes.loaders import ConvRotCLIPLoader, ConvRotDiffusionModelLoader
 from .nodes.logic import IsInputPresent, LazyIfElse, StageBarrier, StagePath
 from .nodes.media import ResizeImageIfPresent, VideoMotionContactSheet
@@ -48,6 +48,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsWanVideoFramesPadding": WanVideoFramesPadding,
     "TuringUtilsMiniMaxH3VideoFramesPadding": MiniMaxH3VideoFramesPadding,
     "TuringUtilsSetVideoLatentNoiseMask": SetVideoLatentNoiseMask,
+    "TuringUtilsVideoLatentCompositeMasked": VideoLatentCompositeMasked,
     "TuringUtilsBerniniContextWindowsCore": BerniniContextWindowsCore,
     "TuringUtilsBerniniInpaintCondition": BerniniInpaintCondition,
     "TuringUtilsKrea2IdentityEditConditioning": Krea2IdentityEditConditioning,
@@ -86,6 +87,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsWanVideoFramesPadding": "Wan Video Frames Padding",
     "TuringUtilsMiniMaxH3VideoFramesPadding": "MiniMax H3 Video Frames Padding",
     "TuringUtilsSetVideoLatentNoiseMask": "Set Video Latent Noise Mask",
+    "TuringUtilsVideoLatentCompositeMasked": "Video Latent Composite Masked",
     "TuringUtilsBerniniContextWindowsCore": "Bernini Context Windows",
     "TuringUtilsBerniniInpaintCondition": "Bernini Inpaint Condition",
     "TuringUtilsKrea2IdentityEditConditioning": "Krea2 Identity Edit Conditioning",
