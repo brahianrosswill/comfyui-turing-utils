@@ -32,10 +32,10 @@ class MiniMaxH3VideoVAEDecode:
     FUNCTION = "decode"
     CATEGORY = "Turing Utils/MiniMax H3"
     DESCRIPTION = (
-        "Native H3 independent-window decoding and linear stitching with fused "
-        "operators, selectable attention, and completed-tile progress. Accepts "
-        "the official VAELoader; operators activate only during this node. Weight "
-        "prefetch and output storage follow ComfyUI's VAE lifecycle."
+        "Official ComfyUI H3 VAE decoding with scoped fused operators and "
+        "selectable attention. ComfyUI owns tiling, batching, transfers, memory "
+        "management and OOM recovery. Accepts the official VAELoader. Lightweight "
+        "tqdm counts submitted tile forwards, not GPU completion."
     )
 
     def decode(
@@ -73,10 +73,10 @@ class MiniMaxH3VideoVAEEncode:
     FUNCTION = "encode"
     CATEGORY = "Turing Utils/MiniMax H3"
     DESCRIPTION = (
-        "MiniMax H3 video encoder with asynchronous pixel buffering, automatic "
-        "tile batching, ComfyUI-managed block-level dynamic-weight prefetch, "
-        "and output storage matching ComfyUI's VAE intermediate dtype. Accepts "
-        "the official VAELoader and preserves its compute dtype."
+        "Official ComfyUI H3 VAE encoding with scoped fused operators. ComfyUI "
+        "owns tiling, batching, transfers, memory management and OOM recovery. "
+        "Accepts the official VAELoader and preserves its compute/output dtype. "
+        "Lightweight tqdm counts submitted tile forwards, not GPU completion."
     )
 
     def encode(

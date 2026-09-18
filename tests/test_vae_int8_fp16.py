@@ -119,11 +119,11 @@ class VAEInt8FP16Test(unittest.TestCase):
                         state["bias"] = torch.zeros(module.out_features, device="cuda", dtype=torch.float16)
                     module.load_state_dict(state, strict=True)
             value = torch.randn(1, 4, 2, 4, 4, device="cuda", dtype=torch.float16)
-            options = video_vae._attention_options("sdpa", value.device)
-            reference = video_vae._decoder_forward(decoder, value, options)
-            with video_vae._vae_operator_scope():
-                candidate = video_vae._decoder_forward(decoder, value, options)
-            restored = video_vae._decoder_forward(decoder, value, options)
+            with video_vae._decoder_overrides(decoder, "sdpa", value.device):
+                reference = decoder(value)
+                with video_vae._vae_operator_scope():
+                    candidate = decoder(value)
+                restored = decoder(value)
         torch.testing.assert_close(candidate, reference, rtol=0, atol=0)
         torch.testing.assert_close(restored, reference, rtol=0, atol=0)
 

@@ -1,15 +1,16 @@
 # MiniMax H3 Video VAE
 
 The H3 VAE nodes accept normal ComfyUI `VAE`, `LATENT`, and `IMAGE` types.
-They retain native H3 spatial/temporal reconstruction and add fused operators,
-decoder attention selection, and completed-tile progress in the UI and tqdm.
+They call the official ComfyUI VAE entry points and add scoped fused operators,
+decoder attention selection, and lightweight submitted-tile counts in tqdm.
 Use the official `VAELoader`; no separate Turing Utils VAE loader is required
 or provided. These optimizations activate only while the dedicated H3 node is
 executing. Other nodes using the same VAE object retain normal dispatch.
 
 ## Decode
 
-`MiniMax H3 Video VAE Decode` evaluates each spatial window independently:
+`MiniMax H3 Video VAE Decode` delegates to `vae.decode(samples)`. The official
+H3 model evaluates each spatial window independently:
 
 - native H3 window geometry (normally 256px with at least 64px overlap);
 - independent image/register tokens and local RoPE for all decoder blocks;
@@ -51,36 +52,45 @@ uses FP32. Do not infer VAE compute precision from the DiT checkpoint's BF16 lab
 
 ## Encode
 
-`MiniMax H3 Video VAE Encode` retains the native 256px/64px tiled CNN encoder,
-linear blending, temporal layout, and latent normalization. It has no attention
+`MiniMax H3 Video VAE Encode` delegates to `vae.encode(pixels)`, retaining the
+official cropping, tiled CNN encoder, linear blending, temporal layout, and
+latent normalization. It has no attention
 selector because the encoder is convolutional. The same execution-local
 operator scope is enabled, but only compatible quantized operations use it;
 ordinary convolutions retain their native implementation and dtype.
 
 ## Execution and validation
 
-Independent windows can be batched within the current memory budget (up to
-sixteen). Only the one-tile requirement is passed to ComfyUI model loading.
-After loading, larger batches are selected from idle/reusable allocator memory
-minus the configured reserve and not-yet-resident VAE weights. Evictable
-DiT/CLIP weights are not counted as optional batching capacity. One tile can
-still require unavoidable offloading on a small card; this is not a guarantee
-that every model remains resident or that concurrent GPU allocations cannot OOM.
-ComfyUI owns model loading and short-lived weight prefetch queues;
-pixel transfers retain asynchronous buffering. Output tensors use
-`vae.vae_output_dtype()`, and progress advances as tile work completes.
+The plugin does not merge spatial tiles into larger batches, create pixel-copy
+streams or pinned double buffers, reserve a non-evicting memory budget, or create
+block-level weight-prefetch queues. ComfyUI owns model loading/unloading,
+DynamicVRAM/aimdo paging, official batching, input/output transfers, dtype and
+OOM recovery. The plugin does not retry allocator or kernel errors on its own.
+Keeping other models resident is not promised; ComfyUI may offload them as needed.
 
-Regression tests compare the decoder directly with native `ViT3DDecoder` and
-`MiniMaxH3VideoVAE.tiled_decode`, including multiple windows, input batches,
-tile-batch sizes, FP16 CUDA execution, and differing pixels in overlap regions.
-Temporal and encoder reference comparisons remain covered separately.
+Only attention and eligible FFN forwards are temporarily adapted on the selected
+decoder instance. The official decoder block loop, spatial blending and temporal
+reconstruction are not replaced. These instance overrides and progress hooks are
+restored on success, errors and cancellation. No process-global attention method
+is patched, and no device tensors are persistently cached on the VAE.
 
-On A40/cu128, a synthetic full-width 36-block INT8/FP16/SDPA decoder window
+Progress is an open-ended tqdm counter of native tile forwards submitted by the
+host, including any official retry attempts. It is not a GPU-completion counter
+or an end-to-end timing measurement. No CUDA events, synchronization, background
+threads or additional ComfyUI UI progress hooks are used for this counter.
+
+Regression tests cover direct delegation to the official VAE, native output
+parity, tile/input-batch preservation, dtype handling, official OOM fallback,
+attention/fusion dispatch, and restoration after errors or cancellation.
+
+Historical operator measurements (before the native-lifecycle simplification):
+on A40/cu128, a synthetic full-width 36-block INT8/FP16/SDPA decoder window
 dropped from 386.96 ms to 110.09 ms. A synthetic 864×480, 22-frame decode at
 tile batch 1 dropped from 5855.08 ms to 1675.47 ms, with bitwise-equal output
 in both comparisons. These are random-weight, resident-model measurements,
 not real-checkpoint quality or end-to-end generation results. Batch 4 saved
 another 103 ms but used 417 MiB more peak memory and was not bitwise equal to
-single-tile execution (maximum pixel difference 0.000895). Larger batches and
-different attention backends must not be described as universally lossless.
+single-tile execution (maximum pixel difference 0.000895). Custom tile batching
+is now removed; these timings are not performance claims for the new lifecycle.
+Different attention backends must not be described as universally lossless.
 Actual SM75/Windows and trained-checkpoint validation are still required.
