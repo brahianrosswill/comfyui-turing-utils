@@ -75,14 +75,14 @@ only after its CUDA sources or required version change.
   of the body timeline for segmented video editing without increasing its
   duration. Image masks and audio follow the same boundary.
 - `Video Prefix Context Noise` is an independent IMAGE processor intended for
-  the composed sequence. Its default recipe applies six-colour block noise to
-  the first 17 frames, tapers the final four affected frames from alpha `0.45`
-  toward `0.10`, and leaves every subsequent frame unchanged.
-  The transition can be widened (for example to eight frames) without changing
-  later frames. Advanced controls expose the end alpha, transition length,
-  pattern, grid mode, and block size. A missing image passes through as absent;
-  batches shorter than `noise_frames` use only their available frames instead
-  of failing. These empirical defaults follow MacroSony's
+  a complete prefix sequence. Its default recipe first preserves the final five
+  frames, tapers the preceding four frames from alpha `0.45` toward `0.10`, and
+  applies full six-colour block noise to every earlier frame. This preserves the
+  same `13 full + 4 transition + 5 clean` layout for a 22-frame H3 prefix without
+  requiring its total length as an input. Short batches allocate the clean tail
+  first, then as much transition as fits, and only then add a full-noise region.
+  Advanced controls expose the end alpha, pattern, grid mode, and block size. A
+  missing image passes through as absent. These empirical defaults follow MacroSony's
   [H3 chained-character-swap recipe](https://github.com/MacroSony/minimax-h3-chained-character-swap)
   and its [ComfyUI context-noise implementation](https://github.com/beijinren/ComfyUI-H3-Context-Noise).
   Missing audio spans are represented by duration-matched silence.

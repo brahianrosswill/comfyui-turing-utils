@@ -248,12 +248,14 @@ def _noise_alpha_schedule(frame_count: int, strength: float, end_strength: float
     end_strength = float(end_strength)
     transition_frames = int(transition_frames)
     if frame_count < 1:
-        raise ValueError("noise_frames must select at least one frame")
+        raise ValueError("frame_count must be positive")
     if not 0.0 <= end_strength <= strength <= 1.0:
         raise ValueError("end_strength must be between 0 and strength")
-    if transition_frames < 1:
-        raise ValueError("transition_frames must be positive")
+    if transition_frames < 0:
+        raise ValueError("transition_frames must not be negative")
     transition_frames = min(transition_frames, frame_count)
+    if transition_frames == 0:
+        return [strength] * frame_count
     result = []
     for position in range(frame_count):
         from_end = frame_count - 1 - position
@@ -300,20 +302,20 @@ def _add_prefix_chroma_blocks(
     *,
     end_strength: float = 0.10,
     transition_frames: int = 4,
-    noise_frames: int = 17,
+    tail_protection_frames: int = 5,
     pattern: str = "poc_chroma_blocks",
     grid_mode: str = "poc_36x64",
     block_size: int = _CHROMA_BLOCK_SIZE,
 ) -> torch.Tensor:
     frame_count, height, width, _ = images.shape
-    noise_frames = int(noise_frames)
-    if noise_frames < 0:
-        raise ValueError("noise_frames must not be negative")
-    noise_frames = min(noise_frames, frame_count)
-    if noise_frames == 0:
+    tail_protection_frames = int(tail_protection_frames)
+    if tail_protection_frames < 0:
+        raise ValueError("tail_protection_frames must not be negative")
+    affected_frames = frame_count - min(tail_protection_frames, frame_count)
+    if affected_frames == 0:
         return images.clone()
     alphas = _noise_alpha_schedule(
-        noise_frames,
+        affected_frames,
         strength,
         end_strength,
         transition_frames,
@@ -478,14 +480,21 @@ class VideoPrefixContextNoise(io.ComfyNode):
             display_name="Video Prefix Context Noise",
             category="Turing Utils/video",
             description=(
-                "Apply coarse colour-block noise only to the beginning of an IMAGE sequence. By default, "
-                "the first 17 frames receive noise with a four-frame transition; every later frame remains "
-                "untouched. A missing IMAGE passes through as absent, and shorter batches are processed only "
-                "for their available frames. Omit this node when no context noise is wanted."
+                "Treat the complete IMAGE batch as a video prefix. Preserve a clean tail first, place a "
+                "noise transition immediately before it, and apply full coarse colour-block noise to every "
+                "earlier frame. Short batches prioritize the protected tail, then the transition, and only "
+                "use full noise when frames remain. A missing IMAGE passes through as absent."
             ),
             inputs=[
                 io.Image.Input("images", optional=True, tooltip="A missing IMAGE is passed through as None."),
-                io.Int.Input("noise_frames", default=17, min=0, max=16384, step=1),
+                io.Int.Input(
+                    "tail_protection_frames",
+                    default=5,
+                    min=0,
+                    max=16384,
+                    step=1,
+                    tooltip="Clean frames reserved at the end of the complete prefix before any noise is allocated.",
+                ),
                 io.Float.Input(
                     "strength",
                     default=0.45,
@@ -502,7 +511,14 @@ class VideoPrefixContextNoise(io.ComfyNode):
                     control_after_generate=True,
                 ),
                 io.Float.Input("end_strength", default=0.10, min=0.0, max=1.0, step=0.01, advanced=True),
-                io.Int.Input("transition_frames", default=4, min=1, max=4096, step=1, advanced=True),
+                io.Int.Input(
+                    "transition_frames",
+                    default=4,
+                    min=0,
+                    max=4096,
+                    step=1,
+                    tooltip="Frames immediately before the clean tail that taper from full to end strength.",
+                ),
                 io.Combo.Input(
                     "pattern",
                     options=["poc_chroma_blocks", "gaussian_rgb", "uniform_rgb"],
@@ -524,7 +540,7 @@ class VideoPrefixContextNoise(io.ComfyNode):
     def execute(
         cls,
         images=None,
-        noise_frames=17,
+        tail_protection_frames=5,
         strength=0.45,
         seed=0,
         end_strength=0.10,
@@ -542,7 +558,7 @@ class VideoPrefixContextNoise(io.ComfyNode):
                 int(seed),
                 end_strength=float(end_strength),
                 transition_frames=int(transition_frames),
-                noise_frames=int(noise_frames),
+                tail_protection_frames=int(tail_protection_frames),
                 pattern=str(pattern),
                 grid_mode=str(grid_mode),
                 block_size=int(block_size),

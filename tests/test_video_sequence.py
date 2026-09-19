@@ -59,12 +59,12 @@ class VideoSequenceTest(unittest.TestCase):
         }
         self.assertEqual(noise_inputs["strength"].default, 0.45)
         self.assertEqual(noise_inputs["end_strength"].default, 0.10)
-        self.assertEqual(noise_inputs["noise_frames"].default, 17)
+        self.assertEqual(noise_inputs["tail_protection_frames"].default, 5)
         self.assertEqual(noise_inputs["transition_frames"].default, 4)
         self.assertTrue(noise_inputs["images"].optional)
-        self.assertNotIn("tail_frames", noise_inputs)
-        self.assertNotIn("clean_tail_frames", noise_inputs)
+        self.assertNotIn("noise_frames", noise_inputs)
         self.assertTrue(noise_inputs["end_strength"].advanced)
+        self.assertFalse(noise_inputs["transition_frames"].advanced)
         self.assertEqual(concat_schema.outputs[-1].display_name, "trim_info")
         self.assertEqual(nodes.TrimVideoContinuationPrefix.define_schema().inputs[-1].id, "trim_info")
         self.assertEqual(nodes.H3SetAudioPrefixNoiseMask.define_schema().inputs[-1].id, "trim_info")
@@ -326,19 +326,34 @@ class VideoSequenceTest(unittest.TestCase):
     def test_prefix_noise_passes_through_none(self):
         self.assertIsNone(nodes.VideoPrefixContextNoise.execute(None).result[0])
 
-    def test_prefix_noise_clamps_noise_frames_to_short_batches(self):
+    def test_prefix_noise_short_batches_prioritize_the_clean_tail(self):
         images = torch.ones(3, 8, 8, 3)
         zero_grid = lambda pattern, width, height, palette_rng, generator: torch.zeros(height, width, 3)
         with mock.patch.object(nodes, "_coarse_noise_frame", side_effect=zero_grid):
             output = nodes.VideoPrefixContextNoise.execute(
                 images,
-                noise_frames=17,
+                tail_protection_frames=5,
                 strength=0.45,
                 end_strength=0.10,
                 transition_frames=4,
             ).result[0]
         self.assertEqual(output.shape, images.shape)
-        self.assertFalse(torch.equal(output, images))
+        torch.testing.assert_close(output, images, rtol=0, atol=0)
+
+    def test_prefix_noise_short_batches_shrink_transition_before_protected_tail(self):
+        images = torch.ones(7, 8, 8, 3)
+        zero_grid = lambda pattern, width, height, palette_rng, generator: torch.zeros(height, width, 3)
+        with mock.patch.object(nodes, "_coarse_noise_frame", side_effect=zero_grid):
+            output = nodes.VideoPrefixContextNoise.execute(
+                images,
+                tail_protection_frames=5,
+                strength=0.45,
+                end_strength=0.10,
+                transition_frames=4,
+            ).result[0]
+        torch.testing.assert_close(output[0], torch.full_like(output[0], 0.725))
+        torch.testing.assert_close(output[1], torch.full_like(output[1], 0.90))
+        torch.testing.assert_close(output[2:], images[2:], rtol=0, atol=0)
 
     def test_validated_noise_schedule_is_flat_then_tapers_to_point_one(self):
         schedule = nodes._noise_alpha_schedule(17, 0.45, 0.10, 4)
@@ -354,7 +369,7 @@ class VideoSequenceTest(unittest.TestCase):
         with mock.patch.object(nodes, "_coarse_noise_frame", side_effect=zero_grid):
             output = nodes.VideoPrefixContextNoise.execute(
                 images,
-                noise_frames=17,
+                tail_protection_frames=5,
                 strength=0.45,
                 seed=7,
                 end_strength=0.10,
@@ -374,12 +389,12 @@ class VideoSequenceTest(unittest.TestCase):
         torch.testing.assert_close(first, second, rtol=0, atol=0)
         self.assertGreaterEqual(first.amin().item(), 0.0)
         self.assertLessEqual(first.amax().item(), 1.0)
-        torch.testing.assert_close(first[17:], images[17:], rtol=0, atol=0)
+        torch.testing.assert_close(first[19:], images[19:], rtol=0, atol=0)
 
-    def test_prefix_noise_zero_frames_is_an_exact_no_op(self):
+    def test_prefix_noise_protecting_the_complete_prefix_is_an_exact_no_op(self):
         images = torch.rand(22, 8, 8, 3)
         output = nodes.VideoPrefixContextNoise.execute(
-            images, noise_frames=0
+            images, tail_protection_frames=22
         ).result[0]
         torch.testing.assert_close(output, images, rtol=0, atol=0)
         self.assertIsNot(output, images)
