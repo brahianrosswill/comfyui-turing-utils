@@ -36,6 +36,10 @@ class VideoSequenceTest(unittest.TestCase):
                 self.assertEqual(schema.node_id, node_id)
                 self.assertNotIn("preview", [output.id for output in schema.outputs])
 
+        loader_inputs = {input_.id: input_ for input_ in nodes.LoadIndexedVideoSegment.define_schema().inputs}
+        self.assertEqual(loader_inputs["segment_index"].min, -1)
+        self.assertEqual(loader_inputs["tail_frames"].default, 22)
+
     def test_segment_paths_are_six_digit_and_confined_to_output(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             nodes.folder_paths, "get_output_directory", return_value=directory
@@ -55,6 +59,48 @@ class VideoSequenceTest(unittest.TestCase):
             output = nodes.LoadIndexedVideoSegment.execute("segments", 8, 21)
             self.assertEqual(output.result, (None, None, 0.0))
             self.assertIsNone(output.ui)
+
+    def test_loader_zero_returns_empty_without_reading_or_scanning(self):
+        with mock.patch.object(nodes.InputImpl, "VideoFromFile") as video_from_file, mock.patch.object(
+            nodes.folder_paths, "get_output_directory"
+        ) as get_output_directory:
+            output = nodes.LoadIndexedVideoSegment.execute("ignored", 0, 21)
+            fingerprint = nodes.LoadIndexedVideoSegment.fingerprint_inputs("ignored", 0, 21)
+        self.assertEqual(output.result, (None, None, 0.0))
+        self.assertEqual(fingerprint, (0, None, 21))
+        video_from_file.assert_not_called()
+        get_output_directory.assert_not_called()
+
+    def test_loader_positive_index_reads_previous_saved_segment(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            nodes.folder_paths, "get_output_directory", return_value=directory
+        ):
+            target = Path(directory) / "segments" / "000006.mp4"
+            target.parent.mkdir()
+            target.write_bytes(b"video")
+            self.assertEqual(nodes._segment_path_for_load("segments", 7), target)
+            self.assertEqual(nodes._segment_path_for_load("segments", 1).name, "000000.mp4")
+            self.assertEqual(nodes._segment_path_for_load("segments", 1_000_000).name, "999999.mp4")
+
+    def test_loader_minus_one_selects_highest_six_digit_segment(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            nodes.folder_paths, "get_output_directory", return_value=directory
+        ):
+            segment_directory = Path(directory) / "segments"
+            segment_directory.mkdir()
+            for name in ("000002.mp4", "000117.mp4", "999999.mp4", "1000000.mp4", "999998.MP4", "notes.mp4"):
+                (segment_directory / name).write_bytes(b"video")
+            self.assertEqual(
+                nodes._segment_path_for_load("segments", -1),
+                segment_directory / "999999.mp4",
+            )
+
+    def test_loader_minus_one_returns_empty_when_no_segment_exists(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            nodes.folder_paths, "get_output_directory", return_value=directory
+        ):
+            output = nodes.LoadIndexedVideoSegment.execute("segments", -1, 21)
+            self.assertEqual(output.result, (None, None, 0.0))
 
     def test_loader_keeps_tail_frames_and_matching_audio(self):
         images = torch.arange(10, dtype=torch.float32)[:, None, None, None].expand(10, 2, 2, 3)
@@ -81,7 +127,7 @@ class VideoSequenceTest(unittest.TestCase):
             target.parent.mkdir()
             target.write_bytes(b"video")
             output_images, output_audio, frame_rate = nodes.LoadIndexedVideoSegment.execute(
-                "segments", 1, 5
+                "segments", 2, 5
             ).result
         torch.testing.assert_close(output_images, images[-5:])
         torch.testing.assert_close(output_audio["waveform"], audio["waveform"][..., -10:])

@@ -35,11 +35,7 @@ def _ceil_fraction(value: Fraction) -> int:
     return -(-value.numerator // value.denominator)
 
 
-def _segment_path(root_directory: str, segment_index: int, *, create: bool = False) -> Path:
-    segment_index = int(segment_index)
-    if not 0 <= segment_index <= 999999:
-        raise ValueError("segment_index must be between 0 and 999999")
-
+def _segment_directory(root_directory: str, *, create: bool = False) -> Path:
     output_root = Path(folder_paths.get_output_directory()).resolve()
     relative = Path(str(root_directory).strip().replace("\\", "/"))
     if relative.is_absolute():
@@ -51,6 +47,15 @@ def _segment_path(root_directory: str, segment_index: int, *, create: bool = Fal
         raise ValueError("root_directory must stay inside the ComfyUI output directory") from error
     if create:
         directory.mkdir(parents=True, exist_ok=True)
+    return directory
+
+
+def _segment_path(root_directory: str, segment_index: int, *, create: bool = False) -> Path:
+    segment_index = int(segment_index)
+    if not 0 <= segment_index <= 999999:
+        raise ValueError("segment_index must be between 0 and 999999")
+
+    directory = _segment_directory(root_directory, create=create)
     return directory / f"{segment_index:06d}.mp4"
 
 
@@ -63,6 +68,40 @@ def _segment_path_for_read(root_directory: str, segment_index: int) -> Path:
     except ValueError as error:
         raise ValueError("Indexed video path must stay inside the ComfyUI output directory") from error
     return resolved
+
+
+def _latest_segment_path(root_directory: str) -> Path | None:
+    directory = _segment_directory(root_directory)
+    if not directory.is_dir():
+        return None
+
+    latest_index = None
+    for candidate in directory.iterdir():
+        name = candidate.name
+        if (
+            len(name) == 10
+            and name[:6].isascii()
+            and name[:6].isdigit()
+            and name[6:] == ".mp4"
+            and not candidate.is_symlink()
+            and candidate.is_file()
+        ):
+            index = int(name[:6])
+            latest_index = index if latest_index is None else max(latest_index, index)
+    if latest_index is None:
+        return None
+    return _segment_path_for_read(root_directory, latest_index)
+
+
+def _segment_path_for_load(root_directory: str, segment_index: int) -> Path | None:
+    segment_index = int(segment_index)
+    if segment_index == 0:
+        return None
+    if segment_index == -1:
+        return _latest_segment_path(root_directory)
+    if not 1 <= segment_index <= 1_000_000:
+        raise ValueError("load segment_index must be -1 or between 0 and 1000000")
+    return _segment_path_for_read(root_directory, segment_index - 1)
 
 
 def _validate_images(images, name: str) -> torch.Tensor:
@@ -214,13 +253,14 @@ class LoadIndexedVideoSegment(io.ComfyNode):
             display_name="Load Indexed Video Segment",
             category="Turing Utils/video",
             description=(
-                "Load NNNNNN.mp4 below the current ComfyUI output directory. "
+                "Load the segment before the requested continuation index below the current ComfyUI output "
+                "directory: 0 returns empty, i loads i-1, and -1 loads the highest six-digit MP4. "
                 "Optionally decode only its final frames and matching audio. A missing file returns empty outputs."
             ),
             inputs=[
                 io.String.Input("root_directory", default="video/segments"),
-                io.Int.Input("segment_index", default=0, min=0, max=999999, step=1),
-                io.Int.Input("tail_frames", default=21, min=0, max=16384, step=1, tooltip="Final frames to load; 0 loads the complete segment."),
+                io.Int.Input("segment_index", default=0, min=-1, max=1_000_000, step=1),
+                io.Int.Input("tail_frames", default=22, min=0, max=16384, step=1, tooltip="Final frames to load; 0 loads the complete segment."),
             ],
             outputs=[
                 io.Image.Output(display_name="images"),
@@ -231,16 +271,18 @@ class LoadIndexedVideoSegment(io.ComfyNode):
 
     @classmethod
     def fingerprint_inputs(cls, root_directory, segment_index, tail_frames):
-        path = _segment_path_for_read(root_directory, segment_index)
+        path = _segment_path_for_load(root_directory, segment_index)
+        if path is None:
+            return (int(segment_index), None, int(tail_frames))
         if not path.is_file():
-            return (str(path), None, int(tail_frames))
+            return (int(segment_index), str(path), None, int(tail_frames))
         stat = path.stat()
-        return (str(path), stat.st_mtime_ns, stat.st_size, int(tail_frames))
+        return (int(segment_index), str(path), stat.st_mtime_ns, stat.st_size, int(tail_frames))
 
     @classmethod
     def execute(cls, root_directory: str, segment_index: int, tail_frames: int) -> io.NodeOutput:
-        path = _segment_path_for_read(root_directory, segment_index)
-        if not path.is_file():
+        path = _segment_path_for_load(root_directory, segment_index)
+        if path is None or not path.is_file():
             return io.NodeOutput(None, None, 0.0)
 
         source = InputImpl.VideoFromFile(str(path))

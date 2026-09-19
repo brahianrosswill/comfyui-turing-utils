@@ -62,9 +62,11 @@ only after its CUDA sources or required version change.
 - `MiniMax H3 Video Frames Padding` pads to H3's `17*n+5` frame grid.
 - `Load/Save Indexed Video Segment` read and atomically write six-digit MP4
   segments such as `000324.mp4` below the active ComfyUI instance's output
-  directory. The loader can return only the final frames with synchronized
-  audio; a missing segment returns empty outputs. The saver supports explicit
-  overwrite and deliberately produces no preview.
+  directory. Loader index `0` returns empty, positive index `i` reads segment
+  `i-1`, and `-1` selects the highest existing segment number. The loader can
+  return only the final frames with synchronized audio, defaulting to the H3
+  `17+5=22`-frame continuation prefix; a missing segment returns empty outputs.
+  The saver supports explicit overwrite and deliberately produces no preview.
 - `Video Continuation Concat` prepends optional image/audio context, supplies
   zero masks for an unmasked prefix and one masks for an unmasked generated
   body, and returns exact rational boundary metadata. Optional 16-pixel chroma
