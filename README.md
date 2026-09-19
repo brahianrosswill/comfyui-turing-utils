@@ -69,8 +69,19 @@ only after its CUDA sources or required version change.
   The saver supports explicit overwrite and deliberately produces no preview.
 - `Video Continuation Concat` prepends optional image/audio context, supplies
   zero masks for an unmasked prefix and one masks for an unmasked generated
-  body, and returns exact rational boundary metadata. Optional 16-pixel chroma
-  blocks fade across the prefix while its final five frames remain clean.
+  body, and returns exact rational boundary metadata. `concat` mode prepends
+  the prefix for continuation generation; `replace` mode overwrites the start
+  of the body timeline for segmented video editing without increasing its
+  duration. Image masks and audio follow the same boundary.
+- `Video Prefix Context Noise` is an independent IMAGE processor intended for
+  the composed sequence. Its default recipe applies six-colour block noise to
+  the first 17 frames, tapers the final four affected frames from alpha `0.45`
+  toward `0.10`, and leaves every subsequent frame unchanged.
+  The transition can be widened (for example to eight frames) without changing
+  later frames. Advanced controls expose the end alpha, transition length,
+  pattern, grid mode, and block size. These empirical defaults follow MacroSony's
+  [H3 chained-character-swap recipe](https://github.com/MacroSony/minimax-h3-chained-character-swap)
+  and its [ComfyUI context-noise implementation](https://github.com/beijinren/ComfyUI-H3-Context-Noise).
   Missing audio spans are represented by duration-matched silence.
 - `Trim Video Continuation Prefix` removes that exact image/audio prefix after
   generation. `H3 Set Audio Prefix Noise Mask` maps the recorded waveform

@@ -42,6 +42,7 @@ from .nodes.video_sequence import (
     SaveIndexedVideoSegment,
     TrimVideoContinuationPrefix,
     VideoContinuationConcat,
+    VideoPrefixContextNoise,
 )
 from .nodes.wan import WanVideoFramesPadding
 
@@ -88,6 +89,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsMiniMaxH3VideoVAEEncode": MiniMaxH3VideoVAEEncode,
     "TuringUtilsLoadIndexedVideoSegment": LoadIndexedVideoSegment,
     "TuringUtilsSaveIndexedVideoSegment": SaveIndexedVideoSegment,
+    "TuringUtilsVideoPrefixContextNoise": VideoPrefixContextNoise,
     "TuringUtilsVideoContinuationConcat": VideoContinuationConcat,
     "TuringUtilsTrimVideoContinuationPrefix": TrimVideoContinuationPrefix,
     "TuringUtilsH3SetAudioPrefixNoiseMask": H3SetAudioPrefixNoiseMask,
@@ -132,6 +134,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsMiniMaxH3VideoVAEEncode": "MiniMax H3 Video VAE Encode",
     "TuringUtilsLoadIndexedVideoSegment": "Load Indexed Video Segment",
     "TuringUtilsSaveIndexedVideoSegment": "Save Indexed Video Segment",
+    "TuringUtilsVideoPrefixContextNoise": "Video Prefix Context Noise",
     "TuringUtilsVideoContinuationConcat": "Video Continuation Concat",
     "TuringUtilsTrimVideoContinuationPrefix": "Trim Video Continuation Prefix",
     "TuringUtilsH3SetAudioPrefixNoiseMask": "H3 Set Audio Prefix Noise Mask",

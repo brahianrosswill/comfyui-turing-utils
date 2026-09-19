@@ -207,6 +207,7 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsMiniMaxH3VideoVAEEncode",
                 "TuringUtilsLoadIndexedVideoSegment",
                 "TuringUtilsSaveIndexedVideoSegment",
+                "TuringUtilsVideoPrefixContextNoise",
                 "TuringUtilsVideoContinuationConcat",
                 "TuringUtilsTrimVideoContinuationPrefix",
                 "TuringUtilsH3SetAudioPrefixNoiseMask",

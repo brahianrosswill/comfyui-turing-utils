@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import os
+import random
 import uuid
 from collections.abc import Mapping
 from fractions import Fraction
@@ -21,7 +22,17 @@ VideoTrimInfo = io.Custom("TURING_UTILS_VIDEO_TRIM_INFO")
 
 _DEFAULT_AUDIO_SAMPLE_RATE = 32000
 _CHROMA_BLOCK_SIZE = 16
-_CLEAN_PREFIX_TAIL = 5
+_CHROMA_POC_GRID = (36, 64)
+# Empirical MIT-licensed recipe documented by MacroSony and packaged for
+# ComfyUI by beijinren/ComfyUI-H3-Context-Noise.
+_CHROMA_PALETTE = (
+    (185, 115, 215),
+    (115, 195, 140),
+    (150, 148, 162),
+    (205, 150, 192),
+    (138, 182, 148),
+    (160, 120, 175),
+)
 
 
 def _frame_rate(value: float) -> Fraction:
@@ -157,7 +168,14 @@ def _match_audio_channels(waveform: torch.Tensor, channels: int, name: str) -> t
     raise ValueError(f"{name} has {current} channels and cannot be matched to {channels}")
 
 
-def _audio_timeline(prefix_audio, body_audio, prefix_frames: int, body_frames: int, frame_rate: Fraction):
+def _audio_timeline(
+    prefix_audio,
+    body_audio,
+    prefix_frames: int,
+    body_frames: int,
+    frame_rate: Fraction,
+    mode: str,
+):
     prefix = _validate_audio(prefix_audio, "prefix_audio") if prefix_audio is not None else None
     body = _validate_audio(body_audio, "body_audio") if body_audio is not None else None
     sample_rate = prefix[1] if prefix is not None else body[1] if body is not None else _DEFAULT_AUDIO_SAMPLE_RATE
@@ -185,9 +203,17 @@ def _audio_timeline(prefix_audio, body_audio, prefix_frames: int, body_frames: i
         waveform = _match_audio_channels(waveform, channels, name).to(device=device, dtype=dtype)
         return _fit_waveform(waveform, length)
 
-    prefix_waveform = prepare(prefix, prefix_length, "prefix_audio")
     body_waveform = prepare(body, body_length, "body_audio")
-    waveform = torch.cat((prefix_waveform, body_waveform), dim=-1)
+    if mode == "concat":
+        prefix_waveform = prepare(prefix, prefix_length, "prefix_audio")
+        waveform = torch.cat((prefix_waveform, body_waveform), dim=-1)
+    elif mode == "replace":
+        waveform = body_waveform.clone()
+        if prefix is not None and prefix_length > 0:
+            prefix_waveform = prepare(prefix, prefix_length, "prefix_audio")
+            waveform[..., :prefix_length] = prefix_waveform
+    else:
+        raise ValueError(f"Unknown continuation mode: {mode!r}")
     return {"waveform": waveform, "sample_rate": sample_rate}, prefix_length
 
 
@@ -213,36 +239,108 @@ def _prepare_mask(mask, frames: int, height: int, width: int, default: float, de
     return mask.clone()
 
 
-def _add_chroma_blocks(images: torch.Tensor, strength: float, seed: int) -> torch.Tensor:
-    frame_count, height, width, _ = images.shape
-    noisy_frames = max(0, frame_count - _CLEAN_PREFIX_TAIL)
-    if noisy_frames == 0 or strength <= 0.0:
-        return images
+def _noise_alpha_schedule(frame_count: int, strength: float, end_strength: float, transition_frames: int) -> list[float]:
+    frame_count = int(frame_count)
+    strength = float(strength)
+    end_strength = float(end_strength)
+    transition_frames = int(transition_frames)
+    if frame_count < 1:
+        raise ValueError("noise_frames must select at least one frame")
+    if not 0.0 <= end_strength <= strength <= 1.0:
+        raise ValueError("end_strength must be between 0 and strength")
+    if transition_frames < 1:
+        raise ValueError("transition_frames must be positive")
+    transition_frames = min(transition_frames, frame_count)
+    result = []
+    for position in range(frame_count):
+        from_end = frame_count - 1 - position
+        if from_end >= transition_frames:
+            result.append(strength)
+        else:
+            result.append(
+                strength
+                + (end_strength - strength)
+                * (transition_frames - from_end)
+                / transition_frames
+            )
+    return result
 
-    generator = torch.Generator(device=images.device)
-    generator.manual_seed(int(seed))
-    grid_height = (height + _CHROMA_BLOCK_SIZE - 1) // _CHROMA_BLOCK_SIZE
-    grid_width = (width + _CHROMA_BLOCK_SIZE - 1) // _CHROMA_BLOCK_SIZE
-    chroma = torch.rand(
-        (frame_count, 2, grid_height, grid_width),
-        generator=generator,
-        device=images.device,
-        dtype=torch.float32,
-    ).mul_(2.0).sub_(1.0)
-    chroma = F.interpolate(chroma, size=(height, width), mode="nearest")
-    cb, cr = chroma[:, 0], chroma[:, 1]
-    offset = torch.stack(
-        (
-            1.402 * cr,
-            -0.344136 * cb - 0.714136 * cr,
-            1.772 * cb,
-        ),
-        dim=-1,
+
+def _nearest_indices(output_size: int, input_size: int, device) -> torch.Tensor:
+    scale = input_size / output_size
+    values = [min(input_size - 1, int((position + 0.5) * scale)) for position in range(output_size)]
+    return torch.tensor(values, dtype=torch.long, device=device)
+
+
+def _coarse_noise_frame(pattern: str, grid_width: int, grid_height: int, palette_rng, torch_generator) -> torch.Tensor:
+    if pattern == "poc_chroma_blocks":
+        rows = [
+            [palette_rng.choice(_CHROMA_PALETTE) for _ in range(grid_width)]
+            for _ in range(grid_height)
+        ]
+        return torch.tensor(rows, dtype=torch.float32).div_(255.0)
+    if pattern == "gaussian_rgb":
+        return torch.randn(
+            (grid_height, grid_width, 3), generator=torch_generator, dtype=torch.float32
+        ).mul_(0.25).add_(0.5).clamp_(0.0, 1.0)
+    if pattern == "uniform_rgb":
+        return torch.rand(
+            (grid_height, grid_width, 3), generator=torch_generator, dtype=torch.float32
+        )
+    raise ValueError(f"Unknown pattern: {pattern!r}")
+
+
+def _add_prefix_chroma_blocks(
+    images: torch.Tensor,
+    strength: float,
+    seed: int,
+    *,
+    end_strength: float = 0.10,
+    transition_frames: int = 4,
+    noise_frames: int = 17,
+    pattern: str = "poc_chroma_blocks",
+    grid_mode: str = "poc_36x64",
+    block_size: int = _CHROMA_BLOCK_SIZE,
+) -> torch.Tensor:
+    frame_count, height, width, _ = images.shape
+    noise_frames = int(noise_frames)
+    if noise_frames < 0:
+        raise ValueError("noise_frames must not be negative")
+    if noise_frames > frame_count:
+        raise ValueError(
+            f"noise_frames is {noise_frames}, but images contains only {frame_count} frames"
+        )
+    if noise_frames == 0:
+        return images.clone()
+    alphas = _noise_alpha_schedule(
+        noise_frames,
+        strength,
+        end_strength,
+        transition_frames,
     )
-    weights = torch.zeros((frame_count,), device=images.device, dtype=torch.float32)
-    weights[:noisy_frames] = torch.linspace(1.0, 1.0 / noisy_frames, noisy_frames, device=images.device)
-    noisy = images.float().add(offset * weights[:, None, None, None] * float(strength)).clamp_(0.0, 1.0)
-    return noisy.to(dtype=images.dtype)
+    if grid_mode == "poc_36x64":
+        grid_width, grid_height = _CHROMA_POC_GRID
+    elif grid_mode == "block_size":
+        block_size = int(block_size)
+        if block_size < 1:
+            raise ValueError("block_size must be positive")
+        grid_width = max(1, round(width / block_size))
+        grid_height = max(1, round(height / block_size))
+    else:
+        raise ValueError(f"Unknown grid_mode: {grid_mode!r}")
+
+    palette_rng = random.Random(int(seed))
+    torch_generator = torch.Generator(device="cpu").manual_seed(int(seed) & 0xFFFFFFFFFFFFFFFF)
+    row_indices = _nearest_indices(height, grid_height, images.device)
+    column_indices = _nearest_indices(width, grid_width, images.device)
+    output = images.clone()
+    for position, alpha in enumerate(alphas):
+        noise = _coarse_noise_frame(
+            pattern, grid_width, grid_height, palette_rng, torch_generator
+        ).to(device=images.device, dtype=images.dtype)
+        noise = noise.index_select(0, row_indices).index_select(1, column_indices)
+        output[position] = output[position] * (1.0 - alpha) + noise * alpha
+    return output
 
 
 class LoadIndexedVideoSegment(io.ComfyNode):
@@ -370,6 +468,83 @@ class SaveIndexedVideoSegment(io.ComfyNode):
         return io.NodeOutput(str(target))
 
 
+class VideoPrefixContextNoise(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        return io.Schema(
+            node_id="TuringUtilsVideoPrefixContextNoise",
+            display_name="Video Prefix Context Noise",
+            category="Turing Utils/video",
+            description=(
+                "Apply coarse colour-block noise only to the beginning of an IMAGE sequence. By default, "
+                "the first 17 frames receive noise with a four-frame transition; every later frame remains "
+                "untouched. Omit this node when no context noise is wanted."
+            ),
+            inputs=[
+                io.Image.Input("images"),
+                io.Int.Input("noise_frames", default=17, min=0, max=16384, step=1),
+                io.Float.Input(
+                    "strength",
+                    default=0.45,
+                    min=0.0,
+                    max=1.0,
+                    step=0.01,
+                    tooltip="Flat blend alpha for the validated H3 context-noise recipe; this is not Gaussian sigma.",
+                ),
+                io.Int.Input(
+                    "seed",
+                    default=0,
+                    min=0,
+                    max=0xffffffffffffffff,
+                    control_after_generate=True,
+                ),
+                io.Float.Input("end_strength", default=0.10, min=0.0, max=1.0, step=0.01, advanced=True),
+                io.Int.Input("transition_frames", default=4, min=1, max=4096, step=1, advanced=True),
+                io.Combo.Input(
+                    "pattern",
+                    options=["poc_chroma_blocks", "gaussian_rgb", "uniform_rgb"],
+                    default="poc_chroma_blocks",
+                    advanced=True,
+                ),
+                io.Combo.Input(
+                    "grid_mode",
+                    options=["poc_36x64", "block_size"],
+                    default="poc_36x64",
+                    advanced=True,
+                ),
+                io.Int.Input("block_size", default=16, min=1, max=256, step=1, advanced=True),
+            ],
+            outputs=[io.Image.Output(display_name="images")],
+        )
+
+    @classmethod
+    def execute(
+        cls,
+        images,
+        noise_frames=17,
+        strength=0.45,
+        seed=0,
+        end_strength=0.10,
+        transition_frames=4,
+        pattern="poc_chroma_blocks",
+        grid_mode="poc_36x64",
+        block_size=16,
+    ) -> io.NodeOutput:
+        return io.NodeOutput(
+            _add_prefix_chroma_blocks(
+                _validate_images(images, "images"),
+                float(strength),
+                int(seed),
+                end_strength=float(end_strength),
+                transition_frames=int(transition_frames),
+                noise_frames=int(noise_frames),
+                pattern=str(pattern),
+                grid_mode=str(grid_mode),
+                block_size=int(block_size),
+            )
+        )
+
+
 class VideoContinuationConcat(io.ComfyNode):
     @classmethod
     def define_schema(cls):
@@ -378,21 +553,23 @@ class VideoContinuationConcat(io.ComfyNode):
             display_name="Video Continuation Concat",
             category="Turing Utils/video",
             description=(
-                "Prepend optional continuation frames/audio to the generated body. Missing prefix masks "
-                "preserve the prefix; missing body masks redraw the body. Optional coarse chroma noise "
-                "fades toward a clean five-frame prefix boundary."
+                "Compose optional prefix frames/audio with a body timeline. Concat mode prepends the prefix; "
+                "replace mode overwrites the beginning of the body without increasing its duration. Missing "
+                "prefix masks preserve the prefix, and missing body masks redraw the body."
             ),
             inputs=[
-                io.Image.Input("body_images"),
-                io.Float.Input("frame_rate", default=24.0, min=0.01, max=1000.0, step=0.01),
-                io.Boolean.Input("add_chroma_noise", default=False),
-                io.Float.Input("noise_strength", default=0.08, min=0.0, max=1.0, step=0.01),
-                io.Int.Input("noise_seed", default=0, min=0, max=0xffffffffffffffff, control_after_generate=True, advanced=True),
                 io.Image.Input("prefix_images", optional=True),
-                io.Mask.Input("prefix_mask", optional=True),
-                io.Audio.Input("prefix_audio", optional=True),
-                io.Mask.Input("body_mask", optional=True),
-                io.Audio.Input("body_audio", optional=True),
+                io.Mask.Input("prefix_mask", optional=True, tooltip="Video/image redraw mask for the prefix; this is not an audio mask."),
+                io.Audio.Input("prefix_audio", optional=True, tooltip="Optional prefix waveform content. Audio preservation is controlled later by the H3 audio latent noise mask."),
+                io.Image.Input("body_images", optional=True, tooltip="Required generated or source body frames."),
+                io.Mask.Input("body_mask", optional=True, tooltip="Video/image redraw mask for the body; this is not an audio mask."),
+                io.Audio.Input("body_audio", optional=True, tooltip="Optional body waveform content. Leave empty when H3 should generate the body audio."),
+                io.Float.Input("frame_rate", default=24.0, min=0.01, max=1000.0, step=0.01),
+                io.Combo.Input(
+                    "mode",
+                    options=["concat", "replace"],
+                    default="concat",
+                ),
             ],
             outputs=[
                 io.Image.Output(display_name="images"),
@@ -405,17 +582,19 @@ class VideoContinuationConcat(io.ComfyNode):
     @classmethod
     def execute(
         cls,
-        body_images,
-        frame_rate,
-        add_chroma_noise,
-        noise_strength,
-        noise_seed=0,
         prefix_images=None,
         prefix_mask=None,
         prefix_audio=None,
+        body_images=None,
         body_mask=None,
         body_audio=None,
+        frame_rate=24.0,
+        mode="concat",
     ) -> io.NodeOutput:
+        if body_images is None:
+            raise ValueError("body_images is required")
+        if mode not in ("concat", "replace"):
+            raise ValueError(f"Unknown continuation mode: {mode!r}")
         body_images = _validate_images(body_images, "body_images")
         rate = _frame_rate(frame_rate)
         body_frames, height, width, _ = body_images.shape
@@ -429,25 +608,43 @@ class VideoContinuationConcat(io.ComfyNode):
                 )
             prefix_frames = int(prefix_images.shape[0])
             prefix_images = prefix_images.to(device=body_images.device, dtype=body_images.dtype)
-            if add_chroma_noise:
-                prefix_images = _add_chroma_blocks(prefix_images, float(noise_strength), int(noise_seed))
         elif prefix_mask is not None or prefix_audio is not None:
             raise ValueError("prefix_mask and prefix_audio require prefix_images")
 
+        if mode == "replace" and prefix_frames > int(body_frames):
+            raise ValueError(
+                f"replace mode cannot fit {prefix_frames} prefix frames into a {int(body_frames)}-frame body"
+            )
+
         prefix_mask = _prepare_mask(prefix_mask, prefix_frames, height, width, 0.0, body_images.device)
         body_mask = _prepare_mask(body_mask, int(body_frames), height, width, 1.0, body_images.device)
-        images = body_images if prefix_images is None else torch.cat((prefix_images, body_images), dim=0)
-        mask = torch.cat((prefix_mask, body_mask), dim=0)
+        if mode == "concat":
+            images = body_images if prefix_images is None else torch.cat((prefix_images, body_images), dim=0)
+            mask = torch.cat((prefix_mask, body_mask), dim=0)
+            trim_frames = prefix_frames
+        else:
+            images = (
+                body_images
+                if prefix_images is None
+                else torch.cat((prefix_images, body_images[prefix_frames:]), dim=0)
+            )
+            mask = body_mask.clone()
+            if prefix_frames > 0:
+                mask[:prefix_frames] = prefix_mask
+            trim_frames = 0
         audio, prefix_audio_samples = _audio_timeline(
             prefix_audio,
             body_audio,
             prefix_frames,
             int(body_frames),
             rate,
+            mode,
         )
         trim_info = {
             "version": 1,
+            "composition_mode": mode,
             "prefix_frames": prefix_frames,
+            "trim_frames": trim_frames,
             "body_frames": int(body_frames),
             "frame_rate_numerator": rate.numerator,
             "frame_rate_denominator": rate.denominator,
@@ -463,13 +660,14 @@ def _trim_info_values(trim_info):
     if not isinstance(trim_info, dict) or int(trim_info.get("version", 0)) != 1:
         raise ValueError("trim_info must come from Video Continuation Concat")
     prefix_frames = int(trim_info["prefix_frames"])
+    trim_frames = int(trim_info.get("trim_frames", prefix_frames))
     rate = Fraction(
         int(trim_info["frame_rate_numerator"]),
         int(trim_info["frame_rate_denominator"]),
     )
-    if prefix_frames < 0 or rate <= 0:
+    if prefix_frames < 0 or not 0 <= trim_frames <= prefix_frames or rate <= 0:
         raise ValueError("trim_info contains an invalid prefix boundary")
-    return prefix_frames, rate
+    return prefix_frames, trim_frames, rate
 
 
 class TrimVideoContinuationPrefix(io.ComfyNode):
@@ -479,11 +677,14 @@ class TrimVideoContinuationPrefix(io.ComfyNode):
             node_id="TuringUtilsTrimVideoContinuationPrefix",
             display_name="Trim Video Continuation Prefix",
             category="Turing Utils/video",
-            description="Remove the continuation prefix from generated IMAGE frames and matching AUDIO. No preview is created.",
+            description=(
+                "Remove the prepended continuation prefix from generated IMAGE frames and matching AUDIO. "
+                "Replace-mode metadata leaves the timeline unchanged. No preview is created."
+            ),
             inputs=[
                 io.Image.Input("images"),
-                VideoTrimInfo.Input("trim_info"),
                 io.Audio.Input("audio", optional=True),
+                VideoTrimInfo.Input("trim_info", optional=True),
             ],
             outputs=[
                 io.Image.Output(display_name="images"),
@@ -492,16 +693,16 @@ class TrimVideoContinuationPrefix(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, images, trim_info, audio=None) -> io.NodeOutput:
+    def execute(cls, images, trim_info=None, audio=None) -> io.NodeOutput:
         images = _validate_images(images, "images")
-        prefix_frames, rate = _trim_info_values(trim_info)
-        if prefix_frames > int(images.shape[0]):
-            raise ValueError(f"trim_info requests {prefix_frames} prefix frames but images contains {int(images.shape[0])}")
-        images = images[prefix_frames:]
+        _, trim_frames, rate = _trim_info_values(trim_info)
+        if trim_frames > int(images.shape[0]):
+            raise ValueError(f"trim_info requests {trim_frames} trim frames but images contains {int(images.shape[0])}")
+        images = images[trim_frames:]
         if audio is not None:
             waveform, sample_rate = _validate_audio(audio, "audio")
-            prefix_samples = _ceil_fraction(Fraction(prefix_frames * sample_rate, 1) / rate)
-            waveform = waveform[..., min(prefix_samples, int(waveform.shape[-1])):]
+            trim_samples = _ceil_fraction(Fraction(trim_frames * sample_rate, 1) / rate)
+            waveform = waveform[..., min(trim_samples, int(waveform.shape[-1])):]
             audio = {"waveform": waveform, "sample_rate": sample_rate}
         return io.NodeOutput(images, audio)
 
@@ -519,18 +720,18 @@ class H3SetAudioPrefixNoiseMask(io.ComfyNode):
             ),
             inputs=[
                 io.Latent.Input("audio_latent"),
-                VideoTrimInfo.Input("trim_info"),
                 io.Combo.Input(
                     "mode",
                     options=["protect_prefix_generate_body", "protect_all", "generate_all"],
                     default="protect_prefix_generate_body",
                 ),
+                VideoTrimInfo.Input("trim_info", optional=True),
             ],
             outputs=[io.Latent.Output(display_name="audio_latent")],
         )
 
     @classmethod
-    def execute(cls, audio_latent, trim_info, mode):
+    def execute(cls, audio_latent, trim_info=None, mode="protect_prefix_generate_body"):
         if not isinstance(audio_latent, dict) or "samples" not in audio_latent:
             raise ValueError("audio_latent must be a LATENT dictionary")
         samples = audio_latent["samples"]

@@ -26,6 +26,7 @@ class VideoSequenceTest(unittest.TestCase):
         expected = {
             nodes.LoadIndexedVideoSegment: "TuringUtilsLoadIndexedVideoSegment",
             nodes.SaveIndexedVideoSegment: "TuringUtilsSaveIndexedVideoSegment",
+            nodes.VideoPrefixContextNoise: "TuringUtilsVideoPrefixContextNoise",
             nodes.VideoContinuationConcat: "TuringUtilsVideoContinuationConcat",
             nodes.TrimVideoContinuationPrefix: "TuringUtilsTrimVideoContinuationPrefix",
             nodes.H3SetAudioPrefixNoiseMask: "TuringUtilsH3SetAudioPrefixNoiseMask",
@@ -39,6 +40,52 @@ class VideoSequenceTest(unittest.TestCase):
         loader_inputs = {input_.id: input_ for input_ in nodes.LoadIndexedVideoSegment.define_schema().inputs}
         self.assertEqual(loader_inputs["segment_index"].min, -1)
         self.assertEqual(loader_inputs["tail_frames"].default, 22)
+
+        concat_schema = nodes.VideoContinuationConcat.define_schema()
+        self.assertEqual(
+            [input_.id for input_ in concat_schema.inputs[:6]],
+            ["prefix_images", "prefix_mask", "prefix_audio", "body_images", "body_mask", "body_audio"],
+        )
+        concat_inputs = {input_.id: input_ for input_ in concat_schema.inputs}
+        self.assertEqual(set(concat_inputs), {
+            "prefix_images", "prefix_mask", "prefix_audio", "body_images", "body_mask",
+            "body_audio", "frame_rate", "mode",
+        })
+        self.assertEqual(concat_inputs["mode"].default, "concat")
+
+        noise_inputs = {
+            input_.id: input_
+            for input_ in nodes.VideoPrefixContextNoise.define_schema().inputs
+        }
+        self.assertEqual(noise_inputs["strength"].default, 0.45)
+        self.assertEqual(noise_inputs["end_strength"].default, 0.10)
+        self.assertEqual(noise_inputs["noise_frames"].default, 17)
+        self.assertEqual(noise_inputs["transition_frames"].default, 4)
+        self.assertNotIn("tail_frames", noise_inputs)
+        self.assertNotIn("clean_tail_frames", noise_inputs)
+        self.assertTrue(noise_inputs["end_strength"].advanced)
+        self.assertEqual(concat_schema.outputs[-1].display_name, "trim_info")
+        self.assertEqual(nodes.TrimVideoContinuationPrefix.define_schema().inputs[-1].id, "trim_info")
+        self.assertEqual(nodes.H3SetAudioPrefixNoiseMask.define_schema().inputs[-1].id, "trim_info")
+
+        concat_schema.finalize()
+        concat_v1 = concat_schema.get_v1_info(nodes.VideoContinuationConcat)
+        self.assertEqual(
+            concat_v1.input_order["optional"],
+            ["prefix_images", "prefix_mask", "prefix_audio", "body_images", "body_mask", "body_audio"],
+        )
+        trim_schema = nodes.TrimVideoContinuationPrefix.define_schema()
+        trim_schema.finalize()
+        self.assertEqual(
+            trim_schema.get_v1_info(nodes.TrimVideoContinuationPrefix).input_order["optional"],
+            ["audio", "trim_info"],
+        )
+        audio_mask_schema = nodes.H3SetAudioPrefixNoiseMask.define_schema()
+        audio_mask_schema.finalize()
+        self.assertEqual(
+            audio_mask_schema.get_v1_info(nodes.H3SetAudioPrefixNoiseMask).input_order["optional"],
+            ["trim_info"],
+        )
 
     def test_segment_paths_are_six_digit_and_confined_to_output(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
@@ -163,12 +210,10 @@ class VideoSequenceTest(unittest.TestCase):
             "sample_rate": 24,
         }
         images, mask, audio, info = nodes.VideoContinuationConcat.execute(
-            body_images,
-            24.0,
-            False,
-            0.08,
             prefix_images=prefix_images,
             prefix_audio=prefix_audio,
+            body_images=body_images,
+            frame_rate=24.0,
         ).result
         torch.testing.assert_close(images[:9], prefix_images)
         torch.testing.assert_close(images[9:], body_images)
@@ -182,6 +227,62 @@ class VideoSequenceTest(unittest.TestCase):
         self.assertEqual(info["prefix_audio_samples"], 9)
         self.assertEqual(info["total_audio_samples"], 13)
         self.assertTrue(info["prefix_audio_present"])
+        self.assertEqual(info["composition_mode"], "concat")
+        self.assertEqual(info["trim_frames"], 9)
+
+    def test_replace_mode_overwrites_prefix_without_extending_timeline(self):
+        prefix_images = torch.full((2, 4, 4, 3), 0.75)
+        body_images = torch.arange(5, dtype=torch.float32)[:, None, None, None].expand(5, 4, 4, 3) / 10
+        prefix_audio = {
+            "waveform": torch.tensor([[[0.7, 0.8]]]),
+            "sample_rate": 1,
+        }
+        body_audio = {
+            "waveform": torch.tensor([[[0.0, 0.1, 0.2, 0.3, 0.4]]]),
+            "sample_rate": 1,
+        }
+        images, mask, audio, info = nodes.VideoContinuationConcat.execute(
+            prefix_images=prefix_images,
+            prefix_audio=prefix_audio,
+            body_images=body_images,
+            body_audio=body_audio,
+            frame_rate=1.0,
+            mode="replace",
+        ).result
+        self.assertEqual(images.shape[0], 5)
+        torch.testing.assert_close(images[:2], prefix_images)
+        torch.testing.assert_close(images[2:], body_images[2:])
+        self.assertEqual(mask[:2].count_nonzero().item(), 0)
+        self.assertTrue(torch.all(mask[2:] == 1))
+        torch.testing.assert_close(
+            audio["waveform"],
+            torch.tensor([[[0.7, 0.8, 0.2, 0.3, 0.4]]]),
+        )
+        self.assertEqual(info["composition_mode"], "replace")
+        self.assertEqual(info["prefix_frames"], 2)
+        self.assertEqual(info["trim_frames"], 0)
+        self.assertEqual(info["total_audio_samples"], 5)
+
+        audio_latent = {"samples": torch.zeros(1, 32, 2, 5)}
+        masked_audio_latent = nodes.H3SetAudioPrefixNoiseMask.execute(
+            audio_latent, info, "protect_prefix_generate_body"
+        ).result[0]
+        self.assertEqual(masked_audio_latent["noise_mask"][..., :2].count_nonzero().item(), 0)
+        self.assertTrue(torch.all(masked_audio_latent["noise_mask"][..., 2:] == 1))
+
+        trimmed_images, trimmed_audio = nodes.TrimVideoContinuationPrefix.execute(
+            images, info, audio
+        ).result
+        torch.testing.assert_close(trimmed_images, images)
+        torch.testing.assert_close(trimmed_audio["waveform"], audio["waveform"])
+
+    def test_replace_mode_rejects_prefix_longer_than_body(self):
+        with self.assertRaisesRegex(ValueError, "cannot fit"):
+            nodes.VideoContinuationConcat.execute(
+                prefix_images=torch.zeros(5, 4, 4, 3),
+                body_images=torch.zeros(4, 4, 4, 3),
+                mode="replace",
+            )
 
     def test_concat_accepts_lazy_audio_mappings(self):
         class LazyAudio(Mapping):
@@ -200,30 +301,70 @@ class VideoSequenceTest(unittest.TestCase):
         body = torch.zeros(4, 8, 8, 3)
         lazy = LazyAudio({"waveform": torch.ones(1, 2, 4), "sample_rate": 24})
         audio = nodes.VideoContinuationConcat.execute(
-            body, 24.0, False, 0.0, body_audio=lazy
+            body_images=body, frame_rate=24.0, body_audio=lazy
         ).result[2]
         torch.testing.assert_close(audio["waveform"], lazy["waveform"])
 
-    def test_concat_chroma_noise_fades_to_five_clean_frames(self):
-        prefix = torch.full((9, 32, 32, 3), 0.5)
-        body = torch.full((3, 32, 32, 3), 0.25)
-        images, _, _, _ = nodes.VideoContinuationConcat.execute(
-            body,
-            24.0,
-            True,
-            0.1,
-            noise_seed=7,
-            prefix_images=prefix,
-        ).result
-        self.assertFalse(torch.equal(images[:4], prefix[:4]))
-        torch.testing.assert_close(images[4:9], prefix[4:9], rtol=0, atol=0)
-        torch.testing.assert_close(images[9:], body, rtol=0, atol=0)
+    def test_prefix_noise_rejects_invalid_cross_field_values(self):
+        images = torch.zeros(22, 8, 8, 3)
+        with self.assertRaisesRegex(ValueError, "between 0 and strength"):
+            nodes.VideoPrefixContextNoise.execute(
+                images, strength=0.2, end_strength=0.3
+            )
+        with self.assertRaisesRegex(ValueError, "only 22 frames"):
+            nodes.VideoPrefixContextNoise.execute(images, noise_frames=23)
+
+    def test_validated_noise_schedule_is_flat_then_tapers_to_point_one(self):
+        schedule = nodes._noise_alpha_schedule(17, 0.45, 0.10, 4)
+        self.assertEqual(schedule[:13], [0.45] * 13)
+        self.assertAlmostEqual(schedule[13], 0.3625, places=12)
+        self.assertAlmostEqual(schedule[14], 0.275, places=12)
+        self.assertAlmostEqual(schedule[15], 0.1875, places=12)
+        self.assertAlmostEqual(schedule[16], 0.10, places=12)
+
+    def test_prefix_noise_uses_blend_alpha_and_only_changes_initial_frames(self):
+        images = torch.ones(22, 8, 8, 3)
+        zero_grid = lambda pattern, width, height, palette_rng, generator: torch.zeros(height, width, 3)
+        with mock.patch.object(nodes, "_coarse_noise_frame", side_effect=zero_grid):
+            output = nodes.VideoPrefixContextNoise.execute(
+                images,
+                noise_frames=17,
+                strength=0.45,
+                seed=7,
+                end_strength=0.10,
+                transition_frames=4,
+            ).result[0]
+        torch.testing.assert_close(output[:13], torch.full_like(output[:13], 0.55))
+        torch.testing.assert_close(output[13], torch.full_like(output[13], 0.6375))
+        torch.testing.assert_close(output[14], torch.full_like(output[14], 0.725))
+        torch.testing.assert_close(output[15], torch.full_like(output[15], 0.8125))
+        torch.testing.assert_close(output[16], torch.full_like(output[16], 0.90))
+        torch.testing.assert_close(output[17:], images[17:], rtol=0, atol=0)
+
+    def test_prefix_noise_is_deterministic_and_bounded(self):
+        images = torch.full((24, 20, 12, 3), 0.5)
+        first = nodes.VideoPrefixContextNoise.execute(images, seed=11).result[0]
+        second = nodes.VideoPrefixContextNoise.execute(images, seed=11).result[0]
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+        self.assertGreaterEqual(first.amin().item(), 0.0)
+        self.assertLessEqual(first.amax().item(), 1.0)
+        torch.testing.assert_close(first[17:], images[17:], rtol=0, atol=0)
+
+    def test_prefix_noise_zero_frames_is_an_exact_no_op(self):
+        images = torch.rand(22, 8, 8, 3)
+        output = nodes.VideoPrefixContextNoise.execute(
+            images, noise_frames=0
+        ).result[0]
+        torch.testing.assert_close(output, images, rtol=0, atol=0)
+        self.assertIsNot(output, images)
 
     def test_concat_requires_prefix_images_for_prefix_side_data(self):
         body = torch.zeros(3, 8, 8, 3)
         with self.assertRaisesRegex(ValueError, "require prefix_images"):
             nodes.VideoContinuationConcat.execute(
-                body, 24.0, False, 0.0, prefix_audio={"waveform": torch.zeros(1, 2, 4), "sample_rate": 24}
+                body_images=body,
+                frame_rate=24.0,
+                prefix_audio={"waveform": torch.zeros(1, 2, 4), "sample_rate": 24},
             )
 
     def test_trim_uses_exact_frame_rate_for_images_and_audio(self):
@@ -278,7 +419,7 @@ class VideoSequenceTest(unittest.TestCase):
         prefix = torch.zeros(9, 8, 8, 3)
         body = torch.zeros(4, 8, 8, 3)
         _, _, _, info = nodes.VideoContinuationConcat.execute(
-            body, 24.0, False, 0.0, prefix_images=prefix
+            prefix_images=prefix, body_images=body, frame_rate=24.0
         ).result
         latent = {"samples": torch.zeros(1, 32, 2, 13)}
         output = nodes.H3SetAudioPrefixNoiseMask.execute(
