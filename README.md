@@ -60,6 +60,20 @@ only after its CUDA sources or required version change.
   selectable absolute or official relative temporal positions.
 - `Wan Video Frames Padding` exposes Wan-compatible frame padding.
 - `MiniMax H3 Video Frames Padding` pads to H3's `17*n+5` frame grid.
+- `Load/Save Indexed Video Segment` read and atomically write six-digit MP4
+  segments such as `000324.mp4` below the active ComfyUI instance's output
+  directory. The loader can return only the final frames with synchronized
+  audio; a missing segment returns empty outputs. The saver supports explicit
+  overwrite and deliberately produces no preview.
+- `Video Continuation Concat` prepends optional image/audio context, supplies
+  zero masks for an unmasked prefix and one masks for an unmasked generated
+  body, and returns exact rational boundary metadata. Optional 16-pixel chroma
+  blocks fade across the prefix while its final five frames remain clean.
+  Missing audio spans are represented by duration-matched silence.
+- `Trim Video Continuation Prefix` removes that exact image/audio prefix after
+  generation. `H3 Set Audio Prefix Noise Mask` maps the recorded waveform
+  boundary onto a standalone `[B,32,2,T]` H3 audio latent: its default mode
+  protects the prefix and generates the body before `H3 Concat AV Latent`.
 - `Set Video Latent Noise Mask` accepts image-frame masks for a standalone
   video latent. Its `type` choices follow CLIP Loader: `wan`, `minimax`
   (H3 video only, default), `ltxv` (LTX-Video/LTX-2 video), `hunyuan_video`,

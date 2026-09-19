@@ -205,6 +205,11 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsMultimodalPromptChat",
                 "TuringUtilsMiniMaxH3VideoVAEDecode",
                 "TuringUtilsMiniMaxH3VideoVAEEncode",
+                "TuringUtilsLoadIndexedVideoSegment",
+                "TuringUtilsSaveIndexedVideoSegment",
+                "TuringUtilsVideoContinuationConcat",
+                "TuringUtilsTrimVideoContinuationPrefix",
+                "TuringUtilsH3SetAudioPrefixNoiseMask",
             ),
         )
 

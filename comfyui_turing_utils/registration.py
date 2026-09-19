@@ -36,6 +36,13 @@ from .nodes.minimax_references import (
     H3SemanticReference,
     H3VideoReference,
 )
+from .nodes.video_sequence import (
+    H3SetAudioPrefixNoiseMask,
+    LoadIndexedVideoSegment,
+    SaveIndexedVideoSegment,
+    TrimVideoContinuationPrefix,
+    VideoContinuationConcat,
+)
 from .nodes.wan import WanVideoFramesPadding
 
 
@@ -79,6 +86,11 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsMultimodalPromptChat": MultimodalPromptChat,
     "TuringUtilsMiniMaxH3VideoVAEDecode": MiniMaxH3VideoVAEDecode,
     "TuringUtilsMiniMaxH3VideoVAEEncode": MiniMaxH3VideoVAEEncode,
+    "TuringUtilsLoadIndexedVideoSegment": LoadIndexedVideoSegment,
+    "TuringUtilsSaveIndexedVideoSegment": SaveIndexedVideoSegment,
+    "TuringUtilsVideoContinuationConcat": VideoContinuationConcat,
+    "TuringUtilsTrimVideoContinuationPrefix": TrimVideoContinuationPrefix,
+    "TuringUtilsH3SetAudioPrefixNoiseMask": H3SetAudioPrefixNoiseMask,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -118,4 +130,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsMultimodalPromptChat": "Multimodal Prompt Chat",
     "TuringUtilsMiniMaxH3VideoVAEDecode": "MiniMax H3 Video VAE Decode",
     "TuringUtilsMiniMaxH3VideoVAEEncode": "MiniMax H3 Video VAE Encode",
+    "TuringUtilsLoadIndexedVideoSegment": "Load Indexed Video Segment",
+    "TuringUtilsSaveIndexedVideoSegment": "Save Indexed Video Segment",
+    "TuringUtilsVideoContinuationConcat": "Video Continuation Concat",
+    "TuringUtilsTrimVideoContinuationPrefix": "Trim Video Continuation Prefix",
+    "TuringUtilsH3SetAudioPrefixNoiseMask": "H3 Set Audio Prefix Noise Mask",
 }
