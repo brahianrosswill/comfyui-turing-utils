@@ -48,14 +48,17 @@ def _ceil_fraction(value: Fraction) -> int:
 
 def _segment_directory(root_directory: str, *, create: bool = False) -> Path:
     output_root = Path(folder_paths.get_output_directory()).resolve()
-    relative = Path(str(root_directory).strip().replace("\\", "/"))
-    if relative.is_absolute():
-        raise ValueError("root_directory must be relative to the ComfyUI output directory")
-    directory = (output_root / relative).resolve()
-    try:
-        directory.relative_to(output_root)
-    except ValueError as error:
-        raise ValueError("root_directory must stay inside the ComfyUI output directory") from error
+    configured = Path(str(root_directory).strip().replace("\\", "/"))
+    if configured.is_absolute():
+        directory = configured.resolve()
+    else:
+        directory = (output_root / configured).resolve()
+        try:
+            directory.relative_to(output_root)
+        except ValueError as error:
+            raise ValueError(
+                "relative root_directory must stay inside the ComfyUI output directory"
+            ) from error
     if create:
         directory.mkdir(parents=True, exist_ok=True)
     return directory
@@ -72,12 +75,12 @@ def _segment_path(root_directory: str, segment_index: int, *, create: bool = Fal
 
 def _segment_path_for_read(root_directory: str, segment_index: int) -> Path:
     path = _segment_path(root_directory, segment_index)
+    directory = path.parent
     resolved = path.resolve()
-    output_root = Path(folder_paths.get_output_directory()).resolve()
     try:
-        resolved.relative_to(output_root)
+        resolved.relative_to(directory)
     except ValueError as error:
-        raise ValueError("Indexed video path must stay inside the ComfyUI output directory") from error
+        raise ValueError("Indexed video path must stay inside root_directory") from error
     return resolved
 
 
@@ -348,8 +351,9 @@ class LoadIndexedVideoSegment(io.ComfyNode):
             display_name="Load Indexed Video Segment",
             category="Turing Utils/video",
             description=(
-                "Load the segment before the requested continuation index below the current ComfyUI output "
-                "directory: 0 returns empty, i loads i-1, and -1 loads the highest six-digit MP4. "
+                "Load the segment before the requested continuation index from root_directory. Relative roots "
+                "are resolved below the current ComfyUI output directory; absolute roots are used directly. "
+                "Index 0 returns empty, i loads i-1, and -1 loads the highest six-digit MP4. "
                 "Optionally decode only its final frames and matching audio. A missing file returns empty outputs."
             ),
             inputs=[
@@ -416,8 +420,9 @@ class SaveIndexedVideoSegment(io.ComfyNode):
             display_name="Save Indexed Video Segment",
             category="Turing Utils/video",
             description=(
-                "Atomically save IMAGE frames and optional AUDIO as NNNNNN.mp4 below the current "
-                "ComfyUI output directory. This node deliberately creates no preview."
+                "Atomically save IMAGE frames and optional AUDIO as NNNNNN.mp4 in root_directory. Relative "
+                "roots are resolved below the current ComfyUI output directory; absolute roots are used "
+                "directly. This node deliberately creates no preview."
             ),
             is_output_node=True,
             inputs=[

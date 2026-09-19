@@ -88,7 +88,7 @@ class VideoSequenceTest(unittest.TestCase):
             ["trim_info"],
         )
 
-    def test_segment_paths_are_six_digit_and_confined_to_output(self):
+    def test_segment_paths_are_six_digit_and_relative_paths_are_confined_to_output(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             nodes.folder_paths, "get_output_directory", return_value=directory
         ):
@@ -97,8 +97,18 @@ class VideoSequenceTest(unittest.TestCase):
             self.assertTrue(path.parent.is_dir())
             with self.assertRaisesRegex(ValueError, "inside"):
                 nodes._segment_path("../outside", 0)
-            with self.assertRaisesRegex(ValueError, "relative"):
-                nodes._segment_path("/outside", 0)
+
+    def test_segment_paths_accept_absolute_root_directory(self):
+        with (
+            tempfile.TemporaryDirectory() as output_directory,
+            tempfile.TemporaryDirectory() as root_directory,
+            mock.patch.object(
+                nodes.folder_paths, "get_output_directory", return_value=output_directory
+            ),
+        ):
+            path = nodes._segment_path(root_directory, 324, create=True)
+            self.assertEqual(path, Path(root_directory) / "000324.mp4")
+            self.assertTrue(path.parent.is_dir())
 
     def test_missing_segment_returns_empty_without_preview(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(

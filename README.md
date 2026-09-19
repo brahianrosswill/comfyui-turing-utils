@@ -61,8 +61,9 @@ only after its CUDA sources or required version change.
 - `Wan Video Frames Padding` exposes Wan-compatible frame padding.
 - `MiniMax H3 Video Frames Padding` pads to H3's `17*n+5` frame grid.
 - `Load/Save Indexed Video Segment` read and atomically write six-digit MP4
-  segments such as `000324.mp4` below the active ComfyUI instance's output
-  directory. Loader index `0` returns empty, positive index `i` reads segment
+  segments such as `000324.mp4`. Relative root directories resolve below the
+  active ComfyUI instance's output directory, while absolute roots are used
+  directly. Loader index `0` returns empty, positive index `i` reads segment
   `i-1`, and `-1` selects the highest existing segment number. The loader can
   return only the final frames with synchronized audio, defaulting to the H3
   `17+5=22`-frame continuation prefix; a missing segment returns empty outputs.
