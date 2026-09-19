@@ -271,7 +271,7 @@ class VideoSequenceTest(unittest.TestCase):
         )
         self.assertEqual(info["composition_mode"], "replace")
         self.assertEqual(info["prefix_frames"], 2)
-        self.assertEqual(info["trim_frames"], 0)
+        self.assertEqual(info["trim_frames"], 2)
         self.assertEqual(info["total_audio_samples"], 5)
 
         audio_latent = {"samples": torch.zeros(1, 32, 2, 5)}
@@ -284,8 +284,8 @@ class VideoSequenceTest(unittest.TestCase):
         trimmed_images, trimmed_audio = nodes.TrimVideoContinuationPrefix.execute(
             images, info, audio
         ).result
-        torch.testing.assert_close(trimmed_images, images)
-        torch.testing.assert_close(trimmed_audio["waveform"], audio["waveform"])
+        torch.testing.assert_close(trimmed_images, images[2:])
+        torch.testing.assert_close(trimmed_audio["waveform"], audio["waveform"][..., 2:])
 
     def test_replace_mode_rejects_prefix_longer_than_body(self):
         with self.assertRaisesRegex(ValueError, "cannot fit"):

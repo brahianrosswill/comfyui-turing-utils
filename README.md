@@ -71,9 +71,11 @@ only after its CUDA sources or required version change.
 - `Video Continuation Concat` prepends optional image/audio context, supplies
   zero masks for an unmasked prefix and one masks for an unmasked generated
   body, and returns exact rational boundary metadata. `concat` mode prepends
-  the prefix for continuation generation; `replace` mode overwrites the start
-  of the body timeline for segmented video editing without increasing its
-  duration. Image masks and audio follow the same boundary.
+  the prefix for continuation generation; `replace` mode fills leading context
+  slots already included in the body timeline without increasing its duration.
+  In either mode the prefix is temporary context and the trim node removes it
+  from the generated images and synchronized audio. Image masks and audio follow
+  the same boundary.
 - `Video Prefix Context Noise` is an independent IMAGE processor intended for
   a complete prefix sequence. Its default recipe first preserves the final five
   frames, tapers the preceding four frames from alpha `0.45` toward `0.10`, and

@@ -575,8 +575,10 @@ class VideoContinuationConcat(io.ComfyNode):
             category="Turing Utils/video",
             description=(
                 "Compose optional prefix frames/audio with a body timeline. Concat mode prepends the prefix; "
-                "replace mode overwrites the beginning of the body without increasing its duration. Missing "
-                "prefix masks preserve the prefix, and missing body masks redraw the body."
+                "replace mode fills leading context slots already included in the body timeline without "
+                "increasing its duration. In both modes the prefix remains temporary context and is marked "
+                "for trimming after generation. Missing prefix masks preserve the prefix, and missing body "
+                "masks redraw the body."
             ),
             inputs=[
                 io.Image.Input("prefix_images", optional=True),
@@ -652,7 +654,7 @@ class VideoContinuationConcat(io.ComfyNode):
             mask = body_mask.clone()
             if prefix_frames > 0:
                 mask[:prefix_frames] = prefix_mask
-            trim_frames = 0
+            trim_frames = prefix_frames
         audio, prefix_audio_samples = _audio_timeline(
             prefix_audio,
             body_audio,
@@ -699,8 +701,9 @@ class TrimVideoContinuationPrefix(io.ComfyNode):
             display_name="Trim Video Continuation Prefix",
             category="Turing Utils/video",
             description=(
-                "Remove the prepended continuation prefix from generated IMAGE frames and matching AUDIO. "
-                "Replace-mode metadata leaves the timeline unchanged. No preview is created."
+                "Remove temporary continuation context from generated IMAGE frames and matching AUDIO. This "
+                "trims prefixes prepended in concat mode as well as leading context slots filled in replace "
+                "mode. No preview is created."
             ),
             inputs=[
                 io.Image.Input("images"),
