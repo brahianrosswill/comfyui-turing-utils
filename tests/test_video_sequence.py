@@ -61,6 +61,7 @@ class VideoSequenceTest(unittest.TestCase):
         self.assertEqual(noise_inputs["end_strength"].default, 0.10)
         self.assertEqual(noise_inputs["noise_frames"].default, 17)
         self.assertEqual(noise_inputs["transition_frames"].default, 4)
+        self.assertTrue(noise_inputs["images"].optional)
         self.assertNotIn("tail_frames", noise_inputs)
         self.assertNotIn("clean_tail_frames", noise_inputs)
         self.assertTrue(noise_inputs["end_strength"].advanced)
@@ -311,8 +312,23 @@ class VideoSequenceTest(unittest.TestCase):
             nodes.VideoPrefixContextNoise.execute(
                 images, strength=0.2, end_strength=0.3
             )
-        with self.assertRaisesRegex(ValueError, "only 22 frames"):
-            nodes.VideoPrefixContextNoise.execute(images, noise_frames=23)
+
+    def test_prefix_noise_passes_through_none(self):
+        self.assertIsNone(nodes.VideoPrefixContextNoise.execute(None).result[0])
+
+    def test_prefix_noise_clamps_noise_frames_to_short_batches(self):
+        images = torch.ones(3, 8, 8, 3)
+        zero_grid = lambda pattern, width, height, palette_rng, generator: torch.zeros(height, width, 3)
+        with mock.patch.object(nodes, "_coarse_noise_frame", side_effect=zero_grid):
+            output = nodes.VideoPrefixContextNoise.execute(
+                images,
+                noise_frames=17,
+                strength=0.45,
+                end_strength=0.10,
+                transition_frames=4,
+            ).result[0]
+        self.assertEqual(output.shape, images.shape)
+        self.assertFalse(torch.equal(output, images))
 
     def test_validated_noise_schedule_is_flat_then_tapers_to_point_one(self):
         schedule = nodes._noise_alpha_schedule(17, 0.45, 0.10, 4)

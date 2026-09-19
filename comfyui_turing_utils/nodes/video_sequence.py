@@ -306,10 +306,7 @@ def _add_prefix_chroma_blocks(
     noise_frames = int(noise_frames)
     if noise_frames < 0:
         raise ValueError("noise_frames must not be negative")
-    if noise_frames > frame_count:
-        raise ValueError(
-            f"noise_frames is {noise_frames}, but images contains only {frame_count} frames"
-        )
+    noise_frames = min(noise_frames, frame_count)
     if noise_frames == 0:
         return images.clone()
     alphas = _noise_alpha_schedule(
@@ -478,10 +475,11 @@ class VideoPrefixContextNoise(io.ComfyNode):
             description=(
                 "Apply coarse colour-block noise only to the beginning of an IMAGE sequence. By default, "
                 "the first 17 frames receive noise with a four-frame transition; every later frame remains "
-                "untouched. Omit this node when no context noise is wanted."
+                "untouched. A missing IMAGE passes through as absent, and shorter batches are processed only "
+                "for their available frames. Omit this node when no context noise is wanted."
             ),
             inputs=[
-                io.Image.Input("images"),
+                io.Image.Input("images", optional=True, tooltip="A missing IMAGE is passed through as None."),
                 io.Int.Input("noise_frames", default=17, min=0, max=16384, step=1),
                 io.Float.Input(
                     "strength",
@@ -520,7 +518,7 @@ class VideoPrefixContextNoise(io.ComfyNode):
     @classmethod
     def execute(
         cls,
-        images,
+        images=None,
         noise_frames=17,
         strength=0.45,
         seed=0,
@@ -530,6 +528,8 @@ class VideoPrefixContextNoise(io.ComfyNode):
         grid_mode="poc_36x64",
         block_size=16,
     ) -> io.NodeOutput:
+        if images is None:
+            return io.NodeOutput(None)
         return io.NodeOutput(
             _add_prefix_chroma_blocks(
                 _validate_images(images, "images"),

@@ -79,7 +79,9 @@ only after its CUDA sources or required version change.
   toward `0.10`, and leaves every subsequent frame unchanged.
   The transition can be widened (for example to eight frames) without changing
   later frames. Advanced controls expose the end alpha, transition length,
-  pattern, grid mode, and block size. These empirical defaults follow MacroSony's
+  pattern, grid mode, and block size. A missing image passes through as absent;
+  batches shorter than `noise_frames` use only their available frames instead
+  of failing. These empirical defaults follow MacroSony's
   [H3 chained-character-swap recipe](https://github.com/MacroSony/minimax-h3-chained-character-swap)
   and its [ComfyUI context-noise implementation](https://github.com/beijinren/ComfyUI-H3-Context-Noise).
   Missing audio spans are represented by duration-matched silence.
