@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import random
@@ -24,6 +25,7 @@ from comfy_api.latest import InputImpl, Types, io
 VideoTrimInfo = io.Custom("TURING_UTILS_VIDEO_TRIM_INFO")
 
 _DEFAULT_AUDIO_SAMPLE_RATE = 32000
+_AAC_FRAME_SAMPLES = 1024
 _CHROMA_BLOCK_SIZE = 16
 _CHROMA_POC_GRID = (36, 64)
 # Empirical MIT-licensed recipe documented by MacroSony and packaged for
@@ -255,10 +257,19 @@ def _decode_segment_audio(
     waveform = waveform.astype(np.float32, copy=False)
     current_samples = int(waveform.shape[1])
     if current_samples < expected_samples:
-        raise ValueError(
-            f"Decoded audio from {path} is {expected_samples - current_samples} samples shorter than its "
-            "exact video-frame duration"
+        shortfall = expected_samples - current_samples
+        if shortfall > _AAC_FRAME_SAMPLES:
+            raise ValueError(
+                f"Decoded audio from {path} is {shortfall} samples shorter than its exact video-frame "
+                f"duration, exceeding the automatic AAC padding limit of {_AAC_FRAME_SAMPLES} samples"
+            )
+        logging.warning(
+            "Decoded audio from %s is %d samples shorter than its exact video-frame duration; "
+            "padding the legacy segment with silence",
+            path,
+            shortfall,
         )
+        waveform = np.pad(waveform, ((0, 0), (0, shortfall)), mode="constant")
     return np.ascontiguousarray(waveform[:, :expected_samples])
 
 
@@ -705,7 +716,8 @@ class SaveIndexedVideoSegment(io.ComfyNode):
             description=(
                 "Atomically save IMAGE frames and optional AUDIO as NNNNNN.mp4 in root_directory. Relative "
                 "roots are resolved below the current ComfyUI output directory; absolute roots are used "
-                "directly. This node deliberately creates no preview."
+                "directly. Audio is trimmed or zero-padded to the exact video-frame duration before encoding. "
+                "This node deliberately creates no preview."
             ),
             is_output_node=True,
             inputs=[
@@ -729,6 +741,10 @@ class SaveIndexedVideoSegment(io.ComfyNode):
             raise FileExistsError(f"Indexed video already exists: {target}")
         if audio is not None:
             waveform, sample_rate = _validate_audio(audio, "audio")
+            expected_samples = _ceil_fraction(
+                Fraction(int(images.shape[0]) * sample_rate, 1) / rate
+            )
+            waveform = _fit_waveform(waveform, expected_samples)
             audio = {"waveform": waveform, "sample_rate": sample_rate}
 
         temporary = target.with_name(f".{target.stem}.{uuid.uuid4().hex}.tmp.mp4")

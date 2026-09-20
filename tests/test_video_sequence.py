@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import numpy as np
 import torch
 
 
@@ -217,6 +218,70 @@ class VideoSequenceTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "reserved"):
                 nodes._merged_segment_path("segments", "000123.mp4")
 
+    def test_merger_pads_a_small_legacy_aac_shortfall(self):
+        class FakeAudioFrame:
+            def to_ndarray(self):
+                return np.ones((2, 530), dtype=np.float32)
+
+        class FakeResampler:
+            def resample(self, frame):
+                return [] if frame is None else [FakeAudioFrame()]
+
+        class FakeContainer:
+            streams = SimpleNamespace(audio=[SimpleNamespace(codec_context=object())])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def decode(self, stream):
+                return [object()]
+
+        with mock.patch.object(nodes.av, "open", return_value=FakeContainer()), mock.patch.object(
+            nodes.av, "AudioResampler", return_value=FakeResampler()
+        ), self.assertLogs(level="WARNING"):
+            waveform = nodes._decode_segment_audio(
+                Path("000000.mp4"),
+                sample_rate=48_000,
+                layout="stereo",
+                channels=2,
+                expected_samples=1_000,
+            )
+
+        self.assertEqual(waveform.shape, (2, 1_000))
+        np.testing.assert_array_equal(waveform[:, :530], np.ones((2, 530), dtype=np.float32))
+        np.testing.assert_array_equal(waveform[:, 530:], np.zeros((2, 470), dtype=np.float32))
+
+    def test_merger_rejects_audio_shortfall_larger_than_one_aac_frame(self):
+        class FakeContainer:
+            streams = SimpleNamespace(audio=[SimpleNamespace(codec_context=object())])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def decode(self, stream):
+                return []
+
+        class FakeResampler:
+            def resample(self, frame):
+                return []
+
+        with mock.patch.object(nodes.av, "open", return_value=FakeContainer()), mock.patch.object(
+            nodes.av, "AudioResampler", return_value=FakeResampler()
+        ), self.assertRaisesRegex(ValueError, "1025.*1024"):
+            nodes._decode_segment_audio(
+                Path("000000.mp4"),
+                sample_rate=48_000,
+                layout="stereo",
+                channels=2,
+                expected_samples=1_025,
+            )
+
     def test_loader_keeps_tail_frames_and_matching_audio(self):
         images = torch.arange(10, dtype=torch.float32)[:, None, None, None].expand(10, 2, 2, 3)
         audio = {"waveform": torch.arange(20, dtype=torch.float32).reshape(1, 1, 20), "sample_rate": 48}
@@ -269,6 +334,41 @@ class VideoSequenceTest(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 nodes.SaveIndexedVideoSegment.execute(images, "segments", 12, 24.0, False)
             nodes.SaveIndexedVideoSegment.execute(images, "segments", 12, 24.0, True)
+
+    def test_saver_fits_audio_to_the_exact_video_frame_duration(self):
+        captured = {}
+
+        class FakeVideo:
+            def save_to(self, path, **kwargs):
+                Path(path).write_bytes(b"encoded")
+
+        def video_from_components(components, **kwargs):
+            captured["components"] = components
+            return FakeVideo()
+
+        images = torch.zeros(3, 4, 6, 3)
+        audio = {
+            "waveform": torch.ones(1, 2, 1_030),
+            "sample_rate": 8_000,
+        }
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            nodes.folder_paths, "get_output_directory", return_value=directory
+        ), mock.patch.object(
+            nodes.InputImpl, "VideoFromComponents", side_effect=video_from_components
+        ):
+            nodes.SaveIndexedVideoSegment.execute(
+                images,
+                "segments",
+                0,
+                16.0,
+                False,
+                audio=audio,
+            )
+
+        waveform = captured["components"].audio["waveform"]
+        self.assertEqual(tuple(waveform.shape), (1, 2, 1_500))
+        torch.testing.assert_close(waveform[..., :1_030], audio["waveform"])
+        self.assertEqual(waveform[..., 1_030:].count_nonzero().item(), 0)
 
     def test_merger_stream_copies_video_and_encodes_one_continuous_audio_track(self):
         frame_rate = 16.0

@@ -67,7 +67,8 @@ only after its CUDA sources or required version change.
   `i-1`, and `-1` selects the highest existing segment number. The loader can
   return only the final frames with synchronized audio, defaulting to the H3
   `17+5=22`-frame continuation prefix; a missing segment returns empty outputs.
-  The saver supports explicit overwrite and deliberately produces no preview.
+  The saver normalizes audio to the exact video-frame duration, supports explicit
+  overwrite, and deliberately produces no preview.
 - `Merge Indexed Video Segments` verifies that `000000.mp4` through the selected
   inclusive maximum index are contiguous and video-compatible, then stream-copies
   the compressed video into one MP4. Maximum index `-1` (the default) selects all
@@ -76,7 +77,9 @@ only after its CUDA sources or required version change.
   segment's independent AAC padding, fits sample counts to exact cumulative
   video-frame boundaries, and performs one continuous AAC encode. This avoids
   cumulative timestamp rounding and encoder-delay seams without holding the
-  complete video as an IMAGE batch. Segments are joined exactly as stored, so
+  complete video as an IMAGE batch. Legacy segments that decode up to one AAC
+  frame short are padded automatically; larger mismatches remain errors. Segments
+  are joined exactly as stored, so
   continuation context must pass through `Trim Video Continuation Prefix`
   before each segment is saved. The merger is atomic and has no preview.
 - `Video Continuation Concat` prepends optional image/audio context, supplies
