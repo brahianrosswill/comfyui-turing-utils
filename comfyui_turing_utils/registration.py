@@ -39,6 +39,7 @@ from .nodes.minimax_references import (
 from .nodes.video_sequence import (
     H3SetAudioPrefixNoiseMask,
     LoadIndexedVideoSegment,
+    MergeIndexedVideoSegments,
     SaveIndexedVideoSegment,
     TrimVideoContinuationPrefix,
     VideoContinuationConcat,
@@ -89,6 +90,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsMiniMaxH3VideoVAEEncode": MiniMaxH3VideoVAEEncode,
     "TuringUtilsLoadIndexedVideoSegment": LoadIndexedVideoSegment,
     "TuringUtilsSaveIndexedVideoSegment": SaveIndexedVideoSegment,
+    "TuringUtilsMergeIndexedVideoSegments": MergeIndexedVideoSegments,
     "TuringUtilsVideoPrefixContextNoise": VideoPrefixContextNoise,
     "TuringUtilsVideoContinuationConcat": VideoContinuationConcat,
     "TuringUtilsTrimVideoContinuationPrefix": TrimVideoContinuationPrefix,
@@ -134,6 +136,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsMiniMaxH3VideoVAEEncode": "MiniMax H3 Video VAE Encode",
     "TuringUtilsLoadIndexedVideoSegment": "Load Indexed Video Segment",
     "TuringUtilsSaveIndexedVideoSegment": "Save Indexed Video Segment",
+    "TuringUtilsMergeIndexedVideoSegments": "Merge Indexed Video Segments",
     "TuringUtilsVideoPrefixContextNoise": "Video Prefix Context Noise",
     "TuringUtilsVideoContinuationConcat": "Video Continuation Concat",
     "TuringUtilsTrimVideoContinuationPrefix": "Trim Video Continuation Prefix",

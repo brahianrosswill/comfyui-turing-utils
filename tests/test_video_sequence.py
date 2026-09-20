@@ -26,6 +26,7 @@ class VideoSequenceTest(unittest.TestCase):
         expected = {
             nodes.LoadIndexedVideoSegment: "TuringUtilsLoadIndexedVideoSegment",
             nodes.SaveIndexedVideoSegment: "TuringUtilsSaveIndexedVideoSegment",
+            nodes.MergeIndexedVideoSegments: "TuringUtilsMergeIndexedVideoSegments",
             nodes.VideoPrefixContextNoise: "TuringUtilsVideoPrefixContextNoise",
             nodes.VideoContinuationConcat: "TuringUtilsVideoContinuationConcat",
             nodes.TrimVideoContinuationPrefix: "TuringUtilsTrimVideoContinuationPrefix",
@@ -40,6 +41,14 @@ class VideoSequenceTest(unittest.TestCase):
         loader_inputs = {input_.id: input_ for input_ in nodes.LoadIndexedVideoSegment.define_schema().inputs}
         self.assertEqual(loader_inputs["segment_index"].min, -1)
         self.assertEqual(loader_inputs["tail_frames"].default, 22)
+
+        merger_inputs = {
+            input_.id: input_
+            for input_ in nodes.MergeIndexedVideoSegments.define_schema().inputs
+        }
+        self.assertEqual(merger_inputs["max_index"].default, -1)
+        self.assertEqual(merger_inputs["max_index"].min, -1)
+        self.assertEqual(merger_inputs["max_index"].max, 999_999)
 
         concat_schema = nodes.VideoContinuationConcat.define_schema()
         self.assertEqual(
@@ -160,6 +169,54 @@ class VideoSequenceTest(unittest.TestCase):
             output = nodes.LoadIndexedVideoSegment.execute("segments", -1, 21)
             self.assertEqual(output.result, (None, None, 0.0))
 
+    def test_segment_merger_rejects_numbering_gaps(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            nodes.folder_paths, "get_output_directory", return_value=directory
+        ):
+            segment_directory = Path(directory) / "segments"
+            segment_directory.mkdir()
+            (segment_directory / "000000.mp4").write_bytes(b"video")
+            (segment_directory / "000002.mp4").write_bytes(b"video")
+            with self.assertRaisesRegex(ValueError, "000001.mp4"):
+                nodes._indexed_segment_paths("segments")
+
+    def test_segment_merger_max_index_is_inclusive_and_ignores_later_segments(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            nodes.folder_paths, "get_output_directory", return_value=directory
+        ):
+            segment_directory = Path(directory) / "segments"
+            segment_directory.mkdir()
+            for index in range(3):
+                (segment_directory / f"{index:06d}.mp4").write_bytes(b"video")
+
+            self.assertEqual(
+                [path.name for path in nodes._indexed_segment_paths("segments", 0)],
+                ["000000.mp4"],
+            )
+            self.assertEqual(
+                [path.name for path in nodes._indexed_segment_paths("segments", 1)],
+                ["000000.mp4", "000001.mp4"],
+            )
+            self.assertEqual(
+                [path.name for path in nodes._indexed_segment_paths("segments", -1)],
+                ["000000.mp4", "000001.mp4", "000002.mp4"],
+            )
+            with self.assertRaisesRegex(ValueError, "000003.mp4"):
+                nodes._indexed_segment_paths("segments", 3)
+
+    def test_merged_filename_stays_inside_root_and_avoids_segment_namespace(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            nodes.folder_paths, "get_output_directory", return_value=directory
+        ):
+            self.assertEqual(
+                nodes._merged_segment_path("segments", "merged.mp4"),
+                Path(directory) / "segments" / "merged.mp4",
+            )
+            with self.assertRaisesRegex(ValueError, "inside root_directory"):
+                nodes._merged_segment_path("segments", "../merged.mp4")
+            with self.assertRaisesRegex(ValueError, "reserved"):
+                nodes._merged_segment_path("segments", "000123.mp4")
+
     def test_loader_keeps_tail_frames_and_matching_audio(self):
         images = torch.arange(10, dtype=torch.float32)[:, None, None, None].expand(10, 2, 2, 3)
         audio = {"waveform": torch.arange(20, dtype=torch.float32).reshape(1, 1, 20), "sample_rate": 48}
@@ -212,6 +269,62 @@ class VideoSequenceTest(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 nodes.SaveIndexedVideoSegment.execute(images, "segments", 12, 24.0, False)
             nodes.SaveIndexedVideoSegment.execute(images, "segments", 12, 24.0, True)
+
+    def test_merger_stream_copies_video_and_encodes_one_continuous_audio_track(self):
+        frame_rate = 16.0
+        sample_rate = 8000
+        frames_per_segment = 3
+        samples_per_segment = 1500
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            nodes.folder_paths, "get_output_directory", return_value=directory
+        ):
+            for index, value in enumerate((0.1, 0.2)):
+                images = torch.zeros(frames_per_segment, 32, 32, 3)
+                images[..., index] = 1.0
+                audio = {
+                    "waveform": torch.full((1, 2, samples_per_segment), value),
+                    "sample_rate": sample_rate,
+                }
+                nodes.SaveIndexedVideoSegment.execute(
+                    images,
+                    "segments",
+                    index,
+                    frame_rate,
+                    False,
+                    audio=audio,
+                )
+
+            segment_directory = Path(directory) / "segments"
+            source_audio_samples = 0
+            for path in sorted(segment_directory.glob("[0-9][0-9][0-9][0-9][0-9][0-9].mp4")):
+                source_audio_samples += int(
+                    nodes.InputImpl.VideoFromFile(str(path)).get_components().audio["waveform"].shape[-1]
+                )
+
+            filename, segment_count = nodes.MergeIndexedVideoSegments.execute(
+                "segments",
+                -1,
+                "merged.mp4",
+                False,
+            ).result
+            merged_path = Path(filename)
+            merged = nodes.InputImpl.VideoFromFile(str(merged_path))
+            components = merged.get_components()
+            self.assertEqual(segment_count, 2)
+            self.assertEqual(merged_path, segment_directory / "merged.mp4")
+            self.assertEqual(merged.get_frame_count(), 6)
+            self.assertEqual(merged.get_frame_rate(), Fraction(16, 1))
+            self.assertEqual(tuple(components.images.shape), (6, 32, 32, 3))
+            self.assertEqual(components.audio["sample_rate"], sample_rate)
+            self.assertLess(int(components.audio["waveform"].shape[-1]), source_audio_samples)
+            self.assertFalse(any(segment_directory.glob(".*.tmp.mp4")))
+            with self.assertRaises(FileExistsError):
+                nodes.MergeIndexedVideoSegments.execute(
+                    "segments",
+                    -1,
+                    "merged.mp4",
+                    False,
+                )
 
     def test_concat_builds_default_masks_and_aligned_audio(self):
         prefix_images = torch.full((9, 8, 8, 3), 0.5)

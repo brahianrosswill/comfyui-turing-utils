@@ -68,6 +68,17 @@ only after its CUDA sources or required version change.
   return only the final frames with synchronized audio, defaulting to the H3
   `17+5=22`-frame continuation prefix; a missing segment returns empty outputs.
   The saver supports explicit overwrite and deliberately produces no preview.
+- `Merge Indexed Video Segments` verifies that `000000.mp4` through the selected
+  inclusive maximum index are contiguous and video-compatible, then stream-copies
+  the compressed video into one MP4. Maximum index `-1` (the default) selects all
+  segments through the highest existing index; `0` selects only `000000.mp4`. It
+  decodes audio per segment, removes each
+  segment's independent AAC padding, fits sample counts to exact cumulative
+  video-frame boundaries, and performs one continuous AAC encode. This avoids
+  cumulative timestamp rounding and encoder-delay seams without holding the
+  complete video as an IMAGE batch. Segments are joined exactly as stored, so
+  continuation context must pass through `Trim Video Continuation Prefix`
+  before each segment is saved. The merger is atomic and has no preview.
 - `Video Continuation Concat` prepends optional image/audio context, supplies
   zero masks for an unmasked prefix and one masks for an unmasked generated
   body, and returns exact rational boundary metadata. `concat` mode prepends
