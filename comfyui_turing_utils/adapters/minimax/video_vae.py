@@ -6,6 +6,7 @@ retries here. Those belong to comfy.sd.VAE and the upstream H3 model.
 
 from __future__ import annotations
 
+import math
 from contextlib import ExitStack, contextmanager
 from functools import partial
 
@@ -53,21 +54,83 @@ def _vae_operator_scope():
         yield
 
 
+def _spatial_tile_count(model, height, width):
+    if not model.tiling:
+        return 1
+    y_starts, _, _ = model.split_tiles(int(height))
+    x_starts, _, _ = model.split_tiles(int(width))
+    return len(y_starts) * len(x_starts)
+
+
+def _encode_tile_total(vae, model, pixels):
+    """Return the exact native H3 forward count for a normal IMAGE batch."""
+    try:
+        if not torch.is_tensor(pixels) or pixels.ndim != 4 or int(pixels.shape[0]) < 1:
+            return None
+        cropped = vae.vae_encode_crop_pixels(pixels)
+        frames, height, width = map(int, cropped.shape[:3])
+        temporal_chunks = 1 if frames == 1 else math.ceil(frames / model.clip_length)
+        return temporal_chunks * _spatial_tile_count(model, height, width)
+    except Exception:
+        # Progress accounting must never change whether the official VAE accepts
+        # an input. Leave unusual inputs open-ended and let vae.encode validate.
+        LOG.debug("Could not precompute H3 VAE encode tile total", exc_info=True)
+        return None
+
+
+def _decode_tile_total(model, latent):
+    """Return the exact native H3 forward count for the usual B=1 latent."""
+    try:
+        if (
+            not torch.is_tensor(latent)
+            or latent.ndim != 5
+            or int(latent.shape[0]) != 1
+            or int(latent.shape[2]) < 1
+        ):
+            return None
+        temporal_tokens = int(latent.shape[2])
+        temporal_chunks = (
+            1
+            if temporal_tokens == 1
+            else int(model._decode_temporal_chunks(temporal_tokens)[1])
+        )
+        height = int(latent.shape[-2]) * model.vae_ratio
+        width = int(latent.shape[-1]) * model.vae_ratio
+        return temporal_chunks * _spatial_tile_count(model, height, width)
+    except Exception:
+        LOG.debug("Could not precompute H3 VAE decode tile total", exc_info=True)
+        return None
+
+
 @contextmanager
-def _tile_progress(module, description):
+def _tile_progress(module, description, total=None):
     """Observe native tile forwards without retaining tensors or synchronizing.
 
-    The counter reports submitted forwards, not GPU completion. An open-ended
-    total also stays honest when ComfyUI retries after OOM or changes batching.
+    The counter reports submitted forwards, not GPU completion. Normal H3
+    single-video inputs have an exact planned total. If an OOM retry submits
+    more work than planned, the display falls back to an open-ended counter.
     No CUDA events, side streams, worker threads, or ComfyUI progress hooks are
     added to the model's execution path.
     """
     with tqdm(
+        total=total,
         desc=description,
         unit="tile",
         disable=not comfy.utils.PROGRESS_BAR_ENABLED,
     ) as terminal:
+        submitted = 0
+
         def update(_module, _inputs, _output):
+            nonlocal submitted
+            submitted += 1
+            if total is not None and submitted > total and terminal.total is not None:
+                LOG.warning(
+                    "%s exceeded planned total=%d; switching to open-ended progress after a retry",
+                    description,
+                    total,
+                )
+                terminal.total = None
+                terminal.refresh()
             terminal.update(1)
 
         handle = module.register_forward_hook(update)
@@ -213,15 +276,21 @@ def _decoder_overrides(decoder, attention, device):
 
 def decode_video(vae, latent, attention="sdpa"):
     model = require_h3_video_vae(vae)
+    tile_total = _decode_tile_total(model, latent)
     LOG.info(
         "H3 VAE decode: native ComfyUI lifecycle, attention=%s; "
-        "tile progress counts submitted forwards",
+        "tile progress counts submitted forwards, planned_total=%s",
         attention,
+        tile_total if tile_total is not None else "dynamic",
     )
     with (
         _vae_operator_scope(),
         _decoder_overrides(model.decoder, attention, vae.device),
-        _tile_progress(model.decoder, "H3 VAE Decode Tiles (submitted)"),
+        _tile_progress(
+            model.decoder,
+            "H3 VAE Decode Tiles (submitted)",
+            total=tile_total,
+        ),
     ):
         # Includes official dtype/output handling, model loading, tiling and OOM
         # fallback. In particular, do not call first_stage_model.decode directly.

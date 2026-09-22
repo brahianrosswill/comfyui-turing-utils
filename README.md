@@ -220,8 +220,9 @@ only after its CUDA sources or required version change.
   area outside the inherited mask; do not overwrite the union with Set Mask.
 - `MiniMax H3 Video VAE Decode/Encode` call the official ComfyUI VAE entry points,
   retaining scoped fused operators, decoder attention selection, and lightweight
-  tqdm counts of submitted tiles. ComfyUI owns tiling, batching, dtype, transfers,
-  model residency and OOM recovery. Custom tile batching, async pixel buffers,
+  tqdm progress with a planned tile total and ETA for normal single-video inputs.
+  ComfyUI owns tiling, batching, dtype, transfers, model residency and OOM recovery.
+  Custom tile batching, async pixel buffers,
   block prefetch and non-evicting memory budgets are removed, along with the
   earlier shared-state decoding and experimental overlap controls.
 - `Patch MiniMax H3 Block Cache (Experimental)` skips stable transformer-block

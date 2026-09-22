@@ -320,17 +320,49 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         module = torch.nn.Identity()
         value = torch.rand(2, 3)
         terminal = mock.Mock()
+        terminal.total = 2
         with mock.patch.object(video_vae, "tqdm") as factory:
             factory.return_value.__enter__.return_value = terminal
-            with video_vae._tile_progress(module, "test"):
+            with video_vae._tile_progress(module, "test", total=2):
                 self.assertIs(module(value), value)
                 self.assertIs(module(value), value)
             self.assertFalse(module._forward_hooks)
             module(value)
         self.assertEqual(terminal.update.call_args_list, [mock.call(1), mock.call(1)])
         factory.assert_called_once_with(
-            desc="test", unit="tile", disable=not video_vae.comfy.utils.PROGRESS_BAR_ENABLED,
+            total=2,
+            desc="test",
+            unit="tile",
+            disable=not video_vae.comfy.utils.PROGRESS_BAR_ENABLED,
         )
+
+    def test_progress_becomes_open_ended_if_a_retry_exceeds_the_plan(self):
+        module = torch.nn.Identity()
+        terminal = mock.Mock()
+        terminal.total = 2
+        with mock.patch.object(video_vae, "tqdm") as factory:
+            factory.return_value.__enter__.return_value = terminal
+            with video_vae._tile_progress(module, "test", total=2):
+                module(torch.zeros(1))
+                module(torch.zeros(1))
+                module(torch.zeros(1))
+        self.assertIsNone(terminal.total)
+        terminal.refresh.assert_called_once_with()
+
+    def test_h3_tile_totals_match_native_spatial_and_temporal_plans(self):
+        vae = make_vae()
+        model = vae.first_stage_model
+
+        pixels = torch.zeros(18, 6, 10, 3)
+        self.assertEqual(video_vae._encode_tile_total(vae, model, pixels), 16)
+
+        latent = torch.zeros(1, 4, 37, 3, 5)
+        self.assertEqual(video_vae._decode_tile_total(model, latent), 56)
+
+    def test_decode_tile_total_stays_dynamic_for_nonstandard_batches(self):
+        model = make_vae().first_stage_model
+        latent = torch.zeros(2, 4, 37, 3, 5)
+        self.assertIsNone(video_vae._decode_tile_total(model, latent))
 
     def test_fused_swiglu_keeps_official_linear_dispatch(self):
         module = SimpleNamespace(w1=mock.Mock(return_value=torch.zeros(1, 5, 16)), w2=object())

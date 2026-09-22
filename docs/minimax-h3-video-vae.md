@@ -2,7 +2,7 @@
 
 The H3 VAE nodes accept normal ComfyUI `VAE`, `LATENT`, and `IMAGE` types.
 They call the official ComfyUI VAE entry points and add scoped fused operators,
-decoder attention selection, and lightweight submitted-tile counts in tqdm.
+decoder attention selection, and lightweight submitted-tile progress in tqdm.
 Use the official `VAELoader`; no separate Turing Utils VAE loader is required
 or provided. These optimizations activate only while the dedicated H3 node is
 executing. Other nodes using the same VAE object retain normal dispatch.
@@ -74,10 +74,15 @@ reconstruction are not replaced. These instance overrides and progress hooks are
 restored on success, errors and cancellation. No process-global attention method
 is patched, and no device tensors are persistently cached on the VAE.
 
-Progress is an open-ended tqdm counter of native tile forwards submitted by the
-host, including any official retry attempts. It is not a GPU-completion counter
-or an end-to-end timing measurement. No CUDA events, synchronization, background
-threads or additional ComfyUI UI progress hooks are used for this counter.
+For normal single-video inputs, progress precomputes the exact native H3 spatial
+and temporal tile plan from the model's own `split_tiles` and temporal-chunk
+helpers. tqdm can therefore show `current/total`, percentage and ETA. The counter
+still measures native tile forwards submitted by the host, not GPU completion or
+end-to-end time. Nonstandard latent batches stay open-ended because ComfyUI may
+split them according to live memory. If an official retry exceeds the planned
+total, the display falls back to open-ended progress rather than showing a false
+percentage. No CUDA events, synchronization, background threads or additional
+ComfyUI UI progress hooks are used.
 
 Regression tests cover direct delegation to the official VAE, native output
 parity, tile/input-batch preservation, dtype handling, official OOM fallback,

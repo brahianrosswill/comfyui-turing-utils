@@ -35,7 +35,7 @@ class MiniMaxH3VideoVAEDecode:
         "Official ComfyUI H3 VAE decoding with scoped fused operators and "
         "selectable attention. ComfyUI owns tiling, batching, transfers, memory "
         "management and OOM recovery. Accepts the official VAELoader. Lightweight "
-        "tqdm counts submitted tile forwards, not GPU completion."
+        "tqdm shows the planned tile total and counts submitted forwards, not GPU completion."
     )
 
     def decode(
@@ -76,7 +76,7 @@ class MiniMaxH3VideoVAEEncode:
         "Official ComfyUI H3 VAE encoding with scoped fused operators. ComfyUI "
         "owns tiling, batching, transfers, memory management and OOM recovery. "
         "Accepts the official VAELoader and preserves its compute/output dtype. "
-        "Lightweight tqdm counts submitted tile forwards, not GPU completion."
+        "Lightweight tqdm shows the planned tile total and counts submitted forwards, not GPU completion."
     )
 
     def encode(
