@@ -35,6 +35,10 @@ class KernelSetupTest(unittest.TestCase):
         environment = {
             "CONDA_PREFIX": str(conda_prefix),
             "COMFYUI_TURING_UTILS_ARCH_LIST": arch_list,
+            # Keep the synthetic Windows toolkit isolated from the Linux host
+            # selected by ops/cuda-env.sh during the normal development suite.
+            "CUDA_HOME": "",
+            "CUDA_PATH": "",
         }
         environment.update(extra_environment or {})
         with (

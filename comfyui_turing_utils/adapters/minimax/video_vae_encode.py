@@ -19,14 +19,14 @@ def encode_video(vae, pixels):
     tile_total = _encode_tile_total(vae, model, pixels)
     LOG.info(
         "H3 VAE encode: native ComfyUI lifecycle; "
-        "tile progress counts submitted forwards, planned_total=%s",
+        "tile progress counts completed logical tiles, planned_total=%s",
         tile_total if tile_total is not None else "dynamic",
     )
     with (
         _vae_operator_scope(),
         _tile_progress(
             model.quant_conv,
-            "H3 VAE Encode Tiles (submitted)",
+            "H3 VAE Encode Tiles",
             total=tile_total,
         ),
     ):

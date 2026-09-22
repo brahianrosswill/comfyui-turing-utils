@@ -848,6 +848,10 @@ def int8_linear(
     convrot: bool = False,
     convrot_groupsize: int = 256,
     input_act: str | None = None,
+    input_act_weight: torch.Tensor | None = None,
+    input_act_eps: float = 0.0,
+    residual: torch.Tensor | None = None,
+    residual_scale: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     from comfy_kitchen.backends import cuda as kitchen_cuda
@@ -868,6 +872,10 @@ def int8_linear(
             convrot=convrot,
             convrot_groupsize=convrot_groupsize,
             input_act=input_act,
+            input_act_weight=input_act_weight,
+            input_act_eps=input_act_eps,
+            residual=residual,
+            residual_scale=residual_scale,
         )
         if output is not None:
             output.copy_(result)
@@ -881,23 +889,37 @@ def int8_linear(
             x2d, convrot_groupsize, input_act=input_act
         )
     else:
-        x2d = apply_input_act(x2d, input_act)
+        x2d = apply_input_act(
+            x2d,
+            input_act,
+            input_act_weight,
+            input_act_eps,
+        )
         qactivation, activation_scale = _quantize_turing_int8_activation(
             x2d, convrot_groupsize
         )
 
     output_dtype = out_dtype or x.dtype
     output_channels = weight.shape[0]
-    output = _turing_int8_gemm(
+    gemm_output = None if residual is not None else output
+    result = _turing_int8_gemm(
         qactivation,
         weight.contiguous(),
         activation_scale,
         weight_scale,
         bias,
         output_dtype,
-        output,
+        gemm_output,
     )
-    return output.reshape(*original_shape[:-1], output_channels)
+    result = result.reshape(*original_shape[:-1], output_channels)
+    if residual is not None:
+        if residual_scale is None:
+            raise ValueError("residual_scale is required when residual is provided")
+        result = torch.addcmul(residual, result, residual_scale)
+        if output is not None:
+            output.copy_(result)
+            return output
+    return result
 
 
 def codebook_w4a8_linear(
@@ -1205,6 +1227,10 @@ def register_backend() -> bool:
                 "convrot": ParamConstraint(dtypes=frozenset({bool})),
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
                 "input_act": ParamConstraint(dtypes=frozenset({str, type(None)})),
+                "input_act_weight": ParamConstraint(dtypes=standard_floats),
+                "input_act_eps": ParamConstraint(dtypes=frozenset({float})),
+                "residual": ParamConstraint(dtypes=standard_floats),
+                "residual_scale": ParamConstraint(dtypes=standard_floats),
             },
             default_devices=cuda_devices,
             call_rules=(require_convrot_256,),

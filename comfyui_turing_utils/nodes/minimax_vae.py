@@ -21,7 +21,7 @@ class MiniMaxH3VideoVAEDecode:
                 "attention": (
                     ["sdpa", "sage", "w8a8"],
                     {
-                        "default": "sdpa",
+                        "default": "w8a8",
                         "tooltip": "Decoder attention only. On Turing, BF16 SDPA inputs are consumed through containers and computed as FP16 to avoid the slow math fallback. W8A8 refers to QK attention, not VAE weight quantization.",
                     },
                 ),
@@ -35,7 +35,7 @@ class MiniMaxH3VideoVAEDecode:
         "Official ComfyUI H3 VAE decoding with scoped fused operators and "
         "selectable attention. ComfyUI owns tiling, batching, transfers, memory "
         "management and OOM recovery. Accepts the official VAELoader. Lightweight "
-        "tqdm shows the planned tile total and counts submitted forwards, not GPU completion."
+        "tqdm shows progress in completed logical tiles, including batched tile forwards."
     )
 
     def decode(
@@ -76,7 +76,7 @@ class MiniMaxH3VideoVAEEncode:
         "Official ComfyUI H3 VAE encoding with scoped fused operators. ComfyUI "
         "owns tiling, batching, transfers, memory management and OOM recovery. "
         "Accepts the official VAELoader and preserves its compute/output dtype. "
-        "Lightweight tqdm shows the planned tile total and counts submitted forwards, not GPU completion."
+        "Lightweight tqdm shows progress in completed logical tiles."
     )
 
     def encode(

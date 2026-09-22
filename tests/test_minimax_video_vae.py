@@ -213,11 +213,12 @@ class MiniMaxVideoVAETest(unittest.TestCase):
                         expected = vae.decode(latent)
                         expected_batches = batches[:]
                         batches.clear()
-                        actual = video_vae.decode_video(vae, latent)
+                        actual = video_vae.decode_video(vae, latent, "sdpa")
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                     self.assertEqual(actual.dtype, output_dtype)
                     self.assertEqual(batches, expected_batches)
-                    self.assertTrue(all(size == batch for size in batches))
+                    self.assertTrue(all(size % batch == 0 for size in batches))
+                    self.assertTrue(any(size > batch for size in batches))
                     torch.testing.assert_close(latent, original, rtol=0, atol=0)
                 finally:
                     handle.remove()
@@ -318,19 +319,20 @@ class MiniMaxVideoVAETest(unittest.TestCase):
 
     def test_progress_only_observes_forwards_and_removes_hook(self):
         module = torch.nn.Identity()
-        value = torch.rand(2, 3)
+        first = torch.rand(4, 3)
+        second = torch.rand(2, 3)
         terminal = mock.Mock()
-        terminal.total = 2
+        terminal.total = 3
         with mock.patch.object(video_vae, "tqdm") as factory:
             factory.return_value.__enter__.return_value = terminal
-            with video_vae._tile_progress(module, "test", total=2):
-                self.assertIs(module(value), value)
-                self.assertIs(module(value), value)
+            with video_vae._tile_progress(module, "test", total=3, base_batch_size=2):
+                self.assertIs(module(first), first)
+                self.assertIs(module(second), second)
             self.assertFalse(module._forward_hooks)
-            module(value)
-        self.assertEqual(terminal.update.call_args_list, [mock.call(1), mock.call(1)])
+            module(second)
+        self.assertEqual(terminal.update.call_args_list, [mock.call(2), mock.call(1)])
         factory.assert_called_once_with(
-            total=2,
+            total=3,
             desc="test",
             unit="tile",
             disable=not video_vae.comfy.utils.PROGRESS_BAR_ENABLED,
@@ -359,42 +361,27 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         latent = torch.zeros(1, 4, 37, 3, 5)
         self.assertEqual(video_vae._decode_tile_total(model, latent), 56)
 
-    def test_decode_tile_total_stays_dynamic_for_nonstandard_batches(self):
+    def test_decode_tile_total_is_independent_of_video_batch_size(self):
         model = make_vae().first_stage_model
         latent = torch.zeros(2, 4, 37, 3, 5)
-        self.assertIsNone(video_vae._decode_tile_total(model, latent))
+        self.assertEqual(video_vae._decode_tile_total(model, latent), 56)
 
-    def test_fused_swiglu_keeps_official_linear_dispatch(self):
-        module = SimpleNamespace(w1=mock.Mock(return_value=torch.zeros(1, 5, 16)), w2=object())
-        value = torch.zeros(1, 5, 8)
-        expected = torch.ones_like(value)
-        fallback = mock.Mock()
-        with (
-            mock.patch.object(video_vae, "_fused_swiglu_eligible", return_value=True),
-            mock.patch.object(video_vae.comfy.ops, "linear_input_act", return_value=expected) as fused,
-        ):
-            actual = video_vae._feed_forward(module, value, original_forward=fallback)
-        self.assertIs(actual, expected)
-        fused.assert_called_once_with(module.w2, module.w1.return_value, "swiglu")
-        fallback.assert_not_called()
-
-    def test_noneligible_ffn_uses_original_forward_without_recursion(self):
+    def test_decoder_override_leaves_official_ffn_untouched(self):
         decoder = make_decoder()
         module = decoder.transformer_blocks[0].ff
-        value = torch.randn(1, 5, 64)
-        with torch.inference_mode():
-            expected = module(value)
-            with video_vae._decoder_overrides(decoder, "sdpa", value.device):
-                actual = module(value)
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        with video_vae._decoder_overrides(decoder, "sdpa", torch.device("cpu")):
+            self.assertNotIn("forward", module.__dict__)
 
     def test_decoder_attention_uses_containers_and_prepared_qk_transform(self):
         module = SimpleNamespace(
             heads=1, dim_head=4, to_qkv=torch.nn.Linear(4, 12),
-            to_out=torch.nn.Identity(), norm_q=SimpleNamespace(weight=None, eps=1e-5),
+            to_out=torch.nn.Linear(4, 4), norm_q=SimpleNamespace(weight=None, eps=1e-5),
             norm_k=SimpleNamespace(weight=None, eps=1e-5),
         )
         value = torch.randn(1, 3, 4)
+        pre_norm = torch.nn.RMSNorm(4)
+        residual = value.clone()
+        residual_scale = torch.ones(4)
         seen = []
 
         def consume(q, k, v, heads, **kwargs):
@@ -406,7 +393,13 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         override = mock.Mock()
         override.container_function = consume
         output = video_vae._attention_forward(
-            module, value, options={"optimized_attention_override": override},
+            module,
+            value,
+            None,
+            pre_norm,
+            residual,
+            residual_scale,
+            options={"optimized_attention_override": override},
         )
         self.assertEqual(output.shape, value.shape)
         self.assertEqual([tuple(t.shape) for t in seen], [(1, 1, 3, 4)] * 3)
@@ -418,7 +411,15 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             request.consume_qkv()
             return AttentionExecutionOutcome(torch.zeros(1, 3, 4))
 
-        video_vae._attention_forward(module, value, options={ATTENTION_EXECUTOR_KEY: execute})
+        video_vae._attention_forward(
+            module,
+            value,
+            None,
+            pre_norm,
+            residual,
+            residual_scale,
+            options={ATTENTION_EXECUTOR_KEY: execute},
+        )
         self.assertFalse(any(key.startswith("_turing_utils") for key in vars(module)))
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -441,6 +442,7 @@ class MiniMaxVideoVAETest(unittest.TestCase):
         encode_inputs = nodes.MiniMaxH3VideoVAEEncode.INPUT_TYPES()["required"]
         self.assertEqual(set(decode_inputs), {"samples", "vae", "attention"})
         self.assertEqual(set(encode_inputs), {"pixels", "vae"})
+        self.assertEqual(decode_inputs["attention"][1]["default"], "w8a8")
         latent = torch.zeros(1, 4, 2, 3, 4)
         nested = mock.Mock(is_nested=True)
         nested.unbind.return_value = (latent, torch.zeros(1))
