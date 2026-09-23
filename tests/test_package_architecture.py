@@ -212,6 +212,9 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsVideoContinuationConcat",
                 "TuringUtilsTrimVideoContinuationPrefix",
                 "TuringUtilsH3SetAudioPrefixNoiseMask",
+                "TuringUtilsVideoMaskGuidedCrop",
+                "TuringUtilsVideoMaskGuidedStitch",
+                "TuringUtilsMaskToVisualPrompts",
             ),
         )
 

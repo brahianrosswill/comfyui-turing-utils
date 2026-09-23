@@ -145,6 +145,29 @@ only after its CUDA sources or required version change.
   With no image connected it returns no image, so one graph can safely feed
   optional first- or last-frame conditioning sockets without making a black
   placeholder frame.
+- `Video Mask Guided Crop` converts one target mask per video frame into a
+  temporally smoothed, fixed-aspect crop sequence. `width` and `height` are both
+  the exact output resolution and the source-frame crop-box ratio; the box is
+  shifted and, when necessary, scaled down so it always stays entirely inside
+  the source frame without padding. Bounded missing-mask runs can interpolate
+  position and logarithmic size, while leading/trailing runs hold the nearest
+  observation; `hold` mode instead keeps the last valid crop. The cropped mask
+  remains empty on missing frames even though the image crop stays continuous.
+  `crop_info` stores the per-frame floating-point transforms.
+- `Video Mask Guided Stitch` maps regenerated crops and their masks back through
+  those exact transforms and composites only the masked pixels over the source
+  video. Its optional feathering is measured in source-video pixels. Extra
+  regenerated tail frames are ignored, while missing frames or mismatched source
+  geometry are rejected.
+- `Mask to Visual Prompts` selects one indexed frame from a MASK batch or scalar
+  guidance IMAGE and returns only that frame plus its mask and reusable visual
+  prompts. Positive points are spread through the mask interior; optional
+  negative points are spread through a nearby exterior ring. Point outputs use
+  the JSON coordinate format shared by KJNodes, SeC, and built-in SAM3. The
+  legacy `BBOX` output targets SeC/KJNodes, while `BOUNDING_BOX` targets current
+  ComfyUI nodes such as SAM3. RGB images are treated only as guidance maps and
+  do not add semantic detection; use a detector, SAM result, or painted mask to
+  define the target first.
 - `Is Input Present` accepts an optional value of any type and reports whether
   it is connected and non-empty; scalar `0` and `false` still count as present.
   Its second output forwards that value or lazily evaluates an optional fallback.

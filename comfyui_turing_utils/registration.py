@@ -45,6 +45,8 @@ from .nodes.video_sequence import (
     VideoContinuationConcat,
     VideoPrefixContextNoise,
 )
+from .nodes.video_roi import VideoMaskGuidedCrop, VideoMaskGuidedStitch
+from .nodes.visual_prompt import MaskToVisualPrompts
 from .nodes.wan import WanVideoFramesPadding
 
 
@@ -95,6 +97,9 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsVideoContinuationConcat": VideoContinuationConcat,
     "TuringUtilsTrimVideoContinuationPrefix": TrimVideoContinuationPrefix,
     "TuringUtilsH3SetAudioPrefixNoiseMask": H3SetAudioPrefixNoiseMask,
+    "TuringUtilsVideoMaskGuidedCrop": VideoMaskGuidedCrop,
+    "TuringUtilsVideoMaskGuidedStitch": VideoMaskGuidedStitch,
+    "TuringUtilsMaskToVisualPrompts": MaskToVisualPrompts,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -141,4 +146,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsVideoContinuationConcat": "Video Continuation Concat",
     "TuringUtilsTrimVideoContinuationPrefix": "Trim Video Continuation Prefix",
     "TuringUtilsH3SetAudioPrefixNoiseMask": "H3 Set Audio Prefix Noise Mask",
+    "TuringUtilsVideoMaskGuidedCrop": "Video Mask Guided Crop",
+    "TuringUtilsVideoMaskGuidedStitch": "Video Mask Guided Stitch",
+    "TuringUtilsMaskToVisualPrompts": "Mask to Visual Prompts",
 }
