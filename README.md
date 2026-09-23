@@ -159,15 +159,17 @@ only after its CUDA sources or required version change.
   video. Its optional feathering is measured in source-video pixels. Extra
   regenerated tail frames are ignored, while missing frames or mismatched source
   geometry are rejected.
-- `Mask to Visual Prompts` selects one indexed frame from a MASK batch or scalar
-  guidance IMAGE and returns only that frame plus its mask and reusable visual
-  prompts. Positive points are spread through the mask interior; optional
-  negative points are spread through a nearby exterior ring. Point outputs use
-  the JSON coordinate format shared by KJNodes, SeC, and built-in SAM3. The
-  legacy `BBOX` output targets SeC/KJNodes, while `BOUNDING_BOX` targets current
-  ComfyUI nodes such as SAM3. RGB images are treated only as guidance maps and
-  do not add semantic detection; use a detector, SAM result, or painted mask to
-  define the target first.
+- `Mask to Visual Prompts` uses the first frame from its IMAGE and MASK inputs
+  and returns reusable visual prompts plus a rendered preview. Positive points
+  combine perceptually distinct colour-region representatives, mask-medial
+  points biased toward thin structures, and spatially spread interior
+  fallbacks. Optional negative points are spread through a nearby exterior
+  ring. The preview overlays a subtle thresholded-mask tint and contour, an
+  amber bounding box, green positive markers, and red negative markers. Point
+  outputs use the JSON coordinate format shared by KJNodes, SeC, and built-in
+  SAM3. The legacy `BBOX` output targets SeC/KJNodes, while `BOUNDING_BOX`
+  targets current ComfyUI nodes such as SAM3. Input batch lengths may differ,
+  but their first frames must have matching spatial dimensions.
 - `Is Input Present` accepts an optional value of any type and reports whether
   it is connected and non-empty; scalar `0` and `false` still count as present.
   Its second output forwards that value or lazily evaluates an optional fallback.
