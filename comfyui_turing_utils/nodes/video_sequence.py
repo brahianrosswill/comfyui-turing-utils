@@ -654,6 +654,14 @@ class LoadIndexedVideoSegment(io.ComfyNode):
                 io.String.Input("root_directory", default="video/segments"),
                 io.Int.Input("segment_index", default=0, min=-1, max=1_000_000, step=1),
                 io.Int.Input("tail_frames", default=22, min=0, max=16384, step=1, tooltip="Final frames to load; 0 loads the complete segment."),
+                io.Boolean.Input(
+                    "reload_on_change",
+                    default=True,
+                    tooltip=(
+                        "Reload when the selected file's timestamp or size changes. Disable while debugging "
+                        "to reuse the cached decode until another graph input changes."
+                    ),
+                ),
             ],
             outputs=[
                 io.Image.Output(display_name="images"),
@@ -663,7 +671,22 @@ class LoadIndexedVideoSegment(io.ComfyNode):
         )
 
     @classmethod
-    def fingerprint_inputs(cls, root_directory, segment_index, tail_frames):
+    def fingerprint_inputs(
+        cls,
+        root_directory=None,
+        segment_index=None,
+        tail_frames=None,
+        reload_on_change=True,
+    ):
+        # ComfyUI intentionally does not resolve linked inputs while evaluating a
+        # node fingerprint. In automatic mode we must conservatively reload because
+        # the selected file cannot be stat'ed here. Cached mode explicitly opts out
+        # of that external-file check and lets the normal graph signature decide.
+        if reload_on_change is False:
+            return ("reuse_cached",)
+        if root_directory is None or segment_index is None or tail_frames is None:
+            return float("NaN")
+
         path = _segment_path_for_load(root_directory, segment_index)
         if path is None:
             return (int(segment_index), None, int(tail_frames))
@@ -673,7 +696,13 @@ class LoadIndexedVideoSegment(io.ComfyNode):
         return (int(segment_index), str(path), stat.st_mtime_ns, stat.st_size, int(tail_frames))
 
     @classmethod
-    def execute(cls, root_directory: str, segment_index: int, tail_frames: int) -> io.NodeOutput:
+    def execute(
+        cls,
+        root_directory: str,
+        segment_index: int,
+        tail_frames: int,
+        reload_on_change: bool = True,
+    ) -> io.NodeOutput:
         path = _segment_path_for_load(root_directory, segment_index)
         if path is None or not path.is_file():
             return io.NodeOutput(None, None, 0.0)

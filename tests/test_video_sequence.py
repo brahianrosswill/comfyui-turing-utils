@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sys
 import tempfile
 import unittest
@@ -138,6 +139,23 @@ class VideoSequenceTest(unittest.TestCase):
         self.assertEqual(fingerprint, (0, None, 21))
         video_from_file.assert_not_called()
         get_output_directory.assert_not_called()
+
+    def test_loader_fingerprint_conservatively_reloads_linked_inputs(self):
+        self.assertTrue(
+            math.isnan(
+                nodes.LoadIndexedVideoSegment.fingerprint_inputs(
+                    None, None, None, True
+                )
+            )
+        )
+
+    def test_loader_can_ignore_file_changes_while_debugging(self):
+        with mock.patch.object(nodes, "_segment_path_for_load") as segment_path:
+            fingerprint = nodes.LoadIndexedVideoSegment.fingerprint_inputs(
+                "segments", 7, 22, False
+            )
+        self.assertEqual(fingerprint, ("reuse_cached",))
+        segment_path.assert_not_called()
 
     def test_loader_positive_index_reads_previous_saved_segment(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
