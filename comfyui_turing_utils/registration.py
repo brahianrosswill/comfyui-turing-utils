@@ -14,6 +14,7 @@ from .nodes.loaders import ConvRotCLIPLoader, ConvRotDiffusionModelLoader
 from .nodes.logic import IsInputPresent, LazyIfElse, StageBarrier, StagePath
 from .nodes.media import ResizeImageIfPresent, VideoMotionContactSheet
 from .nodes.multimodal_chat import MultimodalChatOptions, MultimodalPromptChat
+from .nodes.sec import SeCModelLoader, SeCTrackVisualConcept
 from .nodes.minimax import (
     H3AddNoise,
     H3ConcatAVLatent,
@@ -100,6 +101,8 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsVideoMaskGuidedCrop": VideoMaskGuidedCrop,
     "TuringUtilsVideoMaskGuidedStitch": VideoMaskGuidedStitch,
     "TuringUtilsMaskToVisualPrompts": MaskToVisualPrompts,
+    "TuringUtilsSeCModelLoader": SeCModelLoader,
+    "TuringUtilsSeCTrackVisualConcept": SeCTrackVisualConcept,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -149,4 +152,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsVideoMaskGuidedCrop": "Video Mask Guided Crop",
     "TuringUtilsVideoMaskGuidedStitch": "Video Mask Guided Stitch",
     "TuringUtilsMaskToVisualPrompts": "Mask to Visual Prompts",
+    "TuringUtilsSeCModelLoader": "Load SeC Model",
+    "TuringUtilsSeCTrackVisualConcept": "SeC Track Visual Concept",
 }

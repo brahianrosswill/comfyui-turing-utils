@@ -25,6 +25,7 @@ W8A8, W4A4, legacy W4A8, and attention paths keep their earlier minimum.
 cd ComfyUI/custom_nodes
 git clone https://github.com/wjie98/comfyui-turing-utils.git
 cd comfyui-turing-utils
+python -m pip install -r requirements.txt
 python -m pip install -v --no-build-isolation -e ./kernel
 ```
 
@@ -170,6 +171,18 @@ only after its CUDA sources or required version change.
   SAM3. The legacy `BBOX` output targets SeC/KJNodes, while `BOUNDING_BOX`
   targets current ComfyUI nodes such as SAM3. Input batch lengths may differ,
   but their first frames must have matching spatial dimensions.
+- `Load SeC Model` loads single-file or Hugging Face directory-format SeC
+  checkpoints from `ComfyUI/models/sams`. The checkpoint starts on ComfyUI's
+  offload device and is registered through a model patcher; there is no manual
+  device selector or private unload lifecycle.
+- `SeC Track Visual Concept` accepts the JSON points and legacy `BBOX` emitted
+  by `Mask to Visual Prompts`, plus an optional direct mask. Frames are consumed
+  from the IMAGE tensor without temporary JPEG files. With a mask connected,
+  that mask is authoritative, the BBOX limits its region, and clicks are checked
+  for consistency. Without a mask, the box and all clicks are submitted in one
+  SAM2 prompt so one prompt type cannot silently erase another. Video frames and
+  per-run tracking state remain on CPU while ComfyUI owns model loading,
+  retention, and eviction; only the tracked mask batch is returned.
 - `Is Input Present` accepts an optional value of any type and reports whether
   it is connected and non-empty; scalar `0` and `false` still count as present.
   Its second output forwards that value or lazily evaluates an optional fallback.

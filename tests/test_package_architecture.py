@@ -215,6 +215,8 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsVideoMaskGuidedCrop",
                 "TuringUtilsVideoMaskGuidedStitch",
                 "TuringUtilsMaskToVisualPrompts",
+                "TuringUtilsSeCModelLoader",
+                "TuringUtilsSeCTrackVisualConcept",
             ),
         )
 

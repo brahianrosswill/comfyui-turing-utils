@@ -2,3 +2,9 @@
 # Keep it free of comfyui-turing-utils-kernel so CUDA compilation is an explicit user step:
 #   python -m pip install -v --no-build-isolation -e ./kernel
 safetensors
+accelerate>=1.0
+peft>=0.10
+timm>=0.9
+opencv-python-headless>=4.5
+omegaconf>=2.1
+iopath
