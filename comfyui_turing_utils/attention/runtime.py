@@ -53,6 +53,7 @@ class AttentionRuntimeConfig:
             "sla",
             "h3_virtual_kv",
             "h3_image_sol",
+            "veda",
         }:
             raise ValueError(f"unsupported attention strategy: {strategy}")
         if strategy == "dense":

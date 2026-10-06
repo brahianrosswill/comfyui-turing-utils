@@ -336,7 +336,9 @@ class KernelSetupTest(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertIn('#include "torch_compat.h"', source)
         self.assertNotIn("ATen/cuda/CUDAContext", source)
-        self.assertNotIn("CUDAGuard", source)
+        # c10's core device guard is required for Veda's ragged descriptor
+        # uploads; it does not introduce optional cuSPARSE headers.
+        self.assertIn("#include <c10/cuda/CUDAGuard.h>", source)
         self.assertNotIn("cusparse", source.lower())
         self.assertIn("key_score_summary", source)
         self.assertIn("dequantize_int8_tile", source)

@@ -503,6 +503,7 @@ def decide_attention_heads(
     base_model=None,
     logical_key_rows: int | None = None,
     residual_subblocks: int = 0,
+    extra_workspace_per_head: int = 0,
 ) -> AttentionDecision:
     """Choose a whole-head group without changing global sequence attention."""
     rows = int(x.shape[0])
@@ -549,7 +550,7 @@ def decide_attention_heads(
             quantized_value=quantized_value,
             logical_key_rows=logical_key_rows,
             residual_subblocks=residual_subblocks,
-        )
+        ) + group * extra_workspace_per_head
 
     # A cut is legal whenever both sides cover complete ConvRot-256 blocks.
     # This is the TP-style gcd boundary: D128 permits every two heads, for

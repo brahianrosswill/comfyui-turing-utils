@@ -169,6 +169,7 @@ class PackageArchitectureTest(unittest.TestCase):
         self.assertEqual(
             tuple(NODE_CLASS_MAPPINGS),
             (
+                "TuringUtilsH3VedaAttentionStrategy",
                 "TuringUtilsConvRotDiffusionModelLoader",
                 "TuringUtilsConvRotCLIPLoader",
                 "TuringUtilsWanVideoFramesPadding",

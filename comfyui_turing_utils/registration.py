@@ -15,6 +15,7 @@ from .nodes.logic import IsInputPresent, LazyIfElse, StageBarrier, StagePath
 from .nodes.media import ResizeImageIfPresent, VideoMotionContactSheet
 from .nodes.multimodal_chat import MultimodalChatOptions, MultimodalPromptChat
 from .nodes.sec import SeCModelLoader, SeCTrackVisualConcept
+from .nodes.veda import H3VedaAttentionStrategy
 from .nodes.minimax import (
     H3AddNoise,
     H3ConcatAVLatent,
@@ -59,6 +60,7 @@ install_combined_minimax_conditioning_support()
 
 
 NODE_CLASS_MAPPINGS = {
+    "TuringUtilsH3VedaAttentionStrategy": H3VedaAttentionStrategy,
     "TuringUtilsConvRotDiffusionModelLoader": ConvRotDiffusionModelLoader,
     "TuringUtilsConvRotCLIPLoader": ConvRotCLIPLoader,
     "TuringUtilsWanVideoFramesPadding": WanVideoFramesPadding,
@@ -111,6 +113,7 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "TuringUtilsH3VedaAttentionStrategy": "Configure H3 Veda Sparse Attention",
     "TuringUtilsConvRotDiffusionModelLoader": "Load ConvRot DiT",
     "TuringUtilsConvRotCLIPLoader": "Load ConvRot CLIP",
     "TuringUtilsWanVideoFramesPadding": "Wan Video Frames Padding",

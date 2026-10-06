@@ -37,6 +37,7 @@ from .activation_policy import (
     ensure_dynamic_vram_headroom,
     estimate_attention_lifecycle_peak,
 )
+from .veda.engine import workspace_per_head as veda_workspace_per_head
 from ...runtime.capabilities import kernel_capabilities
 from .layout import (
     ATTENTION_LAYOUT_KEY,
@@ -746,6 +747,76 @@ def _apply_minimax_qk_transform(attention, query, key, rope_freqs):
     return attention.q_norm(query), attention.k_norm(key)
 
 
+def _veda_projected_head_group(attention, x, transform, qweight, weight_scale,
+                               bias, head_start, head_stop, quantized_input, options):
+    """Project tile-ordered real rows; never materialize full floating Q/K/V."""
+    from .veda.engine import attend
+    from ...attention.patches import _attention_layer_metadata
+    import comfy.model_prefetch
+
+    sequence, dim = x.shape[0], int(attention.head_dim)
+    group = head_stop - head_start
+    selected_group = None
+    selected_weights = None
+
+    def release():
+        nonlocal selected_group, selected_weights
+        selected_group = selected_weights = None
+
+    def project(indices, local_heads):
+        nonlocal selected_group, selected_weights
+        if quantized_input is None:
+            qa, scale = _quantize_qkv_rows(attention.qkv_proj, x.index_select(0, indices))
+        else:
+            qa, scale = (t.index_select(0, indices) for t in quantized_input)
+        contiguous = local_heads == list(range(local_heads[0], local_heads[0]+len(local_heads)))
+        if not contiguous and selected_group != tuple(local_heads):
+            # One bounded INT8 row pack per tile-shape group, reused across
+            # row chunks. Per-head tiny GEMMs are much slower than this copy.
+            inner = int(attention.heads) * dim
+            slices = [(c * inner + (head_start+h)*dim, c * inner + (head_start+h+1)*dim)
+                      for c in range(3) for h in local_heads]
+            selected_weights = (
+                torch.cat([qweight[start:stop] for start, stop in slices], dim=0),
+                weight_scale if weight_scale.numel() == 1 else torch.cat(
+                    [weight_scale.reshape(-1)[start:stop] for start, stop in slices]),
+                None if bias is None else torch.cat([bias[start:stop] for start, stop in slices]))
+            selected_group = tuple(local_heads)
+        weights = (qweight, weight_scale, bias) if contiguous else selected_weights
+        start = head_start + local_heads[0] if contiguous else 0
+        total_heads = int(attention.heads) if contiguous else len(local_heads)
+        projected = []
+        for component in range(3):
+            projected.append(_w8_qkv_component(
+                qa, scale, *weights, component=component,
+                head_start=start, head_stop=start+len(local_heads), heads=total_heads,
+                head_dim=dim, output_dtype=x.dtype).view(indices.numel(), len(local_heads), dim))
+        selected_transform = _sample_qk_transform(transform, indices, sequence)
+        query, key = _apply_minimax_qk_transform(attention, projected[0], projected[1],
+                                                selected_transform.freqs)
+        return query, key, projected[2]
+
+    # Fixed callback scratch: input gather/quantization and GEMM intermediates.
+    # Additional tile QKV/features/quantization are budgeted inside attend().
+    chunk_tiles = int(options.get("turing_utils_veda_projection_chunk_tiles", 16))
+    if chunk_tiles < 1:
+        raise ValueError("Veda projection chunk must contain at least one tile")
+    chunk_rows = min(sequence, chunk_tiles * 128)
+    project.workspace_bytes = chunk_rows * (x.shape[1] * (x.element_size() + 3) +
+                                            group * dim * 12 + 16)
+    project.workspace_bytes += 3 * group * dim * (qweight.shape[1] + 8)
+    project.release = release
+    layer, _ = _attention_layer_metadata(options)
+    meta = x.new_empty((1, 1, 1, dim)).expand(1, group, sequence, dim)
+    with comfy.model_prefetch.pause_malloc_graph():
+        result = attend(meta, meta, meta, config=options["turing_utils_veda"],
+                        packed_layout=options["minimax_h3_layout"], layer=layer,
+                        head_start=head_start, cache=options.get("turing_utils_veda_forward_cache"),
+                        projector=project, prepare_chunk_tiles=chunk_tiles,
+                        heterogeneous=options.get("turing_utils_veda_heterogeneous", False))
+    return result.transpose(1, 2).flatten(2).squeeze(0)
+
+
 def _head_sharded_attention(
     attention,
     x: torch.Tensor,
@@ -797,11 +868,40 @@ def _head_sharded_attention(
             if executor is not None
             else None
         )
-        compact = callable(streamed_executor) and reusable_k_anchor_available()
+        veda = transformer_options.get("turing_utils_attention_strategy") == "veda"
+        compact = callable(streamed_executor) and reusable_k_anchor_available() and not veda
         for head_start in range(0, heads, head_group):
             head_stop = min(head_start + head_group, heads)
             group = head_stop - head_start
-            if compact:
+            group_options = transformer_options
+            if veda:
+                group_options = dict(transformer_options, turing_utils_attention_head_start=head_start)
+            veda_schedule = transformer_options.get("turing_utils_veda_schedule")
+            if (veda and veda_schedule is not None and not veda_schedule.is_dense(transformer_options)
+                    and transformer_options.get("turing_utils_veda_auto_schedule", False)):
+                from .memory_state import runtime_memory
+                from .veda.selection import choose_projected_chunk
+                from ...attention.patches import _attention_layer_metadata
+                layer, _ = _attention_layer_metadata(transformer_options)
+                layout = transformer_options.get("minimax_h3_layout")
+                if layer is not None and layout is not None:
+                    workspace = veda_workspace_per_head(
+                        transformer_options["turing_utils_veda"], layout, layer,
+                        x.element_size(), torch.cuda.get_device_capability(x.device),
+                        transformer_options.get("turing_utils_veda_forward_cache"), chunk_tiles=0) * group
+                    available, _, _ = runtime_memory(x.device)
+                    tiles = choose_projected_chunk(rows=sequence, heads=group, dim=head_dim,
+                        hidden=x.shape[1], element_size=x.element_size(), available=available,
+                        workspace=workspace)
+                    if tiles:
+                        group_options = dict(group_options, turing_utils_veda_projected_qkv=True,
+                                             turing_utils_veda_projection_chunk_tiles=tiles)
+            if (veda and veda_schedule is not None and not veda_schedule.is_dense(transformer_options)
+                    and group_options.get("turing_utils_veda_projected_qkv", False)):
+                group_output = _veda_projected_head_group(
+                    attention, x, transform, qweight, weight_scale, bias,
+                    head_start, head_stop, quantized_input, group_options)
+            elif compact:
                 qk, value = _stream_qkv_head_group(
                     attention,
                     x,
@@ -876,7 +976,7 @@ def _head_sharded_attention(
                         group,
                         mask=None,
                         skip_reshape=True,
-                        transformer_options=transformer_options,
+                        transformer_options=group_options,
                     ).squeeze(0)
                 del query, key, value
             _profile_cuda(
@@ -1140,6 +1240,20 @@ def _make_attention_forward(
         # K-anchor stabilization is disabled. Older kernels keep the complete
         # projection path instead of failing after committing partial output.
         stream_abi_available = reusable_k_anchor_available()
+        veda_extra_workspace = 0
+        if transformer_options.get("turing_utils_attention_strategy") == "veda":
+            # Veda TripPool needs floating post-RoPE Q/K, before the attention
+            # rotation. Compact QKV would discard those values too early.
+            streamed_executor = None
+            from ...attention.patches import _attention_layer_metadata
+            layer, _ = _attention_layer_metadata(transformer_options)
+            packed_layout = transformer_options.get("minimax_h3_layout")
+            if layer is not None and packed_layout is not None and packed_layout.seq_len == x.shape[0]:
+                veda_extra_workspace = veda_workspace_per_head(
+                    transformer_options["turing_utils_veda"], packed_layout, layer,
+                    x.element_size(), torch.cuda.get_device_capability(x.device),
+                    transformer_options.get("turing_utils_veda_forward_cache"),
+                )
         qkv_is_w8 = convrot_weight_kind(self.qkv_proj.weight) == "w8a8"
         runtime_plan = _runtime_activation_plan(base_model)
         head_decision = None
@@ -1165,8 +1279,9 @@ def _make_attention_forward(
                 base_model=base_model,
                 logical_key_rows=logical_key_rows,
                 residual_subblocks=virtual_residual_subblocks,
+                extra_workspace_per_head=veda_extra_workspace,
             )
-            if head_decision.sharded:
+            if head_decision.sharded or transformer_options.get("turing_utils_veda_projected_qkv", False):
                 profile_shape = (1, self.heads, x.shape[0], self.head_dim)
                 CUDA_PHASE_PROFILER.begin_operation(
                     "attention",
