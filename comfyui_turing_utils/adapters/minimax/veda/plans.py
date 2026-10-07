@@ -120,9 +120,12 @@ class PlanTable:
 
         exact_candidates = [p for p in candidates if p.grid == grid]
         plan = min(exact_candidates or candidates, key=cost)
-        exact = plan.grid == grid
+        native = any(plan is p for p in self.plans.values())
+        exact = plan.grid == grid and native
         if exact:
             how = f'trained for this size ({describe_grid(grid)})'
+        elif plan.grid == grid:
+            how = f'transposed trained plan: {describe_grid(grid)} (not a native trained geometry)'
         else:
             how = (f'nearest trained size: {describe_grid(plan.grid)} '
                    f'(this video: {describe_grid(grid)})')

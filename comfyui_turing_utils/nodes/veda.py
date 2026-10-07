@@ -18,12 +18,12 @@ class H3VedaAttentionStrategy:
 
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {
+        inputs = {"required": {
             "model": ("MODEL",),
             "predictor_name": (predictor_choices(),),
             "predictor_precision": (list(PRECISIONS), {"default": "w8a8"}),
-            "keep_ratio": ("FLOAT", {"default": 0.1, "min": 0.001, "max": 1.0, "step": 0.01}),
-            "reference_keep_ratio": ("FLOAT", {"default": 1.0, "min": 0.001, "max": 1.0, "step": 0.01}),
+            "keep_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "0 uses the predictor's trained keep ratio; 1 keeps full attention."}),
+            "reference_keep_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "0 uses the predictor's trained keep ratio; 1 keeps references dense in both directions."}),
             "plan_policy": (["nearest", "strict"],),
             "dense_prefix_steps": ("INT", {"default": 0, "min": 0, "max": 10000}),
             "dense_suffix_steps": ("INT", {"default": 0, "min": 0, "max": 10000}),
@@ -31,10 +31,10 @@ class H3VedaAttentionStrategy:
             "dense_suffix_layers": ("INT", {"default": 0, "min": 0, "max": 10000}),
             "debug": ("BOOLEAN", {"default": False}),
         }}
+        for name, spec in inputs["required"].items():
+            if name not in ("model", "predictor_name", "predictor_precision"):
+                inputs["required"][name] = (spec[0], {**(spec[1] if len(spec) > 1 else {}), "advanced": True})
+        return inputs
 
     def configure(self, model, **kwargs):
-        # Legacy experimental workflow/API inputs must not override automatic
-        # scheduling. Internal benchmark entry points remain independently usable.
-        kwargs.pop("execution_mode", None)
-        kwargs.pop("projection_chunk_tiles", None)
         return (configure(model, **kwargs),)

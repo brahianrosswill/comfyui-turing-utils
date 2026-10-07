@@ -18,7 +18,6 @@
  */
 
 #include "../utils.cuh"
-#include <c10/cuda/CUDAGuard.h>
 #include "../math.cuh"
 #include "attn_utils.cuh"
 #include "dispatch_utils.h"
@@ -854,7 +853,7 @@ __device__ __forceinline__ void load_quantized_value_tile_async(
 template <int HeadDim, typename T, bool UseW8A8, bool ForceDense,
           bool IsCausal, bool Varlen, int ResidualSubblocks, int KeyStages,
           bool ExternalRoute = false, bool SparseValuePipeline = false,
-          bool MappedValue = false, bool RaggedVeda = false>
+          bool MappedValue = false>
 __global__ void sparse_attention_kernel(
     const int8_t *__restrict__ query_int8,
     const int8_t *__restrict__ key_int8,
@@ -900,41 +899,12 @@ __global__ void sparse_attention_kernel(
     float threshold_sigma,
     float softmax_scale,
     int route_original_basis,
-    const int32_t *tile_valid_counts,
-    int tile_metadata_stride,
-    const int64_t *heterogeneous_descriptors)
+    const int32_t *tile_valid_counts)
 {
   using G = AttentionGeometry<HeadDim>;
   using S = AttentionStorage<HeadDim, SparseValuePipeline>;
-  if constexpr (RaggedVeda)
-  {
-    const int64_t *d = heterogeneous_descriptors + int64_t(blockIdx.y) * 14;
-    query_int8 = reinterpret_cast<const int8_t *>(d[0]);
-    key_int8 = reinterpret_cast<const int8_t *>(d[1]);
-    value = reinterpret_cast<const T *>(d[2]);
-    output = reinterpret_cast<T *>(d[3]);
-    query_scale = reinterpret_cast<const float *>(d[4]);
-    key_scale = reinterpret_cast<const float *>(d[5]);
-    external_route_words = reinterpret_cast<const uint32_t *>(d[6]);
-    sparse_query_blocks = reinterpret_cast<const uint8_t *>(d[7]);
-    tile_valid_counts = reinterpret_cast<const int32_t *>(d[8]);
-    query_length = key_length = int(d[9]);
-    if (int(blockIdx.x) * kBlockTokens >= query_length) return;
-    num_query_heads = num_kv_heads = 1;
-    num_query_blocks = num_key_blocks = query_length / kBlockTokens;
-    stride_sequence_q_int8 = d[10]; stride_sequence_k_int8 = d[11];
-    stride_sequence_v = d[12]; stride_sequence_o = d[13];
-    stride_head_q_int8 = stride_head_k_int8 = stride_head_v = stride_head_o = 0;
-    stride_batch_q_int8 = stride_batch_k_int8 = stride_batch_v = stride_batch_o = 0;
-  }
   if constexpr (ExternalRoute)
   {
-    if (tile_valid_counts != nullptr && tile_metadata_stride != 0)
-    {
-      const int lane = int(blockIdx.z) * num_query_heads + int(blockIdx.y);
-      tile_valid_counts += int64_t(lane) * tile_metadata_stride;
-      sparse_query_blocks += int64_t(lane) * tile_metadata_stride * 2;
-    }
     // Veda packs valid rows at the front of each 128-token tile. Do not
     // execute softmax/MMA for a completely padded physical 64-row query CTA.
     // Zero its output to preserve the public finite-padding contract.
@@ -1012,8 +982,8 @@ __global__ void sparse_attention_kernel(
       shared_bytes + S::kCompactionScratchOffset);
 
   const int query_block = blockIdx.x;
-  const int query_head = RaggedVeda ? 0 : blockIdx.y;
-  const int batch = RaggedVeda ? 0 : blockIdx.z;
+  const int query_head = blockIdx.y;
+  const int batch = blockIdx.z;
   int query_start = 0;
   int key_start = 0;
   if constexpr (Varlen)
@@ -2075,7 +2045,7 @@ void launch_sparse_threshold_attention(
       threshold_sigma,
       softmax_scale,
       route_original_basis,
-      nullptr, 0, nullptr);
+      nullptr);
   check_launch("sparse attention");
 }
 
@@ -2217,7 +2187,7 @@ void dispatch_sparse_threshold_attention(
 }
 
 template <int HeadDim, typename T, bool UseW8A8, int KeyStages,
-          bool SparseValuePipeline = false, bool RaggedVeda = false>
+          bool SparseValuePipeline = false>
 void launch_sla_attention(
     at::Tensor query_int8,
     at::Tensor key_int8,
@@ -2231,9 +2201,7 @@ void launch_sla_attention(
     at::Tensor sparse_query_blocks,
     at::Tensor selected_count,
     float softmax_scale,
-    const int32_t *tile_valid_counts,
-    int tile_metadata_stride,
-    at::Tensor descriptors = at::Tensor())
+    const int32_t *tile_valid_counts)
 {
   using G = AttentionGeometry<HeadDim>;
   using S = AttentionStorage<HeadDim, SparseValuePipeline>;
@@ -2245,11 +2213,10 @@ void launch_sla_attention(
   const int num_query_blocks = div_ceil(query_length, kBlockTokens);
   const int num_key_blocks = div_ceil(key_length, kBlockTokens);
   dim3 attention_grid(num_query_blocks, num_query_heads, batch_size);
-  if constexpr (RaggedVeda) attention_grid.y = descriptors.size(0);
   dim3 attention_block(WARP_SIZE, kWarps);
   auto attention_kernel =
       sparse_attention_kernel<HeadDim, T, UseW8A8, false, false, false,
-                              1, KeyStages, true, SparseValuePipeline, false, RaggedVeda>;
+                              1, KeyStages, true, SparseValuePipeline>;
   configure_dynamic_shared_memory(
       attention_kernel, S::kAttentionSharedBytes, "SLA sparse attention");
   attention_kernel<<<
@@ -2303,8 +2270,7 @@ void launch_sla_attention(
       0.0f,
       softmax_scale,
       0,
-      tile_valid_counts, tile_metadata_stride,
-      RaggedVeda ? descriptors.data_ptr<int64_t>() : nullptr);
+      tile_valid_counts);
   check_launch("SLA sparse attention");
 }
 
@@ -2323,8 +2289,7 @@ void dispatch_sla_attention(
     float softmax_scale,
     bool use_w8a8,
     int key_tile_tokens,
-    const int32_t *tile_valid_counts = nullptr,
-    int tile_metadata_stride = 0)
+    const int32_t *tile_valid_counts = nullptr)
 {
   const bool sparse_value_pipeline =
       use_w8a8 && current_cuda_device_major() >= 8;
@@ -2332,7 +2297,7 @@ void dispatch_sla_attention(
   launch_sla_attention<HEAD_DIM, SCALAR, W8A8, STAGES, PIPELINE>(           \
       query_int8, key_int8, value, value_int8, value_scale, output,          \
       query_scale, key_scale, route_words, sparse_query_blocks,              \
-      selected_count, softmax_scale, tile_valid_counts, tile_metadata_stride)
+      selected_count, softmax_scale, tile_valid_counts)
 #define DISPATCH_SLA(HEAD_DIM, SCALAR)                                      \
   do                                                                         \
   {                                                                          \
@@ -2748,11 +2713,8 @@ static at::Tensor routed_sparse_online_attn(
                 "Veda requires matching self-attention Q/K dimensions");
     const bool shared = tile_valid_counts.dim() == 1 &&
         tile_valid_counts.numel() == div_ceil(key_length, 128);
-    const bool heterogeneous = tile_valid_counts.dim() == 2 &&
-        tile_valid_counts.size(0) == batch_size * query_heads &&
-        tile_valid_counts.size(1) == div_ceil(key_length, 128) && key_length % 128 == 0;
-    TORCH_CHECK(tile_valid_counts.device() == query_int8.device() && (shared || heterogeneous),
-                "Veda valid counts must be [tiles] or [batch*heads, tiles]");
+    TORCH_CHECK(tile_valid_counts.device() == query_int8.device() && shared,
+                "Veda valid counts must be [tiles]");
   }
   TORCH_CHECK(
       query_int8.dim() == 4 && key_int8.dim() == 4 && value.dim() == 4 &&
@@ -2781,8 +2743,7 @@ static at::Tensor routed_sparse_online_attn(
   TORCH_CHECK(
       route_words.sizes() == at::IntArrayRef(
           {batch_size, query_heads, query_blocks_128, route_word_count}) &&
-          sparse_query_blocks.numel() == query_blocks_64 *
-              ((tile_valid_counts.defined() && tile_valid_counts.dim() == 2) ? batch_size * query_heads : 1),
+          sparse_query_blocks.numel() == query_blocks_64,
       "SLA route policy shapes are incompatible");
   if (use_w8a8)
   {
@@ -2807,8 +2768,7 @@ static at::Tensor routed_sparse_online_attn(
       query_int8, key_int8, value, value_int8, value_scale, output,
       query_scale, key_scale, route_words, sparse_query_blocks,
       selected_count, softmax_scale, use_w8a8 != 0, key_tile_tokens,
-      tile_valid_counts.defined() ? tile_valid_counts.data_ptr<int32_t>() : nullptr,
-      (tile_valid_counts.defined() && tile_valid_counts.dim() == 2) ? tile_valid_counts.size(1) : 0);
+      tile_valid_counts.defined() ? tile_valid_counts.data_ptr<int32_t>() : nullptr);
   return selected_count;
 }
 
@@ -2834,74 +2794,6 @@ void veda_sparse_online_attn(
       qs, ks, routes, sparse_queries, scale, 0, 0, 64, valid_counts);
 }
 
-void veda_sparse_ragged_attn(
-    std::vector<at::Tensor> qs_in, std::vector<at::Tensor> ks_in,
-    std::vector<at::Tensor> vs, std::vector<at::Tensor> outputs,
-    std::vector<at::Tensor> qscales, std::vector<at::Tensor> kscales,
-    std::vector<at::Tensor> routes, std::vector<at::Tensor> sparse,
-    std::vector<at::Tensor> counts, float scale)
-{
-  const size_t n = qs_in.size();
-  TORCH_CHECK(n > 0 && ks_in.size() == n && vs.size() == n && outputs.size() == n &&
-      qscales.size() == n && kscales.size() == n && routes.size() == n &&
-      sparse.size() == n && counts.size() == n, "Veda ragged tensor lists must match");
-  int heads = 0;
-  size_t largest = 0;
-  for (size_t i = 0; i < n; ++i)
-  {
-    auto q = qs_in[i]; auto k = ks_in[i]; auto v = vs[i];
-    for (auto t : {q, k, v, outputs[i], qscales[i], kscales[i], routes[i], sparse[i], counts[i]})
-    {
-      CHECK_CUDA(t);
-      TORCH_CHECK(t.device() == qs_in[0].device(), "Veda ragged devices must match");
-    }
-    TORCH_CHECK(q.dim() == 4 && q.size(0) == 1 && q.size(1) > 0 && q.size(2) > 0 &&
-        q.size(2) % 128 == 0 && q.size(3) == 128 && k.sizes() == q.sizes() &&
-        v.sizes() == q.sizes() && outputs[i].sizes() == q.sizes(), "Veda ragged requires batch-one D128 QKVO");
-    CHECK_LASTDIM_CONTIGUOUS(q); CHECK_LASTDIM_CONTIGUOUS(k);
-    CHECK_LASTDIM_CONTIGUOUS(v); CHECK_LASTDIM_CONTIGUOUS(outputs[i]);
-    CHECK_DTYPE(q, at::ScalarType::Char); CHECK_DTYPE(k, at::ScalarType::Char);
-    TORCH_CHECK(v.scalar_type() == vs[0].scalar_type() && outputs[i].scalar_type() == v.scalar_type() &&
-        (v.scalar_type() == at::ScalarType::Half || v.scalar_type() == at::ScalarType::BFloat16),
-        "Veda ragged V/O must share FP16 or BF16 dtype");
-    const int h = q.size(1), s = q.size(2), tiles = s / 128;
-    for (auto t : {qscales[i], kscales[i], routes[i], sparse[i], counts[i]}) CHECK_CONTIGUOUS(t);
-    CHECK_DTYPE(qscales[i], at::ScalarType::Float); CHECK_DTYPE(kscales[i], at::ScalarType::Float);
-    CHECK_DTYPE(routes[i], at::ScalarType::Int); CHECK_DTYPE(counts[i], at::ScalarType::Int);
-    CHECK_DTYPE(sparse[i], at::ScalarType::Byte);
-    TORCH_CHECK(qscales[i].sizes() == at::IntArrayRef({1,h,s/16}) &&
-        kscales[i].sizes() == at::IntArrayRef({1,h,s/64}) &&
-        routes[i].sizes() == at::IntArrayRef({1,h,tiles,div_ceil(tiles*2,32)}) &&
-        counts[i].dim() == 1 && counts[i].numel() == tiles &&
-        sparse[i].dim() == 1 && sparse[i].numel() == tiles*2, "Invalid Veda ragged metadata");
-    heads += h;
-    if (s > qs_in[largest].size(2)) largest = i;
-  }
-  c10::cuda::CUDAGuard guard(qs_in[0].device());
-  auto host = at::empty({heads,14}, at::TensorOptions().dtype(at::kLong).device(at::kCPU).pinned_memory(true));
-  auto d = host.data_ptr<int64_t>();
-  for (size_t i = 0; i < n; ++i)
-    for (int h = 0; h < qs_in[i].size(1); ++h)
-    {
-      auto ptr = [h](at::Tensor t) { return reinterpret_cast<int64_t>(t.data_ptr()) + h*t.stride(1)*t.element_size(); };
-      *d++ = ptr(qs_in[i]); *d++ = ptr(ks_in[i]); *d++ = ptr(vs[i]); *d++ = ptr(outputs[i]);
-      *d++ = ptr(qscales[i]); *d++ = ptr(kscales[i]); *d++ = ptr(routes[i]);
-      *d++ = reinterpret_cast<int64_t>(sparse[i].data_ptr());
-      *d++ = reinterpret_cast<int64_t>(counts[i].data_ptr());
-      *d++ = qs_in[i].size(2);
-      *d++ = qs_in[i].stride(2); *d++ = ks_in[i].stride(2);
-      *d++ = vs[i].stride(2); *d++ = outputs[i].stride(2);
-    }
-  auto descriptors = host.to(qs_in[0].device(), true);
-  auto empty = at::empty({0}, qs_in[0].options().dtype(at::kLong));
-  const size_t i = largest;
-  if (vs[i].scalar_type() == at::ScalarType::Half)
-    launch_sla_attention<128,half,false,1,false,true>(qs_in[i],ks_in[i],vs[i],at::Tensor(),at::Tensor(),
-        outputs[i],qscales[i],kscales[i],routes[i],sparse[i],empty,scale,nullptr,0,descriptors);
-  else
-    launch_sla_attention<128,nv_bfloat16,false,1,false,true>(qs_in[i],ks_in[i],vs[i],at::Tensor(),at::Tensor(),
-        outputs[i],qscales[i],kscales[i],routes[i],sparse[i],empty,scale,nullptr,0,descriptors);
-}
 
 void quantize_v_int8_varlen_sm75(
     at::Tensor value,

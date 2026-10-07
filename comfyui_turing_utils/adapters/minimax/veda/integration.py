@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import math
 
 from ....attention.orchestration import install_attention_strategy
 from ....attention.patches import (
@@ -14,6 +15,16 @@ from ....kernel_api import kernel_extension_has_symbol
 from ..layout import is_minimax_h3_model
 from .engine import VedaConfig, attend
 from .predictor import load_bundle
+from ....log import get_logger
+
+LOG = get_logger("minimax.veda")
+
+
+def resolve_keep_ratio(value, trained):
+    value = trained if value == 0 else value
+    if not math.isfinite(value) or not 0 < value <= 1:
+        raise ValueError("Veda keep ratios must be 0 (trained default) or in (0, 1]")
+    return value
 
 
 def register_predictor_folder():
@@ -47,10 +58,13 @@ def make_override(config: VedaConfig, dense_override, schedule: SparseSchedule):
         # Predictor staging and data-dependent Top-K must not become persistent
         # allocations owned by the DiT allocation graph.
         with comfy.model_prefetch.pause_malloc_graph():
-            return attend(q, k, v, config=config, packed_layout=options["minimax_h3_layout"],
+            result = attend(q, k, v, config=config, packed_layout=options["minimax_h3_layout"],
                           layer=layer, head_start=int(options.get("turing_utils_attention_head_start", 0)),
-                          cache=options.get("turing_utils_veda_forward_cache"),
-                          heterogeneous=options.get("turing_utils_veda_heterogeneous", False))
+                          cache=options.get("turing_utils_veda_forward_cache"))
+            cache = options.get("turing_utils_veda_forward_cache")
+            if cache is not None:
+                cache["sparse_calls"] = cache.get("sparse_calls", 0) + 1
+            return result
 
     def override(original, q, k, v, heads, mask=None, attn_precision=None,
                  skip_reshape=False, skip_output_reshape=False, **kwargs):
@@ -94,33 +108,32 @@ def forward_scope(executor, x, timestep, context, transformer_options, **kwargs)
     try:
         return executor(x, timestep, context, options, **kwargs)
     finally:
+        config = transformer_options.get("turing_utils_veda")
+        if config is not None and config.debug:
+            LOG.info("Veda forward finished: sparse calls=%d (head-sharded calls counted separately)",
+                     cache.get("sparse_calls", 0))
         cache.clear()
 
 
 def configure(model, *, predictor_name: str, predictor_precision: str = "w8a8",
-              keep_ratio: float = 0.1, reference_keep_ratio: float = 1.0,
+              keep_ratio: float = 0.0, reference_keep_ratio: float = 0.0,
               plan_policy: str = "nearest", dense_prefix_steps: int = 0,
               dense_suffix_steps: int = 0, dense_prefix_layers: int = 0,
-              dense_suffix_layers: int = 0, debug: bool = False,
-              execution_mode: str = "auto", projection_chunk_tiles: int = 16):
+              dense_suffix_layers: int = 0, debug: bool = False):
     if not is_minimax_h3_model(model):
         raise ValueError("Configure H3 Veda Sparse Attention requires MiniMax H3")
     if plan_policy not in ("nearest", "strict"):
         raise ValueError("Veda plan_policy must be nearest or strict")
-    if execution_mode not in ("auto", "serial", "heterogeneous", "compact_qkv", "compact_qkv_heterogeneous"):
-        raise ValueError("Unsupported Veda execution_mode")
-    if "heterogeneous" in execution_mode and not kernel_extension_has_symbol(
-            "veda_sparse_ragged_attn", "_sage_qattn_sm75"):
-        raise RuntimeError("Rebuild the Turing Utils kernel for heterogeneous Veda")
-    if not 1 <= projection_chunk_tiles <= 128:
-        raise ValueError("Veda projection_chunk_tiles must be in [1, 128]")
-    if not 0 < keep_ratio <= 1 or not 0 < reference_keep_ratio <= 1:
-        raise ValueError("Veda keep ratios must be in (0, 1]")
-    if not kernel_extension_has_symbol("veda_sparse_online_attn", "_sage_qattn_sm75"):
+    required = ("veda_sparse_online_attn", "veda_gather_pool", "veda_scatter_tiles",
+                "veda_projection_int8", "veda_pack_routes", "veda_prepare_scores",
+                "veda_finish_selection")
+    if any(not kernel_extension_has_symbol(name, "_sage_qattn_sm75") for name in required):
         raise RuntimeError("Rebuild the Turing Utils CUDA kernel to enable H3 Veda")
     folders = register_predictor_folder()
     path = folders.get_full_path_or_raise("veda", predictor_name)
     bundle = load_bundle(path, predictor_precision)
+    keep_ratio = resolve_keep_ratio(keep_ratio, bundle.keep_ratio)
+    reference_keep_ratio = resolve_keep_ratio(reference_keep_ratio, bundle.keep_ratio)
     blocks = model.model.diffusion_model.blocks
     if len(blocks) != bundle.num_layers or any(
         block.attn.heads != bundle.num_heads or block.attn.head_dim != bundle.head_dim
@@ -128,6 +141,17 @@ def configure(model, *, predictor_name: str, predictor_precision: str = "w8a8",
     ):
         raise ValueError("Veda predictor layer/head dimensions do not match this H3 model")
     runtime = attention_base_runtime(model, use_w8a8=None)
+    import comfy.patcher_extension
+    previous = model.model_options.get("transformer_options", {}).get("turing_utils_attention_strategy")
+    if previous and previous != "veda":
+        LOG.warning("Veda replaces attention strategy %s; sparse strategies are not stacked", previous)
+    if "block_sparse_attention" in (getattr(model, "callbacks", {}) or {}).get(
+            comfy.patcher_extension.CallbacksMP.ON_PREPARE_STATE, {}):
+        raise ValueError("Remove ComfyUI Model Sparse Attention before configuring Veda: it replaces H3 attention blocks")
+    if keep_ratio == reference_keep_ratio == 1:
+        dense_prefix_layers = len(blocks)
+    LOG.info("Veda configured: predictor=%s precision=%s keep(target/reference)=%.4f/%.4f plan=%s; scheduling=auto",
+             predictor_name, predictor_precision, keep_ratio, reference_keep_ratio, plan_policy)
     schedule = SparseSchedule(dense_prefix_steps=dense_prefix_steps,
                               dense_suffix_steps=dense_suffix_steps,
                               dense_prefix_layers=dense_prefix_layers,
@@ -142,10 +166,8 @@ def configure(model, *, predictor_name: str, predictor_precision: str = "w8a8",
     installed.model.model_options["transformer_options"]["turing_utils_veda"] = config
     installed.model.model_options["transformer_options"]["turing_utils_veda_schedule"] = schedule
     options = installed.model.model_options["transformer_options"]
-    options["turing_utils_veda_projected_qkv"] = execution_mode.startswith("compact_qkv")
-    options["turing_utils_veda_heterogeneous"] = "heterogeneous" in execution_mode
-    options["turing_utils_veda_projection_chunk_tiles"] = projection_chunk_tiles
-    options["turing_utils_veda_auto_schedule"] = execution_mode == "auto"
+    options["turing_utils_veda_projected_qkv"] = False
+    options["turing_utils_veda_auto_schedule"] = True
     import comfy.patcher_extension
 
     wrapper_type = comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL

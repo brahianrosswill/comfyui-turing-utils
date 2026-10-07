@@ -209,12 +209,8 @@ def project_features(features: torch.Tensor, projection: Projection, precision: 
         quantized = quantized.reshape(*x.shape[:2], -1)
         scales = scales.reshape(*x.shape[:2], 1)
         native = load_kernel_extension("_sage_qattn_sm75")
-        if hasattr(native, "veda_projection_int8"):
-            return native.veda_projection_int8(quantized, projection.weight, scales,
-                                               projection.scale, x.contiguous())
-        outputs = [ops.turing_int8_linear(quantized[h], projection.weight[h], scales[h],
-                                     projection.scale[h]) for h in range(x.shape[0])]
-        return torch.stack(outputs) + x[..., :dim]
+        return native.veda_projection_int8(quantized, projection.weight, scales,
+                                           projection.scale, x.contiguous())
     output_dtype = FLOAT_DTYPES[precision]
     # Round both operands to BF16 *before* FP32 emulation on SM75. Round the
     # projection result and residual addition as BF16 operators would do.

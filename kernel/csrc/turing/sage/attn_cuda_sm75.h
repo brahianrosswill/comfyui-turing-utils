@@ -155,13 +155,6 @@ void veda_sparse_online_attn(
                     at::Tensor route_words, at::Tensor sparse_query_blocks,
                     at::Tensor tile_valid_counts, float softmax_scale);
 
-void veda_sparse_ragged_attn(
-                    std::vector<at::Tensor> q, std::vector<at::Tensor> k,
-                    std::vector<at::Tensor> v, std::vector<at::Tensor> output,
-                    std::vector<at::Tensor> qs, std::vector<at::Tensor> ks,
-                    std::vector<at::Tensor> routes, std::vector<at::Tensor> sparse,
-                    std::vector<at::Tensor> counts, float scale);
-
 void quantize_v_int8_varlen_sm75(at::Tensor value,
                     at::Tensor cu_seqlens_k,
                     at::Tensor value_offsets,

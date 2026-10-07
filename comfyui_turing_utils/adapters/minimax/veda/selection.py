@@ -65,7 +65,7 @@ def select_tiles(scores: torch.Tensor, layout: TileLayout, keep_ratio: float,
     blocks = [(0, layout.n_ref_tiles, layout.ref_tokens, reference_keep_ratio),
               (layout.n_ref_tiles, columns, layout.target_tokens, keep_ratio)]
     native = load_kernel_extension("_sage_qattn_sm75") if scores.is_cuda else None
-    fused = native is not None and hasattr(native, "veda_finish_selection")
+    fused = native is not None
     rows = None if fused else torch.arange(row_start, row_start + queries, device=scores.device)
     indices, keeps = [], []
     for start, stop, tokens, ratio in blocks:

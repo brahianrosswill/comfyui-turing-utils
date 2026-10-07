@@ -10,7 +10,6 @@ from ....kernel_api import load_kernel_extension, load_turing_sage
 from ....log import get_logger
 from ..memory_state import runtime_memory
 from . import h3_layout, tiling
-from .pooling import pool_video_tiles
 from .predictor import PredictorBundle, Projection, ProjectionTransfer, project_features, score_tiles
 from .selection import choose_score_rows, compact_reduces_groups, estimate_workspace_bytes, select_tiles
 
@@ -30,6 +29,8 @@ class VedaConfig:
 def workspace_per_head(config: VedaConfig, packed_layout, layer: int, element_size: int,
                        capability: tuple[int, int], cache=None, *, chunk_tiles=32) -> int:
     """CPU size planning before QKV projection chooses its head shard."""
+    if config.keep_ratio == config.reference_keep_ratio == 1:
+        return 0
     spec = layout_spec(packed_layout, cache)
     bundle = config.bundle
     plan = bundle.plans.select(spec.target.grid).plan
@@ -43,14 +44,11 @@ def workspace_per_head(config: VedaConfig, packed_layout, layer: int, element_si
     stage = bundle.staged_bytes_per_head
     if bundle.precision == "bf16" and capability < (8, 0):
         stage *= 3
-    native = load_kernel_extension("_sage_qattn_sm75")
-    fused = hasattr(native, "veda_gather_pool")
     return estimate_workspace_bytes(slots=(video_tiles + globals_count) * 128,
                                     video_tiles=video_tiles, heads=1, head_dim=bundle.head_dim,
                                     projection_bytes_per_head=stage, element_size=element_size,
-                                    score_rows=128, fused_prepare=fused,
-                                    head_major_prepare=hasattr(native, "veda_prepare_scores"),
-                                    chunk_tiles=chunk_tiles if fused else 0)
+                                    score_rows=128, fused_prepare=True,
+                                    head_major_prepare=True, chunk_tiles=chunk_tiles)
 
 
 def layout_spec(packed_layout, cache):
@@ -66,18 +64,8 @@ def layout_spec(packed_layout, cache):
 def pack_routes(indices: torch.Tensor, keep: torch.Tensor, layout: tiling.TileLayout):
     """Pack one query-row chunk, without retaining full quadratic Top-K lists."""
     native = load_kernel_extension("_sage_qattn_sm75")
-    if hasattr(native, "veda_pack_routes"):
-        return native.veda_pack_routes(indices.contiguous(), keep.contiguous(),
-                                       layout.valid_count, layout.n_video_tiles)
-    # The CUDA route uses 64-token physical blocks and 128-token query tiles.
-    half = torch.arange(2, device=indices.device)
-    blocks = (indices[..., None] * 2 + half).flatten(-2)
-    valid = (keep[..., None] & (layout.valid_count[indices][..., None] > half * 64)).flatten(-2)
-    blocks = blocks.masked_fill(~valid, -1).to(torch.int32)
-    exact = torch.zeros(layout.n_tiles * 2, dtype=torch.uint8, device=indices.device)
-    exact[layout.n_video_tiles * 2:] = 1
-    exact &= (layout.valid_count[:, None] > half * 64).flatten().to(torch.uint8)
-    return native.sla_build_route_words(blocks.unsqueeze(0).contiguous(), exact, layout.n_tiles * 2)
+    return native.veda_pack_routes(indices.contiguous(), keep.contiguous(),
+                                   layout.valid_count, layout.n_video_tiles)
 
 
 def run_sparse_tiles(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -116,7 +104,7 @@ def run_sparse_packed(packed, layout, routes, output_dtype):
 def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
            config: VedaConfig, packed_layout, layer: int, head_start: int = 0, cache=None,
            prepare_chunk_tiles: int = -1, score_chunk_rows: int = 0,
-           projector=None, heterogeneous: bool = False):
+           projector=None):
     """HND tensors, already RMS-normalized and RoPE-transformed."""
     bundle = config.bundle
     if score_chunk_rows < 0:
@@ -136,35 +124,29 @@ def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
     if config.plan_policy == "strict" and not choice.exact:
         raise ValueError(f"Veda has no exact tile plan: {choice.how}")
     plan = choice.plan
+    report_key = ("reported_plan", spec.target.grid)
+    if cache is None or report_key not in cache:
+        (LOG.info if choice.exact else LOG.warning)("Veda plan: %s", choice.how)
+        if spec.skipped:
+            LOG.warning("Veda keeps unmapped references dense: %s", "; ".join(spec.skipped))
+        if cache is not None:
+            cache[report_key] = True
     # A bounded GPU layout may survive this call within a single forward.
     # Only the CPU bundle survives between sampling runs.
     output = torch.empty((spec.seq_len + 1, q.shape[1], bundle.head_dim),
                          dtype=v.dtype, device=v.device)
     q, k, v = (x[0].transpose(0, 1) for x in (q, k, v))
     shape_heads = {}
-    for local_head in range(q.shape[1]):
-        shape_id = plan.head_shape[layer][head_start + local_head]
-        shape_heads.setdefault(shape_id, []).append(local_head)
+    heads_key = ("shape_heads", plan.name, layer, head_start, q.shape[1])
+    if cache is not None and heads_key in cache:
+        shape_heads = cache[heads_key]
+    else:
+        for local_head in range(q.shape[1]):
+            shape_id = plan.head_shape[layer][head_start + local_head]
+            shape_heads.setdefault(shape_id, []).append(local_head)
+        if cache is not None:
+            cache[heads_key] = shape_heads
     layer_transfer = None
-    pending = []
-    def flush_pending():
-        if not pending:
-            return
-        from .heterogeneous import batch_workspace_bytes, run_heterogeneous
-        items = [(p, l, r) for p, l, r, hi in pending]
-        available, _, _ = runtime_memory(q.device)
-        budget = max(0, available - 64 * 1024**2 - getattr(projector, "workspace_bytes", 0))
-        native = load_kernel_extension("_sage_qattn_sm75")
-        if len(items) > 1 and batch_workspace_bytes(items) <= budget:
-            results = run_heterogeneous(items, budget_bytes=budget)
-            for result, (_, tile_layout, _, hi) in zip(results, pending):
-                native.veda_scatter_tiles(output, result[0].transpose(0, 1).to(v.dtype),
-                                         tile_layout.scatter_index, hi, tile_layout.valid_count)
-        else:
-            for packed_item, tile_layout, route, hi in pending:
-                result = run_sparse_packed(packed_item, tile_layout, route, v.dtype)
-                native.veda_scatter_tiles(output, result, tile_layout.scatter_index, hi, tile_layout.valid_count)
-        pending.clear()
     for shape_id, local_heads in shape_heads.items():
         shape = plan.shapes[shape_id]
         # Keeping references dense means BOTH directions remain dense, not
@@ -204,13 +186,11 @@ def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
         if bundle.precision == "bf16" and torch.cuda.get_device_capability(q.device) < (8, 0):
             stage_bytes *= 3  # BF16 storage + FP32 emulation operands.
         native = load_kernel_extension("_sage_qattn_sm75")
-        fused_prepare = hasattr(native, "veda_gather_pool")
         sizes = dict(
             slots=layout.num_slots, video_tiles=layout.n_video_tiles, heads=1,
             head_dim=bundle.head_dim, projection_bytes_per_head=stage_bytes,
             element_size=q.element_size(), score_rows=score_rows,
-            fused_prepare=fused_prepare,
-            head_major_prepare=hasattr(native, "veda_prepare_scores"),
+            fused_prepare=True, head_major_prepare=True,
         )
         available, _, _ = runtime_memory(q.device)
         budget = max(0, available - 64 * 1024**2 - getattr(projector, "workspace_bytes", 0))
@@ -221,17 +201,13 @@ def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
             # Pay extra chunk launches only when they permit a larger head
             # group under the same non-evicting budget.
             fewer_groups = compact_reduces_groups(len(local_heads), budget, full_cost, compact_cost)
-            chunks = 32 if fused_prepare and fewer_groups else 0
+            chunks = 32 if fewer_groups else 0
         per_head = estimate_workspace_bytes(**sizes, chunk_tiles=chunks)
         if projector is not None:
             chunks = max(1, chunks or 32)
             # The regular whole-path estimate is retained conservatively:
             # projection input gathering/GEMM scratch belongs to the callback.
             per_head = max(per_head, estimate_workspace_bytes(**sizes, chunk_tiles=chunks))
-        if pending and budget < per_head * min(len(local_heads), 14):
-            flush_pending()
-            available, _, _ = runtime_memory(q.device)
-            budget = max(0, available - 64 * 1024**2 - getattr(projector, "workspace_bytes", 0))
         group_size = min(len(local_heads), 14, budget // max(per_head, 1))
         if group_size < 1:
             raise RuntimeError(f"Veda needs {per_head / 1024**2:.0f} MiB for one head; "
@@ -279,13 +255,10 @@ def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
                 finally:
                     if callable(getattr(projector, "release", None)):
                         projector.release()
-            elif hasattr(native, "veda_gather_pool"):
+            else:
                 tq, tk, tv, qfeatures, kfeatures = native.veda_gather_pool(
                     q, k, v, layout.gather_index, head_indices,
                     layout.valid_count, layout.n_video_tiles)
-            else:
-                tq, tk, tv = (tiling.gather_tiles(x, layout, head_indices) for x in (q, k, v))
-                qfeatures, kfeatures = pool_video_tiles(tq, layout), pool_video_tiles(tk, layout)
             pq, pk = transfer.consume(q.device)
             if layer_transfer is not None:
                 if group == list(range(group[0], group[-1] + 1)):
@@ -301,6 +274,10 @@ def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
             khat = project_features(kfeatures, pk, bundle.precision)
             del qfeatures, kfeatures
             del pk, transfer
+            # Scoring always uses FP32. Convert once per head group, not the
+            # entire K projection again for every query chunk. No change to
+            # projection rounding or Top-K selection semantics.
+            qhat, khat = qhat.float(), khat.float()
             routes = torch.zeros((1, len(group), layout.n_tiles, (layout.n_tiles * 2 + 31) // 32),
                                  dtype=torch.int32, device=q.device)
             for row in range(0, layout.n_video_tiles, score_rows):
@@ -315,25 +292,7 @@ def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
                 packed = load_turing_sage().prequantize_sageattn(*[
                     x.transpose(0, 1).unsqueeze(0).to(attention_dtype) for x in (tq, tk, tv)])
                 del tq, tk, tv
-            if heterogeneous:
-                pending.append((packed, layout, routes, head_indices))
-                del packed, routes
-                # Bound retained compact groups; no cross-call GPU cache.
-                if len(pending) >= 3:
-                    flush_pending()
-                elif start + group_size < len(local_heads):
-                    # The next shape already rechecks its budget above. Only
-                    # intra-shape shards need an additional live observation.
-                    free, _, _ = runtime_memory(q.device)
-                    next_workspace = per_head * group_size + getattr(projector, "workspace_bytes", 0)
-                    if free < next_workspace + 64 * 1024**2:
-                        flush_pending()
-                continue
             result = run_sparse_packed(packed, layout, routes, v.dtype)
-            if hasattr(native, "veda_scatter_tiles"):
-                native.veda_scatter_tiles(output, result, layout.scatter_index, head_indices, layout.valid_count)
-            else:
-                tiling.scatter_tiles_(output, result, layout, head_indices)
+            native.veda_scatter_tiles(output, result, layout.scatter_index, head_indices, layout.valid_count)
             del packed, result, routes
-    flush_pending()
     return output[:-1].transpose(0, 1).unsqueeze(0)

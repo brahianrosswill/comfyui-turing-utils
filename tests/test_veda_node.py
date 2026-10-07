@@ -25,11 +25,19 @@ def test_veda_node_has_predictor_not_lora():
     assert "projection_chunk_tiles" not in inputs
 
 
-def test_veda_legacy_execution_controls_cannot_override_automatic_policy():
-    with mock.patch("comfyui_turing_utils.nodes.veda.configure", return_value="model") as configure:
-        H3VedaAttentionStrategy().configure("input", predictor_name="test.safetensors",
-            execution_mode="compact_qkv_heterogeneous", projection_chunk_tiles=128)
-    configure.assert_called_once_with("input", predictor_name="test.safetensors")
+def test_veda_configuration_has_only_automatic_execution():
+    import inspect
+    from comfyui_turing_utils.adapters.minimax.veda.integration import configure
+    from comfyui_turing_utils.adapters.minimax.veda.engine import attend
+    assert 'execution_mode' not in inspect.signature(configure).parameters
+    assert 'projection_chunk_tiles' not in inspect.signature(configure).parameters
+    assert 'heterogeneous' not in inspect.signature(attend).parameters
+
+
+def test_veda_removed_execution_controls_are_rejected():
+    with pytest.raises(TypeError, match="execution_mode"):
+        H3VedaAttentionStrategy().configure(None, predictor_name="test.safetensors",
+                                           execution_mode="heterogeneous")
 
 
 def test_veda_strategy_replaces_sol_and_keeps_dense_backend():

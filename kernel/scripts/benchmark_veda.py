@@ -35,8 +35,6 @@ def main():
                         help="Interleave three tile shapes across heads (synthetic plan)")
     parser.add_argument("--score-chunk-rows", type=int, default=0,
                         help="0 budget-aware auto, positive forces route-score chunk rows")
-    parser.add_argument("--heterogeneous", action="store_true",
-                        help="Experimental padded compact heterogeneous attention batch")
     parser.add_argument("--projected-qkv", action="store_true",
                         help="Compare full vs tile-streamed real W8A8 GEMM + RMSNorm/RoPE")
     parser.add_argument("--projection-hidden", type=int, default=7168)
@@ -100,15 +98,13 @@ def main():
         options = {"turing_utils_veda": config, "minimax_h3_layout": layout,
                    "turing_utils_attention_layout": {"layer_index": 0, "layer_count": 1},
                    "turing_utils_veda_forward_cache": cache,
-                   "turing_utils_veda_projection_chunk_tiles": args.projection_chunk_tiles,
-                   "turing_utils_veda_heterogeneous": args.heterogeneous}
+                   "turing_utils_veda_projection_chunk_tiles": args.projection_chunk_tiles}
         quantized = a._cache_quantized_qkv_input(attention.qkv_proj,x,16384) if args.cache_qkv_input else None
         def full():
             q,k,v = a._project_qkv_head_group(attention,x,qw,ws,None,0,h,16384,quantized)
             q,k = a._apply_minimax_qk_transform(attention,q,k,freqs)
             return attend(*(t.transpose(0,1).unsqueeze(0) for t in (q,k,v)),
-                          config=config,packed_layout=layout,layer=0,cache=cache,
-                          heterogeneous=args.heterogeneous)
+                          config=config,packed_layout=layout,layer=0,cache=cache)
         measure("W8 QKV + full Veda", full)
         measure("W8 tile-projected compact Veda", lambda: a._veda_projected_head_group(
             attention,x,transform,qw,ws,None,0,h,quantized,options))
@@ -122,8 +118,7 @@ def main():
         config, cache = VedaConfig(bundle), {}
         measure(f"Veda {precision} keep=.1 warm layout", lambda: attend(
             q, k, v, config=config, packed_layout=layout, layer=0, cache=cache,
-            prepare_chunk_tiles=args.prepare_chunk_tiles, score_chunk_rows=args.score_chunk_rows,
-            heterogeneous=args.heterogeneous))
+            prepare_chunk_tiles=args.prepare_chunk_tiles, score_chunk_rows=args.score_chunk_rows))
         cache.clear()
 
 

@@ -16,19 +16,6 @@ def test_veda_automatic_projection_requires_pressure_and_budget():
     assert choose_projected_chunk(**common, available=reserve) == 0
 
 
-def test_veda_ragged_workspace_excludes_repacking():
-    from types import SimpleNamespace
-    import torch
-    from comfyui_turing_utils.adapters.minimax.veda.heterogeneous import batch_workspace_bytes
-
-    items = [(SimpleNamespace(value=torch.empty(1, h, tiles*128, 128, dtype=torch.float16)),
-              SimpleNamespace(n_tiles=tiles, num_slots=tiles*128), None)
-             for h, tiles in ((2, 3), (3, 11))]
-    expected = sum(p.value.numel()*2 + l.n_tiles*2 + p.value.shape[1]*14*8 for p,l,r in items)
-    assert batch_workspace_bytes(items, ragged=True) == expected
-    assert expected < batch_workspace_bytes(items, ragged=False)
-
-
 def test_veda_score_chunk_growth_preserves_head_group_budget():
     base = 10 * 1024**2
     extra = (241 - 128) * 241 * 64

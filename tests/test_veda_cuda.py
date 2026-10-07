@@ -68,7 +68,8 @@ def test_veda_cuda_fused_selection_matches_reference(monkeypatch, ratios):
     scores = torch.randn(3, layout.n_video_tiles, layout.n_video_tiles, device=device).round()
     actual = [selection.select_tiles(scores[:, a:b].contiguous(), layout, *ratios, row_start=a)
               for a, b in ((0, 7), (7, layout.n_video_tiles))]
-    monkeypatch.setattr(selection, "load_kernel_extension", lambda name: SimpleNamespace())
+    # Explicitly select the reference evaluator, not an obsolete kernel ABI.
+    monkeypatch.setattr(selection, "load_kernel_extension", lambda name: None)
     expected = [selection.select_tiles(scores[:, a:b].contiguous(), layout, *ratios, row_start=a)
                 for a, b in ((0, 7), (7, layout.n_video_tiles))]
     for pair_a, pair_b in zip(actual, expected):
@@ -229,8 +230,7 @@ def test_veda_cuda_real_projected_qkv_matches_full_rope(cached, scalar_scale, he
     layout = SimpleNamespace(seq_len=seq, signature=(3, 1, 14, 38, 7),
                              segments=[(0, 3, "text"), (3, 10, "audio"), (10, seq, "video")])
     options = {"turing_utils_veda": VedaConfig(bundle), "minimax_h3_layout": layout,
-               "turing_utils_attention_layout": {"layer_index": 0, "layer_count": 1},
-               "turing_utils_veda_heterogeneous": True}
+               "turing_utils_attention_layout": {"layer_index": 0, "layer_count": 1}}
     quantized = a._cache_quantized_qkv_input(attention.qkv_proj, x, 64) if cached else None
     q, k, v = a._project_qkv_head_group(attention, x, qw, ws, bias, head_start, heads, 64, quantized)
     q, k = a._apply_minimax_qk_transform(attention, q, k, freqs)
@@ -292,13 +292,10 @@ def test_veda_cuda_head_shards_use_global_predictor_indices(precision):
     q, k, v = [torch.randn(1, heads, 143, dim, device="cuda", dtype=torch.float16) for _ in range(3)]
     cache = {}
     whole = attend(q, k, v, config=config, packed_layout=layout, layer=0, cache=cache)
-    batched = attend(q, k, v, config=config, packed_layout=layout, layer=0,
-                     cache={}, heterogeneous=True)
-    torch.testing.assert_close(batched, whole, atol=0.002, rtol=0.002)
     def project(indices, head_list):
         return tuple(t[0].transpose(0, 1).index_select(0, indices)[:, head_list] for t in (q, k, v))
     streamed = attend(q, k, v, config=config, packed_layout=layout, layer=0,
-                      cache={}, projector=project, prepare_chunk_tiles=2, heterogeneous=True)
+                      cache={}, projector=project, prepare_chunk_tiles=2)
     torch.testing.assert_close(streamed, whole, atol=0.002, rtol=0.002)
     row_chunked = attend(q, k, v, config=config, packed_layout=layout, layer=0,
                         cache={}, score_chunk_rows=1)

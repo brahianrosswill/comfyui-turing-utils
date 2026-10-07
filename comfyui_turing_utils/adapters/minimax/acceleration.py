@@ -812,8 +812,7 @@ def _veda_projected_head_group(attention, x, transform, qweight, weight_scale,
         result = attend(meta, meta, meta, config=options["turing_utils_veda"],
                         packed_layout=options["minimax_h3_layout"], layer=layer,
                         head_start=head_start, cache=options.get("turing_utils_veda_forward_cache"),
-                        projector=project, prepare_chunk_tiles=chunk_tiles,
-                        heterogeneous=options.get("turing_utils_veda_heterogeneous", False))
+                        projector=project, prepare_chunk_tiles=chunk_tiles)
     return result.transpose(1, 2).flatten(2).squeeze(0)
 
 
