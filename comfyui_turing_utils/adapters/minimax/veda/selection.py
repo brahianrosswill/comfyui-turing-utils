@@ -111,7 +111,7 @@ def estimate_workspace_bytes(*, slots: int, video_tiles: int, heads: int,
                              head_dim: int, projection_bytes_per_head: int,
                              element_size: int, score_rows: int,
                              fused_prepare: bool = False, chunk_tiles: int = 0,
-                             head_major_prepare: bool = False) -> int:
+                             head_major_prepare: bool = False, use_w8a8: bool = False) -> int:
     """Conservative live workspace in addition to the caller's Q/K/V tensors.
 
     Includes staged projections, gathered Q/K/V/O, INT8 Q/K, pool temporaries,
@@ -130,6 +130,9 @@ def estimate_workspace_bytes(*, slots: int, video_tiles: int, heads: int,
         gathered = slots * head_dim * (2 * element_size + 2)
         gathered += chunk * head_dim * tile_bytes
     pool = 0 if fused_prepare else video_tiles * TILE_SIZE * head_dim * element_size * 3
+    if use_w8a8:
+        # V conversion overlaps its floating input; channel scales span all tiles.
+        gathered += slots * head_dim + head_dim * 4
     features = video_tiles * head_dim * 4 * 10
     scoring = min(score_rows, video_tiles) * video_tiles * 64
     route = math.ceil(slots / TILE_SIZE) * math.ceil(math.ceil(slots / 64) / 32) * 4

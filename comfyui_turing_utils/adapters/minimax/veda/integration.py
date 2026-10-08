@@ -150,8 +150,10 @@ def configure(model, *, predictor_name: str, predictor_precision: str = "w8a8",
         raise ValueError("Remove ComfyUI Model Sparse Attention before configuring Veda: it replaces H3 attention blocks")
     if keep_ratio == reference_keep_ratio == 1:
         dense_prefix_layers = len(blocks)
-    LOG.info("Veda configured: predictor=%s precision=%s keep(target/reference)=%.4f/%.4f plan=%s; scheduling=auto",
-             predictor_name, predictor_precision, keep_ratio, reference_keep_ratio, plan_policy)
+    implementation = ("veda:rotated_int8_qk_int8_pv" if predictor_precision == "w8a8"
+                      else "veda:int8_qk_float_pv")
+    LOG.info("Veda configured: predictor=%s precision=%s attention=%s keep(target/reference)=%.4f/%.4f plan=%s; scheduling=auto",
+             predictor_name, predictor_precision, implementation, keep_ratio, reference_keep_ratio, plan_policy)
     schedule = SparseSchedule(dense_prefix_steps=dense_prefix_steps,
                               dense_suffix_steps=dense_suffix_steps,
                               dense_prefix_layers=dense_prefix_layers,
@@ -159,7 +161,7 @@ def configure(model, *, predictor_name: str, predictor_precision: str = "w8a8",
     config = VedaConfig(bundle, keep_ratio, reference_keep_ratio, plan_policy, debug)
     override = make_override(config, runtime.dense_override, schedule)
     installed = install_attention_strategy(model, override, strategy="Veda", backend="veda",
-                                          implementation="veda:sm75_int8_qk_fp16_pv",
+                                          implementation=implementation,
                                           runtime_config=runtime)
     if not installed.layout.installed:
         raise RuntimeError(f"H3 Veda layout provider unavailable: {installed.layout.reason}")

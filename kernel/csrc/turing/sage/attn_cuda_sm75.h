@@ -153,7 +153,8 @@ void veda_sparse_online_attn(
                     at::Tensor value, at::Tensor output,
                     at::Tensor query_scale, at::Tensor key_scale,
                     at::Tensor route_words, at::Tensor sparse_query_blocks,
-                    at::Tensor tile_valid_counts, float softmax_scale);
+                    at::Tensor tile_valid_counts, float softmax_scale,
+                    at::Tensor value_int8, at::Tensor value_scale, int use_w8a8);
 
 void quantize_v_int8_varlen_sm75(at::Tensor value,
                     at::Tensor cu_seqlens_k,

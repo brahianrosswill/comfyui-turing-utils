@@ -2784,14 +2784,19 @@ at::Tensor sla_sparse_online_attn(
 void veda_sparse_online_attn(
     at::Tensor q, at::Tensor k, at::Tensor v, at::Tensor out,
     at::Tensor qs, at::Tensor ks, at::Tensor routes,
-    at::Tensor sparse_queries, at::Tensor valid_counts, float scale)
+    at::Tensor sparse_queries, at::Tensor valid_counts, float scale,
+    at::Tensor vi, at::Tensor vs, int use_w8a8)
 {
   TORCH_CHECK(q.device() == k.device() && q.device() == v.device() &&
       q.device() == out.device() && q.device() == qs.device() &&
       q.device() == ks.device() && q.device() == routes.device() &&
       q.device() == sparse_queries.device(), "Veda tensors must share a CUDA device");
-  routed_sparse_online_attn(q, k, v, at::Tensor(), at::Tensor(), out,
-      qs, ks, routes, sparse_queries, scale, 0, 0, 64, valid_counts);
+  if (use_w8a8) {
+    TORCH_CHECK(vi.device() == q.device() && vs.device() == q.device(),
+                "Veda quantized V must share the Q/K device");
+  }
+  routed_sparse_online_attn(q, k, v, vi, vs, out,
+      qs, ks, routes, sparse_queries, scale, 0, use_w8a8, 64, valid_counts);
 }
 
 

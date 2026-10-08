@@ -42,6 +42,17 @@ def test_advanced_inputs_use_trained_defaults():
     assert inputs['reference_keep_ratio'][1]['default'] == 0
 
 
+def test_w8a8_workspace_includes_full_sequence_value_quantization_overlap():
+    from comfyui_turing_utils.adapters.minimax.veda.selection import estimate_workspace_bytes
+    sizes = dict(slots=1024, video_tiles=7, heads=3, head_dim=128,
+                 projection_bytes_per_head=1000, element_size=2, score_rows=128,
+                 fused_prepare=True, head_major_prepare=True)
+    for chunk in (0, 2):
+        baseline = estimate_workspace_bytes(**sizes, chunk_tiles=chunk)
+        rotated = estimate_workspace_bytes(**sizes, chunk_tiles=chunk, use_w8a8=True)
+        assert rotated - baseline == 3 * (1024 * 128 + 128 * 4)
+
+
 def test_transposed_plan_is_not_claimed_as_native_training():
     plan = TilePlan('landscape', (2, 8, 16), [TileShape(1, 8, 16)], [[0]])
     table = PlanTable([plan])

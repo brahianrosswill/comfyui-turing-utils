@@ -110,14 +110,16 @@ def test_veda_cuda_fused_routes_match_reference():
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-def test_veda_cuda_compact_preparation_matches_whole(dtype):
+@pytest.mark.parametrize("use_w8a8", [False, True])
+def test_veda_cuda_compact_preparation_matches_whole(dtype, use_w8a8):
+    from comfyui_turing_utils.adapters.minimax.veda.quantization import prequantize, finish_value
     from comfyui_turing_utils.adapters.minimax.veda.prepare import prepare_compact
     from comfyui_turing_utils.adapters.minimax.veda.pooling import pool_video_tiles
     device = torch.device("cuda", 0)
     layout = build_tile_layout([TiledSpan(3, (3, 7, 19), TileShape(1, 8, 16))], 413, device)
     heads = torch.tensor([1, 0], device=device)
     source = [torch.randn(413, 2, 128, device=device, dtype=dtype) for _ in range(3)]
-    packed, fq, fk = prepare_compact(*source, layout, heads, chunk_tiles=2)
+    packed, fq, fk = prepare_compact(*source, layout, heads, chunk_tiles=2, use_w8a8=use_w8a8)
     host_layout = build_tile_layout([TiledSpan(3, (3, 7, 19), TileShape(1, 8, 16))], 413)
     visited = []
     def projector(indices, head_list):
@@ -125,17 +127,21 @@ def test_veda_cuda_compact_preparation_matches_whole(dtype):
         return tuple(t.index_select(0, indices)[:, head_list] for t in source)
     projected, pfq, pfk = prepare_compact(
         *source, layout, heads, chunk_tiles=2, projector=projector,
-        host_layout=host_layout, head_list=[1, 0])
+        host_layout=host_layout, head_list=[1, 0], use_w8a8=use_w8a8)
     assert sorted(visited) == list(range(413))  # No padded or repeated GEMM rows.
-    for field in ("query_int8", "key_int8", "query_scale", "key_scale", "value"):
+    fields = ("query_int8", "key_int8", "query_scale", "key_scale", "value")
+    if use_w8a8:
+        fields += ("value_int8", "value_scale")
+        assert packed.value.numel() == 0
+    for field in fields:
         torch.testing.assert_close(getattr(projected, field), getattr(packed, field), atol=0, rtol=0)
     torch.testing.assert_close(pfq, fq, atol=0, rtol=0)
     torch.testing.assert_close(pfk, fk, atol=0, rtol=0)
     gathered = [gather_tiles(x, layout, heads) for x in source]
     attention_dtype = torch.bfloat16 if dtype == torch.float32 else dtype
-    expected = load_turing_sage().prequantize_sageattn(*[
-        x.transpose(0, 1).unsqueeze(0).to(attention_dtype) for x in gathered])
-    for field in ("query_int8", "key_int8", "query_scale", "key_scale", "value"):
+    expected = finish_value(prequantize(*[
+        x.transpose(0, 1).unsqueeze(0).to(attention_dtype) for x in gathered], use_w8a8=use_w8a8))
+    for field in fields:
         torch.testing.assert_close(getattr(packed, field), getattr(expected, field), atol=0, rtol=0)
     for actual, tiled in zip((fq, fk), gathered[:2]):
         torch.testing.assert_close(actual, pool_video_tiles(tiled, layout), atol=2e-6, rtol=2e-5)
@@ -143,7 +149,10 @@ def test_veda_cuda_compact_preparation_matches_whole(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("amplitude", [1., 0.001, 0.])
-def test_veda_cuda_partial_tiles_match_quantized_sdpa(dtype, amplitude):
+@pytest.mark.parametrize("use_w8a8", [False, True])
+def test_veda_cuda_partial_tiles_match_quantized_sdpa(dtype, amplitude, use_w8a8):
+    from comfyui_turing_utils.adapters.minimax.veda.quantization import prequantize, finish_value
+    from comfyui_turing_utils.adapters.minimax.veda.engine import run_sparse_packed
     torch.manual_seed(71)
     device = torch.device("cuda", 0)
     layout = build_tile_layout([TiledSpan(3, (1, 7, 19), TileShape(1, 8, 16))], 143, device)
@@ -157,10 +166,10 @@ def test_veda_cuda_partial_tiles_match_quantized_sdpa(dtype, amplitude):
     routes = torch.zeros((1, 2, layout.n_tiles, (layout.n_tiles * 2 + 31) // 32),
                          device=device, dtype=torch.int32)
     routes[:, :, :layout.n_video_tiles] = pack_routes(index, keep, layout)
-    actual = run_sparse_tiles(q, k, v, layout, routes)
-    packed = load_turing_sage().prequantize_sageattn(*[
+    packed = finish_value(prequantize(*[
         x.transpose(0, 1).unsqueeze(0) for x in (q, k, v)
-    ])
+    ], use_w8a8=use_w8a8))
+    actual = run_sparse_packed(packed, layout, routes, dtype)
     qref = packed.query_int8.float() * packed.query_scale.repeat_interleave(16, -1)[..., None]
     kref = packed.key_int8.float() * packed.key_scale.repeat_interleave(64, -1)[..., None]
     pos = torch.arange(layout.num_slots, device=device)
@@ -168,7 +177,14 @@ def test_veda_cuda_partial_tiles_match_quantized_sdpa(dtype, amplitude):
     mask = ((word >> ((pos // 64) % 32)) & 1).bool()
     mask[:, :, layout.n_video_tiles * 128:] = True
     mask &= layout.slot_valid[None, None, None, :].bool()
-    expected = F.scaled_dot_product_attention(qref, kref, packed.value.float(), attn_mask=mask)
+    if use_w8a8:
+        # Native PV consumes a 16-token lane permutation, not plain HND V.
+        lane = pos % 16
+        physical = (pos & ~15) | (lane & 1) | ((lane >> 3 & 1) << 1) | ((lane >> 1 & 1) << 2) | ((lane >> 2 & 1) << 3)
+        vref = packed.value_int8[..., physical].transpose(-1, -2).float() * packed.value_scale[..., None, :]
+    else:
+        vref = packed.value.float()
+    expected = F.scaled_dot_product_attention(qref, kref, vref, attn_mask=mask)
     expected = expected[0].transpose(0, 1)
     real = layout.slot_valid.bool()
     assert actual.dtype == dtype

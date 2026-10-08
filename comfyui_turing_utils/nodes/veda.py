@@ -13,7 +13,10 @@ class H3VedaAttentionStrategy:
         "H3 only. Loads a Veda predictor bundle from models/veda, not a LoRA. "
         "Only the current predictor head group is staged on GPU. BF16 uses "
         "FP32 arithmetic with BF16 activations/output on Turing; FP32 is a "
-        "separate diagnostic mode. Nearest plans may be outside training geometry."
+        "separate diagnostic mode. W8A8 predictor selects rotated INT8 QK/PV attention; "
+        "floating predictors select unrotated INT8 QK / floating PV attention. "
+        "Attention rotation is independent of predictor ConvRot. "
+        "Nearest plans may be outside training geometry."
     )
 
     @classmethod

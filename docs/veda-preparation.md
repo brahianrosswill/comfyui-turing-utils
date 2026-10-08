@@ -22,8 +22,10 @@ forward sparse-call counts (including head shards).
 
 - Fused gather/valid-only TripPool, INT8 batched predictor GEMM and route
   preprocessing/postprocessing. PyTorch Top-K preserves selection semantics.
-- Physical HND V storage, INT8 QK / floating PV attention, padded-CTA skipping
-  and fused scatter.
+- W8A8 predictor selects shared randomized Hadamard Q/K + INT8 QK/PV;
+  floating predictor selects unrotated INT8 QK / floating PV (Sage-style).
+  Both use padded-CTA skipping and fused scatter. This is a linked policy,
+  not a global dtype: BF16 predictor does not select floating QK attention.
 - Head groups and score chunks adapt to the non-evicting memory budget.
   Projected Q/K features convert to FP32 once per group, not per score chunk.
 - Whole projection is preferred when it fits. Tile-streamed W8A8 QKV is only
@@ -35,8 +37,13 @@ forward sparse-call counts (including head shards).
 - Forward-local layout cache is bounded to 4 MiB. Predictor staging, projection
   scratch, input gathers and weight row packs participate in the budget.
 - BF16 predictor mode rounds operands/results to BF16, using FP32 arithmetic
-  on Turing. FP16 and FP32 remain supported. Predictor precision does not
-  change the attention kernel's quantization contract.
+  on Turing. FP16 and FP32 remain supported.
+- Attention rotation is separate from predictor ConvRot. TripPool always sees
+  original post-RoPE Q/K; max/min pooling does not commute with rotation.
+  Attention deliberately omits K-anchor centering (unlike dense W8A8's default)
+  to avoid chunk-local offsets corrupting cross-chunk softmax. V is quantized
+  once per head group with whole-sequence channel scales, then floating V is
+  released. The temporary float/INT8 overlap is included in memory planning.
 
 ## Validation
 
@@ -59,3 +66,23 @@ scratch but was slower when the whole path fit. This is why it is selected
 only under memory pressure. Random predictor tests are not real-checkpoint
 quality validation or quality-matched comparisons with SOL. Actual 2080 Ti,
 Windows and end-to-end video quality/performance validation remain outstanding.
+
+### Linked attention backend validation
+
+SM75/SM86 compilation and A40 runtime checks passed; 84 Veda tests passed,
+including both backend families, partial tiles and exact whole/chunk packing.
+The fixed-route synthetic benchmark (`kernel/scripts/benchmark_veda_attention.py`)
+uses 14 heads, D=128, BF16 input, with no predictor or route-selection timing.
+Representative synchronized preparation + attention timings (milliseconds):
+
+| Tokens | Keep | Unrotated INT8 QK / floating PV | Rotated INT8 QK/PV |
+| --- | --- | --- | --- |
+| 4,096 | 10% | 0.308 | 0.350 |
+| 4,096 | 30% | 0.550 | 0.534 |
+| 19,968 | 10% | 4.099 | 3.332 |
+| 19,968 | 30% | 10.296 | 7.583 |
+
+Rotation and V quantization have real preparation costs: shorter, highly sparse
+sequences can regress even though the attention kernel itself is faster.
+These measurements establish neither end-to-end H3 speedup nor real-video
+quality superiority; the configured precision policy is not an autotuner.

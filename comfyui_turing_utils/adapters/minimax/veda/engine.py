@@ -6,12 +6,13 @@ from dataclasses import dataclass, fields
 
 import torch
 
-from ....kernel_api import load_kernel_extension, load_turing_sage
+from ....kernel_api import load_kernel_extension
 from ....log import get_logger
 from ..memory_state import runtime_memory
 from . import h3_layout, tiling
 from .predictor import PredictorBundle, Projection, ProjectionTransfer, project_features, score_tiles
 from .selection import choose_score_rows, compact_reduces_groups, estimate_workspace_bytes, select_tiles
+from .quantization import prequantize, finish_value
 
 
 LOG = get_logger("minimax.veda")
@@ -48,7 +49,8 @@ def workspace_per_head(config: VedaConfig, packed_layout, layer: int, element_si
                                     video_tiles=video_tiles, heads=1, head_dim=bundle.head_dim,
                                     projection_bytes_per_head=stage, element_size=element_size,
                                     score_rows=128, fused_prepare=True,
-                                    head_major_prepare=True, chunk_tiles=chunk_tiles)
+                                    head_major_prepare=True, chunk_tiles=chunk_tiles,
+                                    use_w8a8=bundle.precision == "w8a8")
 
 
 def layout_spec(packed_layout, cache):
@@ -69,20 +71,18 @@ def pack_routes(indices: torch.Tensor, keep: torch.Tensor, layout: tiling.TileLa
 
 
 def run_sparse_tiles(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-                     layout: tiling.TileLayout, routes: torch.Tensor) -> torch.Tensor:
+                     layout: tiling.TileLayout, routes: torch.Tensor, *, use_w8a8=False) -> torch.Tensor:
     """NHD tiled Q/K/V -> NHD; one softmax over selected video + global K/V."""
     native = load_kernel_extension("_sage_qattn_sm75")
     if not hasattr(native, "veda_sparse_online_attn"):
         raise RuntimeError("Veda requires rebuilding the Turing Utils CUDA kernel")
-    # Predictor precision is independent of attention precision. The latter
-    # retains the existing INT8 QK / floating PV contract on both SM75 and SM86.
     attention_dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
-    sage = load_turing_sage()
-    packed = sage.prequantize_sageattn(
+    packed = finish_value(prequantize(
         q.transpose(0, 1).unsqueeze(0).to(attention_dtype),
         k.transpose(0, 1).unsqueeze(0).to(attention_dtype),
         v.transpose(0, 1).unsqueeze(0).to(attention_dtype),
-    )
+        use_w8a8=use_w8a8,
+    ))
     return run_sparse_packed(packed, layout, routes, v.dtype)
 
 
@@ -91,12 +91,16 @@ def run_sparse_packed(packed, layout, routes, output_dtype):
     device = packed.query_int8.device
     sparse_queries = torch.zeros(layout.n_tiles * 2, dtype=torch.uint8, device=device)
     sparse_queries[:layout.n_video_tiles * 2] = 1
-    output = torch.empty_like(packed.value)
+    output = torch.empty(packed.query_int8.shape, device=device, dtype=packed.value.dtype)
+    vi = getattr(packed, "value_int8", None)
+    vs = getattr(packed, "value_scale", None)
+    empty = torch.empty(0, device=device)
     with torch.cuda.device(device):
         native.veda_sparse_online_attn(
             packed.query_int8, packed.key_int8, packed.value, output,
             packed.query_scale, packed.key_scale, routes, sparse_queries,
             layout.valid_count, packed.sm_scale,
+            vi if vi is not None else empty, vs if vs is not None else empty, int(vi is not None),
         )
     return output[0].transpose(0, 1).to(output_dtype)
 
@@ -190,7 +194,7 @@ def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
             slots=layout.num_slots, video_tiles=layout.n_video_tiles, heads=1,
             head_dim=bundle.head_dim, projection_bytes_per_head=stage_bytes,
             element_size=q.element_size(), score_rows=score_rows,
-            fused_prepare=True, head_major_prepare=True,
+            fused_prepare=True, head_major_prepare=True, use_w8a8=bundle.precision == "w8a8",
         )
         available, _, _ = runtime_memory(q.device)
         budget = max(0, available - 64 * 1024**2 - getattr(projector, "workspace_bytes", 0))
@@ -251,7 +255,8 @@ def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
                 try:
                     packed, qfeatures, kfeatures = prepare_compact(
                         q, k, v, layout, head_indices, chunk_tiles=chunks,
-                        projector=projector, host_layout=host_layout, head_list=group)
+                        projector=projector, host_layout=host_layout, head_list=group,
+                        use_w8a8=bundle.precision == "w8a8")
                 finally:
                     if callable(getattr(projector, "release", None)):
                         projector.release()
@@ -289,8 +294,9 @@ def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
             del qhat, khat
             if packed is None:
                 attention_dtype = torch.bfloat16 if tq.dtype == torch.float32 else tq.dtype
-                packed = load_turing_sage().prequantize_sageattn(*[
-                    x.transpose(0, 1).unsqueeze(0).to(attention_dtype) for x in (tq, tk, tv)])
+                packed = finish_value(prequantize(*[
+                    x.transpose(0, 1).unsqueeze(0).to(attention_dtype) for x in (tq, tk, tv)],
+                    use_w8a8=bundle.precision == "w8a8"))
                 del tq, tk, tv
             result = run_sparse_packed(packed, layout, routes, v.dtype)
             native.veda_scatter_tiles(output, result, layout.scatter_index, head_indices, layout.valid_count)

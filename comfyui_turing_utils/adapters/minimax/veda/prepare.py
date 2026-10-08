@@ -1,21 +1,22 @@
-"""Bounded tile preparation: retain INT8 Q/K, floating V and predictor features.
+"""Bounded tile preparation: retain INT8 Q/K, V and predictor features.
 
 Tile chunks are multiples of 128, preserving Sage's 16/64-token quantization
 groups exactly. Predictor pooling happens BEFORE quantization. This is not the
-SOL compact path (which has a different rotation/stabilization contract).
+SOL compact path. Rotated packing intentionally omits K-anchor stabilization.
 """
 from dataclasses import replace
 
 import torch
 
-from ....kernel_api import load_kernel_extension, load_turing_sage
+from ....kernel_api import load_kernel_extension
+from .quantization import prequantize, finish_value
 
 
 def prepare_compact(q, k, v, layout, heads, *, chunk_tiles=64,
-                    projector=None, host_layout=None, head_list=None):
+                    projector=None, host_layout=None, head_list=None, use_w8a8=False):
     if chunk_tiles < 1:
         raise ValueError("Veda tile chunk must be positive")
-    native, sage = load_kernel_extension("_sage_qattn_sm75"), load_turing_sage()
+    native = load_kernel_extension("_sage_qattn_sm75")
     group, slots, dim = heads.numel(), layout.num_slots, q.shape[-1]
     dtype = torch.bfloat16 if q.dtype == torch.float32 else q.dtype
     qfeatures = torch.empty((group, layout.n_video_tiles, dim*3), device=q.device, dtype=torch.float32)
@@ -65,8 +66,9 @@ def prepare_compact(q, k, v, layout, heads, *, chunk_tiles=64,
         if nvideo:
             qfeatures[:, tile:tile+nvideo].copy_(fq)
             kfeatures[:, tile:tile+nvideo].copy_(fk)
-        part = sage.prequantize_sageattn(*[
-            x.transpose(0, 1).unsqueeze(0).to(dtype) for x in (tq, tk, tv)])
+        part = prequantize(*[
+            x.transpose(0, 1).unsqueeze(0).to(dtype) for x in (tq, tk, tv)],
+            use_w8a8=use_w8a8)
         if packed is None:
             packed = replace(part,
                 query_int8=torch.empty((1, group, slots, dim), device=q.device, dtype=torch.int8),
@@ -80,4 +82,4 @@ def prepare_compact(q, k, v, layout, heads, *, chunk_tiles=64,
         packed.key_scale[:, :, start_row//64:end_row//64].copy_(part.key_scale)
         packed.value[:, :, start_row:end_row].copy_(part.value)
         del tq, tk, tv, fq, fk, part
-    return packed, qfeatures, kfeatures
+    return finish_value(packed), qfeatures, kfeatures
