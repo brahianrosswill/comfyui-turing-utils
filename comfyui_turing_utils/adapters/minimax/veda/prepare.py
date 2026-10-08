@@ -26,6 +26,7 @@ def prepare_compact(q, k, v, layout, heads, *, chunk_tiles=64,
         raise ValueError("Projected Veda preparation requires host layout and head indices")
     projection_plan = None
     if projector is not None:
+        local_heads = torch.arange(group, device=q.device, dtype=torch.long)
         plans = getattr(host_layout, "_projection_chunks", None)
         if plans is None:
             plans = host_layout._projection_chunks = {}
@@ -59,10 +60,9 @@ def prepare_compact(q, k, v, layout, heads, *, chunk_tiles=64,
             if any(tuple(t.shape) != expected or t.device != q.device or t.dtype != q.dtype
                    for t in projected) or len(projected) != 3:
                 raise ValueError("Veda projector must return matching post-RoPE NHD Q/K/V")
-            local_heads = torch.arange(group, device=q.device, dtype=torch.long)
             tq, tk, tv, fq, fk = native.veda_gather_pool(
                 *projected, local_gather, local_heads, layout.valid_count[tile:end], nvideo)
-            del projected, source_indices, local_gather, local_heads
+            del projected, source_indices, local_gather
         if nvideo:
             qfeatures[:, tile:tile+nvideo].copy_(fq)
             kfeatures[:, tile:tile+nvideo].copy_(fk)

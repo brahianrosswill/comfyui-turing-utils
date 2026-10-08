@@ -74,7 +74,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
   m.def("sla_sparse_online_attn", &sla_sparse_online_attn, "SLA fixed-Top-K sparse attention with FP16 or W8A8 PV for sm75+");
   m.def("veda_sparse_online_attn", &veda_sparse_online_attn, "Veda external routing with partial-tile masks and FP16 PV for sm75+");
   m.def("veda_gather_pool", &veda_gather_pool, "Fused Veda QKV gather and FP32 TripPool");
-  m.def("veda_projection_int8", &veda_projection_int8, "Batched INT8 predictor with BF16 residual");
   m.def("veda_pack_routes", &veda_pack_routes, "Fused Veda route packing and global union");
   m.def("veda_scatter_tiles", &veda_scatter_tiles, "Restore Veda tile output without writing padding slots");
   m.def("veda_prepare_scores", &veda_prepare_scores, "Fused Veda score masking and forced diagonal");

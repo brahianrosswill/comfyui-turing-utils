@@ -34,8 +34,6 @@
 #include <mutex>
 #include <type_traits>
 
-#include "veda_prepare.cuh"
-
 namespace {
 
 constexpr int kBlockTokens = 64;

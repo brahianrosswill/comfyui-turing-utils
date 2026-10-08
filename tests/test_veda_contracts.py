@@ -10,7 +10,7 @@ from comfyui_turing_utils.adapters.minimax.veda.integration import resolve_keep_
 from comfyui_turing_utils.adapters.minimax.veda.engine import VedaConfig, workspace_per_head
 from comfyui_turing_utils.adapters.minimax.veda.plans import PlanTable, TilePlan
 from comfyui_turing_utils.adapters.minimax.veda.tiling import TileShape
-from comfyui_turing_utils.adapters.minimax.veda.reference import official_logits, route_agreement
+from .veda_reference import official_logits, route_agreement
 from comfyui_turing_utils.adapters.minimax.veda.predictor import convert_projection, project_features, score_tiles
 from comfyui_turing_utils.nodes.attention import AttentionStrategy, veda_inputs, _ATTENTION_STRATEGIES
 

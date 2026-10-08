@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import torch
 
-from . import tiling
+from comfyui_turing_utils.adapters.minimax.veda import tiling
 
 
 def pool_video_tiles(x: torch.Tensor,

@@ -63,11 +63,16 @@ def layout_spec(packed_layout, cache):
     return cache["spec"]
 
 
-def pack_routes(indices: torch.Tensor, keep: torch.Tensor, layout: tiling.TileLayout):
+def pack_routes(indices: torch.Tensor, keep: torch.Tensor, layout: tiling.TileLayout,
+                *, out: torch.Tensor | None = None, row_start: int = 0):
     """Pack one query-row chunk, without retaining full quadratic Top-K lists."""
     native = load_kernel_extension("_sage_qattn_sm75")
-    return native.veda_pack_routes(indices.contiguous(), keep.contiguous(),
-                                   layout.valid_count, layout.n_video_tiles)
+    if out is None:
+        out = torch.empty((1, indices.shape[0], indices.shape[1], (layout.n_tiles * 2 + 31) // 32),
+                          device=indices.device, dtype=torch.int32)
+    native.veda_pack_routes(indices.contiguous(), keep.contiguous(),
+                            layout.valid_count, layout.n_video_tiles, out, row_start)
+    return out
 
 
 def run_sparse_tiles(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -289,7 +294,7 @@ def attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *,
                 scores = score_tiles(qhat[:, row:row + score_rows], khat)
                 index, keep = select_tiles(scores, layout, config.keep_ratio,
                                            config.reference_keep_ratio, row_start=row)
-                routes[:, :, row:row + index.shape[1]] = pack_routes(index, keep, layout)
+                pack_routes(index, keep, layout, out=routes, row_start=row)
                 del scores, index, keep
             del qhat, khat
             if packed is None:

@@ -460,6 +460,36 @@ at::Tensor int8_linear_impl(at::Tensor activation,
     return output;
 }
 
+at::Tensor turing_int8_batched_residual(at::Tensor x, at::Tensor w,
+                                      at::Tensor xs, at::Tensor ws, at::Tensor residual) {
+    TORCH_CHECK(x.is_cuda() && x.dim() == 3 && w.dim() == 3 && residual.dim() == 3,
+                "batched INT8 residual GEMM expects CUDA [H,M,K], [H,N,K], [H,M,R]");
+    TORCH_CHECK(x.scalar_type() == at::kChar && w.scalar_type() == at::kChar &&
+                residual.scalar_type() == at::kBFloat16 && xs.scalar_type() == at::kFloat &&
+                ws.scalar_type() == at::kFloat, "batched INT8 residual GEMM dtype mismatch");
+    for (const auto &t : {w, xs, ws, residual})
+        TORCH_CHECK(t.device() == x.device(), "batched INT8 residual GEMM device mismatch");
+    const int64_t h=x.size(0), m=x.size(1), k=x.size(2), n=w.size(1);
+    TORCH_CHECK(h>0 && h<=65535 && m>0 && n>0 && k>0 && k%16==0 && n%8==0 &&
+                w.size(0)==h && w.size(2)==k && xs.numel()==h*m && ws.numel()==h*n &&
+                residual.size(0)==h && residual.size(1)==m && residual.size(2)>=n &&
+                residual.size(2)%8==0, "batched INT8 residual GEMM shape/alignment mismatch");
+    const c10::cuda::CUDAGuard guard(x.device());
+    TORCH_CHECK(getCurrentDeviceProperties()->major >= 8 ||
+                (getCurrentDeviceProperties()->major == 7 && getCurrentDeviceProperties()->minor >= 5),
+                "batched INT8 residual GEMM requires SM75 or newer");
+    x=x.contiguous(); w=w.contiguous(); residual=residual.contiguous();
+    if (reinterpret_cast<uintptr_t>(x.data_ptr())%16) x=x.clone();
+    if (reinterpret_cast<uintptr_t>(w.data_ptr())%16) w=w.clone();
+    if (reinterpret_cast<uintptr_t>(residual.data_ptr())%16) residual=residual.clone();
+    xs=xs.contiguous(); ws=ws.contiguous();
+    auto out=at::empty({h,m,n}, residual.options());
+    TorchOpContext ctx;
+    comfyui_turing_utils::kernels::turing_int8_batched_residual(
+        from_torch(x), from_torch(w), from_torch(xs), from_torch(ws), from_torch(residual), from_torch(out));
+    return out;
+}
+
 at::Tensor turing_int8_linear(at::Tensor activation, at::Tensor weight,
                               at::Tensor activation_scale, at::Tensor weight_scale,
                               std::optional<at::Tensor> bias) {
@@ -1249,6 +1279,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         turing_nvfp4_convrot_quantize(w, b, s, first, out.size(0), k, out, scales);
     });
     m.attr("nvfp4_runtime_schema") = 6;
+    m.def("turing_int8_batched_residual", &turing_int8_batched_residual,
+          pybind11::arg("activation"), pybind11::arg("weight"),
+          pybind11::arg("activation_scale"), pybind11::arg("weight_scale"), pybind11::arg("residual"));
     m.def("turing_int8_linear",
           &turing_int8_linear,
           pybind11::arg("activation"),

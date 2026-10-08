@@ -126,6 +126,21 @@ def _turing_nvfp4_convrot_quantize_out_fake(weight, blocks, tensor_scale, output
     return None
 
 
+@torch.library.custom_op("turing_utils::int8_batched_residual", mutates_args=())
+def turing_int8_batched_residual(
+    activation: torch.Tensor, weight: torch.Tensor,
+    activation_scale: torch.Tensor, weight_scale: torch.Tensor,
+    residual: torch.Tensor,
+) -> torch.Tensor:
+    """Per-head W8A8 GEMM with FP32 scales/residual and one BF16 writeback."""
+    return _C.turing_int8_batched_residual(activation, weight, activation_scale, weight_scale, residual)
+
+
+@turing_int8_batched_residual.register_fake
+def _turing_int8_batched_residual_fake(activation, weight, activation_scale, weight_scale, residual):
+    return torch.empty((*activation.shape[:2], weight.shape[1]), device=activation.device, dtype=torch.bfloat16)
+
+
 @torch.library.custom_op("turing_utils::int8_linear", mutates_args=())
 def turing_int8_linear(
     activation: torch.Tensor,

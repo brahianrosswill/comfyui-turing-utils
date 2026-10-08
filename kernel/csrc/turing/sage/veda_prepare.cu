@@ -4,15 +4,8 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
-#include <c10/macros/Export.h>
-#include <cublas_v2.h>
-
-// Match PyTorch's exported declaration without CUDAContext.h, which also
-// requires unrelated cuSPARSE/cuSOLVER development headers on Windows.
-// Keep using PyTorch's handle so its stream and workspace management apply.
-namespace at::cuda {
-TORCH_CUDA_CPP_API cublasHandle_t getCurrentCUDABlasHandle();
-}
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
 
 namespace veda_prepare {
 template<class T>
@@ -85,25 +78,13 @@ __global__ void finish_selection(const float* best, const int64_t* selected,
   keep[i]=rank<low+extra && best[i]>-INFINITY && counts[col]>0;
 }
 
-__global__ void projection_epilogue(const int32_t* acc, const float* xs,
-    const float* ws, const __nv_bfloat16* residual, __nv_bfloat16* out,
-    int rows, int n, int residual_stride) {
-  int64_t i=int64_t(blockIdx.x)*blockDim.x+threadIdx.x;
-  // y indexes heads; x indexes rows/channels of a head.
-  if(i>=int64_t(rows)*n) return;
-  int h=blockIdx.y, r=i/n, d=i%n;
-  int64_t offset=int64_t(h)*rows*n+i;
-  float f=float(acc[offset])*xs[h*rows+r]*ws[h*n+d];
-  // Match existing BF16 GEMM output followed by BF16 residual addition.
-  out[offset]=__float2bfloat16_rn(__bfloat162float(__float2bfloat16_rn(f))+
-      __bfloat162float(residual[(int64_t(h)*rows+r)*residual_stride+d]));
-}
 
 __global__ void routes(const int64_t* indices, const bool* keep,
     const int32_t* counts, int32_t* out, int selected, int queries,
-    int video_tiles, int tiles, int words) {
+    int video_tiles, int tiles, int words, int out_rows, int row_start) {
   int row=blockIdx.x;
-  auto* bits=reinterpret_cast<unsigned int*>(out+int64_t(row)*words);
+  int64_t target=int64_t(row/queries)*out_rows+row%queries+row_start;
+  auto* bits=reinterpret_cast<unsigned int*>(out+target*words);
   for(int w=threadIdx.x;w<words;w+=blockDim.x) bits[w]=0;
   __syncthreads();
   for(int j=threadIdx.x;j<selected;j+=blockDim.x) {
@@ -210,54 +191,23 @@ std::vector<torch::Tensor> veda_finish_selection(torch::Tensor best, torch::Tens
   return {indices,keep};
 }
 
-torch::Tensor veda_projection_int8(torch::Tensor x, torch::Tensor w,
-    torch::Tensor xs, torch::Tensor ws, torch::Tensor residual) {
-  TORCH_CHECK(x.is_cuda() && x.dim()==3 && w.dim()==3 && x.is_contiguous() &&
-    w.is_contiguous() && x.scalar_type()==torch::kInt8 && w.scalar_type()==torch::kInt8,
-    "Veda predictor expects contiguous batched INT8 operands");
-  int h=x.size(0),m=x.size(1),k=x.size(2),n=w.size(1);
-  TORCH_CHECK(h>0 && m>0 && n==128 && k%4==0 && w.size(0)==h && w.size(2)==k,
-    "Veda predictor dimensions mismatch");
-  for(const auto& t:{w,xs,ws,residual}) TORCH_CHECK(t.device()==x.device() && t.is_contiguous(),"Veda predictor device/strides mismatch");
-  TORCH_CHECK(xs.scalar_type()==torch::kFloat32 && ws.scalar_type()==torch::kFloat32 &&
-    xs.numel()==h*m && ws.numel()==h*n && residual.scalar_type()==torch::kBFloat16 &&
-    residual.dim()==3 && residual.size(0)==h && residual.size(1)==m && residual.size(2)>=n,
-    "Veda predictor scales/residual mismatch");
-  c10::cuda::CUDAGuard guard(x.device());
-  auto acc=torch::empty({h,m,n},x.options().dtype(torch::kInt32));
-  auto out=torch::empty({h,m,n},x.options().dtype(torch::kBFloat16));
-  auto handle=at::cuda::getCurrentCUDABlasHandle();
-  int32_t alpha=1,beta=0;
-  // Column-major W^T [N,K] times X^T [K,M] gives row-major [M,N].
-  auto status=cublasGemmStridedBatchedEx(handle,CUBLAS_OP_T,CUBLAS_OP_N,n,m,k,
-    &alpha,w.data_ptr<int8_t>(),CUDA_R_8I,k,int64_t(n)*k,
-    x.data_ptr<int8_t>(),CUDA_R_8I,k,int64_t(m)*k,&beta,
-    acc.data_ptr<int32_t>(),CUDA_R_32I,n,int64_t(m)*n,h,
-    CUBLAS_COMPUTE_32I,CUBLAS_GEMM_DEFAULT_TENSOR_OP);
-  TORCH_CHECK(status==CUBLAS_STATUS_SUCCESS,"Veda batched INT8 GEMM failed: ",int(status));
-  veda_prepare::projection_epilogue<<<dim3((m*n+255)/256,h),256,0,c10::cuda::getCurrentCUDAStream()>>>(
-    acc.data_ptr<int32_t>(),xs.data_ptr<float>(),ws.data_ptr<float>(),
-    reinterpret_cast<const __nv_bfloat16*>(residual.data_ptr()),
-    reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),m,n,residual.size(2));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
-}
 
-torch::Tensor veda_pack_routes(torch::Tensor indices, torch::Tensor keep,
-    torch::Tensor counts,int64_t video_tiles) {
+void veda_pack_routes(torch::Tensor indices, torch::Tensor keep,
+    torch::Tensor counts,int64_t video_tiles,torch::Tensor out,int64_t row_start) {
   TORCH_CHECK(indices.is_cuda() && indices.dim()==3 && indices.scalar_type()==torch::kInt64 &&
     keep.sizes()==indices.sizes() && keep.scalar_type()==torch::kBool &&
     counts.dim()==1 && counts.scalar_type()==torch::kInt32,
     "Veda route inputs invalid");
-  for(const auto& t:{indices,keep,counts}) TORCH_CHECK(t.device()==indices.device() && t.is_contiguous(),"Veda routes device/strides mismatch");
+  for(const auto& t:{indices,keep,counts,out}) TORCH_CHECK(t.device()==indices.device() && t.is_contiguous(),"Veda routes device/strides mismatch");
   TORCH_CHECK(video_tiles>=0 && video_tiles<=counts.numel(),"Veda video tile count invalid");
   c10::cuda::CUDAGuard guard(indices.device());
   int words=(counts.numel()*2+31)/32;
-  auto out=torch::empty({1,indices.size(0),indices.size(1),words},indices.options().dtype(torch::kInt32));
+  TORCH_CHECK(out.scalar_type()==torch::kInt32 && out.dim()==4 && out.size(0)==1 &&
+    out.size(1)==indices.size(0) && out.size(3)==words && row_start>=0 &&
+    row_start+indices.size(1)<=out.size(2),"Veda route output shape/offset invalid");
   if(indices.size(0)*indices.size(1)>0)
     veda_prepare::routes<<<indices.size(0)*indices.size(1),128,0,c10::cuda::getCurrentCUDAStream()>>>(
       indices.data_ptr<int64_t>(),keep.data_ptr<bool>(),counts.data_ptr<int32_t>(),out.data_ptr<int32_t>(),
-      indices.size(2),indices.size(1),video_tiles,counts.numel(),words);
+      indices.size(2),indices.size(1),video_tiles,counts.numel(),words,out.size(2),row_start);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
 }

@@ -21,13 +21,15 @@ SETUP_PATH = PLUGIN_ROOT / "kernel" / "setup.py"
 
 class KernelSetupTest(unittest.TestCase):
     def test_veda_preparation_avoids_unrelated_cuda_library_headers(self):
-        source = (PLUGIN_ROOT / "kernel/csrc/turing/sage/veda_prepare.cuh").read_text()
+        source = (PLUGIN_ROOT / "kernel/csrc/turing/sage/veda_prepare.cu").read_text()
         for header in ("ATen/cuda/CUDAContext.h", "ATen/cuda/CUDAContextLight.h",
-                       "cusparse.h", "cusolverDn.h"):
+                       "cusparse.h", "cusolverDn.h", "cublas_v2.h"):
             self.assertNotIn(f"#include <{header}>", source)
         self.assertIn("#include <c10/cuda/CUDAStream.h>", source)
-        self.assertIn("#include <cublas_v2.h>", source)
-        self.assertIn("TORCH_CUDA_CPP_API cublasHandle_t getCurrentCUDABlasHandle();", source)
+        self.assertNotIn("cublasGemm", source)
+        self.assertNotIn("projection_int8", source)
+        attention = (PLUGIN_ROOT / "kernel/csrc/turing/sage/sol_sparse_cuda_sm75.cu").read_text()
+        self.assertNotIn('#include "veda_prepare', attention)
 
     @staticmethod
     def _extension(*, name, **kwargs):
@@ -117,6 +119,7 @@ class KernelSetupTest(unittest.TestCase):
         )
         self.assertIn("csrc/turing/sage/sol_sparse_cuda_sm75.cu", extensions[1].kwargs["sources"])
         self.assertIn("csrc/turing/sage/quant_v_int8_cuda_sm75.cu", extensions[1].kwargs["sources"])
+        self.assertIn("csrc/turing/sage/veda_prepare.cu", extensions[1].kwargs["sources"])
         self.assertIn(
             "csrc/turing/sage/qk_preprocess.cu", extensions[2].kwargs["sources"]
         )

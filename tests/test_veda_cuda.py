@@ -12,8 +12,11 @@ from comfyui_turing_utils.adapters.minimax.veda.engine import VedaConfig, attend
 from comfyui_turing_utils.adapters.minimax.veda.predictor import PredictorBundle, convert_projection, project_features
 from comfyui_turing_utils.adapters.minimax.veda.plans import PlanTable, TilePlan
 from comfyui_turing_utils.adapters.minimax.veda.selection import select_tiles
+from .veda_pooling_reference import pool_video_tiles
+from .veda_tiling_reference import gather_tiles, scatter_tiles_
+from .veda_selection_reference import select_tiles as select_tiles_reference
 from comfyui_turing_utils.adapters.minimax.veda.tiling import (
-    TileShape, TiledSpan, build_tile_layout, gather_tiles,
+    TileShape, TiledSpan, build_tile_layout,
 )
 
 
@@ -22,7 +25,6 @@ pytestmark = pytest.mark.skipif(os.environ.get("VEDA_TEST_CUDA") != "1", reason=
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_veda_cuda_fused_gather_pool(dtype):
-    from comfyui_turing_utils.adapters.minimax.veda.pooling import pool_video_tiles
     device = torch.device("cuda", 0)
     layout = build_tile_layout([TiledSpan(3, (1, 7, 19), TileShape(1, 8, 16))], 143, device)
     heads = torch.tensor([3, 1], device=device)
@@ -41,7 +43,6 @@ def test_veda_cuda_fused_gather_pool(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_veda_cuda_native_scatter_preserves_unselected_heads(dtype):
-    from comfyui_turing_utils.adapters.minimax.veda.tiling import scatter_tiles_
     device = torch.device("cuda", 0)
     layout = build_tile_layout([TiledSpan(3, (1, 7, 19), TileShape(1, 8, 16))], 143, device)
     heads = torch.tensor([3, 1], device=device)
@@ -55,7 +56,7 @@ def test_veda_cuda_native_scatter_preserves_unselected_heads(dtype):
 
 
 @pytest.mark.parametrize("ratios", [(0.1, 0.2), (0.5234, 1.0), (1.0, 0.05), (1.0, 1.0)])
-def test_veda_cuda_fused_selection_matches_reference(monkeypatch, ratios):
+def test_veda_cuda_fused_selection_matches_reference(ratios):
     from comfyui_turing_utils.adapters.minimax.veda import selection
     device = torch.device("cuda", 0)
     layout = build_tile_layout([
@@ -68,9 +69,7 @@ def test_veda_cuda_fused_selection_matches_reference(monkeypatch, ratios):
     scores = torch.randn(3, layout.n_video_tiles, layout.n_video_tiles, device=device).round()
     actual = [selection.select_tiles(scores[:, a:b].contiguous(), layout, *ratios, row_start=a)
               for a, b in ((0, 7), (7, layout.n_video_tiles))]
-    # Explicitly select the reference evaluator, not an obsolete kernel ABI.
-    monkeypatch.setattr(selection, "load_kernel_extension", lambda name: None)
-    expected = [selection.select_tiles(scores[:, a:b].contiguous(), layout, *ratios, row_start=a)
+    expected = [select_tiles_reference(scores[:, a:b].contiguous(), layout, *ratios, row_start=a)
                 for a, b in ((0, 7), (7, layout.n_video_tiles))]
     for pair_a, pair_b in zip(actual, expected):
         for a, b in zip(pair_a, pair_b):
@@ -78,16 +77,61 @@ def test_veda_cuda_fused_selection_matches_reference(monkeypatch, ratios):
 
 
 def test_veda_cuda_batched_projection_matches_individual_gemms():
-    native = load_kernel_extension("_sage_qattn_sm75")
     ops = load_kernel_extension("ops")
     heads, rows = 3, 157
     x = torch.randn(heads, rows, 512, device="cuda", dtype=torch.bfloat16)
     qi, scale = ops.turing_bf16_int8_convrot_quantize(x.flatten(0, 1))
     qi, scale = qi.reshape(heads, rows, 512), scale.reshape(heads, rows, 1)
     p = convert_projection(torch.randn(heads, 384, 128), "w8a8").stage(list(range(heads)), x.device)
-    actual = native.veda_projection_int8(qi, p.weight, scale, p.scale, x)
-    expected = torch.stack([ops.turing_int8_linear(qi[h], p.weight[h], scale[h], p.scale[h])
-                            for h in range(heads)]) + x[..., :128]
+    actual = ops.turing_int8_batched_residual(qi, p.weight, scale, p.scale, x)
+    acc = torch.bmm(qi.double(), p.weight.double().transpose(1, 2)).float()
+    expected = ((acc * scale).double() * p.scale.reshape(heads, 1, 128).double()
+                + x[..., :128].double()).float().bfloat16()
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("heads,rows,k", [(1, 1, 16), (3, 17, 384), (3, 157, 512), (2, 33, 48), (14, 65, 512)])
+@pytest.mark.parametrize("offset", [0, 1])
+def test_veda_cuda_projection_fused_cutlass_exact(heads, rows, k, offset):
+    torch.manual_seed(521)
+    native = load_kernel_extension("ops")
+    def operand(shape):
+        size = 1
+        for dim in shape:
+            size *= dim
+        return torch.randint(-128, 128, (size + offset,), device="cuda", dtype=torch.int8)[offset:].view(shape)
+    x, w = operand((heads, rows, k)), operand((heads, 128, k))
+    xs = torch.rand(heads, rows, device="cuda") * .02
+    ws = torch.rand(heads, 128, device="cuda") * .02
+    if rows > 1:
+        xs[0, 0] = 0
+    residual = torch.randn(heads, rows, 384, device="cuda", dtype=torch.bfloat16)
+    # FP64 is an exact integer accumulation oracle for these small INT8 dots.
+    acc = torch.bmm(x.double(), w.double().transpose(1, 2)).float()
+    # Emulate the final FP32 FMA with FP64 arithmetic then one FP32 rounding.
+    # torch.addcmul may round the product separately at BF16 tie boundaries.
+    expected = ((acc * xs[..., None]).double() * ws[:, None, :].double()
+                + residual[..., :128].double()).float().bfloat16()
+    actual = native.turing_int8_batched_residual(x, w, xs, ws, residual)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("m,n,k", [(1, 128, 384), (157, 128, 512), (65, 256, 512)])
+def test_veda_cuda_shared_gemm_keeps_existing_2d_rounding(dtype, m, n, k):
+    ops = load_kernel_extension("ops")
+    x = torch.randint(-8, 8, (m, k), device="cuda", dtype=torch.int8)
+    w = torch.randint(-8, 8, (n, k), device="cuda", dtype=torch.int8)
+    xs = torch.full((m, 1), .125, device="cuda")
+    ws = torch.full((n, 1), .0625, device="cuda")
+    bias = torch.randint(-8, 8, (n,), device="cuda").float() * .25
+    scaled = torch.bmm(x.double()[None], w.double().T[None])[0].float() * .125 * .0625
+    if dtype == torch.float16:
+        actual = ops.turing_fp16_int8_linear(x, w, xs, ws, bias)
+        expected = (scaled.half().float() + bias.half().float()).half()
+    else:
+        actual = ops.turing_int8_linear(x, w, xs, ws, bias)
+        expected = (scaled + bias).bfloat16()
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
@@ -107,6 +151,12 @@ def test_veda_cuda_fused_routes_match_reference():
     expected = load_kernel_extension("_sage_qattn_sm75").sla_build_route_words(
         blocks.unsqueeze(0).contiguous(), exact, layout.n_tiles * 2)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    output = torch.full((1, 3, index.shape[1] + 4, actual.shape[-1]), 123,
+                        dtype=torch.int32, device=device)
+    result = pack_routes(index, keep, layout, out=output, row_start=2)
+    assert result.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(output[:, :, 2:-2], expected, atol=0, rtol=0)
+    assert (output[:, :, :2] == 123).all() and (output[:, :, -2:] == 123).all()
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
@@ -114,7 +164,6 @@ def test_veda_cuda_fused_routes_match_reference():
 def test_veda_cuda_compact_preparation_matches_whole(dtype, use_w8a8):
     from comfyui_turing_utils.adapters.minimax.veda.quantization import prequantize, finish_value
     from comfyui_turing_utils.adapters.minimax.veda.prepare import prepare_compact
-    from comfyui_turing_utils.adapters.minimax.veda.pooling import pool_video_tiles
     device = torch.device("cuda", 0)
     layout = build_tile_layout([TiledSpan(3, (3, 7, 19), TileShape(1, 8, 16))], 413, device)
     heads = torch.tensor([1, 0], device=device)

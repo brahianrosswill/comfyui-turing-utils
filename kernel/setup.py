@@ -539,6 +539,7 @@ if _includes_integer_attention_arch():
                     "csrc/turing/sage/qk_int_sv_f16_varlen_cuda_sm75.cu",
                     "csrc/turing/sage/sol_sparse_cuda_sm75.cu",
                     "csrc/turing/sage/quant_v_int8_cuda_sm75.cu",
+                    "csrc/turing/sage/veda_prepare.cu",
                 ],
                 define_macros=ARCHITECTURE_MACROS,
                 include_dirs=sage_include_dirs,

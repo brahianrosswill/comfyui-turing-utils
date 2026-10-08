@@ -200,24 +200,22 @@ def project_features(features: torch.Tensor, projection: Projection, precision: 
     compute_dtype = predictor_compute_dtype(precision, capability)
     dim = features.shape[-1] // 3
     if precision == "w8a8":
-        # Optional backend, imported only when selected. Reuse the existing
-        # SM75 GEMM rather than dequantizing the weights for a floating GEMM.
+        # Use the shared ConvRot GEMM with per-head weights and fused residual.
         ops = load_kernel_extension("ops")
         x = features.to(torch.bfloat16)
         padded = F.pad(x, (0, projection.weight.shape[-1] - x.shape[-1]))
         quantized, scales = ops.turing_bf16_int8_convrot_quantize(padded.flatten(0, 1).contiguous())
         quantized = quantized.reshape(*x.shape[:2], -1)
         scales = scales.reshape(*x.shape[:2], 1)
-        native = load_kernel_extension("_sage_qattn_sm75")
-        return native.veda_projection_int8(quantized, projection.weight, scales,
-                                           projection.scale, x.contiguous())
+        return ops.turing_int8_batched_residual(quantized, projection.weight, scales,
+                                               projection.scale, x.contiguous())
     output_dtype = FLOAT_DTYPES[precision]
-    # Round both operands to BF16 *before* FP32 emulation on SM75. Round the
-    # projection result and residual addition as BF16 operators would do.
+    # SM75 emulates BF16 operands in FP32, but still returns BF16. Add the
+    # residual before the final conversion, without a rounded GEMM temporary.
     x = features.to(output_dtype)
     weight = projection.weight.to(output_dtype)
-    projected = torch.bmm(x.to(compute_dtype), weight.to(compute_dtype)).to(output_dtype)
-    return (projected.float() + x[..., :dim].float()).to(output_dtype)
+    x = x.to(compute_dtype)
+    return torch.baddbmm(x[..., :dim], x, weight.to(compute_dtype)).to(output_dtype)
 
 
 def score_tiles(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:

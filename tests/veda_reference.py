@@ -1,4 +1,4 @@
-"""Independent official-arithmetic oracle; never used on the production path.
+"""Independent official-arithmetic oracle for tests only.
 
 Pass decoded source weights, NOT already converted W8A8 weights. Upstream
 stores host projections in BF16, but keeps pooled features, projection results,

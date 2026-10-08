@@ -288,7 +288,7 @@ template <typename Output,
           int WN,
           int InputAlignment = 16,
           int WeightAlignment = 16,
-          typename ScaleT = uint8_t, bool RoundHalf = true>
+          typename ScaleT = uint8_t, bool RoundHalf = true, bool Residual = false>
 struct TuringW4A8Gemm {
     static constexpr bool PackedWeight = Kind != WeightKind::kInt8;
     static constexpr bool CodebookWeight = Kind == WeightKind::kCodebookW4;
@@ -394,10 +394,13 @@ struct TuringW4A8Gemm {
         ThreadMap,
         ElementCompute,
         cute::Stride<_0, _1, int32_t>>;
-    using Bias = cutlass::epilogue::threadblock::VisitorRowBroadcast<
+    using RowBias = cutlass::epilogue::threadblock::VisitorRowBroadcast<
         ThreadMap,
         ElementCompute,
         cute::Stride<_0, _1, int32_t>>;
+    using Bias = std::conditional_t<Residual,
+        cutlass::epilogue::threadblock::VisitorAuxLoad<ThreadMap, ElementC,
+            cute::Stride<int64_t, _1, int64_t>>, RowBias>;
     using ScaleActivation = cutlass::epilogue::threadblock::VisitorCompute<
         cutlass::multiplies,
         ElementCompute,
@@ -492,7 +495,9 @@ struct TuringW4A8Gemm {
                     int output_stride,
                     cudaStream_t stream,
                     const ScaleT *group_scale = nullptr,
-                    const float *codebook = nullptr) {
+                    const float *codebook = nullptr,
+                    int batches = 1, const Output *residual = nullptr,
+                    int residual_stride = 0) {
         cutlass::gemm::GemmCoord problem(m, n, k);
         auto scale_arguments = [&]() -> typename ScaledOutput::Arguments {
             if constexpr (RoundHalf && std::is_same_v<ElementC, cutlass::half_t>) {
@@ -504,15 +509,18 @@ struct TuringW4A8Gemm {
                         {const_cast<float *>(weight_scale), 0.0f, {_0{}, _1{}, n}}, {}};
             }
         };
+        auto addend = [&]() -> typename Bias::Arguments {
+            if constexpr (Residual) return {const_cast<Output *>(residual), Output(0),
+                {residual_stride, _1{}, int64_t(m) * residual_stride}};
+            else return {const_cast<float *>(bias), 0.0f, {_0{}, _1{}, n}};
+        };
         typename Callbacks::Arguments callbacks{
-            {scale_arguments(),
-             {const_cast<float *>(bias), 0.0f, {_0{}, _1{}, n}},
-             {}},
+            {scale_arguments(), addend(), {}},
             {output, {output_stride, _1{}, static_cast<int64_t>(m) * output_stride}}};
         typename Gemm::Arguments arguments(
-            cutlass::gemm::GemmUniversalMode::kGemm,
+            batches == 1 ? cutlass::gemm::GemmUniversalMode::kGemm : cutlass::gemm::GemmUniversalMode::kBatched,
             problem,
-            1,
+            batches,
             callbacks,
             const_cast<int8_t *>(activation),
             reinterpret_cast<ElementB *>(const_cast<int8_t *>(weight)),
@@ -633,7 +641,7 @@ bool run_int8_tile(const int8_t *activation,
 // Native SM80 INT8 Tensor Core mainloop.  Keeping the same EVT epilogue as
 // the SM75 implementation makes this a schedule substitution only: integer
 // accumulation, row/channel scales, bias, and BF16 rounding are unchanged.
-template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages, typename Output, bool RoundHalf = true>
+template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages, typename Output, bool RoundHalf = true, bool Residual = false>
 struct AmpereInt8Gemm {
     using ElementA = int8_t;
     using ElementB = int8_t;
@@ -658,8 +666,11 @@ struct AmpereInt8Gemm {
         ThreadMap, ComputeT, cute::Stride<_1, _0, int32_t>>;
     using WScale = cutlass::epilogue::threadblock::VisitorRowBroadcast<
         ThreadMap, ComputeT, cute::Stride<_0, _1, int32_t>>;
-    using Bias = cutlass::epilogue::threadblock::VisitorRowBroadcast<
+    using RowBias = cutlass::epilogue::threadblock::VisitorRowBroadcast<
         ThreadMap, ComputeT, cute::Stride<_0, _1, int32_t>>;
+    using Bias = std::conditional_t<Residual,
+        cutlass::epilogue::threadblock::VisitorAuxLoad<ThreadMap, ElementC,
+            cute::Stride<int64_t, _1, int64_t>>, RowBias>;
     using Multiply = cutlass::epilogue::threadblock::VisitorCompute<
         cutlass::multiplies, ComputeT, ComputeT,
         cutlass::FloatRoundStyle::round_to_nearest>;
@@ -705,7 +716,9 @@ struct AmpereInt8Gemm {
                     int n,
                     int k,
                     int output_stride,
-                    cudaStream_t stream) {
+                    cudaStream_t stream,
+                    int batches = 1, const Output *residual = nullptr,
+                    int residual_stride = 0) {
         cutlass::gemm::GemmCoord problem(m, n, k);
         auto scale_arguments = [&]() -> typename ScaledOutput::Arguments {
             if constexpr (RoundHalf && std::is_same_v<ElementC, cutlass::half_t>) {
@@ -717,16 +730,19 @@ struct AmpereInt8Gemm {
                         {const_cast<float *>(weight_scale), 0.0f, {_0{}, _1{}, n}}, {}};
             }
         };
+        auto addend = [&]() -> typename Bias::Arguments {
+            if constexpr (Residual) return {const_cast<Output *>(residual), Output(0),
+                {residual_stride, _1{}, int64_t(m) * residual_stride}};
+            else return {const_cast<float *>(bias), 0.0f, {_0{}, _1{}, n}};
+        };
         typename Callbacks::Arguments callbacks{
-            {scale_arguments(),
-             {const_cast<float *>(bias), 0.0f, {_0{}, _1{}, n}},
-             {}},
+            {scale_arguments(), addend(), {}},
             {reinterpret_cast<ElementC *>(output),
              {output_stride, _1{}, static_cast<int64_t>(m) * output_stride}}};
         typename Gemm::Arguments arguments(
-            cutlass::gemm::GemmUniversalMode::kGemm,
+            batches == 1 ? cutlass::gemm::GemmUniversalMode::kGemm : cutlass::gemm::GemmUniversalMode::kBatched,
             problem,
-            1,
+            batches,
             callbacks,
             const_cast<int8_t *>(activation),
             const_cast<int8_t *>(weight),
@@ -1215,6 +1231,32 @@ void turing_int8_linear(Tensor activation,
     if (!launched) {
         throw std::runtime_error("CUTLASS SM75 INT8 kernel rejected the problem shape");
     }
+    checkCUDA(cudaGetLastError());
+}
+
+void turing_int8_batched_residual(Tensor activation, Tensor weight,
+                                Tensor activation_scale, Tensor weight_scale,
+                                Tensor residual, Tensor output) {
+    const int h = activation.size(0), m = activation.size(1), k = activation.size(2);
+    const int n = weight.size(1), residual_stride = residual.size(2);
+    auto *result = reinterpret_cast<cutlass::bfloat16_t *>(output.ptr);
+    auto *addend = reinterpret_cast<const cutlass::bfloat16_t *>(residual.ptr);
+    bool launched;
+    if (getCurrentDeviceProperties()->major >= 8) {
+        launched = AmpereInt8Gemm<32, 128, 64, 32, 32, 64, 3,
+            cutlass::bfloat16_t, false, true>::run(
+                activation.data_ptr<int8_t>(), weight.data_ptr<int8_t>(),
+                activation_scale.data_ptr<float>(), weight_scale.data_ptr<float>(),
+                nullptr, result, m, n, k, n, getCurrentCUDAStream(), h, addend, residual_stride);
+    } else {
+        launched = TuringW4A8Gemm<cutlass::bfloat16_t, WeightKind::kInt8,
+            32, 128, 32, 32, 16, 16, uint8_t, false, true>::run(
+                activation.data_ptr<int8_t>(), weight.data_ptr<int8_t>(),
+                activation_scale.data_ptr<float>(), weight_scale.data_ptr<float>(),
+                nullptr, result, m, n, k, n, getCurrentCUDAStream(),
+                nullptr, nullptr, h, addend, residual_stride);
+    }
+    if (!launched) throw std::runtime_error("CUTLASS batched INT8 residual GEMM rejected the shape");
     checkCUDA(cudaGetLastError());
 }
 

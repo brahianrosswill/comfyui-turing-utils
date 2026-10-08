@@ -20,9 +20,7 @@
 
 std::vector<at::Tensor> veda_gather_pool(at::Tensor, at::Tensor, at::Tensor,
     at::Tensor, at::Tensor, at::Tensor, int64_t);
-at::Tensor veda_projection_int8(at::Tensor, at::Tensor, at::Tensor,
-    at::Tensor, at::Tensor);
-at::Tensor veda_pack_routes(at::Tensor, at::Tensor, at::Tensor, int64_t);
+void veda_pack_routes(at::Tensor, at::Tensor, at::Tensor, int64_t, at::Tensor, int64_t);
 void veda_scatter_tiles(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor);
 at::Tensor veda_prepare_scores(at::Tensor, at::Tensor, int64_t, int64_t, int64_t);
 std::vector<at::Tensor> veda_finish_selection(at::Tensor, at::Tensor, at::Tensor,

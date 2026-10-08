@@ -10,10 +10,11 @@ from comfyui_turing_utils.adapters.minimax.veda.predictor import (
     FORMAT, PRECISIONS, Projection, convert_projection, load_bundle,
     predictor_compute_dtype, project_features, rotate_features,
 )
-from comfyui_turing_utils.adapters.minimax.veda.pooling import pool_video_tiles
-from comfyui_turing_utils.adapters.minimax.veda.selection import select_tiles
+from .veda_pooling_reference import pool_video_tiles
+from .veda_selection_reference import select_tiles
+from .veda_tiling_reference import gather_tiles
 from comfyui_turing_utils.adapters.minimax.veda.tiling import (
-    TileShape, TiledSpan, build_tile_layout, gather_tiles,
+    TileShape, TiledSpan, build_tile_layout,
 )
 
 
@@ -24,10 +25,12 @@ def test_bf16_sm75_emulates_arithmetic_not_output_dtype():
     projection = convert_projection(weights, "bf16")
     actual = project_features(features, projection, "bf16", capability=(7, 5))
     x = features.bfloat16()
-    expected = torch.bmm(x.float(), weights.bfloat16().float()).bfloat16()
-    expected = (expected.float() + x[..., :128].float()).bfloat16()
+    projected = torch.bmm(x.float(), weights.bfloat16().float())
+    expected = (projected + x[..., :128].float()).bfloat16()
     assert actual.dtype == torch.bfloat16
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    old = (projected.bfloat16().float() + x[..., :128].float()).bfloat16()
+    assert not torch.equal(actual, old)
     assert predictor_compute_dtype("bf16", (7, 5)) == torch.float32
     assert predictor_compute_dtype("bf16", (8, 6)) == torch.bfloat16
 

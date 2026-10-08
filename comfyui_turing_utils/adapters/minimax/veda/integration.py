@@ -125,10 +125,12 @@ def configure(model, *, predictor_name: str, predictor_precision: str = "w8a8",
     if plan_policy not in ("nearest", "strict"):
         raise ValueError("Veda plan_policy must be nearest or strict")
     required = ("veda_sparse_online_attn", "veda_gather_pool", "veda_scatter_tiles",
-                "veda_projection_int8", "veda_pack_routes", "veda_prepare_scores",
+                "veda_pack_routes", "veda_prepare_scores",
                 "veda_finish_selection")
     if any(not kernel_extension_has_symbol(name, "_sage_qattn_sm75") for name in required):
         raise RuntimeError("Rebuild the Turing Utils CUDA kernel to enable H3 Veda")
+    if predictor_precision == "w8a8" and not kernel_extension_has_symbol("turing_int8_batched_residual"):
+        raise RuntimeError("Rebuild the Turing Utils CUDA kernel for batched INT8 projection")
     folders = register_predictor_folder()
     path = folders.get_full_path_or_raise("veda", predictor_name)
     bundle = load_bundle(path, predictor_precision)
