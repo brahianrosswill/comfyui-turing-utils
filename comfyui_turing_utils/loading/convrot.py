@@ -20,6 +20,9 @@ import comfy.utils
 
 from ..adapters.dynamic_vram import install_dynamic_vram_sample_fence
 from ..adapters.registry import apply_model_adapters
+from ..adapters.minimax.nvfp4 import install_nvfp4_mlp_fusions
+from ..kernel_api import load_nvfp4_backend
+from ..quantization.nvfp4 import nvfp4_operations
 from ..attention import apply_attention_backend, normalize_attention_backend
 from ..log import get_logger
 from ..precision import (
@@ -100,6 +103,11 @@ def validate_runtime_support(
     expected: ConvRotSummary,
     device: torch.device | None = None,
 ) -> None:
+    if expected.nvfp4:
+        if device is None:
+            device = comfy.model_management.get_torch_device()
+        if device.type == "cuda":
+            load_nvfp4_backend().validate_runtime(device)
     if expected.w4a8 == 0 and expected.codebook_w4a8 == 0:
         return
 
@@ -156,9 +164,15 @@ def load_convrot_model(
         metadata=metadata,
     )
     compute_dtype = select_compute_dtype(model_config, load_device)
+    model_options = {"dtype": compute_dtype} if compute_dtype is not None else {}
+    if expected.nvfp4:
+        # Comfy skips legacy metadata conversion when custom operations are supplied.
+        state_dict, metadata = comfy.utils.convert_old_quants(
+            state_dict, diffusion_model_prefix, metadata=metadata)
+        model_options["custom_operations"] = nvfp4_operations(compute_dtype, load_device)
     model = comfy.sd.load_diffusion_model_state_dict(
         state_dict,
-        model_options={"dtype": compute_dtype} if compute_dtype is not None else {},
+        model_options=model_options,
         metadata=metadata,
         disable_dynamic=disable_dynamic,
     )
@@ -178,15 +192,18 @@ def load_convrot_model(
 
     LOG.info(
         "Loaded ConvRot model with force_int8_gemm=%s: "
-        "W4A4=%d, legacy_W4A8=%d, codebook_W4A8=%d, W8A8=%d",
+        "W4A4=%d, legacy_W4A8=%d, codebook_W4A8=%d, W8A8=%d, NVFP4=%d",
         force_int8_gemm,
         loaded.w4a4,
         loaded.w4a8,
         loaded.codebook_w4a8,
         loaded.w8a8,
+        loaded.nvfp4,
     )
     install_dynamic_vram_sample_fence(model, load_device)
     apply_model_adapters(model, load_device)
+    if expected.nvfp4:
+        install_nvfp4_mlp_fusions(model)
     apply_attention_backend(
         model,
         attention_backend,
@@ -243,6 +260,9 @@ def load_convrot_clip(
         state_dict, model_prefix="", metadata=metadata
     )
     model_options["quantization_metadata"] = {"mixed_ops": True}
+    if expected.nvfp4:
+        model_options["custom_operations"] = nvfp4_operations(
+            None, load_device, full_precision_mm=True)
     clip = comfy.sd.load_text_encoder_state_dicts(
         [state_dict],
         embedding_directory=embedding_directory,
@@ -260,12 +280,13 @@ def load_convrot_clip(
 
     LOG.info(
         "Loaded ConvRot CLIP with force_int8_gemm=%s: "
-        "W4A4=%d, legacy_W4A8=%d, codebook_W4A8=%d, W8A8=%d",
+        "W4A4=%d, legacy_W4A8=%d, codebook_W4A8=%d, W8A8=%d, NVFP4=%d",
         force_int8_gemm,
         loaded.w4a4,
         loaded.w4a8,
         loaded.codebook_w4a8,
         loaded.w8a8,
+        loaded.nvfp4,
     )
     install_clip_operator_scope(clip)
     clip.patcher.cached_patcher_init = (

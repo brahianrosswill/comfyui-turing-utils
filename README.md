@@ -40,6 +40,154 @@ only after its CUDA sources or required version change.
 
 ## Nodes
 
+### Shared application models
+
+`MiniMax H3 Latent Upscale` and `SeC Track Visual Concept` include their
+model selectors. When a workflow is submitted through ComfyUI's prompt server,
+applications with identical model names and loading settings (or identical
+links supplying those settings) share one internal loader. Application inputs
+such as videos, points, masks and scale do not enter the loader's cache key.
+This also works across frontend subgraphs, which submit a flattened prompt.
+Within a prompt the shared loader executes once, even with caching disabled.
+Across prompts, reuse follows ComfyUI's normal cache policy; eviction or
+disabling caching permits reloading. GPU offload/reload remains ComfyUI-managed.
+
+The old loader interfaces remain registered as development-only internal nodes,
+not additional normal workflow steps. Existing explicit model connections are
+accepted by the prompt compiler. Direct Python callers can still call the
+original loading functions; callers bypassing the prompt server must invoke
+`compile_shared_loaders` before handing a graph to `PromptExecutor`.
+
+- `Load ConvRot DiT` and `Load ConvRot CLIP` also accept ComfyUI-native `nvfp4`
+  layers alongside `int8_tensorwise`, `convrot_w4a4`, and `asym_w4a8_int8`.
+  Mixed formats dispatch per layer; official format identifiers are preserved.
+  The former standalone `Load NVFP4 DiT` node is removed: replace it with
+  `Load ConvRot DiT` in saved workflows. The NVFP4 CUDA path retains packed
+  NVFP4 weights, and uses A8/S8 GEMM with at most 16 MiB per temporary S8 staging
+  buffer for normal model widths (two buffers in the measured overlap range).
+  It does not use native Blackwell A4 arithmetic.
+  DiT attention retains the ConvRot loader's `w8a8` default; `sdpa` and `sage`
+  remain available. ConvRot layers keep their existing dispatch; other formats
+  and explicit full-precision layers retain ComfyUI execution. CLIP's CPU
+  option uses a dense NVFP4 fallback. `force_int8_gemm` does not rewrite NVFP4.
+  LoRA uses ComfyUI's patch/requantization lifecycle; patching may temporarily
+  expand a layer, and weight hooks can take the dense fallback. Full H3 video
+  quality and 2080 Ti runtime validation are still pending. Rebuild the current
+  kernel sources before trying this node.
+  The single runtime path applies paired ConvRot256 to activations and decoded
+  NVFP4 weights, then runs row-scaled INT8 Tensor Core GEMM. NVFP4 decode,
+  FP32 weight rotation and S8 quantization are fused. Only bounded call-local
+  S8 tiles are expanded (normally at most 16 MiB); native NVFP4 storage remains
+  unchanged. No rotated/requantized model copy or backend selector is retained.
+  Logical K need not be divisible by 256: both operands are zero-padded before
+  rotation, ignoring serialized padding. Logical N tails and FP16/BF16/FP32
+  outputs are supported. K above 16384 uses a streaming two-pass specialization
+  of the same algorithm. Pre-scales and SwiGLU run before rotation; ComfyUI
+  remains responsible for LoRA hooks and requantization.
+  `kernel/scripts/benchmark_nvfp4_routes.py --profile` compares the one runtime
+  implementation against preexpanded W8A8/FP16/BF16 controls and separates its
+  activation, weight conversion, and GEMM costs. Real weights plus synthetic
+  activations are not a substitute for video/LLM quality validation.
+  A40 / M=19989 convergence benchmark (milliseconds, synthetic BF16 inputs):
+  QKV 25.08 vs expanded W8A8 23.40 / FP16 39.88 / BF16 39.00;
+  FFN-down 19.49 vs 18.47 / 28.37 / 25.90. W8A8 controls use the same
+  NVFP4-derived rotated S8 weights, not independently quantized checkpoints.
+  Added relative L2 error versus decoded NVFP4 is about 1.31% / 1.39%.
+  Standalone component timings are QKV activation 0.95, weight conversion 1.42,
+  chunked GEMM 22.81; FFN-down 2.85, 1.03, 16.10. These isolated measurements
+  are not strictly additive. Further work should prioritize GEMM utilization
+  and FFN activation/rotation fusion; even eliminating weight conversion alone
+  cannot deliver a large long-sequence speedup.
+  Follow-up optimization on the same A40/M=19989 workload: QKV 24.92 ms
+  (essentially unchanged), FFN-down 18.54 ms versus the prior 19.49 ms.
+  SM86 BF16 long/wide-K GEMMs use a four-stage asynchronous mainloop; other
+  shapes retain their baseline schedule. SwiGLU is fused with rotation/A8
+  quantization for BF16/FP32 when shared memory and input layout allow it, with a compact
+  BF16 row-buffer fallback. FP16 uses bounded row-chunk FP32 rotation/quantization
+  after activation to avoid half-divisor underflow on zero/tiny rows; it does
+  not use the fused half-divisor path. Channel pre-scales retain the correct unfused
+  ordering. Including SwiGLU, FFN-down measured 19.11 ms versus 22.95 ms with
+  unfused activation under the same final GEMM schedule; incremental peak
+  allocated memory (including output, excluding inputs/resident weights) fell
+  from 1093 to 492 MiB. Fusion slightly improved error against FP32 SwiGLU in
+  these synthetic tests, but is not bit-identical to BF16 intermediate rounding.
+  Register-resident weight quantization reuses a rounded FP32 scale reciprocal;
+  rare S8 boundary values can change by one code, with regression error bounds.
+  Output row strides are aligned to 128 bytes without computing extra weight
+  rows. Non-aligned N tests gained about 1–2%; native H3 widths already align.
+  Additional K padding beyond ConvRot256 was slower and is not enabled.
+  Nsight Compute counters were unavailable due to driver permissions, so these
+  are event-timing measurements, not measured MFU/occupancy claims.
+  Bounded two-stream staging is now used for the measured SM86 BF16 range
+  (M=8192..24576, padded K=8192..16384, padded N=4096..16383). It keeps the
+  original GEMM chunk size and reuses two <=16 MiB S8 buffers with explicit
+  producer/consumer events; no decoded weight cache persists. Other shapes,
+  devices/dtypes and CUDA Graph capture retain serial staging. This is overlap,
+  not decode-inside-GEMM: the intermediate S8 write still exists. Paired A40
+  M=19989 FFN timings were 18.15 -> 17.79 ms, or 18.79 -> 17.88 ms including
+  fused SwiGLU, with bit-identical serial/pipelined results and ~14 MiB extra
+  temporary storage for K=14336. Expanded resident S8 controls were 16.53 and
+  17.24 ms respectively. Halving chunks to avoid the second-buffer cost hurt
+  some long sequences and is not enabled. These remain synthetic-activation,
+  real-weight operator tests, not full-video or SM75 results.
+
+  `kernel/scripts/benchmark_nvfp4_h3_block.py` adds a whole core DiT-block
+  comparison using real checkpoint weights and synthetic tokens. It excludes
+  RoPE, SOL, model offloading, and the full video pipeline; expanded weights
+  remain resident only as benchmark controls. For A40/M=19989, compact NVFP4
+  measured 203.69 ms, expanded S8 200.13 ms, and decoded BF16 256.46 ms.
+  Disabling SwiGLU fusion took 210.20 ms; fusion reduced incremental peak
+  allocation from 2597 to 2054 MiB. Relative L2 versus the decoded NVFP4 BF16
+  block was 0.61%; this is not a perceptual-quality guarantee. At M=8192 the
+  corresponding compact/S8/BF16 timings were 62.88/54.34/79.69 ms.
+  Further half-width MLP staging reduced memory but regressed latency by
+  7--15%; row-chunking repeated weight conversion and was also slower.
+  Serial call-local S8 buffer reuse did not materially improve long-sequence
+  latency. These candidates are not enabled and add no runtime selectors.
+
+  SM75 portability was cross-compiled with CUDA 13.0, not inferred from SM86:
+  the 128x256x64 INT8 GEMM uses 208 registers/thread, 256 threads and 48 KiB
+  dynamic shared memory, with no ptxas spills. Both registers and shared memory
+  limit it to one CTA/SM (25% theoretical warp occupancy). Weight conversion
+  uses 54 registers/thread at K=5376 and 72 at K=14336: respectively four and
+  three CTAs/SM (100%/75%). The BF16 SwiGLU row-buffer fallback at K=14336
+  selects 1024 threads on SM75 for long sequences: 30 registers/thread,
+  61440 dynamic + 144 static shared bytes, one CTA/SM and 100% warp occupancy.
+  These kernels have zero reported spill loads/stores. SM86 retains its own
+  schedules; the two architectures need not have matching register counts.
+
+  `kernel/scripts/audit_nvfp4_resources.py` reads exact SM75/SM86 cubins using
+  cuobjdump and the standalone NVIDIA occupancy calculator. Build its helper
+  `kernel/scripts/occupancy_model.cpp` with a host C++ compiler and
+  `-I "$CUDA_HOME/include"`, placing the executable in the instance's temporary
+  directory, then pass `--binary PATH_TO_CORE_EXTENSION --calculator PATH_TO_HELPER`.
+  Optional `--build-log PATH` reads spill counters from a build made with
+  `NVCC_APPEND_FLAGS='--ptxas-options=-v'`. Build both architectures with
+  `COMFYUI_TURING_UTILS_ARCH_LIST='7.5;8.6'`. All 19 reported SM86 residency
+  predictions matched the A40 driver occupancy API. These are resource ceilings,
+  not achieved occupancy or speed predictions; SM75/Windows runtime and visual
+  validation remain required. Linux binaries cannot be reused on Windows.
+
+  A diagnostic 128x128x64 CTA / 32x64 warp candidate reduced SM75 register
+  usage from 208 to 124/thread and shared memory from 48 to 32 KiB, giving
+  two CTAs/SM with no spills. SM86 compiled to 126 registers/thread and also
+  supported two CTAs/SM, confirmed by the driver. However, A40 real-weight
+  tests at M=8192/19989/32768 regressed despite bit-identical BF16 outputs.
+  At M=19989, compact QKV/out-proj/FFN-up/FFN-down took respectively
+  40.49/14.73/53.66/31.08 ms versus 25.80/9.58/34.89/19.49 ms using the
+  original SM75 algorithm on the same GPU (FFN-down includes SwiGLU).
+  This candidate is not enabled or retained in runtime dispatch. Its SM75
+  resource improvement is proven; its speed on an actual 2080 Ti is not.
+
+  LoRA merging is inherited from ComfyUI, not replaced by this GEMM kernel:
+  dequantize the original NVFP4 weight, accumulate the complete patch list in
+  the selected merge dtype, then requantize once with recalculated tensor and
+  block scales. ComfyUI's positive-seed path uses its stochastic NVFP4 rounding;
+  Kitchen's standalone default quantizer is deterministic. Neither guarantees
+  lossless LoRA merging, including on Blackwell. Tests compare packed bytes and
+  both scales against official Linear/requantize paths for multiple LoRAs,
+  FP32/BF16 merges, stochastic/deterministic modes and padded dimensions.
+  Weight preparation for INT8 GEMM never modifies those stored NVFP4 bytes.
 - `Load ConvRot DiT` loads ComfyUI ConvRot diffusion models. It supports W8A8,
   W4A8, and W4A4 dispatch. Its attention choices are `w8a8`, `sage`, and
   `sdpa`; W8A8 is the default.
@@ -180,7 +328,7 @@ only after its CUDA sources or required version change.
   SAM3. The legacy `BBOX` output targets older KJNodes consumers, while
   `BOUNDING_BOX` targets SeC and current ComfyUI nodes such as SAM3. Input batch
   lengths may differ, but their first frames must have matching spatial dimensions.
-- `Load SeC Model` loads single-file or Hugging Face directory-format SeC
+- `SeC Track Visual Concept` includes model selection and loads single-file or Hugging Face directory-format SeC
   checkpoints from `ComfyUI/models/sams`. The checkpoint starts on ComfyUI's
   offload device and is registered through a model patcher; there is no manual
   device selector or private unload lifecycle. Its `auto` attention mode selects
@@ -257,7 +405,7 @@ only after its CUDA sources or required version change.
   first/last keyframes must still be single-frame latents matching the target
   spatial grid. Semantic embeddings and their token tags are kept unchanged;
   reference meaning and ordering are controlled by the workflow.
-- `Load MiniMax H3 Latent Upscaler` loads the attention-free 3D learned latent
+- `MiniMax H3 Latent Upscale` includes model/precision selection and loads the attention-free 3D learned latent
   upscaler through ComfyUI's normal offload lifecycle. Place compatible weights
   from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
   in `models/latent_upscale_models/`.

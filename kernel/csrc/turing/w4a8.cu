@@ -75,6 +75,11 @@ __device__ __forceinline__ float load_group_scale<uint8_t>(uint8_t value) {
     return __half2float(__nv_cvt_fp8_to_halfraw(value, __NV_E4M3));
 }
 
+template <>
+__device__ __forceinline__ float load_group_scale<float>(float value) {
+    return value;
+}
+
 // CUTLASS normally loads the packed operand fragment and applies a stateless
 // numeric transform before storing it to shared memory. Grouped-codebook W4
 // also needs a per-group E4M3 scale and a 16-entry codebook. This iterator
@@ -82,7 +87,7 @@ __device__ __forceinline__ float load_group_scale<uint8_t>(uint8_t value) {
 // decoding in registers. MmaPipelined therefore writes exactly the same S8
 // crosswise shared-memory tile as the existing W8A8 kernel: no decoded global
 // workspace and no additional shared memory are introduced.
-template <typename Shape_, typename ThreadMap_>
+template <typename Shape_, typename ThreadMap_, typename ScaleT = uint8_t>
 class TuringCodebookW4Iterator {
 public:
     using Shape = Shape_;
@@ -116,7 +121,7 @@ public:
 
     struct Params {
         typename RawIterator::Params raw;
-        uint8_t const *group_scale = nullptr;
+        ScaleT const *group_scale = nullptr;
         float const *codebook = nullptr;
         int groups_per_row = 0;
 
@@ -128,13 +133,14 @@ public:
 
 private:
     RawIterator raw_;
-    uint8_t const *group_scale_ = nullptr;
+    ScaleT const *group_scale_ = nullptr;
     float const *codebook_ = nullptr;
     int groups_per_row_ = 0;
     int extent_k_ = 0;
     int extent_n_ = 0;
     int thread_k_ = 0;
     int thread_n_ = 0;
+    int advance_k_ = Shape::kRow;
     bool enabled_ = true;
 
 public:
@@ -156,6 +162,9 @@ public:
         auto const thread_offset = ThreadMap::initial_offset(thread_id);
         thread_k_ = threadblock_offset.row() + thread_offset.contiguous();
         thread_n_ = threadblock_offset.column() + thread_offset.strided();
+        // PredicatedTileIterator visits the K residue first, then full tiles.
+        const int residue = (extent.row() - threadblock_offset.row()) % Shape::kRow;
+        advance_k_ = residue == 0 ? Shape::kRow : residue;
     }
 
     CUTLASS_HOST_DEVICE
@@ -168,7 +177,8 @@ public:
     CUTLASS_HOST_DEVICE
     TuringCodebookW4Iterator &operator++() {
         ++raw_;
-        thread_k_ += Shape::kRow;
+        thread_k_ += advance_k_;
+        advance_k_ = Shape::kRow;
         return *this;
     }
 
@@ -219,7 +229,7 @@ public:
                 int const n = thread_n_ + s * ThreadMap::Delta::kStrided;
                 bool const valid = enabled_ && n < extent_n_ && k < extent_k_;
                 float const scale = valid
-                    ? load_group_scale<uint8_t>(
+                    ? load_group_scale<ScaleT>(
                           group_scale_[static_cast<int64_t>(n) * groups_per_row_ + k / 16])
                     : 0.0f;
 
@@ -237,7 +247,7 @@ public:
     }
 };
 
-template <typename BaseKernel>
+template <typename BaseKernel, typename ScaleT>
 struct TuringCodebookGemmKernel : BaseKernel {
     using Base = BaseKernel;
     using Arguments = typename Base::Arguments;
@@ -257,7 +267,7 @@ struct TuringCodebookGemmKernel : BaseKernel {
 
     private:
         void set_codebook_params(Arguments const &args) {
-            this->params_B.group_scale = reinterpret_cast<uint8_t const *>(args.ptr_C);
+            this->params_B.group_scale = reinterpret_cast<ScaleT const *>(args.ptr_C);
             this->params_B.codebook = reinterpret_cast<float const *>(args.ptr_D);
             this->params_B.groups_per_row = args.problem_size.k() / 16;
         }
@@ -277,7 +287,8 @@ template <typename Output,
           int WM,
           int WN,
           int InputAlignment = 16,
-          int WeightAlignment = 16>
+          int WeightAlignment = 16,
+          typename ScaleT = uint8_t, bool RoundHalf = true>
 struct TuringW4A8Gemm {
     static constexpr bool PackedWeight = Kind != WeightKind::kInt8;
     static constexpr bool CodebookWeight = Kind == WeightKind::kCodebookW4;
@@ -335,7 +346,7 @@ struct TuringW4A8Gemm {
         CodebookWeight,
         TuringCodebookW4Iterator<
             cutlass::MatrixShape<ThreadblockShape::kK, ThreadblockShape::kN>,
-            typename MmaCore::IteratorThreadMapB>,
+            typename MmaCore::IteratorThreadMapB, ScaleT>,
         PredicatedIteratorB>;
 
     using TransformA = cutlass::NumericArrayConverter<
@@ -415,7 +426,7 @@ struct TuringW4A8Gemm {
         Accumulator,
         cutlass::epilogue::threadblock::Sm80EVT<ScaleWeight, ActivationScale, WeightScale>>;
     using ScaledOutput = std::conditional_t<
-        std::is_same_v<ElementC, cutlass::half_t>, FP16ScaledOutput, BF16ScaledOutput>;
+        RoundHalf && std::is_same_v<ElementC, cutlass::half_t>, FP16ScaledOutput, BF16ScaledOutput>;
     using AddBias = cutlass::epilogue::threadblock::VisitorCompute<
         cutlass::plus,
         ElementC,
@@ -463,7 +474,7 @@ struct TuringW4A8Gemm {
         ThreadblockSwizzle>;
     using GemmKernel = std::conditional_t<
         CodebookWeight,
-        TuringCodebookGemmKernel<BaseGemmKernel>,
+        TuringCodebookGemmKernel<BaseGemmKernel, ScaleT>,
         BaseGemmKernel>;
     using Gemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
     static_assert(sizeof(typename GemmKernel::SharedStorage) <= 48 * 1024,
@@ -480,11 +491,11 @@ struct TuringW4A8Gemm {
                     int k,
                     int output_stride,
                     cudaStream_t stream,
-                    const uint8_t *group_scale = nullptr,
+                    const ScaleT *group_scale = nullptr,
                     const float *codebook = nullptr) {
         cutlass::gemm::GemmCoord problem(m, n, k);
         auto scale_arguments = [&]() -> typename ScaledOutput::Arguments {
-            if constexpr (std::is_same_v<ElementC, cutlass::half_t>) {
+            if constexpr (RoundHalf && std::is_same_v<ElementC, cutlass::half_t>) {
                 return {{},
                         {{const_cast<float *>(activation_scale), 0.0f, {_1{}, _0{}, m}},
                          {const_cast<float *>(weight_scale), 0.0f, {_0{}, _1{}, n}}, {}}, {}};
@@ -592,7 +603,7 @@ bool run_k_tail_tile(const int8_t *activation,
         stream);
 }
 
-template <int TBM, int TBN, int WM, int WN, typename Output>
+template <int TBM, int TBN, int WM, int WN, typename Output, bool RoundHalf = true>
 bool run_int8_tile(const int8_t *activation,
                    const int8_t *weight,
                    const float *activation_scale,
@@ -605,7 +616,7 @@ bool run_int8_tile(const int8_t *activation,
                    int output_stride,
                    cudaStream_t stream) {
     return TuringW4A8Gemm<
-        Output, WeightKind::kInt8, TBM, TBN, WM, WN>::run(
+        Output, WeightKind::kInt8, TBM, TBN, WM, WN, 16, 16, uint8_t, RoundHalf>::run(
         activation,
         weight,
         activation_scale,
@@ -622,7 +633,7 @@ bool run_int8_tile(const int8_t *activation,
 // Native SM80 INT8 Tensor Core mainloop.  Keeping the same EVT epilogue as
 // the SM75 implementation makes this a schedule substitution only: integer
 // accumulation, row/channel scales, bias, and BF16 rounding are unchanged.
-template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages, typename Output>
+template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages, typename Output, bool RoundHalf = true>
 struct AmpereInt8Gemm {
     using ElementA = int8_t;
     using ElementB = int8_t;
@@ -637,7 +648,7 @@ struct AmpereInt8Gemm {
     using InstructionShape = cutlass::gemm::GemmShape<16, 8, 32>;
     using Swizzle = cutlass::gemm::threadblock::GemmIdentityThreadblockSwizzle<>;
     static constexpr int Alignment = 16;
-    static constexpr int AlignmentC = 8;
+    static constexpr int AlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
     static constexpr int EpilogueStages = 1;
 
     using ThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<
@@ -663,7 +674,7 @@ struct AmpereInt8Gemm {
         FP16Scale, Accumulator,
         cutlass::epilogue::threadblock::Sm80EVT<Multiply, XScale, WScale>>;
     using ScaledOutput = std::conditional_t<
-        std::is_same_v<ElementC, cutlass::half_t>, FP16ScaledOutput, BF16ScaledOutput>;
+        RoundHalf && std::is_same_v<ElementC, cutlass::half_t>, FP16ScaledOutput, BF16ScaledOutput>;
     using Add = cutlass::epilogue::threadblock::VisitorCompute<
         cutlass::plus, ElementC, ComputeT,
         cutlass::FloatRoundStyle::round_to_nearest>;
@@ -697,7 +708,7 @@ struct AmpereInt8Gemm {
                     cudaStream_t stream) {
         cutlass::gemm::GemmCoord problem(m, n, k);
         auto scale_arguments = [&]() -> typename ScaledOutput::Arguments {
-            if constexpr (std::is_same_v<ElementC, cutlass::half_t>) {
+            if constexpr (RoundHalf && std::is_same_v<ElementC, cutlass::half_t>) {
                 return {{},
                         {{const_cast<float *>(activation_scale), 0.0f, {_1{}, _0{}, m}},
                          {const_cast<float *>(weight_scale), 0.0f, {_0{}, _1{}, n}}, {}}, {}};
@@ -741,7 +752,7 @@ struct AmpereInt8Gemm {
     }
 };
 
-template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages, typename Output>
+template <int TBM, int TBN, int TBK, int WM, int WN, int WK, int Stages, typename Output, bool RoundHalf = true>
 bool run_ampere_int8_tile(const int8_t *activation,
                           const int8_t *weight,
                           const float *activation_scale,
@@ -754,16 +765,16 @@ bool run_ampere_int8_tile(const int8_t *activation,
                           int output_stride,
                           cudaStream_t stream) {
     return AmpereInt8Gemm<
-        TBM, TBN, TBK, WM, WN, WK, Stages, Output>::run(
+        TBM, TBN, TBK, WM, WN, WK, Stages, Output, RoundHalf>::run(
         activation, weight, activation_scale, weight_scale, bias, output,
         m, n, k, output_stride, stream);
 }
 
-template <int TBM, int TBN, int WM, int WN>
+template <int TBM, int TBN, int WM, int WN, typename ScaleT>
 bool run_codebook_tile(const int8_t *activation,
                        const int8_t *weight,
                        const float *activation_scale,
-                       const uint8_t *group_scale,
+                       const ScaleT *group_scale,
                        const float *channel_scale,
                        const float *codebook,
                        const float *bias,
@@ -773,7 +784,8 @@ bool run_codebook_tile(const int8_t *activation,
                        int k,
                        cudaStream_t stream) {
     return TuringW4A8Gemm<
-        cutlass::bfloat16_t, WeightKind::kCodebookW4, TBM, TBN, WM, WN>::run(
+        cutlass::bfloat16_t, WeightKind::kCodebookW4, TBM, TBN, WM, WN,
+        16, 16, ScaleT>::run(
         activation,
         weight,
         activation_scale,
@@ -805,7 +817,7 @@ bool dispatch(const int8_t *activation,
         output, m, n, k, output_stride, stream);
 }
 
-template <typename Output>
+template <typename Output, bool RoundHalf = true>
 bool dispatch_int8(const int8_t *activation,
                    const int8_t *weight,
                    const float *activation_scale,
@@ -816,22 +828,34 @@ bool dispatch_int8(const int8_t *activation,
                    int n,
                    int k,
                    int output_stride,
-                   cudaStream_t stream) {
+                   cudaStream_t stream,
+                   int original_n = 0) {
     const cudaDeviceProp *properties = getCurrentDeviceProperties();
-    if (properties->major >= 8 && n >= 16384) {
-        return run_ampere_int8_tile<128, 256, 64, 64, 64, 64, 3>(
+    // Long, wide-K contractions benefit from SM86's asynchronous four-stage
+    // mainloop. Keep short shapes and other architectures on their baseline.
+    if constexpr (std::is_same_v<Output, cutlass::bfloat16_t>) {
+        if (properties->major == 8 && properties->minor == 6 && m >= 8192 && k >= 8192 &&
+            std::max(n, original_n) >= 4096 && std::max(n, original_n) < 16384) {
+            return run_ampere_int8_tile<128, 256, 64, 64, 64, 64, 4, Output, RoundHalf>(
+                activation, weight, activation_scale, weight_scale, bias,
+                output, m, n, k, output_stride, stream);
+        }
+    }
+    if (properties->major >= 8 && std::max(n, original_n) >= 16384) {
+        return run_ampere_int8_tile<128, 256, 64, 64, 64, 64, 3, Output, RoundHalf>(
             activation, weight, activation_scale, weight_scale, bias,
             output, m, n, k, output_stride, stream);
     }
-    return run_int8_tile<128, 256, 64, 64>(
+    return run_int8_tile<128, 256, 64, 64, Output, RoundHalf>(
         activation, weight, activation_scale, weight_scale, bias,
         output, m, n, k, output_stride, stream);
 }
 
+template <typename ScaleT>
 bool dispatch_codebook(const int8_t *activation,
                        const int8_t *weight,
                        const float *activation_scale,
-                       const uint8_t *group_scale,
+                       const ScaleT *group_scale,
                        const float *channel_scale,
                        const float *codebook,
                        const float *bias,
@@ -855,9 +879,10 @@ bool dispatch_codebook(const int8_t *activation,
 // Decode one 16-column vector per thread. This intentionally matches Kitchen's
 // reference rounding and E4M3 conversion so the staged SM75 path is bit exact
 // before the INT8 contraction.
+template <typename ScaleT>
 __global__ void decode_codebook_w4_to_s8(
     const int8_t *__restrict__ packed_weight,
-    const uint8_t *__restrict__ group_scale,
+    const ScaleT *__restrict__ group_scale,
     const float *__restrict__ codebook,
     int8_t *__restrict__ output,
     int64_t vector_count,
@@ -889,7 +914,7 @@ __global__ void decode_codebook_w4_to_s8(
         const unsigned bytes = output_word < 2 ? packed.x : packed.y;
         const int input_shift = (output_word & 1) * 16;
         const int local_group = group_size >= 16 ? 0 : (output_word * 4) / group_size;
-        const float scale = load_group_scale<uint8_t>(
+        const float scale = load_group_scale<ScaleT>(
             group_scale[scale_row + base_group + local_group]);
         unsigned decoded_word = 0;
 #pragma unroll
@@ -923,8 +948,9 @@ __global__ void decode_codebook_w4_to_s8(
         decoded;
 }
 
+template <typename ScaleT>
 void launch_codebook_decode(const int8_t *packed_weight,
-                            const uint8_t *group_scale,
+                            const ScaleT *group_scale,
                             const float *codebook,
                             int8_t *workspace,
                             int rows,
@@ -1034,7 +1060,8 @@ void turing_w4a8_linear(Tensor activation,
     checkCUDA(cudaGetLastError());
 }
 
-void turing_codebook_w4a8_linear(Tensor activation,
+template <typename ScaleT>
+void codebook_w4a8_linear_impl(Tensor activation,
                                  Tensor weight,
                                  Tensor activation_scale,
                                  Tensor group_scale,
@@ -1065,7 +1092,7 @@ void turing_codebook_w4a8_linear(Tensor activation,
     const auto *activation_ptr = activation.data_ptr<int8_t>();
     const auto *weight_ptr = weight.data_ptr<int8_t>();
     const auto *activation_scale_ptr = activation_scale.data_ptr<float>();
-    const auto *group_scale_ptr = group_scale.data_ptr<uint8_t>();
+    const auto *group_scale_ptr = group_scale.data_ptr<ScaleT>();
     const auto *channel_scale_ptr = channel_scale.data_ptr<float>();
     const auto *codebook_ptr = codebook.data_ptr<float>();
     const auto *bias_ptr = bias.valid() ? bias.data_ptr<float>() : nullptr;
@@ -1129,12 +1156,28 @@ void turing_codebook_w4a8_linear(Tensor activation,
     checkCUDA(cudaGetLastError());
 }
 
+void turing_codebook_w4a8_linear(Tensor activation, Tensor weight,
+                                 Tensor activation_scale, Tensor group_scale,
+                                 Tensor channel_scale, Tensor codebook,
+                                 Tensor bias, Tensor workspace, Tensor output,
+                                 int group_size, bool inline_decode) {
+    if (group_scale.scalar_type() == Tensor::FP32) {
+        codebook_w4a8_linear_impl<float>(activation, weight, activation_scale,
+            group_scale, channel_scale, codebook, bias, workspace, output,
+            group_size, inline_decode);
+    } else {
+        codebook_w4a8_linear_impl<uint8_t>(activation, weight, activation_scale,
+            group_scale, channel_scale, codebook, bias, workspace, output,
+            group_size, inline_decode);
+    }
+}
+
 void turing_int8_linear(Tensor activation,
                         Tensor weight,
                         Tensor activation_scale,
                         Tensor weight_scale,
                         Tensor bias,
-                        Tensor output) {
+                        Tensor output, bool precise) {
     const int m = activation.size(0);
     const int k = activation.size(1);
     const int n = weight.size(0);
@@ -1146,14 +1189,26 @@ void turing_int8_linear(Tensor activation,
     }
     // Row-major [N,K] weights are already a column-major [K,N] GEMM operand.
     // Never transpose/materialize a second weight buffer.
+    // Column chunks retain the parent width in the output stride. Preserve
+    // that scheduling hint instead of treating each QKV chunk as a narrow layer.
     const auto launch = [&](auto *output_ptr) {
+        using Output = std::remove_pointer_t<decltype(output_ptr)>;
+        if (precise) return dispatch_int8<Output, false>(
+            activation.data_ptr<int8_t>(), weight.data_ptr<int8_t>(),
+            activation_scale.data_ptr<float>(), weight_scale.data_ptr<float>(),
+            bias.valid() ? bias.data_ptr<float>() : nullptr, output_ptr,
+            m, n, k, static_cast<int>(output.stride(0)), getCurrentCUDAStream(),
+            static_cast<int>(output.stride(0)));
         return dispatch_int8(
             activation.data_ptr<int8_t>(), weight.data_ptr<int8_t>(),
             activation_scale.data_ptr<float>(), weight_scale.data_ptr<float>(),
             bias.valid() ? bias.data_ptr<float>() : nullptr, output_ptr,
-            m, n, k, static_cast<int>(output.stride(0)), getCurrentCUDAStream());
+            m, n, k, static_cast<int>(output.stride(0)), getCurrentCUDAStream(),
+            static_cast<int>(output.stride(0)));
     };
-    const bool launched = output.scalar_type() == Tensor::FP16
+    const bool launched = output.scalar_type() == Tensor::FP32
+        ? launch(static_cast<float *>(output.ptr))
+        : output.scalar_type() == Tensor::FP16
         ? launch(static_cast<cutlass::half_t *>(output.ptr))
         : launch(static_cast<cutlass::bfloat16_t *>(output.ptr));
 

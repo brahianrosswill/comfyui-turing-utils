@@ -16,6 +16,7 @@ W4_FORMAT = "convrot_w4a4"
 CODEBOOK_W4_FORMAT = "asym_w4a8_int8"
 W8_FORMAT = "int8_tensorwise"
 LEGACY_W8_FORMAT = "int8_rowwise"
+NVFP4_FORMAT = "nvfp4"
 MAX_SAFETENSORS_HEADER_SIZE = 128 * 1024 * 1024
 MAX_QUANT_CONFIG_SIZE = 1024 * 1024
 
@@ -26,6 +27,7 @@ class ConvRotSummary:
     w4a8: int = 0
     codebook_w4a8: int = 0
     w8a8: int = 0
+    nvfp4: int = 0
 
 
 def _params(config: dict, layer_name: str) -> dict:
@@ -55,6 +57,8 @@ def _classify_config(config: dict, layer_name: str, force_int8_gemm: bool) -> tu
     _normalize_legacy_config(config, layer_name)
     quant_format = config.get("format")
     params = _params(config, layer_name)
+    if quant_format == NVFP4_FORMAT:
+        return "nvfp4", "int8"
     if quant_format == W4_FORMAT:
         activation_dtype = _config_value(config, params, "linear_dtype", "int4")
         if activation_dtype not in {"int4", "int8"}:
@@ -284,7 +288,7 @@ def configure_convrot_activation(
 
     if force_int8_gemm:
         for _, config, weight_dtype, _ in classified_records:
-            if weight_dtype != "w4_codebook":
+            if weight_dtype not in {"w4_codebook", "nvfp4"}:
                 config["linear_dtype"] = "int8"
 
     if header_quantization is not None:
@@ -293,6 +297,7 @@ def configure_convrot_activation(
         state_dict[key] = _encode_quant_tensor(config)
 
     summary = ConvRotSummary(
+        nvfp4=sum(1 for kind, _ in layer_types.values() if kind == "nvfp4"),
         w4a4=sum(1 for weight_dtype, act_dtype in layer_types.values() if (weight_dtype, act_dtype) == ("w4", "int4")),
         w4a8=sum(1 for weight_dtype, act_dtype in layer_types.values() if (weight_dtype, act_dtype) == ("w4", "int8")),
         codebook_w4a8=sum(
@@ -310,11 +315,14 @@ def _summarize_convrot_modules(root: torch.nn.Module) -> ConvRotSummary:
     w4a8 = 0
     codebook_w4a8 = 0
     w8a8 = 0
+    nvfp4 = 0
     for _, module in root.named_modules():
         quant_format = getattr(module, "quant_format", None)
         weight = getattr(module, "weight", None)
         params = getattr(weight, "_params", None)
-        if quant_format == W4_FORMAT:
+        if quant_format == NVFP4_FORMAT:
+            nvfp4 += 1
+        elif quant_format == W4_FORMAT:
             activation_dtype = getattr(params, "linear_dtype", None)
             if activation_dtype == "int4":
                 w4a4 += 1
@@ -343,6 +351,7 @@ def _summarize_convrot_modules(root: torch.nn.Module) -> ConvRotSummary:
         w4a8=w4a8,
         codebook_w4a8=codebook_w4a8,
         w8a8=w8a8,
+        nvfp4=nvfp4,
     )
 
 

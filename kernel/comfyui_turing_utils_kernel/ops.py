@@ -59,8 +59,8 @@ def turing_codebook_w4a8_linear(
         raise RuntimeError("Turing codebook W4A8 requires sm75 or newer")
     if group_scale.dtype == torch.float8_e4m3fn:
         group_scale = group_scale.view(torch.uint8)
-    if group_scale.dtype != torch.uint8:
-        raise TypeError("group_scale must be float8_e4m3fn or its raw uint8 view")
+    if group_scale.dtype not in (torch.uint8, torch.float32):
+        raise TypeError("group_scale must be float8_e4m3fn, raw uint8, or float32")
     return _C.turing_codebook_w4a8_linear(
         activation.contiguous(),
         weight.contiguous(),
@@ -91,6 +91,39 @@ def _turing_codebook_w4a8_linear_fake(
         dtype=torch.bfloat16,
         device=activation.device,
     )
+
+
+@torch.library.custom_op("turing_utils::nvfp4_convrot_quantize", mutates_args=())
+def turing_nvfp4_convrot_quantize(
+    weight: torch.Tensor, blocks: torch.Tensor, tensor_scale: torch.Tensor,
+    first_row: int = 0, rows: int = -1, input_columns: int = -1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """NVFP4 -> regular ConvRot256 -> rowwise S8, without global FP32 scratch."""
+    if blocks.dtype == torch.float8_e4m3fn:
+        blocks = blocks.view(torch.uint8)
+    return _C.turing_nvfp4_convrot_quantize(weight, blocks, tensor_scale, first_row, rows, input_columns)
+
+
+@turing_nvfp4_convrot_quantize.register_fake
+def _turing_nvfp4_convrot_quantize_fake(weight, blocks, tensor_scale, first_row=0, rows=-1, input_columns=-1):
+    count = weight.size(0) - first_row if rows < 0 else rows
+    return (torch.empty((count, ((weight.size(1) * 2 if input_columns < 0 else input_columns) + 255) // 256 * 256), device=weight.device, dtype=torch.int8),
+            torch.empty((count,), device=weight.device, dtype=torch.float32))
+
+
+@torch.library.custom_op("turing_utils::nvfp4_convrot_quantize_out", mutates_args=("output", "scales"))
+def turing_nvfp4_convrot_quantize_out(
+    weight: torch.Tensor, blocks: torch.Tensor, tensor_scale: torch.Tensor,
+    output: torch.Tensor, scales: torch.Tensor, first_row: int = 0, input_columns: int = -1,
+) -> None:
+    if blocks.dtype == torch.float8_e4m3fn:
+        blocks = blocks.view(torch.uint8)
+    _C.turing_nvfp4_convrot_quantize_out(weight, blocks, tensor_scale, output, scales, first_row, input_columns)
+
+
+@turing_nvfp4_convrot_quantize_out.register_fake
+def _turing_nvfp4_convrot_quantize_out_fake(weight, blocks, tensor_scale, output, scales, first_row=0, input_columns=-1):
+    return None
 
 
 @torch.library.custom_op("turing_utils::int8_linear", mutates_args=())

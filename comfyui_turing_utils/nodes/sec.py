@@ -17,6 +17,7 @@ class SeCModelLoader(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsSeCModelLoader",
             display_name="Load SeC Model",
+            is_dev_only=True,
             category="Turing Utils/SeC",
             description=(
                 "Load a SeC visual-concept tracking model through ComfyUI's model "
@@ -47,11 +48,12 @@ class SeCModelLoader(io.ComfyNode):
         return io.NodeOutput(load_sec_model(model_name, attention))
 
 
-class SeCTrackVisualConcept(io.ComfyNode):
+class SeCTrackVisualConceptApply(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="TuringUtilsSeCTrackVisualConcept",
+            node_id="TuringUtilsSeCTrackVisualConceptApply",
+            is_dev_only=True,
             display_name="SeC Track Visual Concept",
             category="Turing Utils/SeC",
             description=(
@@ -160,4 +162,19 @@ class SeCTrackVisualConcept(io.ComfyNode):
         return io.NodeOutput(masks)
 
 
-__all__ = ["SeCModelLoader", "SeCTrackVisualConcept"]
+class SeCTrackVisualConcept(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        schema = SeCTrackVisualConceptApply.define_schema()
+        schema.node_id = "TuringUtilsSeCTrackVisualConcept"
+        schema.is_dev_only = False
+        schema.inputs = SeCModelLoader.define_schema().inputs + schema.inputs[1:]
+        return schema
+
+    @classmethod
+    def execute(cls, model_name, frames, attention="auto", **kwargs):
+        return SeCTrackVisualConceptApply.execute(
+            load_sec_model(model_name, attention), frames, **kwargs)
+
+
+__all__ = ["SeCModelLoader", "SeCTrackVisualConcept", "SeCTrackVisualConceptApply"]

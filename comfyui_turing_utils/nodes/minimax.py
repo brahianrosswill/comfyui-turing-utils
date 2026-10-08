@@ -323,6 +323,7 @@ class MiniMaxH3LatentUpscaleModelLoader(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsMiniMaxH3LatentUpscaleModelLoader",
             display_name="Load MiniMax H3 Latent Upscaler",
+            is_dev_only=True,
             category="Turing Utils/loaders",
             description=(
                 "Load an attention-free 3D MiniMax H3 latent upscaler from "
@@ -351,11 +352,12 @@ class MiniMaxH3LatentUpscaleModelLoader(io.ComfyNode):
         return io.NodeOutput(load_h3_latent_upscaler(model_name, precision))
 
 
-class MiniMaxH3LatentUpscale(io.ComfyNode):
+class MiniMaxH3LatentUpscaleApply(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="TuringUtilsMiniMaxH3LatentUpscale",
+            node_id="TuringUtilsMiniMaxH3LatentUpscaleApply",
+            is_dev_only=True,
             display_name="MiniMax H3 Latent Upscale",
             category="Turing Utils/latent",
             description=(
@@ -398,3 +400,20 @@ class MiniMaxH3LatentUpscale(io.ComfyNode):
             scale,
         )
         return io.NodeOutput(output_latent, output_conditioning, width, height)
+
+
+class MiniMaxH3LatentUpscale(io.ComfyNode):
+    @classmethod
+    def define_schema(cls):
+        schema = MiniMaxH3LatentUpscaleApply.define_schema()
+        schema.node_id = "TuringUtilsMiniMaxH3LatentUpscale"
+        schema.is_dev_only = False
+        schema.inputs = MiniMaxH3LatentUpscaleModelLoader.define_schema().inputs + schema.inputs[1:]
+        return schema
+
+    @classmethod
+    def execute(cls, model_name, latent, precision="auto", conditioning=None, scale=2.0):
+        # Direct Python callers can still use the original loader interface.
+        # Server prompts share the loader through the prompt compiler.
+        return MiniMaxH3LatentUpscaleApply.execute(
+            load_h3_latent_upscaler(model_name, precision), latent, conditioning, scale)

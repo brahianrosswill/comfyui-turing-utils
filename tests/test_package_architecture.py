@@ -195,6 +195,7 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsH3BuildConditioning",
                 "TuringUtilsMiniMaxH3LatentUpscaleModelLoader",
                 "TuringUtilsMiniMaxH3LatentUpscale",
+                "TuringUtilsMiniMaxH3LatentUpscaleApply",
                 "TuringUtilsMiniMaxH3BlockCachePatch",
                 "TuringUtilsSolAttentionStrategy",
                 "TuringUtilsSlaAttentionStrategy",
@@ -219,6 +220,7 @@ class PackageArchitectureTest(unittest.TestCase):
                 "TuringUtilsMaskToVisualPrompts",
                 "TuringUtilsSeCModelLoader",
                 "TuringUtilsSeCTrackVisualConcept",
+                "TuringUtilsSeCTrackVisualConceptApply",
             ),
         )
 

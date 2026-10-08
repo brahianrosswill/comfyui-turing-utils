@@ -48,6 +48,22 @@ def quant_config(value: torch.Tensor) -> dict:
 
 
 class ConvRotActivationTest(unittest.TestCase):
+    def test_nvfp4_mixed_formats_keep_official_metadata(self):
+        configs = {
+            "nv": {"format": "nvfp4", "full_precision_matrix_mult": False},
+            "w8": {"format": "int8_tensorwise", "convrot": True},
+            "w4": {"format": "convrot_w4a4"},
+            "book": {"format": "asym_w4a8_int8"},
+        }
+        state = {name + ".comfy_quant": quant_tensor(config) for name, config in configs.items()}
+        _, summary = configure_convrot_activation(state, None, True)
+        self.assertEqual(summary, ConvRotSummary(nvfp4=1, w8a8=1, w4a8=1, codebook_w4a8=1))
+        self.assertEqual(quant_config(state["nv.comfy_quant"]), configs["nv"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "native.safetensors"
+            save_file({"nv.comfy_quant": state["nv.comfy_quant"]}, path)
+            self.assertIsNone(_convrot_skip_reason(path))
+
     def test_grouped_codebook_w4a8_metadata_is_preserved(self):
         key = "blocks.0.mlp.fc1.comfy_quant"
         state_dict = {

@@ -491,6 +491,7 @@ core_ext = CUDAExtension(
         "csrc/bindings.cpp",
         "csrc/turing/bf16_epilogue.cu",
         "csrc/turing/convrot_quant.cu",
+        "csrc/turing/nvfp4_int8.cu",
         "csrc/turing/segmented_rms_adaln.cu",
         "csrc/turing/w4a8.cu",
     ],

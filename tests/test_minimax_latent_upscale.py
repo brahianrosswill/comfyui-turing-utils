@@ -26,7 +26,8 @@ from comfyui_turing_utils.adapters.minimax.latent_upscaler import (  # noqa: E40
 )
 from comfyui_turing_utils.nodes.latent import SetVideoLatentNoiseMask, VideoLatentCompositeMasked  # noqa: E402
 from comfyui_turing_utils.nodes.minimax import (  # noqa: E402
-    MiniMaxH3LatentUpscale,
+    MiniMaxH3LatentUpscaleApply as MiniMaxH3LatentUpscale,
+    MiniMaxH3LatentUpscale as UnifiedLatentUpscale,
     MiniMaxH3LatentUpscaleModelLoader,
 )
 
@@ -120,16 +121,18 @@ class MiniMaxH3LatentUpscaleTest(unittest.TestCase):
 
     def test_schema_exposes_conditioning_and_multiplier(self):
         loader = MiniMaxH3LatentUpscaleModelLoader.define_schema()
-        upscale = MiniMaxH3LatentUpscale.define_schema()
+        upscale = UnifiedLatentUpscale.define_schema()
         self.assertEqual(loader.node_id, "TuringUtilsMiniMaxH3LatentUpscaleModelLoader")
         self.assertEqual(upscale.node_id, "TuringUtilsMiniMaxH3LatentUpscale")
         self.assertEqual([item.id for item in upscale.inputs], [
-            "upscale_model",
+            "model_name",
+            "precision",
             "latent",
             "conditioning",
             "scale",
         ])
-        self.assertTrue(upscale.inputs[2].optional)
+        self.assertTrue(upscale.inputs[3].optional)
+        self.assertTrue(loader.is_dev_only)
 
     @mock.patch("comfy.model_management.load_models_gpu")
     def test_fl2av_upscales_video_keyframes_and_video_mask(self, load_models_gpu):

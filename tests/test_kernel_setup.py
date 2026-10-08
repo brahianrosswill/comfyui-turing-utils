@@ -474,12 +474,16 @@ class KernelSetupTest(unittest.TestCase):
         self.assertNotIn("GEMM_TUNE", source)
         self.assertNotIn("GEMM_CACHE", source)
         self.assertNotIn("PersistentTileTuneCache", source)
-        self.assertIn("properties->major >= 8 && n >= 16384", source)
+        # Staged NVFP4 retains the full output width for architecture dispatch;
+        # shrinking a temporary chunk must not change the selected GEMM family.
+        self.assertIn("properties->major >= 8 && std::max(n, original_n) >= 16384", source)
+        self.assertIn("int original_n = 0", source)
+        self.assertIn("static_cast<int>(output.stride(0)));", source)
         self.assertIn(
-            "run_ampere_int8_tile<128, 256, 64, 64, 64, 64, 3>",
+            "run_ampere_int8_tile<128, 256, 64, 64, 64, 64, 3, Output, RoundHalf>",
             source,
         )
-        self.assertIn("run_int8_tile<128, 256, 64, 64>", source)
+        self.assertIn("run_int8_tile<128, 256, 64, 64, Output, RoundHalf>", source)
 
     def test_legacy_w4a8_edges_remain_on_tensor_cores(self):
         bindings = (PLUGIN_ROOT / "kernel" / "csrc" / "bindings.cpp").read_text(

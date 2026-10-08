@@ -14,7 +14,7 @@ from .nodes.loaders import ConvRotCLIPLoader, ConvRotDiffusionModelLoader
 from .nodes.logic import IsInputPresent, LazyIfElse, StageBarrier, StagePath
 from .nodes.media import ResizeImageIfPresent, VideoMotionContactSheet
 from .nodes.multimodal_chat import MultimodalChatOptions, MultimodalPromptChat
-from .nodes.sec import SeCModelLoader, SeCTrackVisualConcept
+from .nodes.sec import SeCModelLoader, SeCTrackVisualConcept, SeCTrackVisualConceptApply
 from .nodes.veda import H3VedaAttentionStrategy
 from .nodes.minimax import (
     H3AddNoise,
@@ -22,6 +22,7 @@ from .nodes.minimax import (
     H3SeparateAVLatent,
     MiniMaxH3BlockCachePatch,
     MiniMaxH3LatentUpscale,
+    MiniMaxH3LatentUpscaleApply,
     MiniMaxH3LatentUpscaleModelLoader,
     MiniMaxH3VideoFramesPadding,
 )
@@ -86,6 +87,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsH3BuildConditioning": H3BuildConditioning,
     "TuringUtilsMiniMaxH3LatentUpscaleModelLoader": MiniMaxH3LatentUpscaleModelLoader,
     "TuringUtilsMiniMaxH3LatentUpscale": MiniMaxH3LatentUpscale,
+    "TuringUtilsMiniMaxH3LatentUpscaleApply": MiniMaxH3LatentUpscaleApply,
     "TuringUtilsMiniMaxH3BlockCachePatch": MiniMaxH3BlockCachePatch,
     "TuringUtilsSolAttentionStrategy": SolSparseAttentionPatch,
     "TuringUtilsSlaAttentionStrategy": SlaSparseAttentionPatch,
@@ -110,6 +112,7 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsMaskToVisualPrompts": MaskToVisualPrompts,
     "TuringUtilsSeCModelLoader": SeCModelLoader,
     "TuringUtilsSeCTrackVisualConcept": SeCTrackVisualConcept,
+    "TuringUtilsSeCTrackVisualConceptApply": SeCTrackVisualConceptApply,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -139,6 +142,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsH3BuildConditioning": "H3 Build Conditioning",
     "TuringUtilsMiniMaxH3LatentUpscaleModelLoader": "Load MiniMax H3 Latent Upscaler",
     "TuringUtilsMiniMaxH3LatentUpscale": "MiniMax H3 Latent Upscale",
+    "TuringUtilsMiniMaxH3LatentUpscaleApply": "MiniMax H3 Latent Upscale (Internal)",
     "TuringUtilsMiniMaxH3BlockCachePatch": "Patch MiniMax H3 Block Cache (Experimental)",
     "TuringUtilsSolAttentionStrategy": "Configure Sol Sparse Attention",
     "TuringUtilsSlaAttentionStrategy": "Configure SLA Sparse Attention",
@@ -163,4 +167,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsMaskToVisualPrompts": "Mask to Visual Prompts",
     "TuringUtilsSeCModelLoader": "Load SeC Model",
     "TuringUtilsSeCTrackVisualConcept": "SeC Track Visual Concept",
+    "TuringUtilsSeCTrackVisualConceptApply": "SeC Track Visual Concept (Internal)",
 }

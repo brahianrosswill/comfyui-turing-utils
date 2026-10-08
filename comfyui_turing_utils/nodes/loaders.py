@@ -20,8 +20,8 @@ class ConvRotDiffusionModelLoader:
                     service.convrot_model_names(service.DIFFUSION_FOLDER_NAME),
                     {
                         "tooltip": (
-                            "ConvRot DiT file from ComfyUI/models/diffusion_models. "
-                            "Files without supported ConvRot quantization metadata are hidden."
+                            "ConvRot or native NVFP4 DiT from ComfyUI/models/diffusion_models. "
+                            "Mixed formats are selected per layer using ComfyUI/Kitchen metadata."
                         )
                     },
                 ),
@@ -57,6 +57,7 @@ class ConvRotDiffusionModelLoader:
     FUNCTION = "load_diffusion_model"
     CATEGORY = "Turing Utils/loaders"
     TITLE = "Load ConvRot DiT"
+    DESCRIPTION = "Load ConvRot INT8/INT4 and native NVFP4, including mixed checkpoints. NVFP4 retains packed storage and uses paired ConvRot256 with A8/S8 GEMM."
 
     def load_diffusion_model(
         self,
@@ -113,6 +114,7 @@ class ConvRotCLIPLoader:
     FUNCTION = "load_clip"
     CATEGORY = "Turing Utils/loaders"
     TITLE = "Load ConvRot CLIP"
+    DESCRIPTION = "Load ConvRot INT8/INT4 and native NVFP4 text encoders, including mixed checkpoints. NVFP4 uses A8/S8 GEMM on CUDA and dense fallback on CPU."
 
     def load_clip(
         self,

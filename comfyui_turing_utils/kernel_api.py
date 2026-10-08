@@ -13,6 +13,10 @@ def load_kernel_package() -> ModuleType:
     return importlib.import_module(KERNEL_PACKAGE)
 
 
+def load_nvfp4_backend() -> ModuleType:
+    return importlib.import_module(f"{KERNEL_PACKAGE}.nvfp4")
+
+
 def load_kernel_extension(name: str) -> ModuleType:
     if not name or "." in name:
         raise ValueError(f"Invalid kernel extension name: {name!r}")
@@ -99,6 +103,7 @@ __all__ = [
     "kernel_version",
     "load_kernel_extension",
     "load_kernel_package",
+    "load_nvfp4_backend",
     "load_turing_sage",
     "qk_preprocess_protocol_schema",
     "segmented_modulation_schema",

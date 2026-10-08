@@ -280,8 +280,9 @@ at::Tensor turing_codebook_w4a8_linear(at::Tensor activation,
     check_cuda_2d(group_scale, "group_scale");
     TORCH_CHECK(activation.scalar_type() == at::kChar, "activation must be int8");
     TORCH_CHECK(weight.scalar_type() == at::kChar, "weight must use packed int8 storage");
-    TORCH_CHECK(group_scale.scalar_type() == at::kByte,
-                "group_scale must contain raw float8_e4m3fn bytes");
+    TORCH_CHECK(group_scale.scalar_type() == at::kByte ||
+                    group_scale.scalar_type() == at::kFloat,
+                "group_scale must contain raw float8_e4m3fn bytes or float32 scales");
     TORCH_CHECK(activation.device() == weight.device() &&
                     activation.device() == group_scale.device() &&
                     activation.device() == activation_scale.device() &&
@@ -361,6 +362,48 @@ at::Tensor turing_codebook_w4a8_linear(at::Tensor activation,
         int_cast<int>(group_size),
         inline_decode);
     return output;
+}
+
+std::tuple<at::Tensor, at::Tensor> turing_nvfp4_convrot_quantize(
+    at::Tensor weight, at::Tensor blocks, at::Tensor tensor_scale, int64_t first_row, int64_t rows, int64_t input_columns,
+    c10::optional<at::Tensor> output_buffer = c10::nullopt, c10::optional<at::Tensor> scale_buffer = c10::nullopt) {
+    check_cuda_2d(weight, "weight");
+    check_cuda_2d(blocks, "block_scale");
+    TORCH_CHECK(weight.scalar_type() == at::kByte && blocks.scalar_type() == at::kByte,
+                "NVFP4 ConvRot requires packed uint8 weight and raw E4M3 scale bytes");
+    TORCH_CHECK(weight.device() == blocks.device() && weight.device() == tensor_scale.device(),
+                "NVFP4 ConvRot tensors must share a CUDA device");
+    TORCH_CHECK(weight.is_contiguous() && blocks.is_contiguous(), "NVFP4 storage must be contiguous");
+    TORCH_CHECK(tensor_scale.numel() == 1, "tensor_scale must be scalar");
+    const int64_t n = weight.size(0), stored_k = weight.size(1) * 2;
+    const int64_t logical_k = input_columns < 0 ? stored_k : input_columns;
+    TORCH_CHECK(logical_k > 0 && logical_k <= stored_k, "invalid NVFP4 input_columns");
+    const int64_t k = ((logical_k + 255) / 256) * 256;
+    rows = rows < 0 ? n - first_row : rows;
+    TORCH_CHECK(first_row >= 0 && rows > 0 && first_row <= n - rows && n <= INT_MAX,
+                "NVFP4 ConvRot row range is invalid");
+    TORCH_CHECK(k > 0 && k <= INT_MAX && k % 256 == 0, "NVFP4 ConvRot requires K divisible by 256");
+    TORCH_CHECK(blocks.size(0) >= ((n + 127) / 128) * 128 &&
+                    blocks.size(1) >= (stored_k + 15) / 16 && blocks.size(1) % 4 == 0,
+                "NVFP4 ConvRot requires padded cuBLAS scale storage");
+    const at::cuda::CUDAGuard guard(weight.device());
+    const cudaDeviceProp *properties = getCurrentDeviceProperties();
+    TORCH_CHECK(properties->major > 7 || (properties->major == 7 && properties->minor >= 5),
+                "NVFP4 ConvRot requires sm75 or newer");
+    tensor_scale = tensor_scale.to(at::kFloat).contiguous();
+    auto output = output_buffer.has_value() ? *output_buffer : at::empty({rows, k}, weight.options().dtype(at::kChar));
+    auto scales = scale_buffer.has_value() ? *scale_buffer : at::empty({rows}, weight.options().dtype(at::kFloat));
+    TORCH_CHECK(output.device() == weight.device() && output.scalar_type() == at::kChar &&
+                    output.is_contiguous() && output.dim() == 2 && output.size(0) == rows && output.size(1) == k,
+                "NVFP4 output buffer must be contiguous CUDA int8 [rows, padded_k]");
+    TORCH_CHECK(scales.device() == weight.device() && scales.scalar_type() == at::kFloat &&
+                    scales.is_contiguous() && scales.dim() == 1 && scales.numel() == rows,
+                "NVFP4 scale buffer must be contiguous CUDA float32 [rows]");
+    TorchOpContext ctx;
+    comfyui_turing_utils::kernels::turing_nvfp4_convrot_quantize(
+        from_torch(weight), from_torch(blocks), from_torch(tensor_scale),
+        from_torch(output), from_torch(scales), first_row, logical_k);
+    return {output, scales};
 }
 
 at::Tensor int8_linear_impl(at::Tensor activation,
@@ -447,8 +490,8 @@ at::Tensor turing_int8_linear_out(at::Tensor activation,
     TORCH_CHECK(activation.scalar_type() == at::kChar && weight.scalar_type() == at::kChar,
                 "Turing INT8 linear activation and weight must be int8");
     TORCH_CHECK(output.is_cuda() && output.dim() == 2 &&
-                    output.scalar_type() == at::kBFloat16 && output.stride(1) == 1,
-                "INT8 direct output must be a row-major BF16 CUDA matrix");
+                    (output.scalar_type() == at::kBFloat16 || output.scalar_type() == at::kHalf || output.scalar_type() == at::kFloat) && output.stride(1) == 1,
+                "INT8 direct output must be a row-major FP16/BF16/FP32 CUDA matrix");
     TORCH_CHECK(output.size(0) == activation.size(0) &&
                     output.size(1) == weight.size(0) &&
                     output.stride(0) >= output.size(1),
@@ -482,7 +525,7 @@ at::Tensor turing_int8_linear_out(at::Tensor activation,
         from_torch(activation_scale),
         from_torch(weight_scale),
         maybe_tensor(bias),
-        from_torch(output));
+        from_torch(output), true);
     return output;
 }
 
@@ -1197,6 +1240,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           pybind11::arg("bias") = std::nullopt,
           pybind11::arg("group_size") = 16,
           pybind11::arg("chunk_rows") = 0);
+    m.def("turing_nvfp4_convrot_quantize", [](at::Tensor w, at::Tensor b, at::Tensor s,
+            int64_t first, int64_t rows, int64_t k) {
+        return turing_nvfp4_convrot_quantize(w, b, s, first, rows, k);
+    });
+    m.def("turing_nvfp4_convrot_quantize_out", [](at::Tensor w, at::Tensor b, at::Tensor s,
+            at::Tensor out, at::Tensor scales, int64_t first, int64_t k) {
+        turing_nvfp4_convrot_quantize(w, b, s, first, out.size(0), k, out, scales);
+    });
+    m.attr("nvfp4_runtime_schema") = 6;
     m.def("turing_int8_linear",
           &turing_int8_linear,
           pybind11::arg("activation"),

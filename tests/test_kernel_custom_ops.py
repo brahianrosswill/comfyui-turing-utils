@@ -295,6 +295,7 @@ class KernelCustomOpContractTest(unittest.TestCase):
         )
         self.assertEqual(int8_linear.shape, (7, 64))
         self.assertEqual(int8_linear.dtype, torch.bfloat16)
+
         direct_linear = torch.empty(
             (7, 64), dtype=torch.bfloat16, device="meta"
         )
@@ -342,6 +343,33 @@ class KernelCustomOpContractTest(unittest.TestCase):
         )
         self.assertEqual(fused_normalized.shape, x2.shape)
         self.assertEqual(fused_normalized.dtype, x2.dtype)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.cuda.get_device_capability() >= (7, 5),
+        "CUDA Tensor Cores required",
+    )
+    def test_codebook_float_scales_inline_and_staged(self):
+        # Independent integer oracle, non-full N tile, biased output, and
+        # multiple chunks. Both scale dtypes must retain identical semantics.
+        torch.manual_seed(803)
+        m, n, k = 8193, 80, 96
+        qx = torch.randint(-127, 128, (m, k), device="cuda", dtype=torch.int8)
+        codes = torch.randint(0, 16, (n, k), device="cuda", dtype=torch.uint8)
+        packed = (codes[:, ::2] | (codes[:, 1::2] << 4)).contiguous().view(torch.int8)
+        book = torch.tensor([0, .5, 1, 1.5, 2, 3, 4, 6, 0, -.5, -1, -1.5, -2, -3, -4, -6], device="cuda")
+        sx = torch.full((m,), .001, device="cuda")
+        sw = torch.full((n,), .002, device="cuda")
+        bias = torch.randn(n, device="cuda") * .01
+        for dtype in (torch.float32, torch.float8_e4m3fn):
+            scales = (torch.rand(n, k // 16, device="cuda") * 30).to(dtype)
+            w8 = (book[codes.long()] * scales.float().repeat_interleave(16, 1)).round().clamp(-127, 127)
+            reference = (qx.float() @ w8.t()) * sx[:, None] * sw[None, :] + bias
+            for chunk in (-1, 32):
+                actual = kernel.turing_codebook_w4a8_linear(
+                    qx, packed, sx, scales, sw, book, bias, chunk_rows=chunk,
+                )
+                torch.testing.assert_close(actual.float(), reference,
+                                           rtol=.004, atol=2e-6)
 
     def test_sol_and_varlen_are_fullgraph_leaves(self):
         q = torch.empty((1, 4, 129, 128), dtype=torch.bfloat16, device="meta")

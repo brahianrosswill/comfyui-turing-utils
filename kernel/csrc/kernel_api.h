@@ -4,6 +4,9 @@
 
 namespace comfyui_turing_utils::kernels {
 
+void turing_nvfp4_convrot_quantize(Tensor weight, Tensor blocks, Tensor tensor_scale,
+    Tensor output, Tensor scales, int first_row, int logical_k);
+
 void turing_w4a8_linear(Tensor activation,
                         Tensor weight,
                         Tensor activation_scale,
@@ -28,7 +31,7 @@ void turing_int8_linear(Tensor activation,
                         Tensor activation_scale,
                         Tensor weight_scale,
                         Tensor bias,
-                        Tensor output);
+                        Tensor output, bool precise = false);
 
 void turing_fp16_int8_quantize(Tensor input, Tensor output, Tensor scales);
 

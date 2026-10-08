@@ -157,6 +157,9 @@ class SeCNodeTest(unittest.TestCase):
         tracker_inputs = [item.id for item in tracker.inputs]
         self.assertNotIn("device", loader_inputs)
         self.assertEqual(loader_inputs, ["model_name", "attention"])
+        self.assertTrue(loader.is_dev_only)
+        self.assertEqual(tracker_inputs[:3], ["model_name", "attention", "frames"])
+        self.assertNotIn("model", tracker_inputs)
         self.assertNotIn("offload_video_to_cpu", tracker_inputs)
         self.assertNotIn("auto_unload_model", tracker_inputs)
         self.assertNotIn("allow_mask_overlap", loader_inputs)
