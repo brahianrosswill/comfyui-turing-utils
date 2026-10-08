@@ -55,7 +55,26 @@ __device__ __forceinline__ int8_t quantize_s8(float value)
   return static_cast<int8_t>(converted);
 }
 
-template <typename T, int Threads>
+template <typename T, bool Aligned>
+__device__ __forceinline__ void load_channels(const T *ptr, float (&values)[kChannelTile])
+{
+  if constexpr (Aligned)
+  {
+    union { uint4 packed; T channels[kChannelTile]; } data;
+    data.packed = *reinterpret_cast<const uint4 *>(ptr);
+#pragma unroll
+    for (int c = 0; c < kChannelTile; ++c)
+      values[c] = to_float(data.channels[c]);
+  }
+  else
+  {
+#pragma unroll
+    for (int c = 0; c < kChannelTile; ++c)
+      values[c] = to_float(ptr[c]);
+  }
+}
+
+template <typename T, int Threads, bool Aligned>
 __global__ void quantize_value_kernel(
     const T *__restrict__ value,
     int8_t *__restrict__ quantized,
@@ -83,25 +102,31 @@ __global__ void quantize_value_kernel(
     maximum[channel] = 0.0f;
 
   int token = threadIdx.x;
-  const int body = sequence_length - Threads;
-  for (; token < body; token += 2 * Threads)
+  const int body = sequence_length - 3 * Threads;
+  for (; token < body; token += 4 * Threads)
   {
+    float a[kChannelTile], b[kChannelTile], c[kChannelTile], d[kChannelTile];
+    load_channels<T, Aligned>(base + token * stride_sequence, a);
+    load_channels<T, Aligned>(base + (token + Threads) * stride_sequence, b);
+    load_channels<T, Aligned>(base + (token + 2 * Threads) * stride_sequence, c);
+    load_channels<T, Aligned>(base + (token + 3 * Threads) * stride_sequence, d);
 #pragma unroll
     for (int channel = 0; channel < kChannelTile; ++channel)
     {
-      const float first = fabsf(to_float(base[token * stride_sequence + channel]));
-      const float second = fabsf(to_float(
-          base[(token + Threads) * stride_sequence + channel]));
-      maximum[channel] = fmaxf(maximum[channel], fmaxf(first, second));
+      maximum[channel] = fmaxf(maximum[channel],
+          fmaxf(fmaxf(fabsf(a[channel]), fabsf(b[channel])),
+                fmaxf(fabsf(c[channel]), fabsf(d[channel]))));
     }
   }
   for (; token < sequence_length; token += Threads)
   {
+    float values[kChannelTile];
+    load_channels<T, Aligned>(base + token * stride_sequence, values);
 #pragma unroll
     for (int channel = 0; channel < kChannelTile; ++channel)
       maximum[channel] = fmaxf(
           maximum[channel],
-          fabsf(to_float(base[token * stride_sequence + channel])));
+          fabsf(values[channel]));
   }
 
 #pragma unroll
@@ -133,6 +158,10 @@ __global__ void quantize_value_kernel(
   }
   __syncthreads();
 
+  float channel_inverse[kChannelTile];
+#pragma unroll
+  for (int channel = 0; channel < kChannelTile; ++channel)
+    channel_inverse[channel] = inverse_scale[channel];
   const int64_t output_base =
       static_cast<int64_t>(batch_head * head_dim + channel_start) *
       padded_sequence_length;
@@ -143,12 +172,13 @@ __global__ void quantize_value_kernel(
     const int within_group = source & 15;
     const int destination =
         (source & ~15) | inverse_permute_16(within_group);
+    float values[kChannelTile];
+    load_channels<T, Aligned>(base + source * stride_sequence, values);
 #pragma unroll
     for (int channel = 0; channel < kChannelTile; ++channel)
     {
       quantized[output_base + channel * padded_sequence_length + destination] =
-          quantize_s8(to_float(base[source * stride_sequence + channel]) *
-                      inverse_scale[channel]);
+          quantize_s8(values[channel] * channel_inverse[channel]);
     }
   }
   for (int source = sequence_length + threadIdx.x;
@@ -161,6 +191,21 @@ __global__ void quantize_value_kernel(
     for (int channel = 0; channel < kChannelTile; ++channel)
       quantized[output_base + channel * padded_sequence_length + destination] = 0;
   }
+}
+
+template <typename T, int Threads>
+void launch_quantize(at::Tensor value, at::Tensor quantized, at::Tensor scale,
+                     int blocks, cudaStream_t stream)
+{
+  bool aligned = reinterpret_cast<uintptr_t>(value.data_ptr()) % 16 == 0;
+  for (int dim = 0; dim < 3; ++dim)
+    aligned &= value.size(dim) == 1 || value.stride(dim) % kChannelTile == 0;
+  auto kernel = aligned ? quantize_value_kernel<T, Threads, true>
+                        : quantize_value_kernel<T, Threads, false>;
+  kernel<<<blocks, Threads, 0, stream>>>(
+      reinterpret_cast<const T *>(value.data_ptr()), quantized.data_ptr<int8_t>(),
+      scale.data_ptr<float>(), value.size(2), quantized.size(3), value.size(1),
+      value.size(3), value.stride(0), value.stride(1), value.stride(2));
 }
 
 void check_launch()
@@ -210,37 +255,22 @@ void quantize_v_int8_sm75(
       value.device() == quantized.device() && value.device() == scale.device(),
       "Turing W8A8 V tensors must share a CUDA device");
 
-  constexpr int Threads = 256;
   const int blocks = value.size(0) * value.size(1) *
       (value.size(3) / kChannelTile);
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
   if (value.scalar_type() == at::ScalarType::Half)
   {
-    quantize_value_kernel<half, Threads><<<blocks, Threads, 0, stream>>>(
-        reinterpret_cast<const half *>(value.data_ptr()),
-        quantized.data_ptr<int8_t>(),
-        scale.data_ptr<float>(),
-        value.size(2),
-        quantized.size(3),
-        value.size(1),
-        value.size(3),
-        value.stride(0),
-        value.stride(1),
-        value.stride(2));
+    if (value.size(2) <= 256)
+      launch_quantize<half, 128>(value, quantized, scale, blocks, stream);
+    else
+      launch_quantize<half, 512>(value, quantized, scale, blocks, stream);
   }
   else
   {
-    quantize_value_kernel<nv_bfloat16, Threads><<<blocks, Threads, 0, stream>>>(
-        reinterpret_cast<const nv_bfloat16 *>(value.data_ptr()),
-        quantized.data_ptr<int8_t>(),
-        scale.data_ptr<float>(),
-        value.size(2),
-        quantized.size(3),
-        value.size(1),
-        value.size(3),
-        value.stride(0),
-        value.stride(1),
-        value.stride(2));
+    if (value.size(2) <= 256)
+      launch_quantize<nv_bfloat16, 128>(value, quantized, scale, blocks, stream);
+    else
+      launch_quantize<nv_bfloat16, 512>(value, quantized, scale, blocks, stream);
   }
   check_launch();
 }

@@ -462,7 +462,7 @@ __device__ __forceinline__ void apply_out_of_bound_mask(const uint32_t &K_idx_la
 
 // for DTypeQKAccum float
 template <uint32_t num_tiles_q, uint32_t num_tiles_k, uint32_t num_tiles_v, bool use_half_o_scale, bool exp_offset, bool fuse_scale=false, typename DTypeSVAccum>
-__device__ __forceinline__ void update_mdo(float RS[][num_tiles_k][8], DTypeSVAccum RO[][num_tiles_v][8], float m[][2], float d[][2], const float &sm_scale, const float exp_offset_value = S_FP8_OFFSET)
+__device__ __forceinline__ void update_mdo(float RS[][num_tiles_k][8], DTypeSVAccum RO[][num_tiles_v][8], float m[][2], float d[][2], const float &sm_scale, const float exp_offset_value = S_FP8_OFFSET, float (*tile_scale)[2] = nullptr)
 {
   static_assert(std::is_same<DTypeSVAccum, half>::value || (!use_half_o_scale));
 #pragma unroll
@@ -544,7 +544,15 @@ __device__ __forceinline__ void update_mdo(float RS[][num_tiles_k][8], DTypeSVAc
       }
 
       // raise RS to exponent
+      // Use the full U8 range in each tile, then restore its contribution to
+      // the running softmax scale in both PV and the denominator. Callers
+      // without tile_scale (including Sol's floating summary) are unchanged.
       float negative_m = -m[fq][k];
+      if (tile_scale != nullptr)
+      {
+        tile_scale[fq][k] = math::ptx_exp2(m_temp - m[fq][k]);
+        negative_m = -m_temp;
+      }
 #pragma unroll
       for (uint32_t fk = 0; fk < num_tiles_k; fk++)
       {
@@ -674,7 +682,7 @@ __device__ __forceinline__ void RS_8_to_16(uint32_t RS_8[][num_tiles_k / 2][4], 
 }
 
 template <uint32_t num_tiles_q, uint32_t num_tiles_k, ComputeUnit compute_unit = ComputeUnit::kTensorCore, typename T>
-__device__ __forceinline__ void accumulate_d(T RS[][num_tiles_k][(compute_unit == ComputeUnit::kTensorCore)? 4 : 8], float d[][2])
+__device__ __forceinline__ void accumulate_d(T RS[][num_tiles_k][(compute_unit == ComputeUnit::kTensorCore)? 4 : 8], float d[][2], const float (*tile_scale)[2] = nullptr)
 {
   // for compute unit cuda core, RS is float
   // for compute unit tensor core, RS is packed half
@@ -695,8 +703,10 @@ __device__ __forceinline__ void accumulate_d(T RS[][num_tiles_k][(compute_unit =
       else if constexpr (compute_unit == ComputeUnit::kCudaCore)
       {
         // partial accumulate with cuda core
-        d[fq][0] += RS[fq][fk][0] + RS[fq][fk][1] + RS[fq][fk][4] + RS[fq][fk][5];
-        d[fq][1] += RS[fq][fk][2] + RS[fq][fk][3] + RS[fq][fk][6] + RS[fq][fk][7];
+        const float scale0 = tile_scale == nullptr ? 1.0f : tile_scale[fq][0];
+        const float scale1 = tile_scale == nullptr ? 1.0f : tile_scale[fq][1];
+        d[fq][0] += (RS[fq][fk][0] + RS[fq][fk][1] + RS[fq][fk][4] + RS[fq][fk][5]) * scale0;
+        d[fq][1] += (RS[fq][fk][2] + RS[fq][fk][3] + RS[fq][fk][6] + RS[fq][fk][7]) * scale1;
       }
     }
   }

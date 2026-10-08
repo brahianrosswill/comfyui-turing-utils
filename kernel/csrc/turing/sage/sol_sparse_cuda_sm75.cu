@@ -1610,15 +1610,20 @@ __global__ void sparse_attention_kernel(
       {
         key_bound = key_block * kBlockTokens + max(0, min(kBlockTokens,
             tile_valid_counts[key_block / 2] - (key_block % 2) * kBlockTokens));
-        // Mask *after* dequantization: a finite negative sentinel multiplied
-        // by tiny/zero QK scales can otherwise admit padded keys to softmax.
-#pragma unroll
-        for (int tile = 0; tile < 4; ++tile)
-#pragma unroll
-          for (int element = 0; element < 8; ++element)
-            score[0][tile][element] *= exact_score_scale;
-        exact_score_scale = 1.0f;
       }
+    }
+    // Mask after dequantization for every masked tile, including causal
+    // attention and a partial final K tile. Zero/tiny QK scales must not turn
+    // the negative sentinel into a valid score. Full unmasked tiles keep the
+    // scale fused into softmax.
+    if (ExternalRoute || IsCausal || (key_block + 1) * kBlockTokens > key_length)
+    {
+#pragma unroll
+      for (int tile = 0; tile < 4; ++tile)
+#pragma unroll
+        for (int element = 0; element < 8; ++element)
+          score[0][tile][element] *= exact_score_scale;
+      exact_score_scale = 1.0f;
     }
     apply_out_of_bound_mask<1, 4>(key_lane_base, score, key_bound);
     if constexpr (IsCausal)
@@ -1629,17 +1634,18 @@ __global__ void sparse_attention_kernel(
     }
     if constexpr (UseW8A8)
     {
+      float probability_scale[1][2];
       update_mdo<1, 4, G::kValueTiles, false, true, false>(
           score,
           output_fragment,
           row_max,
           denominator,
           exact_score_scale,
-          S_U8_OFFSET);
+          S_U8_OFFSET,
+          probability_scale);
       uint32_t probability_u8[1][2][4];
       RS_to_u8<1, 4>(score, probability_u8);
-      accumulate_d<1, 4, ComputeUnit::kCudaCore>(score, denominator);
-      float probability_scale[1][2] = {{1.0f, 1.0f}};
+      accumulate_d<1, 4, ComputeUnit::kCudaCore>(score, denominator, probability_scale);
       smem_t<SwizzleMode::k64B, 4> current_value(
           value_stage == 0
               ? shared_selected_value_int8.base
