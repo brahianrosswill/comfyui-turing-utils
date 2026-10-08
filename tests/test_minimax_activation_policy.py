@@ -405,7 +405,7 @@ class MiniMaxActivationPolicyTest(unittest.TestCase):
             without_v8.estimated_peak_bytes + int(0.7 * _GIB),
         )
 
-    def test_virtual_kv_peak_uses_logical_key_rows(self):
+    def test_mapped_kv_peak_uses_logical_key_rows(self):
         physical = activation_policy.estimate_attention_lifecycle_peak(
             rows=5_996,
             heads=56,

@@ -14,7 +14,7 @@ import torch
 from ...log import get_logger
 from ..methods import OriginalMethod, weak_method
 from ...attention.integration import AttentionSiteStatus, execute_projected_attention
-from ...attention.layout import ATTENTION_LAYOUT_REQUIREMENT_KEY, attention_semantic_layout
+from ...attention.layout import ATTENTION_LAYOUT_REQUIREMENT_KEY
 from ...attention.protocol import (
     QKTransformSpec,
     RMSNormSpec,
@@ -35,10 +35,8 @@ from .activation_policy import (
     decide_attention_heads,
     decide_ffn_channels,
     ensure_dynamic_vram_headroom,
-    estimate_attention_lifecycle_peak,
 )
 from .veda.engine import workspace_per_head as veda_workspace_per_head
-from ...runtime.capabilities import kernel_capabilities
 from .layout import (
     ATTENTION_LAYOUT_KEY,
     RUNTIME_CONTEXT_ATTR,
@@ -95,34 +93,6 @@ def _profile_cuda(phase: str, function, /, *args, **kwargs):
     if CUDA_PHASE_PROFILER.enabled:
         return CUDA_PHASE_PROFILER.call(phase, function, *args, **kwargs)
     return function(*args, **kwargs)
-
-
-def _virtual_kv_logical_rows(
-    transformer_options: dict,
-    physical_rows: int,
-) -> int | None:
-    if transformer_options.get("turing_utils_attention_strategy") != "h3_virtual_kv":
-        return None
-    layout = attention_semantic_layout(transformer_options)
-    if layout is None or layout.provider != "minimax_h3":
-        return None
-    if layout.validate(physical_rows, physical_rows) is not None:
-        return None
-    targets = [segment for segment in layout.key_segments if segment.role == "target_video"]
-    if len(targets) != 1:
-        return None
-    target = targets[0]
-    topologies = [
-        topology
-        for topology in layout.topologies
-        if topology.topology_id == target.topology_id
-    ]
-    if len(topologies) != 1:
-        return None
-    tokens_per_frame = int(topologies[0].tokens_per_frame)
-    if target.stop - target.start != 2 * tokens_per_frame:
-        return None
-    return physical_rows + 5 * tokens_per_frame
 
 
 def _direct_int8_output_available() -> bool:
@@ -942,41 +912,18 @@ def _head_sharded_attention(
                     16_384,
                     quantized_input,
                 )
-                if (
-                    transformer_options.get("turing_utils_attention_strategy")
-                    == "h3_virtual_kv"
-                ):
-                    outcome = execute_projected_attention(
-                        query.transpose(0, 1).unsqueeze(0),
-                        key.transpose(0, 1).unsqueeze(0),
-                        value.transpose(0, 1).unsqueeze(0),
-                        heads=group,
-                        qk_transform=transform,
-                        transformer_options=transformer_options,
-                        container_factory=attention_container,
-                    )
-                    if not outcome.supported:
-                        _warn_attention_fallback(
-                            transformer_options,
-                            path="head_sharded_virtual_kv",
-                            rows=sequence,
-                            reason=outcome.reason,
-                        )
-                        return None
-                    group_output = outcome.output.squeeze(0)
-                else:
-                    query, key = _apply_minimax_qk_transform(
-                        attention, query, key, rope_freqs
-                    )
-                    group_output = optimized_attention(
-                        attention_container(query.transpose(0, 1).unsqueeze(0)),
-                        attention_container(key.transpose(0, 1).unsqueeze(0)),
-                        attention_container(value.transpose(0, 1).unsqueeze(0)),
-                        group,
-                        mask=None,
-                        skip_reshape=True,
-                        transformer_options=group_options,
-                    ).squeeze(0)
+                query, key = _apply_minimax_qk_transform(
+                    attention, query, key, rope_freqs
+                )
+                group_output = optimized_attention(
+                    attention_container(query.transpose(0, 1).unsqueeze(0)),
+                    attention_container(key.transpose(0, 1).unsqueeze(0)),
+                    attention_container(value.transpose(0, 1).unsqueeze(0)),
+                    group,
+                    mask=None,
+                    skip_reshape=True,
+                    transformer_options=group_options,
+                ).squeeze(0)
                 del query, key, value
             _profile_cuda(
                 "minimax.head_output_store",
@@ -1194,42 +1141,6 @@ def _make_attention_forward(
             )
 
         transform = _qk_transform(self, x, rope_freqs)
-        virtual_kv = (
-            transformer_options.get("turing_utils_attention_strategy")
-            == "h3_virtual_kv"
-        )
-        logical_key_rows = (
-            _virtual_kv_logical_rows(transformer_options, int(x.shape[0]))
-            if virtual_kv
-            else None
-        )
-        virtual_kv_mode = getattr(
-            executor, "turing_utils_h3_virtual_kv_mode", None
-        )
-        virtual_kv_capability = getattr(
-            executor,
-            "turing_utils_h3_virtual_kv_mapped_capability",
-            "mapped_sparse_kv" if virtual_kv_mode == "residual" else "mapped_kv",
-        )
-        virtual_kv_numeric_backend = getattr(
-            executor,
-            "turing_utils_h3_virtual_kv_numeric_backend",
-            "w8a8",
-        )
-        mapped_virtual_kv = bool(
-            virtual_kv
-            and logical_key_rows is not None
-            and virtual_kv_mode in {"fast", "residual"}
-            and getattr(
-                executor,
-                "turing_utils_h3_virtual_kv_mapped_available",
-                False,
-            )
-            and kernel_capabilities().supports(virtual_kv_capability).supported
-        )
-        virtual_residual_subblocks = (
-            2 if mapped_virtual_kv and virtual_kv_mode == "residual" else 0
-        )
         streamed_executor = (
             getattr(executor, _STREAMED_QKV_EXECUTOR_ATTR, None)
             if executor is not None
@@ -1256,10 +1167,7 @@ def _make_attention_forward(
         qkv_is_w8 = convrot_weight_kind(self.qkv_proj.weight) == "w8a8"
         runtime_plan = _runtime_activation_plan(base_model)
         head_decision = None
-        # Exact mapped virtual K/V can use whole-head sharding because every
-        # shard retains physical K/V until the fused logical-RoPE preprocessor.
-        # The compact streamed path still prequantizes physical K too early.
-        if qkv_is_w8 and (not virtual_kv or mapped_virtual_kv):
+        if qkv_is_w8:
             head_decision = decide_attention_heads(
                 x,
                 heads=int(self.heads),
@@ -1267,17 +1175,11 @@ def _make_attention_forward(
                 compact_qk=bool(
                     callable(streamed_executor)
                     and stream_abi_available
-                    and not virtual_kv
                 ),
                 quantized_input=True,
-                quantized_value=bool(
-                    callable(streamed_executor)
-                    or (mapped_virtual_kv and virtual_kv_numeric_backend == "w8a8")
-                ),
+                quantized_value=callable(streamed_executor),
                 runtime_plan=runtime_plan,
                 base_model=base_model,
-                logical_key_rows=logical_key_rows,
-                residual_subblocks=virtual_residual_subblocks,
                 extra_workspace_per_head=veda_extra_workspace,
             )
             if head_decision.sharded or transformer_options.get("turing_utils_veda_projected_qkv", False):
@@ -1332,46 +1234,6 @@ def _make_attention_forward(
                     estimated_peak_bytes=head_decision.estimated_peak_bytes,
                     runtime_plan=runtime_plan,
                 )
-
-        if (
-            virtual_kv
-            and logical_key_rows is not None
-            and head_decision is None
-            and base_model is not None
-        ):
-            virtual_peak = estimate_attention_lifecycle_peak(
-                rows=int(x.shape[0]),
-                heads=int(self.heads),
-                head_dim=int(self.head_dim),
-                hidden_size=int(x.shape[-1]),
-                element_size=int(x.element_size()),
-                head_group=int(self.heads),
-                compact_qk=False,
-                cache_quantized_input=False,
-                quantized_value=bool(
-                    mapped_virtual_kv and virtual_kv_numeric_backend == "w8a8"
-                ),
-                logical_key_rows=logical_key_rows,
-                residual_subblocks=virtual_residual_subblocks,
-            )
-            if not mapped_virtual_kv:
-                # Exact fallback materializes logical BF16 K and V before the
-                # selected dense backend preprocesses them.
-                virtual_peak += (
-                    2
-                    * logical_key_rows
-                    * int(self.heads)
-                    * int(self.head_dim)
-                    * int(x.element_size())
-                )
-            ensure_dynamic_vram_headroom(
-                base_model,
-                x.device,
-                rows=int(x.shape[0]),
-                operation="virtual_kv",
-                estimated_peak_bytes=virtual_peak,
-                runtime_plan=runtime_plan,
-            )
 
         if executor is None:
             _warn_attention_fallback(

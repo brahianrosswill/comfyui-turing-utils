@@ -17,7 +17,7 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 from comfyui_turing_utils.nodes.multimodal_chat import (  # noqa: E402
     ChatOptions,
     DEFAULT_CHAT_OPTIONS,
-    MultimodalChatOptions,
+    build_chat_options,
     MultimodalPromptChat,
     build_chat_request,
     build_user_content,
@@ -49,26 +49,26 @@ class MultimodalPromptChatTest(unittest.TestCase):
         self.assertEqual(inputs["videos"].template.input.io_type, "IMAGE")
         self.assertTrue(inputs["images"].optional)
         self.assertTrue(inputs["videos"].optional)
-        self.assertTrue(inputs["options"].optional)
-        self.assertEqual(inputs["options"].io_type, "TURING_UTILS_CHAT_OPTIONS")
-        self.assertNotIn("disable_thinking", inputs)
+        self.assertNotIn("options", inputs)
+        self.assertTrue(inputs["disable_thinking"].advanced)
+        self.assertTrue(inputs["disable_thinking"].optional)
+        self.assertTrue(inputs["system_prompt"].advanced)
+        self.assertTrue(all(item.optional for item in schema.inputs[11:]))
 
-    def test_options_node_owns_advanced_parameters_and_defaults_to_8k(self):
-        schema = MultimodalChatOptions.define_schema()
-        self.assertEqual(schema.node_id, "TuringUtilsMultimodalChatOptions")
-        self.assertEqual(schema.outputs[0].io_type, "TURING_UTILS_CHAT_OPTIONS")
-        inputs = {item.id: item for item in schema.inputs}
+    def test_inline_encoding_only_exposes_jpeg_quality_for_jpeg(self):
+        inputs = {item.id: item for item in MultimodalPromptChat.define_schema().inputs}
+        self.assertNotIn("jpeg_quality", inputs)
+        encoding = inputs["image_format"]
+        self.assertTrue(encoding.as_dict()["advanced"])
+        self.assertEqual([option.key for option in encoding.options], ["jpeg", "png"])
+        self.assertEqual([item.id for item in encoding.options[0].inputs], ["jpeg_quality"])
+        self.assertEqual(encoding.options[1].inputs, [])
+
+    def test_inline_options_preserve_defaults(self):
+        inputs = {item.id: item for item in MultimodalPromptChat.define_schema().inputs}
         self.assertTrue(inputs["disable_thinking"].default)
         self.assertEqual(inputs["max_output_tokens"].default, 8192)
-        self.assertNotIn("cache_buster", inputs)
-        self.assertEqual(MultimodalChatOptions.execute().result[0], DEFAULT_CHAT_OPTIONS)
-
-    def test_unconnected_and_connected_default_options_build_identical_requests(self):
-        connected = MultimodalChatOptions.execute().result[0]
-        implicit = build_chat_request("model", "system", "user", DEFAULT_CHAT_OPTIONS)
-        explicit = build_chat_request("model", "system", "user", connected)
-        self.assertEqual(implicit, explicit)
-        self.assertEqual(implicit["max_tokens"], 8192)
+        self.assertEqual(build_chat_options(), DEFAULT_CHAT_OPTIONS)
 
     def test_endpoint_accepts_root_version_and_complete_urls(self):
         expected = "http://127.0.0.1:9200/v1/chat/completions"
@@ -227,6 +227,18 @@ class MultimodalPromptChatTest(unittest.TestCase):
 
 
 class MultimodalPromptChatExecutionTest(unittest.IsolatedAsyncioTestCase):
+    async def test_inline_options(self):
+        with patch("comfyui_turing_utils.nodes.multimodal_chat.request_chat_completion",
+                   return_value={"choices": [{"message": {"content": "response"}}]}) as request:
+            await MultimodalPromptChat.execute(
+                "user", "system", "http://localhost:9200", "test-model", "",
+                temperature=0.25, max_output_tokens=512,
+                image_format={"image_format": "png"}, timeout_seconds=45)
+            body = request.call_args.args[2]
+            self.assertEqual(body["temperature"], 0.25)
+            self.assertEqual(body["max_tokens"], 512)
+            self.assertEqual(request.call_args.args[3], 45)
+
     async def test_accepts_either_prompt_without_empty_messages(self):
         for prompt, system_prompt in (
             ("", "system"),

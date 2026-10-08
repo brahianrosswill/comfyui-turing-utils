@@ -275,7 +275,7 @@ class VideoLatentNoiseMaskTest(unittest.TestCase):
             self.apply(torch.zeros(2, 2, 3), 2, "unknown")
 
     def test_rejects_invalid_mask_shapes_and_batches(self):
-        for mask in (None, torch.zeros(2, 3), torch.zeros(1, 1, 2, 2, 3)):
+        for mask in (torch.zeros(2, 3), torch.zeros(1, 1, 2, 2, 3)):
             with self.subTest(shape=getattr(mask, "shape", None)):
                 with self.assertRaisesRegex(ValueError, "Expected MASK"):
                     self.apply(mask, 2)

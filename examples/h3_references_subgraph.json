@@ -1,0 +1,585 @@
+{
+  "id": "fee21870-a227-46e2-8b82-3da7b7573ec7",
+  "revision": 0,
+  "last_node_id": 5,
+  "last_link_id": 24,
+  "nodes": [
+    {
+      "id": 5,
+      "type": "a5ac7e19-457c-4995-8a57-59b07dcd47cb",
+      "pos": [
+        200,
+        200
+      ],
+      "size": [
+        276.3208984375,
+        208
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "clip",
+          "localized_name": "clip",
+          "name": "clip",
+          "type": "CLIP",
+          "link": null
+        },
+        {
+          "label": "prompt",
+          "localized_name": "prompt",
+          "name": "prompt",
+          "type": "STRING",
+          "widget": {
+            "name": "prompt"
+          },
+          "link": null
+        },
+        {
+          "label": "latent",
+          "localized_name": "latent",
+          "name": "latent",
+          "type": "LATENT",
+          "link": null
+        },
+        {
+          "label": "first_frame",
+          "localized_name": "first_frame",
+          "name": "first_frame",
+          "shape": 7,
+          "type": "TURING_UTILS_H3_KEYFRAME_REFERENCE",
+          "link": null
+        },
+        {
+          "label": "last_frame",
+          "localized_name": "last_frame",
+          "name": "last_frame",
+          "shape": 7,
+          "type": "TURING_UTILS_H3_KEYFRAME_REFERENCE",
+          "link": null
+        },
+        {
+          "label": "image_reference",
+          "localized_name": "image_reference",
+          "name": "image_reference",
+          "shape": 7,
+          "type": "TURING_UTILS_H3_IMAGE_REFERENCE",
+          "link": null
+        },
+        {
+          "label": "video_reference",
+          "localized_name": "video_reference",
+          "name": "video_reference",
+          "shape": 7,
+          "type": "TURING_UTILS_H3_VIDEO_REFERENCE",
+          "link": null
+        },
+        {
+          "label": "audio_reference",
+          "localized_name": "audio_reference",
+          "name": "audio_reference",
+          "shape": 7,
+          "type": "TURING_UTILS_H3_AUDIO_REFERENCE",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "label": "conditioning",
+          "localized_name": "conditioning",
+          "name": "conditioning",
+          "type": "CONDITIONING",
+          "links": null
+        }
+      ],
+      "properties": {
+        "previewExposures": []
+      },
+      "widgets_values": [
+        ""
+      ],
+      "widgets_values_named": {
+        "prompt": ""
+      }
+    }
+  ],
+  "links": [],
+  "groups": [],
+  "definitions": {
+    "subgraphs": [
+      {
+        "id": "a5ac7e19-457c-4995-8a57-59b07dcd47cb",
+        "version": 1,
+        "state": {
+          "lastGroupId": 0,
+          "lastNodeId": 5,
+          "lastLinkId": 24,
+          "lastRerouteId": 0
+        },
+        "revision": 0,
+        "config": {},
+        "name": "H3 Shared References Conditioning",
+        "inputNode": {
+          "id": -10,
+          "bounding": [
+            -203.044921875,
+            -104,
+            143.044921875,
+            208
+          ]
+        },
+        "outputNode": {
+          "id": -20,
+          "bounding": [
+            60,
+            -34,
+            128,
+            68
+          ]
+        },
+        "inputs": [
+          {
+            "id": "4c985324-a0b9-46a1-8719-2bee8f258b1a",
+            "name": "clip",
+            "type": "CLIP",
+            "linkIds": [
+              2
+            ],
+            "localized_name": "clip",
+            "label": "clip",
+            "pos": [
+              51,
+              24
+            ]
+          },
+          {
+            "id": "79642f13-39c9-49c4-afd6-b08bb51aa77a",
+            "name": "prompt",
+            "type": "STRING",
+            "linkIds": [
+              3
+            ],
+            "localized_name": "prompt",
+            "label": "prompt",
+            "pos": [
+              51,
+              144
+            ]
+          },
+          {
+            "id": "6040a731-dcbd-4fe1-894b-f77258a0c67e",
+            "name": "latent",
+            "type": "LATENT",
+            "linkIds": [
+              4
+            ],
+            "localized_name": "latent",
+            "label": "latent",
+            "pos": [
+              51,
+              164
+            ]
+          },
+          {
+            "id": "da662c82-484f-450e-b660-658865ff9f76",
+            "name": "first_frame",
+            "type": "TURING_UTILS_H3_KEYFRAME_REFERENCE",
+            "linkIds": [
+              5,
+              6
+            ],
+            "localized_name": "first_frame",
+            "label": "first_frame",
+            "shape": 7,
+            "pos": [
+              51,
+              44
+            ]
+          },
+          {
+            "id": "7ac1c52a-db22-4c85-a243-004af4c3ec27",
+            "name": "last_frame",
+            "type": "TURING_UTILS_H3_KEYFRAME_REFERENCE",
+            "linkIds": [
+              7,
+              8
+            ],
+            "localized_name": "last_frame",
+            "label": "last_frame",
+            "shape": 7,
+            "pos": [
+              51,
+              64
+            ]
+          },
+          {
+            "id": "0de495bd-b589-4efa-a7c5-db0743fd8017",
+            "name": "image_reference",
+            "type": "TURING_UTILS_H3_IMAGE_REFERENCE",
+            "linkIds": [
+              9,
+              10
+            ],
+            "localized_name": "image_reference",
+            "label": "image_reference",
+            "shape": 7,
+            "pos": [
+              51,
+              84
+            ]
+          },
+          {
+            "id": "52ca69b2-ec86-437c-bead-69dbd5a56759",
+            "name": "video_reference",
+            "type": "TURING_UTILS_H3_VIDEO_REFERENCE",
+            "linkIds": [
+              11,
+              12
+            ],
+            "localized_name": "video_reference",
+            "label": "video_reference",
+            "shape": 7,
+            "pos": [
+              51,
+              104
+            ]
+          },
+          {
+            "id": "34f347e9-b6f2-4fd1-ad76-8735050f9fd5",
+            "name": "audio_reference",
+            "type": "TURING_UTILS_H3_AUDIO_REFERENCE",
+            "linkIds": [
+              13,
+              14
+            ],
+            "localized_name": "audio_reference",
+            "label": "audio_reference",
+            "shape": 7,
+            "pos": [
+              51,
+              124
+            ]
+          }
+        ],
+        "outputs": [
+          {
+            "id": "bf310eed-a0a2-47d1-8cff-9a0d5cf44c1c",
+            "name": "conditioning",
+            "type": "CONDITIONING",
+            "linkIds": [
+              15
+            ],
+            "localized_name": "conditioning",
+            "label": "conditioning",
+            "pos": [
+              24,
+              24
+            ]
+          }
+        ],
+        "widgets": [],
+        "nodes": [
+          {
+            "id": 3,
+            "type": "TuringUtilsH3SemanticReference",
+            "pos": [
+              0,
+              0
+            ],
+            "size": [
+              400,
+              200
+            ],
+            "flags": {},
+            "order": 0,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "clip",
+                "name": "clip",
+                "type": "CLIP",
+                "link": 2
+              },
+              {
+                "localized_name": "first_frame",
+                "name": "first_frame",
+                "shape": 7,
+                "type": "TURING_UTILS_H3_KEYFRAME_REFERENCE",
+                "link": 5
+              },
+              {
+                "localized_name": "last_frame",
+                "name": "last_frame",
+                "shape": 7,
+                "type": "TURING_UTILS_H3_KEYFRAME_REFERENCE",
+                "link": 7
+              },
+              {
+                "localized_name": "image_reference",
+                "name": "image_reference",
+                "shape": 7,
+                "type": "TURING_UTILS_H3_IMAGE_REFERENCE",
+                "link": 9
+              },
+              {
+                "localized_name": "video_reference",
+                "name": "video_reference",
+                "shape": 7,
+                "type": "TURING_UTILS_H3_VIDEO_REFERENCE",
+                "link": 11
+              },
+              {
+                "localized_name": "audio_reference",
+                "name": "audio_reference",
+                "shape": 7,
+                "type": "TURING_UTILS_H3_AUDIO_REFERENCE",
+                "link": 13
+              },
+              {
+                "localized_name": "prompt",
+                "name": "prompt",
+                "type": "STRING",
+                "widget": {
+                  "name": "prompt"
+                },
+                "link": 3
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "semantic_reference",
+                "name": "semantic_reference",
+                "type": "TURING_UTILS_H3_SEMANTIC_REFERENCE",
+                "links": [
+                  1
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "TuringUtilsH3SemanticReference"
+            },
+            "widgets_values": [
+              ""
+            ],
+            "widgets_values_named": {
+              "prompt": ""
+            }
+          },
+          {
+            "id": 4,
+            "type": "TuringUtilsH3BuildConditioning",
+            "pos": [
+              400,
+              0
+            ],
+            "size": [
+              226.7578125,
+              146
+            ],
+            "flags": {},
+            "order": 1,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "semantic_reference",
+                "name": "semantic_reference",
+                "type": "TURING_UTILS_H3_SEMANTIC_REFERENCE",
+                "link": 1
+              },
+              {
+                "localized_name": "latent",
+                "name": "latent",
+                "type": "LATENT",
+                "link": 4
+              },
+              {
+                "localized_name": "first_frame",
+                "name": "first_frame",
+                "shape": 7,
+                "type": "TURING_UTILS_H3_KEYFRAME_REFERENCE",
+                "link": 6
+              },
+              {
+                "localized_name": "last_frame",
+                "name": "last_frame",
+                "shape": 7,
+                "type": "TURING_UTILS_H3_KEYFRAME_REFERENCE",
+                "link": 8
+              },
+              {
+                "localized_name": "image_reference",
+                "name": "image_reference",
+                "shape": 7,
+                "type": "TURING_UTILS_H3_IMAGE_REFERENCE",
+                "link": 10
+              },
+              {
+                "localized_name": "video_reference",
+                "name": "video_reference",
+                "shape": 7,
+                "type": "TURING_UTILS_H3_VIDEO_REFERENCE",
+                "link": 12
+              },
+              {
+                "localized_name": "audio_reference",
+                "name": "audio_reference",
+                "shape": 7,
+                "type": "TURING_UTILS_H3_AUDIO_REFERENCE",
+                "link": 14
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "conditioning",
+                "name": "conditioning",
+                "type": "CONDITIONING",
+                "links": [
+                  15
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "TuringUtilsH3BuildConditioning"
+            }
+          }
+        ],
+        "groups": [],
+        "links": [
+          {
+            "id": 1,
+            "origin_id": 3,
+            "origin_slot": 0,
+            "target_id": 4,
+            "target_slot": 0,
+            "type": "TURING_UTILS_H3_SEMANTIC_REFERENCE"
+          },
+          {
+            "id": 2,
+            "origin_id": -10,
+            "origin_slot": 0,
+            "target_id": 3,
+            "target_slot": 0,
+            "type": "CLIP"
+          },
+          {
+            "id": 5,
+            "origin_id": -10,
+            "origin_slot": 3,
+            "target_id": 3,
+            "target_slot": 1,
+            "type": "TURING_UTILS_H3_KEYFRAME_REFERENCE"
+          },
+          {
+            "id": 6,
+            "origin_id": -10,
+            "origin_slot": 3,
+            "target_id": 4,
+            "target_slot": 2,
+            "type": "TURING_UTILS_H3_KEYFRAME_REFERENCE"
+          },
+          {
+            "id": 7,
+            "origin_id": -10,
+            "origin_slot": 4,
+            "target_id": 3,
+            "target_slot": 2,
+            "type": "TURING_UTILS_H3_KEYFRAME_REFERENCE"
+          },
+          {
+            "id": 8,
+            "origin_id": -10,
+            "origin_slot": 4,
+            "target_id": 4,
+            "target_slot": 3,
+            "type": "TURING_UTILS_H3_KEYFRAME_REFERENCE"
+          },
+          {
+            "id": 9,
+            "origin_id": -10,
+            "origin_slot": 5,
+            "target_id": 3,
+            "target_slot": 3,
+            "type": "TURING_UTILS_H3_IMAGE_REFERENCE"
+          },
+          {
+            "id": 10,
+            "origin_id": -10,
+            "origin_slot": 5,
+            "target_id": 4,
+            "target_slot": 4,
+            "type": "TURING_UTILS_H3_IMAGE_REFERENCE"
+          },
+          {
+            "id": 11,
+            "origin_id": -10,
+            "origin_slot": 6,
+            "target_id": 3,
+            "target_slot": 4,
+            "type": "TURING_UTILS_H3_VIDEO_REFERENCE"
+          },
+          {
+            "id": 12,
+            "origin_id": -10,
+            "origin_slot": 6,
+            "target_id": 4,
+            "target_slot": 5,
+            "type": "TURING_UTILS_H3_VIDEO_REFERENCE"
+          },
+          {
+            "id": 13,
+            "origin_id": -10,
+            "origin_slot": 7,
+            "target_id": 3,
+            "target_slot": 5,
+            "type": "TURING_UTILS_H3_AUDIO_REFERENCE"
+          },
+          {
+            "id": 14,
+            "origin_id": -10,
+            "origin_slot": 7,
+            "target_id": 4,
+            "target_slot": 6,
+            "type": "TURING_UTILS_H3_AUDIO_REFERENCE"
+          },
+          {
+            "id": 3,
+            "origin_id": -10,
+            "origin_slot": 1,
+            "target_id": 3,
+            "target_slot": 6,
+            "type": "STRING"
+          },
+          {
+            "id": 4,
+            "origin_id": -10,
+            "origin_slot": 2,
+            "target_id": 4,
+            "target_slot": 1,
+            "type": "LATENT"
+          },
+          {
+            "id": 15,
+            "origin_id": 4,
+            "origin_slot": 0,
+            "target_id": -20,
+            "target_slot": 0,
+            "type": "CONDITIONING"
+          }
+        ],
+        "extra": {}
+      }
+    ]
+  },
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.9,
+      "offset": [
+        416,
+        110
+      ]
+    }
+  },
+  "version": 0.4
+}

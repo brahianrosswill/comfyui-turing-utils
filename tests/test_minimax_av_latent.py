@@ -15,15 +15,15 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 import comfy.nested_tensor  # noqa: E402
 
 
-from comfyui_turing_utils.nodes import minimax as minimax_nodes  # noqa: E402
+from comfy_extras import nodes_lt as minimax_nodes  # noqa: E402
 
 
 class MiniMaxH3AVLatentTest(unittest.TestCase):
-    def test_schema_uses_stable_h3_node_ids(self):
-        concat = minimax_nodes.H3ConcatAVLatent.define_schema()
-        separate = minimax_nodes.H3SeparateAVLatent.define_schema()
-        self.assertEqual(concat.node_id, "TuringUtilsH3ConcatAVLatent")
-        self.assertEqual(separate.node_id, "TuringUtilsH3SeparateAVLatent")
+    def test_official_schema_provides_av_nodes(self):
+        concat = minimax_nodes.LTXVConcatAVLatent.define_schema()
+        separate = minimax_nodes.LTXVSeparateAVLatent.define_schema()
+        self.assertEqual(concat.node_id, "LTXVConcatAVLatent")
+        self.assertEqual(separate.node_id, "LTXVSeparateAVLatent")
 
     def test_concat_and_separate_round_trip(self):
         video = torch.randn(2, 24, 7, 8, 12)
@@ -33,7 +33,7 @@ class MiniMaxH3AVLatentTest(unittest.TestCase):
         video_latent = {"samples": video, "noise_mask": video_mask, "video_metadata": 1}
         audio_latent = {"samples": audio, "noise_mask": audio_mask, "audio_metadata": 2}
 
-        av_latent = minimax_nodes.H3ConcatAVLatent.execute(video_latent, audio_latent).result[0]
+        av_latent = minimax_nodes.LTXVConcatAVLatent.execute(video_latent, audio_latent).result[0]
         av_video, av_audio = av_latent["samples"].unbind()
         av_video_mask, av_audio_mask = av_latent["noise_mask"].unbind()
         self.assertIs(av_video, video)
@@ -43,7 +43,7 @@ class MiniMaxH3AVLatentTest(unittest.TestCase):
         self.assertEqual(av_latent["video_metadata"], 1)
         self.assertEqual(av_latent["audio_metadata"], 2)
 
-        separated_video, separated_audio = minimax_nodes.H3SeparateAVLatent.execute(av_latent).result
+        separated_video, separated_audio = minimax_nodes.LTXVSeparateAVLatent.execute(av_latent).result
         self.assertIs(separated_video["samples"], video)
         self.assertIs(separated_audio["samples"], audio)
         self.assertIs(separated_video["noise_mask"], video_mask)
@@ -54,7 +54,7 @@ class MiniMaxH3AVLatentTest(unittest.TestCase):
         audio = torch.randn(1, 32, 2, 19)
         audio_mask = torch.zeros_like(audio)
 
-        output = minimax_nodes.H3ConcatAVLatent.execute(
+        output = minimax_nodes.LTXVConcatAVLatent.execute(
             {"samples": video},
             {"samples": audio, "noise_mask": audio_mask},
         ).result[0]
@@ -71,7 +71,7 @@ class MiniMaxH3AVLatentTest(unittest.TestCase):
             "samples": comfy.nested_tensor.NestedTensor((video, original_audio)),
         }
 
-        output = minimax_nodes.H3ConcatAVLatent.execute(
+        output = minimax_nodes.LTXVConcatAVLatent.execute(
             existing,
             {"samples": replacement_audio, "noise_mask": replacement_mask},
         ).result[0]
@@ -85,23 +85,6 @@ class MiniMaxH3AVLatentTest(unittest.TestCase):
         self.assertTrue(torch.equal(audio_mask[..., :5], replacement_mask))
         self.assertTrue(torch.equal(audio_mask[..., 5:], torch.ones_like(audio_mask[..., 5:])))
 
-    def test_rejects_non_h3_stream_shapes(self):
-        with self.assertRaisesRegex(ValueError, "H3 video latent"):
-            minimax_nodes.H3ConcatAVLatent.execute(
-                {"samples": torch.zeros(1, 16, 7, 8, 12)},
-                {"samples": torch.zeros(1, 32, 2, 19)},
-            )
-        with self.assertRaisesRegex(ValueError, "H3 audio latent"):
-            minimax_nodes.H3ConcatAVLatent.execute(
-                {"samples": torch.zeros(1, 24, 7, 8, 12)},
-                {"samples": torch.zeros(1, 16, 2, 19)},
-            )
-
-    def test_separate_rejects_a_non_nested_latent(self):
-        with self.assertRaisesRegex(ValueError, "nested video/audio"):
-            minimax_nodes.H3SeparateAVLatent.execute(
-                {"samples": torch.zeros(1, 24, 7, 8, 12)}
-            )
 
 
 if __name__ == "__main__":

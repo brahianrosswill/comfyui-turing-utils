@@ -437,7 +437,7 @@ class VideoMotionContactSheet(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsVideoMotionContactSheet",
             display_name="Video Motion Contact Sheet",
-            category="Turing Utils/video",
+            category="Turing Utils/Video",
             description="Sample N x N frames from a VIDEO or IMAGE batch and arrange them as an optional annotated filmstrip-style motion storyboard.",
             is_experimental=True,
             inputs=[
@@ -497,7 +497,7 @@ class ResizeImageIfPresent(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsResizeImageIfPresent",
             display_name="Resize Image If Present",
-            category="Turing Utils/image",
+            category="Turing Utils/Video",
             description="Resize and optionally crop or pad an image. An unconnected image produces an absent image instead of a placeholder frame.",
             inputs=[
                 io.Image.Input("image", optional=True, tooltip="Leave unconnected to produce no image."),

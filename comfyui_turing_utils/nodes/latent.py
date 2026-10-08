@@ -97,7 +97,7 @@ class SetVideoLatentNoiseMask(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsSetVideoLatentNoiseMask",
             display_name="Set Video Latent Noise Mask",
-            category="Turing Utils/video",
+            category="Turing Utils/Mask",
             description=(
                 "Set a video-only noise mask. Matching mask/latent time counts map directly; "
                 "otherwise merge image-frame masks by the selected VAE's temporal groups. "
@@ -106,7 +106,7 @@ class SetVideoLatentNoiseMask(io.ComfyNode):
             ),
             inputs=[
                 io.Latent.Input("samples", tooltip="Standalone video latent [B,C,T,H,W]. Separate audio/video latents first."),
-                io.Mask.Input("mask", tooltip="[frames,H,W], or [B,frames,H,W] for separate video batches. A single mask sequence is shared across the video batch. 0 preserves, 1 redraws."),
+                io.Mask.Input("mask", optional=True, tooltip="[frames,H,W], or [B,frames,H,W]. Missing mask preserves the input latent unchanged. 0 preserves, 1 redraws."),
                 io.Combo.Input("type", options=list(VIDEO_MASK_SPECS), default="minimax", tooltip=(
                     "Used only when frame counts differ. wan (2.1/2.2), hunyuan_video and "
                     "hunyuan_video_15: first frame then groups of 4; ltxv (LTX-Video/LTX-2 video): "
@@ -117,9 +117,11 @@ class SetVideoLatentNoiseMask(io.ComfyNode):
         )
 
     @classmethod
-    def execute(cls, samples, mask, type):
+    def execute(cls, samples, mask=None, type="minimax"):
         video = _video_samples(samples)
         output = samples.copy()
+        if mask is None:
+            return io.NodeOutput(output)
         output["noise_mask"] = _map_video_mask(video, mask, type)
         return io.NodeOutput(output)
 
@@ -130,7 +132,7 @@ class VideoLatentCompositeMasked(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsVideoLatentCompositeMasked",
             display_name="Video Latent Composite Masked",
-            category="Turing Utils/video",
+            category="Turing Utils/Mask",
             description=(
                 "Composite matching standalone video latents using hard coverage. Union the replacement "
                 "latent's inherited noise_mask with the optional mask; every nonzero value means replace, "

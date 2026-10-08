@@ -643,7 +643,7 @@ class LoadIndexedVideoSegment(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsLoadIndexedVideoSegment",
             display_name="Load Indexed Video Segment",
-            category="Turing Utils/video",
+            category="Turing Utils/Video",
             description=(
                 "Load the segment before the requested continuation index from root_directory. Relative roots "
                 "are resolved below the current ComfyUI output directory; absolute roots are used directly. "
@@ -741,7 +741,7 @@ class SaveIndexedVideoSegment(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsSaveIndexedVideoSegment",
             display_name="Save Indexed Video Segment",
-            category="Turing Utils/video",
+            category="Turing Utils/Video",
             description=(
                 "Atomically save IMAGE frames and optional AUDIO as NNNNNN.mp4 in root_directory. Relative "
                 "roots are resolved below the current ComfyUI output directory; absolute roots are used "
@@ -804,7 +804,7 @@ class MergeIndexedVideoSegments(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsMergeIndexedVideoSegments",
             display_name="Merge Indexed Video Segments",
-            category="Turing Utils/video",
+            category="Turing Utils/Video",
             description=(
                 "Merge contiguous NNNNNN.mp4 segments from index 0 through max_index into one MP4 without "
                 "decoding or re-encoding the video stream. A max_index of -1 selects every segment through "
@@ -869,7 +869,8 @@ class VideoPrefixContextNoise(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsVideoPrefixContextNoise",
             display_name="Video Prefix Context Noise",
-            category="Turing Utils/video",
+            accept_all_inputs=True,
+            category="Turing Utils/Video",
             description=(
                 "Treat the complete IMAGE batch as a video prefix. Preserve a clean tail first, place a "
                 "noise transition immediately before it, and apply full coarse colour-block noise to every "
@@ -916,13 +917,16 @@ class VideoPrefixContextNoise(io.ComfyNode):
                     default="poc_chroma_blocks",
                     advanced=True,
                 ),
-                io.Combo.Input(
+                io.DynamicCombo.Input(
                     "grid_mode",
-                    options=["poc_36x64", "block_size"],
-                    default="poc_36x64",
-                    advanced=True,
+                    options=[
+                        io.DynamicCombo.Option("poc_36x64", []),
+                        io.DynamicCombo.Option("block_size", [
+                            io.Int.Input("block_size", default=16, min=1, max=256, step=1, optional=True, advanced=True),
+                        ]),
+                    ],
+                    extra_dict={"advanced": True},
                 ),
-                io.Int.Input("block_size", default=16, min=1, max=256, step=1, advanced=True),
             ],
             outputs=[io.Image.Output(display_name="images")],
         )
@@ -940,6 +944,10 @@ class VideoPrefixContextNoise(io.ComfyNode):
         grid_mode="poc_36x64",
         block_size=16,
     ) -> io.NodeOutput:
+        # Old API prompts use flat block_size; the UI migrates it to the branch.
+        if isinstance(grid_mode, dict):
+            block_size = grid_mode.get("block_size") if grid_mode.get("block_size") is not None else block_size
+            grid_mode = grid_mode["grid_mode"]
         if images is None:
             return io.NodeOutput(None)
         return io.NodeOutput(
@@ -963,7 +971,7 @@ class VideoContinuationConcat(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsVideoContinuationConcat",
             display_name="Video Continuation Concat",
-            category="Turing Utils/video",
+            category="Turing Utils/Video",
             description=(
                 "Compose optional prefix frames/audio with a body timeline. Concat mode prepends the prefix; "
                 "replace mode fills leading context slots already included in the body timeline without "
@@ -1090,7 +1098,7 @@ class TrimVideoContinuationPrefix(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsTrimVideoContinuationPrefix",
             display_name="Trim Video Continuation Prefix",
-            category="Turing Utils/video",
+            category="Turing Utils/Video",
             description=(
                 "Remove temporary continuation context from generated IMAGE frames and matching AUDIO. This "
                 "trims prefixes prepended in concat mode as well as leading context slots filled in replace "
@@ -1128,9 +1136,10 @@ class H3SetAudioPrefixNoiseMask(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsH3SetAudioPrefixNoiseMask",
             display_name="H3 Set Audio Prefix Noise Mask",
-            category="Turing Utils/latent",
+            category="Turing Utils/Video",
             description=(
                 "Set a standalone H3 audio latent noise mask from Video Continuation Concat metadata. "
+                "Only prefix protection requires trim_info. Whole-audio protection/generation needs no metadata. "
                 "Zero preserves audio and one generates it; concatenate with the video latent afterward."
             ),
             inputs=[
@@ -1155,17 +1164,16 @@ class H3SetAudioPrefixNoiseMask(io.ComfyNode):
             raise ValueError(f"Expected standalone H3 audio latent [B,32,2,T], got {shape}")
         if mode not in ("protect_prefix_generate_body", "protect_all", "generate_all"):
             raise ValueError(f"Unknown audio mask mode: {mode!r}")
-        _trim_info_values(trim_info)
-        total_samples = int(trim_info.get("total_audio_samples", 0))
-        prefix_samples = int(trim_info.get("prefix_audio_samples", 0))
-        if total_samples < 1 or not 0 <= prefix_samples <= total_samples:
-            raise ValueError("trim_info contains an invalid audio boundary")
-
         if mode == "protect_all":
             mask = torch.zeros_like(samples, dtype=torch.float32)
         elif mode == "generate_all":
             mask = torch.ones_like(samples, dtype=torch.float32)
         else:
+            _trim_info_values(trim_info)
+            total_samples = int(trim_info.get("total_audio_samples", 0))
+            prefix_samples = int(trim_info.get("prefix_audio_samples", 0))
+            if total_samples < 1 or not 0 <= prefix_samples <= total_samples:
+                raise ValueError("trim_info contains an invalid audio boundary")
             latent_length = int(samples.shape[-1])
             if trim_info.get("prefix_audio_present", True):
                 boundary = (2 * prefix_samples * latent_length + total_samples) // (2 * total_samples)

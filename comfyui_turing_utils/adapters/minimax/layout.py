@@ -28,9 +28,6 @@ from .compat import accepts_parameter, make_packed_layout
 
 LOG = get_logger("minimax.layout")
 MINIMAX_H3_LAYOUT_KIND = "minimax_h3"
-H3_IMAGE_SOL_STRATEGY = "h3_image_sol"
-H3_IMAGE_SOL_LAYOUT_KEY = "turing_utils_h3_image_sol_temporal_layout"
-H3_IMAGE_SOL_LAYOUTS = ("dense_start_window", "dense_end_window")
 RUNTIME_CONTEXT_ATTR = "_turing_utils_minimax_runtime_context"
 RUNTIME_PROVIDER_ATTR = "_turing_utils_minimax_layout_provider"
 RUNTIME_OUTER_WRAPPER_KEY = "turing_utils_minimax_runtime_layout"
@@ -64,7 +61,6 @@ _LAYOUT_FIELDS = {
     "layer_index",
     "layer_count",
 }
-_LOGGED_H3_IMAGE_SOL_LAYOUTS = set()
 
 
 def _root_and_diffusion_model(model):
@@ -298,73 +294,6 @@ def minimax_temporal_topology(base_model, diffusion_model, mod_segments):
     }
 
 
-def h3_image_sol_dense_slices(latent_frames: int, temporal_layout: str):
-    """Return H3 latent-time slices whose Query and K/V stay exact."""
-    latent_frames = int(latent_frames)
-    temporal_layout = str(temporal_layout).strip().lower()
-    if temporal_layout not in H3_IMAGE_SOL_LAYOUTS:
-        raise ValueError(
-            "H3 image Sol temporal_layout must be dense_start_window or "
-            "dense_end_window"
-        )
-    if latent_frames < 2 or (latent_frames - 2) % 5:
-        return tuple(range(max(latent_frames, 0)))
-    if temporal_layout == "dense_end_window":
-        return (latent_frames - 2, latent_frames - 1)
-    return (0, 1)
-
-
-def _minimax_semantic_segments(raw_segments, topology, temporal_layout):
-    topology_id = "target_video"
-    tokens_per_frame = int(topology["tokens_per_frame"])
-    latent_frames = int(topology["topology_tokens"]) // tokens_per_frame
-    dense_slices = set(h3_image_sol_dense_slices(latent_frames, temporal_layout))
-    log_key = (temporal_layout, latent_frames, tokens_per_frame)
-    if log_key not in _LOGGED_H3_IMAGE_SOL_LAYOUTS:
-        residual_slices = tuple(
-            frame for frame in range(latent_frames) if frame not in dense_slices
-        )
-        LOG.info(
-            "H3 image Sol layout: temporal_layout=%s latent_t=%d "
-            "dense_slices=%s residual_slices=%s",
-            temporal_layout,
-            latent_frames,
-            tuple(sorted(dense_slices)),
-            residual_slices,
-        )
-        _LOGGED_H3_IMAGE_SOL_LAYOUTS.add(log_key)
-    segments = []
-    for start, stop, role in raw_segments:
-        if role != "target_video":
-            segments.append(AttentionSegment.for_role(start, stop, role))
-            continue
-        for frame in range(latent_frames):
-            frame_start = int(start) + frame * tokens_per_frame
-            frame_stop = frame_start + tokens_per_frame
-            if frame in dense_slices:
-                segments.append(
-                    AttentionSegment(
-                        start=frame_start,
-                        stop=frame_stop,
-                        role=role,
-                        sparse_query_allowed=False,
-                        sparse_key_allowed=False,
-                        exact_kv=True,
-                        topology_id=topology_id,
-                    )
-                )
-            else:
-                segments.append(
-                    AttentionSegment.for_role(
-                        frame_start,
-                        frame_stop,
-                        role,
-                        topology_id=topology_id,
-                    )
-                )
-    return tuple(segments)
-
-
 def publish_minimax_attention_layout(
     transformer_options,
     mod_segments,
@@ -388,26 +317,15 @@ def publish_minimax_attention_layout(
         }
     else:
         topology_id = "target_video"
-        temporal_layout = (
-            transformer_options.get(H3_IMAGE_SOL_LAYOUT_KEY)
-            if transformer_options.get("turing_utils_attention_strategy")
-            == H3_IMAGE_SOL_STRATEGY
-            else None
+        segments = tuple(
+            AttentionSegment.for_role(
+                start,
+                stop,
+                role,
+                topology_id=topology_id if role == "target_video" else None,
+            )
+            for start, stop, role in raw_segments
         )
-        if temporal_layout in H3_IMAGE_SOL_LAYOUTS:
-            segments = _minimax_semantic_segments(
-                raw_segments, topology, temporal_layout
-            )
-        else:
-            segments = tuple(
-                AttentionSegment.for_role(
-                    start,
-                    stop,
-                    role,
-                    topology_id=topology_id if role == "target_video" else None,
-                )
-                for start, stop, role in raw_segments
-            )
         semantic = AttentionSemanticLayout(
             provider=MINIMAX_H3_LAYOUT_KIND,
             query_segments=segments,

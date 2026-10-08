@@ -12,7 +12,7 @@ from comfyui_turing_utils.adapters.minimax.veda.plans import PlanTable, TilePlan
 from comfyui_turing_utils.adapters.minimax.veda.tiling import TileShape
 from comfyui_turing_utils.adapters.minimax.veda.reference import official_logits, route_agreement
 from comfyui_turing_utils.adapters.minimax.veda.predictor import convert_projection, project_features, score_tiles
-from comfyui_turing_utils.nodes.veda import H3VedaAttentionStrategy
+from comfyui_turing_utils.nodes.attention import AttentionStrategy, veda_inputs, _ATTENTION_STRATEGIES
 
 
 def test_removed_cuda_variants_have_no_declarations_or_dispatch():
@@ -34,8 +34,8 @@ def test_ratios_use_bundle_without_changing_explicit_workflows():
 
 
 def test_advanced_inputs_use_trained_defaults():
-    with mock.patch('comfyui_turing_utils.nodes.veda.predictor_choices', return_value=['x']):
-        inputs = H3VedaAttentionStrategy.INPUT_TYPES()['required']
+    with mock.patch('comfyui_turing_utils.nodes.attention.predictor_choices', return_value=['x']):
+        inputs = veda_inputs()['required']
     assert [name for name, spec in inputs.items() if len(spec) < 2 or not spec[1].get('advanced')] == [
         'model', 'predictor_name', 'predictor_precision']
     assert inputs['keep_ratio'][1]['default'] == 0

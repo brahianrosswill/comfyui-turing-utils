@@ -13,7 +13,7 @@ class Krea2IdentityEditConditioning(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsKrea2IdentityEditConditioning",
             display_name="Krea2 Identity Edit Conditioning",
-            category="Turing Utils/conditioning",
+            category="Turing Utils/Krea2",
             description=(
                 "Builds Krea2 Identity Edit conditioning from one required character "
                 "reference and one optional background/edit canvas."

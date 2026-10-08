@@ -40,7 +40,7 @@ class IsInputPresent(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsIsInputPresent",
             display_name="Is Input Present",
-            category="Turing Utils/logic",
+            category="Turing Utils/Workflow",
             description=(
                 "Returns true when the optional input is connected and non-empty. "
                 "The value output forwards the primary input when present, otherwise "
@@ -95,7 +95,7 @@ class LazyIfElse(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsLazyIfElse",
             display_name="Lazy If / Else",
-            category="Turing Utils/logic",
+            category="Turing Utils/Workflow",
             description=(
                 "Returns the selected branch and asks ComfyUI to evaluate only that "
                 "lazy input. An unselected branch is skipped unless another output "
@@ -148,7 +148,7 @@ class StageBarrier(io.ComfyNode):
         return io.Schema(
             node_id=STAGE_BARRIER_NODE_ID,
             display_name="Stage Barrier",
-            category="Turing Utils/logic",
+            category="Turing Utils/Workflow",
             description=(
                 "Tag independent arbitrary-value paths for dependency-first phase "
                 "ordering. Each visual input/output pair is compiled into its own "
@@ -226,7 +226,7 @@ class StagePath(io.ComfyNode):
         return io.Schema(
             node_id=STAGE_PATH_NODE_ID,
             display_name="Stage Path (Internal)",
-            category="Turing Utils/internal",
+            category="",
             description=(
                 "Internal one-input/one-output Stage Barrier route. The server "
                 "creates this node while compiling a submitted workflow."

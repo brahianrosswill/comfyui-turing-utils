@@ -1,30 +1,20 @@
 from __future__ import annotations
 
 from .adapters.minimax.conditioning import install_combined_minimax_conditioning_support
-from .nodes.attention import (
-    H3ImageSolAttentionPatch,
-    H3StaticVirtualKV,
-    SlaSparseAttentionPatch,
-    SolSparseAttentionPatch,
-)
+from .nodes.attention import AttentionStrategy
 from .nodes.bernini import BerniniContextWindowsCore, BerniniInpaintCondition
 from .nodes.krea2 import Krea2IdentityEditConditioning
 from .nodes.latent import SetVideoLatentNoiseMask, VideoLatentCompositeMasked
 from .nodes.loaders import ConvRotCLIPLoader, ConvRotDiffusionModelLoader
 from .nodes.logic import IsInputPresent, LazyIfElse, StageBarrier, StagePath
 from .nodes.media import ResizeImageIfPresent, VideoMotionContactSheet
-from .nodes.multimodal_chat import MultimodalChatOptions, MultimodalPromptChat
-from .nodes.sec import SeCModelLoader, SeCTrackVisualConcept, SeCTrackVisualConceptApply
-from .nodes.veda import H3VedaAttentionStrategy
+from .nodes.multimodal_chat import MultimodalPromptChat
+from .nodes.sec import _SeCLoader, SeCTrackVisualConcept, _SeCApply
 from .nodes.minimax import (
     H3AddNoise,
-    H3ConcatAVLatent,
-    H3SeparateAVLatent,
-    MiniMaxH3BlockCachePatch,
     MiniMaxH3LatentUpscale,
-    MiniMaxH3LatentUpscaleApply,
-    MiniMaxH3LatentUpscaleModelLoader,
-    MiniMaxH3VideoFramesPadding,
+    _H3UpscaleApply,
+    _H3UpscaleLoader,
 )
 from .nodes.minimax_vae import (
     MiniMaxH3VideoVAEDecode,
@@ -54,18 +44,17 @@ from .nodes.video_roi import (
     VideoPadForOutpaint,
 )
 from .nodes.visual_prompt import MaskToVisualPrompts
-from .nodes.wan import WanVideoFramesPadding
+from .nodes.video_padding import VideoFramesPadding
 
 
 install_combined_minimax_conditioning_support()
 
 
 NODE_CLASS_MAPPINGS = {
-    "TuringUtilsH3VedaAttentionStrategy": H3VedaAttentionStrategy,
+    "TuringUtilsVideoFramesPadding": VideoFramesPadding,
+    "TuringUtilsAttentionStrategy": AttentionStrategy,
     "TuringUtilsConvRotDiffusionModelLoader": ConvRotDiffusionModelLoader,
     "TuringUtilsConvRotCLIPLoader": ConvRotCLIPLoader,
-    "TuringUtilsWanVideoFramesPadding": WanVideoFramesPadding,
-    "TuringUtilsMiniMaxH3VideoFramesPadding": MiniMaxH3VideoFramesPadding,
     "TuringUtilsSetVideoLatentNoiseMask": SetVideoLatentNoiseMask,
     "TuringUtilsVideoLatentCompositeMasked": VideoLatentCompositeMasked,
     "TuringUtilsBerniniContextWindowsCore": BerniniContextWindowsCore,
@@ -75,8 +64,6 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsLazyIfElse": LazyIfElse,
     "TuringUtilsStageBarrier": StageBarrier,
     "TuringUtilsStagePath": StagePath,
-    "TuringUtilsH3ConcatAVLatent": H3ConcatAVLatent,
-    "TuringUtilsH3SeparateAVLatent": H3SeparateAVLatent,
     "TuringUtilsH3AddNoise": H3AddNoise,
     "TuringUtilsH3LatentInfo": H3LatentInfo,
     "TuringUtilsH3KeyframeReference": H3KeyframeReference,
@@ -85,17 +72,11 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsH3AudioReference": H3AudioReference,
     "TuringUtilsH3SemanticReference": H3SemanticReference,
     "TuringUtilsH3BuildConditioning": H3BuildConditioning,
-    "TuringUtilsMiniMaxH3LatentUpscaleModelLoader": MiniMaxH3LatentUpscaleModelLoader,
+    "_TuringUtilsH3UpscaleLoader": _H3UpscaleLoader,
     "TuringUtilsMiniMaxH3LatentUpscale": MiniMaxH3LatentUpscale,
-    "TuringUtilsMiniMaxH3LatentUpscaleApply": MiniMaxH3LatentUpscaleApply,
-    "TuringUtilsMiniMaxH3BlockCachePatch": MiniMaxH3BlockCachePatch,
-    "TuringUtilsSolAttentionStrategy": SolSparseAttentionPatch,
-    "TuringUtilsSlaAttentionStrategy": SlaSparseAttentionPatch,
-    "TuringUtilsH3ImageSolAttention": H3ImageSolAttentionPatch,
-    "TuringUtilsH3StaticVirtualKV": H3StaticVirtualKV,
+    "_TuringUtilsH3UpscaleApply": _H3UpscaleApply,
     "TuringUtilsResizeImageIfPresent": ResizeImageIfPresent,
     "TuringUtilsVideoMotionContactSheet": VideoMotionContactSheet,
-    "TuringUtilsMultimodalChatOptions": MultimodalChatOptions,
     "TuringUtilsMultimodalPromptChat": MultimodalPromptChat,
     "TuringUtilsMiniMaxH3VideoVAEDecode": MiniMaxH3VideoVAEDecode,
     "TuringUtilsMiniMaxH3VideoVAEEncode": MiniMaxH3VideoVAEEncode,
@@ -110,17 +91,16 @@ NODE_CLASS_MAPPINGS = {
     "TuringUtilsVideoMaskGuidedStitch": VideoMaskGuidedStitch,
     "TuringUtilsVideoPadForOutpaint": VideoPadForOutpaint,
     "TuringUtilsMaskToVisualPrompts": MaskToVisualPrompts,
-    "TuringUtilsSeCModelLoader": SeCModelLoader,
+    "_TuringUtilsSeCLoader": _SeCLoader,
     "TuringUtilsSeCTrackVisualConcept": SeCTrackVisualConcept,
-    "TuringUtilsSeCTrackVisualConceptApply": SeCTrackVisualConceptApply,
+    "_TuringUtilsSeCApply": _SeCApply,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "TuringUtilsH3VedaAttentionStrategy": "Configure H3 Veda Sparse Attention",
+    "TuringUtilsVideoFramesPadding": "Video Frames Padding",
+    "TuringUtilsAttentionStrategy": "Configure Attention Strategy",
     "TuringUtilsConvRotDiffusionModelLoader": "Load ConvRot DiT",
     "TuringUtilsConvRotCLIPLoader": "Load ConvRot CLIP",
-    "TuringUtilsWanVideoFramesPadding": "Wan Video Frames Padding",
-    "TuringUtilsMiniMaxH3VideoFramesPadding": "MiniMax H3 Video Frames Padding",
     "TuringUtilsSetVideoLatentNoiseMask": "Set Video Latent Noise Mask",
     "TuringUtilsVideoLatentCompositeMasked": "Video Latent Composite Masked",
     "TuringUtilsBerniniContextWindowsCore": "Bernini Context Windows",
@@ -130,8 +110,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsLazyIfElse": "Lazy If / Else",
     "TuringUtilsStageBarrier": "Stage Barrier",
     "TuringUtilsStagePath": "Stage Path (Internal)",
-    "TuringUtilsH3ConcatAVLatent": "H3 Concat AV Latent",
-    "TuringUtilsH3SeparateAVLatent": "H3 Separate AV Latent",
     "TuringUtilsH3AddNoise": "H3 Add Noise",
     "TuringUtilsH3LatentInfo": "H3 Latent Info",
     "TuringUtilsH3KeyframeReference": "H3 Keyframe Reference",
@@ -140,17 +118,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsH3AudioReference": "H3 Audio Reference",
     "TuringUtilsH3SemanticReference": "H3 Semantic Reference",
     "TuringUtilsH3BuildConditioning": "H3 Build Conditioning",
-    "TuringUtilsMiniMaxH3LatentUpscaleModelLoader": "Load MiniMax H3 Latent Upscaler",
+    "_TuringUtilsH3UpscaleLoader": "H3 Upscale Loader (Internal)",
     "TuringUtilsMiniMaxH3LatentUpscale": "MiniMax H3 Latent Upscale",
-    "TuringUtilsMiniMaxH3LatentUpscaleApply": "MiniMax H3 Latent Upscale (Internal)",
-    "TuringUtilsMiniMaxH3BlockCachePatch": "Patch MiniMax H3 Block Cache (Experimental)",
-    "TuringUtilsSolAttentionStrategy": "Configure Sol Sparse Attention",
-    "TuringUtilsSlaAttentionStrategy": "Configure SLA Sparse Attention",
-    "TuringUtilsH3ImageSolAttention": "Configure H3 Image Sol Attention",
-    "TuringUtilsH3StaticVirtualKV": "Configure H3 Static Virtual KV",
+    "_TuringUtilsH3UpscaleApply": "MiniMax H3 Latent Upscale (Internal)",
     "TuringUtilsResizeImageIfPresent": "Resize Image If Present",
     "TuringUtilsVideoMotionContactSheet": "Video Motion Contact Sheet (Experimental)",
-    "TuringUtilsMultimodalChatOptions": "Multimodal Chat Options",
     "TuringUtilsMultimodalPromptChat": "Multimodal Prompt Chat",
     "TuringUtilsMiniMaxH3VideoVAEDecode": "MiniMax H3 Video VAE Decode",
     "TuringUtilsMiniMaxH3VideoVAEEncode": "MiniMax H3 Video VAE Encode",
@@ -165,7 +137,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsVideoMaskGuidedStitch": "Video Mask Guided Stitch",
     "TuringUtilsVideoPadForOutpaint": "Video Pad For Outpaint",
     "TuringUtilsMaskToVisualPrompts": "Mask to Visual Prompts",
-    "TuringUtilsSeCModelLoader": "Load SeC Model",
+    "_TuringUtilsSeCLoader": "SeC Loader (Internal)",
     "TuringUtilsSeCTrackVisualConcept": "SeC Track Visual Concept",
-    "TuringUtilsSeCTrackVisualConceptApply": "SeC Track Visual Concept (Internal)",
+    "_TuringUtilsSeCApply": "SeC Track Visual Concept (Internal)",
 }

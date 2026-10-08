@@ -450,7 +450,7 @@ class MaskToVisualPrompts(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsMaskToVisualPrompts",
             display_name="Mask to Visual Prompts",
-            category="Turing Utils/mask",
+            category="Turing Utils/Mask",
             description=(
                 "Use the first IMAGE/MASK frame to derive reusable positive/negative point "
                 "JSON, legacy KJ BBOX, and canonical SeC/SAM3 BOUNDING_BOX prompts. Positive points "

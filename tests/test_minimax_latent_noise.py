@@ -20,7 +20,8 @@ import comfy.samplers  # noqa: E402
 import comfy.utils  # noqa: E402
 from comfy.nested_tensor import NestedTensor  # noqa: E402
 from comfy_extras.nodes_custom_sampler import DisableNoise, Noise_RandomNoise  # noqa: E402
-from comfyui_turing_utils.nodes.minimax import H3AddNoise, H3ConcatAVLatent, H3SeparateAVLatent  # noqa: E402
+from comfyui_turing_utils.nodes.minimax import H3AddNoise
+from comfy_extras.nodes_lt import LTXVConcatAVLatent, LTXVSeparateAVLatent
 
 
 class H3Sampling(comfy.model_sampling.ModelSamplingAV, comfy.model_sampling.CONST):
@@ -246,11 +247,11 @@ class H3AddNoiseTest(unittest.TestCase):
             self.model.model.model_sampling.inverse_noise_scaling(self.sigmas[0], self.video),
             self.model.model.model_sampling.inverse_noise_scaling(self.sigmas[0], partial_audio),
         ]))
-        _, original_audio = H3SeparateAVLatent.execute({"samples": first_output}).result
+        _, original_audio = LTXVSeparateAVLatent.execute({"samples": first_output}).result
         larger_video = torch.randn(2, 24, 2, 6, 8)
         epsilon = torch.randn_like(larger_video)
         video = self.prepare(larger_video, epsilon)
-        joined = H3ConcatAVLatent.execute(video, original_audio).result[0]
+        joined = LTXVConcatAVLatent.execute(video, original_audio).result[0]
         self.assertIs(joined["samples"].unbind()[1], original_audio["samples"])
         actual_video, actual_audio = self.sampler_start(joined)
         torch.testing.assert_close(actual_video, 0.4 * larger_video + 0.6 * epsilon)

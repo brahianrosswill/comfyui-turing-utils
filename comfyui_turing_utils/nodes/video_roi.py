@@ -569,7 +569,7 @@ class VideoMaskGuidedCrop(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsVideoMaskGuidedCrop",
             display_name="Video Mask Guided Crop",
-            category="Turing Utils/video",
+            category="Turing Utils/Video",
             description=(
                 "Derive a stable, fixed-aspect in-frame crop from one mask per video frame. "
                 "Missing observations are interpolated or held without introducing padded pixels."
@@ -621,7 +621,7 @@ class VideoMaskGuidedStitch(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsVideoMaskGuidedStitch",
             display_name="Video Mask Guided Stitch",
-            category="Turing Utils/video",
+            category="Turing Utils/Video",
             description=(
                 "Map regenerated crops and their masks back through Video Mask Guided Crop's "
                 "per-frame float transforms and composite them over the original video."
@@ -653,7 +653,7 @@ class VideoPadForOutpaint(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsVideoPadForOutpaint",
             display_name="Video Pad For Outpaint",
-            category="Turing Utils/video",
+            category="Turing Utils/Video",
             description=(
                 "Place a video in a larger target-resolution canvas and create a hard outpaint mask. "
                 "Pixel margins and aspect-preserving relative placement use separate dynamic controls."

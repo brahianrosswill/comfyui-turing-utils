@@ -17,7 +17,7 @@ sys.path.insert(0, str(PLUGIN_ROOT))
 
 from comfyui_turing_utils.adapters import sec  # noqa: E402
 from comfyui_turing_utils.nodes.sec import (  # noqa: E402
-    SeCModelLoader,
+    _SeCLoader,
     SeCModelType,
     SeCTrackVisualConcept,
 )
@@ -147,10 +147,10 @@ class SeCNodeTest(unittest.TestCase):
         self.assertEqual(len(model._sec_dtype_input_hook_handles), 2)
 
     def test_schema_removes_manual_device_and_unload_controls(self):
-        loader = SeCModelLoader.define_schema()
+        loader = _SeCLoader.define_schema()
         tracker = SeCTrackVisualConcept.define_schema()
 
-        self.assertEqual(loader.node_id, "TuringUtilsSeCModelLoader")
+        self.assertEqual(loader.node_id, "_TuringUtilsSeCLoader")
         self.assertEqual(tracker.node_id, "TuringUtilsSeCTrackVisualConcept")
         self.assertEqual(SeCModelType.io_type, "TURING_UTILS_SEC_MODEL")
         loader_inputs = [item.id for item in loader.inputs]

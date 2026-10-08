@@ -17,7 +17,7 @@ class BerniniInpaintCondition(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsBerniniInpaintCondition",
             display_name="Bernini Inpaint Condition",
-            category="Turing Utils/conditioning",
+            category="Turing Utils/Bernini",
             inputs=[
                 io.Conditioning.Input("positive"),
                 io.Conditioning.Input("negative"),
@@ -157,7 +157,7 @@ class BerniniContextWindowsCore:
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "apply"
-    CATEGORY = "Turing Utils/patches"
+    CATEGORY = "Turing Utils/Bernini"
     TITLE = "Bernini Context Windows"
 
     def apply(

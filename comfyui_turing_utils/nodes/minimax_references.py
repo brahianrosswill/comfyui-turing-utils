@@ -149,7 +149,7 @@ class H3KeyframeReference(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsH3KeyframeReference",
             display_name="H3 Keyframe Reference",
-            category="Turing Utils/conditioning/minimax",
+            category="Turing Utils/MiniMax H3",
             description=(
                 "Encode dynamic reusable H3 keyframes without assigning first/last "
                 "roles. Each image_N input has a matching keyframe_N output. With an "
@@ -197,7 +197,7 @@ class H3ImageReference(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsH3ImageReference",
             display_name="H3 Image Reference",
-            category="Turing Utils/conditioning/minimax",
+            category="Turing Utils/MiniMax H3",
             description=(
                 "Encode dynamic H3 reference images without cropping or upscaling. "
                 "A latent applies match-area sizing; without one, the short edge is "
@@ -248,7 +248,7 @@ class H3VideoReference(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsH3VideoReference",
             display_name="H3 Video Reference",
-            category="Turing Utils/conditioning/minimax",
+            category="Turing Utils/MiniMax H3",
             description=(
                 "Encode dynamic H3 reference videos that were resampled to 24 FPS "
                 "upstream, plus index-paired soundtracks. Qwen receives a 2 FPS view; "
@@ -349,7 +349,7 @@ class H3AudioReference(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsH3AudioReference",
             display_name="H3 Audio Reference",
-            category="Turing Utils/conditioning/minimax",
+            category="Turing Utils/MiniMax H3",
             description="Encode a dynamic set of standalone H3 reference audio clips.",
             inputs=[
                 io.Vae.Input("audio_vae"),
@@ -382,7 +382,7 @@ class H3SemanticReference(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsH3SemanticReference",
             display_name="H3 Semantic Reference",
-            category="Turing Utils/conditioning/minimax",
+            category="Turing Utils/MiniMax H3",
             description=(
                 "Run one exact Qwen3-VL multimodal encode over the prompt and selected "
                 "H3 references. Reuse the semantic result independently of the "
@@ -437,7 +437,7 @@ class H3BuildConditioning(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsH3BuildConditioning",
             display_name="H3 Build Conditioning",
-            category="Turing Utils/conditioning/minimax",
+            category="Turing Utils/MiniMax H3",
             description=(
                 "Combine a reusable Qwen semantic reference with current-resolution "
                 "first-last-frame, image, video, and audio VAE references. These "
@@ -509,7 +509,7 @@ class H3LatentInfo(io.ComfyNode):
         return io.Schema(
             node_id="TuringUtilsH3LatentInfo",
             display_name="H3 Latent Info",
-            category="Turing Utils/latent",
+            category="Turing Utils/MiniMax H3",
             description=(
                 "Read the decoded pixel width, height, canonical frame count, and "
                 "model FPS from an H3 video or nested AV latent without decoding it."

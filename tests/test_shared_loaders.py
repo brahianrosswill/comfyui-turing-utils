@@ -38,10 +38,10 @@ class SharedLoaderTest(unittest.TestCase):
             different = compile_shared_loaders(prompt)
             self.assertNotEqual(different["a"]["inputs"][socket], different["b"]["inputs"][socket])
 
-    def test_existing_model_connections_are_retained(self):
+    def test_removed_model_only_connections_do_not_bypass_application_validation(self):
         for app, (_, worker, socket, _) in APPLICATIONS.items():
-            result = compile_shared_loaders({"a": {"class_type": app, "inputs": {socket: ["old", 0]}}})
-            self.assertEqual(result["a"], {"class_type": worker, "inputs": {socket: ["old", 0]}})
+            prompt = {"a": {"class_type": app, "inputs": {socket: ["old", 0]}}}
+            self.assertEqual(compile_shared_loaders(prompt), prompt)
 
     def test_core_executor_shares_one_load_even_without_cache(self):
         import nodes

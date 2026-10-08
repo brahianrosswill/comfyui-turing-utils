@@ -254,7 +254,7 @@ original loading functions; callers bypassing the prompt server must invoke
 - `Trim Video Continuation Prefix` removes that exact image/audio prefix after
   generation. `H3 Set Audio Prefix Noise Mask` maps the recorded waveform
   boundary onto a standalone `[B,32,2,T]` H3 audio latent: its default mode
-  protects the prefix and generates the body before `H3 Concat AV Latent`.
+  protects the prefix and generates the body before core `Concat AV Latent`.
 - `Set Video Latent Noise Mask` accepts image-frame masks for a standalone
   video latent. Its `type` choices follow CLIP Loader: `wan`, `minimax`
   (H3 video only, default), `ltxv` (LTX-Video/LTX-2 video), `hunyuan_video`,
@@ -365,9 +365,8 @@ original loading functions; callers bypassing the prompt server must invoke
   0 after reference/VAE preparation, stage 1 after semantic conditioning or
   sampling, and stage 2 after decode; dependent branches may reuse the same
   labels without manual renumbering.
-- `H3 Concat AV Latent` combines standalone H3 video and audio latents into the
-  model's native nested AV latent. `H3 Separate AV Latent` splits the streams
-  again; both nodes preserve matching video/audio noise masks.
+- Use core `Concat AV Latent` / `Separate AV Latent` for H3 AV streams.
+  The plugin-specific duplicate nodes have been removed.
 - `H3 Add Noise` prepares **clean x0** for a continuation sampler using
   `DisableNoise` (or `add_noise=disable`). Connect the continuation H3 `MODEL`,
   `RandomNoise`, the remaining `SIGMAS`, and a clean `LATENT`; the first sigma
@@ -428,41 +427,6 @@ original loading functions; callers bypassing the prompt server must invoke
   Custom tile batching, async pixel buffers,
   block prefetch and non-evicting memory budgets are removed, along with the
   earlier shared-state decoding and experimental overlap controls.
-- `Patch MiniMax H3 Block Cache (Experimental)` skips stable transformer-block
-  spans by reusing one exact trajectory residual. It provides conservative
-  standard, 4-step, and 8-step profiles, isolates sampler branches, prefetches
-  only blocks that actually execute, and follows ComfyUI's Dynamic VRAM and
-  pinned-memory lifecycle. It is a Python-only patch and does not require
-  rebuilding the CUDA package.
-- `Configure H3 Static Virtual KV` is an experimental static-image execution
-  mode for an H3 target containing exactly five output frames (two latent-time
-  slices). Physical Query, attention output, residual, and FFN rows stay at
-  two slices. `conservative` presents attention with seven K/V slices using
-  H3's 22-frame temporal positions by materializing exact BF16 K/V. With kernel
-  0.39.0, `fast` retains only the two physical BF16 K/V slices, gathers them
-  through an exact logical source map, applies all seven real temporal RoPE
-  phases, and materializes only the W8A8 INT8 attention containers. It does not
-  average temporal phases. Kernel 0.41.0 extends `residual`: the two physical
-  latent-time slices and non-video context remain exact, while the five added
-  virtual slices use Sol's `2x32` skipped-block residuals in the same online
-  softmax. W8A8 reads its mapped INT8 V path; inherited Sage or SDPA use the
-  mapped FP16/BF16 Sol path, including mapped summary construction and exact-V
-  tile reads, without materializing seven floating-point K/V slices. Here
-  `sdpa` names the inherited numeric/fallback policy—the residual computation
-  itself still runs in the bundled Sol kernel. Older kernels safely use the
-  exact conservative representation. The node replaces any upstream Sol/SLA
-  strategy; the fast and residual paths require rebuilding the bundled kernel.
-- `Configure H3 Image Sol Attention` keeps the native H3 frame count and every
-  target-video Q/FFN row, then applies fixed `1x64` Sol residuals outside either
-  the opening or closing `1+4` frame group: `dense_start_window` (default)
-  protects latent slices `0, 1`; `dense_end_window` protects `T-2, T-1`.
-  It inherits the standard Sol reference-image/video/audio switches and dense
-  prefix/suffix step/layer controls. Five-frame target attention remains dense;
-  supported longer H3 inputs use their native `5k+2` latent-time layout, and
-  other latent lengths keep all target slices dense. The node is Python-only
-  and replaces an upstream Sol/SLA/virtual-KV strategy. Old workflows must
-  reselect the layout: `dense_window` is renamed to `dense_start_window`, and
-  `dense_anchor_grid` is removed without an automatic replacement.
 - `Multimodal Prompt Chat` sends one non-streaming system/user turn to an
   OpenAI-compatible Chat Completions endpoint using only Python's standard HTTP
   client. Either `prompt` or `system_prompt` may be empty, but not both.
@@ -472,16 +436,29 @@ original loading functions; callers bypassing the prompt server must invoke
   sampled into timestamped `<Video N>` frames. A root URL automatically gains
   `/v1/chat/completions`, while versioned and complete endpoint URLs are kept.
   API keys may be literal, empty for a local placeholder, or `$NAME`/`${NAME}`
-  environment references. The base node keeps the cache-buster control, while
-  the optional `Multimodal Chat Options` node owns thinking, sampling, media,
-  and retry controls; leaving it disconnected
-  uses identical built-in defaults, including an 8192-token output limit and
+  environment references. Thinking, sampling, media, and retry controls now live
+  in the node's advanced inputs. JPEG quality appears only for JPEG encoding.
+  The standalone Options node and socket have been removed. Defaults are unchanged,
+  including an 8192-token output limit and
   `chat_template_kwargs.enable_thinking=false`.
 - `Video Motion Contact Sheet (Experimental)` samples an `N x N` chronological
   storyboard from a loaded `VIDEO` or decoded `IMAGE` frame batch. It can use
   uniform or motion-weighted sampling and optionally wraps each panel in
   annotated film rails so frame numbers and timestamps stay outside the image.
-- `Configure Sol Sparse Attention` applies the production model-generic,
+- `Configure Attention Strategy` is the unified entry for Sol, SLA, and Veda.
+  H3 Image Sol and Static Virtual KV have been removed, including their node IDs.
+  Its dynamic selector exposes only
+  the selected strategy; advanced inputs contain reference protection and
+  dense-step/layer safeguards. Manual prefix length appears only for manual
+  protection. The three previous Sol/SLA/Veda Configure node IDs are removed. Dense backend selection stays in the loader, and this
+  change does not alter kernels or introduce additional model copies/caches.
+  See [node configuration and reusable presets](docs/node-configuration.md)
+  and the [complete node inventory](docs/node-inventory.md).
+- `Video Frames Padding` shares the model `type` choices of Set Video Latent
+  Noise Mask: Wan, MiniMax H3, LTXV, Hunyuan Video, Hunyuan Video 1.5, and Mochi.
+  It can pad images and masks independently, keeping image encoding cached on
+  mask edits. Old Wan/H3 padding node IDs are removed.
+- The Sol strategy applies the production model-generic,
   loader-independent
   long-sequence sparse backend. It uses an input-adaptive statistical threshold,
   keeps one 64-token skipped-block centroid by default, accepts semantic
@@ -491,7 +468,7 @@ original loading functions; callers bypassing the prompt server must invoke
   W8A8 selects integer sparse PV, while Sage/SDPA select the floating FP16
   sparse core. Dense prefix/suffix counts are local to every sampler invocation,
   so one configured model can feed both stages without pass-specific controls.
-- `Configure SLA Sparse Attention` implements the MiniMax H3 Turbo-SLA runtime as
+- The SLA strategy implements the MiniMax H3 Turbo-SLA runtime as
   fixed-budget 128-query by 64-key Top-K routing. It shares Sol's semantic
   reference protection, dense step/layer scheduling, fused Q/K preprocessing,
   tensor lifetime, and inherited W8A8/FP16 numeric path, but deliberately does
@@ -501,10 +478,8 @@ original loading functions; callers bypassing the prompt server must invoke
   Replace them with the `Configure` nodes in existing workflows; the dense
   backend is selected by the loader, not by the old `use_w8a8` widget.
 
-The asymmetric-Q/K and independent-Q/K-RoPE protocol underneath virtual K/V is
-model-independent. The five-frame validation and temporal source mapping are
-owned by the MiniMax adapter; a future Bernini mode can reuse the same kernel
-ABI by supplying Bernini-specific physical/virtual layout metadata.
+The shared asymmetric-Q/K and independent-Q/K-RoPE protocol and kernel ABI
+remain model-independent; the removed H3 static-image adapter is not required.
 
 ## Krea2 Identity Edit wiring
 

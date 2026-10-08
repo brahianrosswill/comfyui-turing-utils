@@ -1,0 +1,606 @@
+{
+  "id": "28623a9d-8949-4fa7-a9d5-a1438d23b7a4",
+  "revision": 0,
+  "last_node_id": 7,
+  "last_link_id": 16,
+  "nodes": [
+    {
+      "id": 7,
+      "type": "ff072d5f-093f-476b-85c4-06508b55a333",
+      "pos": [
+        200,
+        200
+      ],
+      "size": [
+        170.748046875,
+        66
+      ],
+      "flags": {},
+      "order": 0,
+      "mode": 0,
+      "inputs": [
+        {
+          "label": "images",
+          "localized_name": "image",
+          "name": "image",
+          "shape": 7,
+          "type": "IMAGE",
+          "link": null
+        },
+        {
+          "label": "video_vae",
+          "localized_name": "vae",
+          "name": "vae",
+          "type": "VAE",
+          "link": null
+        },
+        {
+          "label": "mask",
+          "localized_name": "mask",
+          "name": "mask",
+          "shape": 7,
+          "type": "MASK",
+          "link": null
+        }
+      ],
+      "outputs": [
+        {
+          "label": "latent",
+          "localized_name": "latent",
+          "name": "latent",
+          "type": "LATENT",
+          "links": null
+        },
+        {
+          "label": "input_length",
+          "localized_name": "input_length",
+          "name": "input_length",
+          "type": "INT",
+          "links": null
+        },
+        {
+          "label": "length",
+          "localized_name": "length",
+          "name": "length",
+          "type": "INT",
+          "links": null
+        }
+      ],
+      "properties": {
+        "previewExposures": []
+      }
+    }
+  ],
+  "links": [],
+  "groups": [],
+  "definitions": {
+    "subgraphs": [
+      {
+        "id": "ff072d5f-093f-476b-85c4-06508b55a333",
+        "version": 1,
+        "state": {
+          "lastGroupId": 0,
+          "lastNodeId": 7,
+          "lastLinkId": 16,
+          "lastRerouteId": 0
+        },
+        "revision": 0,
+        "config": {},
+        "name": "H3 Prepare Video",
+        "inputNode": {
+          "id": -10,
+          "bounding": [
+            -188,
+            -54,
+            128,
+            108
+          ]
+        },
+        "outputNode": {
+          "id": -20,
+          "bounding": [
+            60,
+            -54,
+            128,
+            108
+          ]
+        },
+        "inputs": [
+          {
+            "id": "75661d13-c890-404d-b09d-66d661f525b9",
+            "name": "image",
+            "type": "IMAGE",
+            "linkIds": [
+              5
+            ],
+            "localized_name": "image",
+            "label": "images",
+            "shape": 7,
+            "pos": [
+              51,
+              24
+            ]
+          },
+          {
+            "id": "4883cf68-09a5-4681-98d0-24b984c6de8b",
+            "name": "vae",
+            "type": "VAE",
+            "linkIds": [
+              6
+            ],
+            "localized_name": "vae",
+            "label": "video_vae",
+            "pos": [
+              51,
+              44
+            ]
+          },
+          {
+            "id": "601371c8-90a9-45ab-80d9-b55fcc6fbf74",
+            "name": "mask",
+            "type": "MASK",
+            "linkIds": [
+              7
+            ],
+            "localized_name": "mask",
+            "label": "mask",
+            "shape": 7,
+            "pos": [
+              51,
+              64
+            ]
+          }
+        ],
+        "outputs": [
+          {
+            "id": "58567cb9-ad81-4c74-adca-131d93765c46",
+            "name": "latent",
+            "type": "LATENT",
+            "linkIds": [
+              8
+            ],
+            "localized_name": "latent",
+            "label": "latent",
+            "pos": [
+              24,
+              64
+            ]
+          },
+          {
+            "id": "8e2d0cb8-2c71-45ee-816c-6d9947e1e3eb",
+            "name": "input_length",
+            "type": "INT",
+            "linkIds": [
+              9
+            ],
+            "localized_name": "input_length",
+            "label": "input_length",
+            "pos": [
+              24,
+              44
+            ]
+          },
+          {
+            "id": "cac2582d-b26b-4f07-b7d5-28b1cf33b463",
+            "name": "length",
+            "type": "INT",
+            "linkIds": [
+              10
+            ],
+            "localized_name": "length",
+            "label": "length",
+            "pos": [
+              24,
+              24
+            ]
+          }
+        ],
+        "widgets": [],
+        "nodes": [
+          {
+            "id": 3,
+            "type": "TuringUtilsVideoFramesPadding",
+            "pos": [
+              0,
+              0
+            ],
+            "size": [
+              273.634765625,
+              182
+            ],
+            "flags": {},
+            "order": 0,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "image",
+                "name": "image",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": 5
+              },
+              {
+                "localized_name": "mask",
+                "name": "mask",
+                "shape": 7,
+                "type": "MASK",
+                "link": null
+              },
+              {
+                "localized_name": "type",
+                "name": "type",
+                "type": "COMBO",
+                "widget": {
+                  "name": "type"
+                },
+                "link": null
+              },
+              {
+                "localized_name": "target_frame_count",
+                "name": "target_frame_count",
+                "type": "INT",
+                "widget": {
+                  "name": "target_frame_count"
+                },
+                "link": null
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "image",
+                "name": "image",
+                "type": "IMAGE",
+                "links": [
+                  1
+                ]
+              },
+              {
+                "localized_name": "mask",
+                "name": "mask",
+                "type": "MASK",
+                "links": null
+              },
+              {
+                "localized_name": "width",
+                "name": "width",
+                "type": "INT",
+                "links": null
+              },
+              {
+                "localized_name": "height",
+                "name": "height",
+                "type": "INT",
+                "links": null
+              },
+              {
+                "localized_name": "length",
+                "name": "length",
+                "type": "INT",
+                "links": [
+                  2,
+                  10
+                ]
+              },
+              {
+                "localized_name": "input_length",
+                "name": "input_length",
+                "type": "INT",
+                "links": [
+                  9
+                ]
+              }
+            ],
+            "title": "H3 image padding",
+            "properties": {
+              "Node name for S&R": "TuringUtilsVideoFramesPadding"
+            },
+            "widgets_values": [
+              "minimax",
+              0
+            ],
+            "widgets_values_named": {
+              "type": "minimax",
+              "target_frame_count": 0
+            }
+          },
+          {
+            "id": 4,
+            "type": "TuringUtilsMiniMaxH3VideoVAEEncode",
+            "pos": [
+              400,
+              0
+            ],
+            "size": [
+              245.319921875,
+              46
+            ],
+            "flags": {},
+            "order": 1,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "pixels",
+                "name": "pixels",
+                "type": "IMAGE",
+                "link": 1
+              },
+              {
+                "localized_name": "vae",
+                "name": "vae",
+                "type": "VAE",
+                "link": 6
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "LATENT",
+                "name": "LATENT",
+                "type": "LATENT",
+                "links": [
+                  3
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "TuringUtilsMiniMaxH3VideoVAEEncode"
+            }
+          },
+          {
+            "id": 5,
+            "type": "TuringUtilsVideoFramesPadding",
+            "pos": [
+              800,
+              0
+            ],
+            "size": [
+              306.009375,
+              182
+            ],
+            "flags": {},
+            "order": 2,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "image",
+                "name": "image",
+                "shape": 7,
+                "type": "IMAGE",
+                "link": null
+              },
+              {
+                "localized_name": "mask",
+                "name": "mask",
+                "shape": 7,
+                "type": "MASK",
+                "link": 7
+              },
+              {
+                "localized_name": "type",
+                "name": "type",
+                "type": "COMBO",
+                "widget": {
+                  "name": "type"
+                },
+                "link": null
+              },
+              {
+                "localized_name": "target_frame_count",
+                "name": "target_frame_count",
+                "type": "INT",
+                "widget": {
+                  "name": "target_frame_count"
+                },
+                "link": 2
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "image",
+                "name": "image",
+                "type": "IMAGE",
+                "links": null
+              },
+              {
+                "localized_name": "mask",
+                "name": "mask",
+                "type": "MASK",
+                "links": [
+                  4
+                ]
+              },
+              {
+                "localized_name": "width",
+                "name": "width",
+                "type": "INT",
+                "links": null
+              },
+              {
+                "localized_name": "height",
+                "name": "height",
+                "type": "INT",
+                "links": null
+              },
+              {
+                "localized_name": "length",
+                "name": "length",
+                "type": "INT",
+                "links": null
+              },
+              {
+                "localized_name": "input_length",
+                "name": "input_length",
+                "type": "INT",
+                "links": null
+              }
+            ],
+            "title": "H3 mask-only padding (separate cache)",
+            "properties": {
+              "Node name for S&R": "TuringUtilsVideoFramesPadding"
+            },
+            "widgets_values": [
+              "minimax",
+              0
+            ],
+            "widgets_values_named": {
+              "type": "minimax",
+              "target_frame_count": 0
+            }
+          },
+          {
+            "id": 6,
+            "type": "TuringUtilsSetVideoLatentNoiseMask",
+            "pos": [
+              0,
+              350
+            ],
+            "size": [
+              290.253515625,
+              78
+            ],
+            "flags": {},
+            "order": 3,
+            "mode": 0,
+            "inputs": [
+              {
+                "localized_name": "samples",
+                "name": "samples",
+                "type": "LATENT",
+                "link": 3
+              },
+              {
+                "localized_name": "mask",
+                "name": "mask",
+                "shape": 7,
+                "type": "MASK",
+                "link": 4
+              },
+              {
+                "localized_name": "type",
+                "name": "type",
+                "type": "COMBO",
+                "widget": {
+                  "name": "type"
+                },
+                "link": null
+              }
+            ],
+            "outputs": [
+              {
+                "localized_name": "latent",
+                "name": "latent",
+                "type": "LATENT",
+                "links": [
+                  8
+                ]
+              }
+            ],
+            "properties": {
+              "Node name for S&R": "TuringUtilsSetVideoLatentNoiseMask"
+            },
+            "widgets_values": [
+              "minimax"
+            ],
+            "widgets_values_named": {
+              "type": "minimax"
+            }
+          }
+        ],
+        "groups": [],
+        "links": [
+          {
+            "id": 1,
+            "origin_id": 3,
+            "origin_slot": 0,
+            "target_id": 4,
+            "target_slot": 0,
+            "type": "IMAGE"
+          },
+          {
+            "id": 2,
+            "origin_id": 3,
+            "origin_slot": 4,
+            "target_id": 5,
+            "target_slot": 3,
+            "type": "INT"
+          },
+          {
+            "id": 3,
+            "origin_id": 4,
+            "origin_slot": 0,
+            "target_id": 6,
+            "target_slot": 0,
+            "type": "LATENT"
+          },
+          {
+            "id": 4,
+            "origin_id": 5,
+            "origin_slot": 1,
+            "target_id": 6,
+            "target_slot": 1,
+            "type": "MASK"
+          },
+          {
+            "id": 5,
+            "origin_id": -10,
+            "origin_slot": 0,
+            "target_id": 3,
+            "target_slot": 0,
+            "type": "IMAGE"
+          },
+          {
+            "id": 6,
+            "origin_id": -10,
+            "origin_slot": 1,
+            "target_id": 4,
+            "target_slot": 1,
+            "type": "VAE"
+          },
+          {
+            "id": 7,
+            "origin_id": -10,
+            "origin_slot": 2,
+            "target_id": 5,
+            "target_slot": 1,
+            "type": "MASK"
+          },
+          {
+            "id": 10,
+            "origin_id": 3,
+            "origin_slot": 4,
+            "target_id": -20,
+            "target_slot": 2,
+            "type": "INT"
+          },
+          {
+            "id": 9,
+            "origin_id": 3,
+            "origin_slot": 5,
+            "target_id": -20,
+            "target_slot": 1,
+            "type": "INT"
+          },
+          {
+            "id": 8,
+            "origin_id": 6,
+            "origin_slot": 0,
+            "target_id": -20,
+            "target_slot": 0,
+            "type": "LATENT"
+          }
+        ],
+        "extra": {}
+      }
+    ]
+  },
+  "config": {},
+  "extra": {
+    "ds": {
+      "scale": 0.9,
+      "offset": [
+        416,
+        110
+      ]
+    }
+  },
+  "version": 0.4
+}

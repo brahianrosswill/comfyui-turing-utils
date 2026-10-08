@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from comfyui_turing_utils.nodes.veda import H3VedaAttentionStrategy
+from comfyui_turing_utils.nodes.attention import AttentionStrategy, veda_inputs, _ATTENTION_STRATEGIES
 from comfyui_turing_utils.attention.runtime import AttentionRuntimeConfig
 from comfyui_turing_utils.adapters.minimax.veda.integration import forward_scope, make_override
 from comfyui_turing_utils.adapters.minimax.veda.predictor import PredictorBundle, convert_projection
@@ -14,13 +14,13 @@ from comfyui_turing_utils.adapters.minimax.veda.tiling import TileShape
 
 
 def test_veda_node_has_predictor_not_lora():
-    with mock.patch("comfyui_turing_utils.nodes.veda.predictor_choices", return_value=["test.safetensors"]):
-        inputs = H3VedaAttentionStrategy.INPUT_TYPES()["required"]
+    with mock.patch("comfyui_turing_utils.nodes.attention.predictor_choices", return_value=["test.safetensors"]):
+        inputs = veda_inputs()["required"]
     assert inputs["predictor_precision"][0] == ["w8a8", "bf16", "fp16", "fp32"]
     assert inputs["predictor_precision"][1]["default"] == "w8a8"
     assert "lora" not in str(inputs).lower()
     assert "w4a4" not in str(inputs)
-    assert H3VedaAttentionStrategy.RETURN_TYPES == ("MODEL",)
+    assert AttentionStrategy.define_schema().outputs[0].io_type == "MODEL"
     assert "execution_mode" not in inputs
     assert "projection_chunk_tiles" not in inputs
 
@@ -36,8 +36,8 @@ def test_veda_configuration_has_only_automatic_execution():
 
 def test_veda_removed_execution_controls_are_rejected():
     with pytest.raises(TypeError, match="execution_mode"):
-        H3VedaAttentionStrategy().configure(None, predictor_name="test.safetensors",
-                                           execution_mode="heterogeneous")
+        AttentionStrategy.execute(None, {"strategy": "veda", "predictor_name": "test.safetensors",
+                                           "execution_mode": "heterogeneous"})
 
 
 def test_veda_strategy_replaces_sol_and_keeps_dense_backend():
@@ -52,8 +52,9 @@ def test_veda_strategy_replaces_sol_and_keeps_dense_backend():
 
 def test_veda_node_delegates_without_lora_mutation():
     model, result = object(), object()
-    with mock.patch("comfyui_turing_utils.nodes.veda.configure", return_value=result) as configure:
-        assert H3VedaAttentionStrategy().configure(model, predictor_name="test.safetensors") == (result,)
+    configure = mock.Mock(return_value=result)
+    with mock.patch.dict(_ATTENTION_STRATEGIES, {"veda": configure}):
+        assert AttentionStrategy.execute(model, {"strategy": "veda", "predictor_name": "test.safetensors"}).result == (result,)
     configure.assert_called_once_with(model, predictor_name="test.safetensors")
 
 

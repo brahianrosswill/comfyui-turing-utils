@@ -787,6 +787,7 @@ class ConvRotCLIPLoaderTest(unittest.TestCase):
                 "BOOLEAN",
                 {
                     "default": False,
+                    "advanced": True,
                     "tooltip": (
                         "False follows each layer's activation format. "
                         "True forces INT8 GEMM activations."

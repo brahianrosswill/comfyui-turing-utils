@@ -10,15 +10,15 @@ from ..adapters.sec import load_sec_model, sec_model_choices, track_visual_conce
 SeCModelType = io.Custom("TURING_UTILS_SEC_MODEL")
 
 
-class SeCModelLoader(io.ComfyNode):
+class _SeCLoader(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         choices = sec_model_choices()
         return io.Schema(
-            node_id="TuringUtilsSeCModelLoader",
-            display_name="Load SeC Model",
+            node_id="_TuringUtilsSeCLoader",
+            display_name="SeC Loader (Internal)",
             is_dev_only=True,
-            category="Turing Utils/SeC",
+            category="",
             description=(
                 "Load a SeC visual-concept tracking model through ComfyUI's model "
                 "lifecycle. Device placement, residency, and unloading are managed by ComfyUI."
@@ -48,14 +48,14 @@ class SeCModelLoader(io.ComfyNode):
         return io.NodeOutput(load_sec_model(model_name, attention))
 
 
-class SeCTrackVisualConceptApply(io.ComfyNode):
+class _SeCApply(io.ComfyNode):
     @classmethod
     def define_schema(cls):
         return io.Schema(
-            node_id="TuringUtilsSeCTrackVisualConceptApply",
+            node_id="_TuringUtilsSeCApply",
             is_dev_only=True,
             display_name="SeC Track Visual Concept",
-            category="Turing Utils/SeC",
+            category="",
             description=(
                 "Track one visual concept through a video. With mask connected, the mask is "
                 "authoritative and points must agree with it; the bounding box limits its region. "
@@ -165,16 +165,18 @@ class SeCTrackVisualConceptApply(io.ComfyNode):
 class SeCTrackVisualConcept(io.ComfyNode):
     @classmethod
     def define_schema(cls):
-        schema = SeCTrackVisualConceptApply.define_schema()
+        schema = _SeCApply.define_schema()
         schema.node_id = "TuringUtilsSeCTrackVisualConcept"
         schema.is_dev_only = False
-        schema.inputs = SeCModelLoader.define_schema().inputs + schema.inputs[1:]
+        schema.category = "Turing Utils/Mask"
+        schema.inputs = _SeCLoader.define_schema().inputs + schema.inputs[1:]
+        next(item for item in schema.inputs if item.id == "attention").advanced = True
         return schema
 
     @classmethod
     def execute(cls, model_name, frames, attention="auto", **kwargs):
-        return SeCTrackVisualConceptApply.execute(
+        return _SeCApply.execute(
             load_sec_model(model_name, attention), frames, **kwargs)
 
 
-__all__ = ["SeCModelLoader", "SeCTrackVisualConcept", "SeCTrackVisualConceptApply"]
+__all__ = ["_SeCLoader", "SeCTrackVisualConcept", "_SeCApply"]

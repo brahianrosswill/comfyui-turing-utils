@@ -29,6 +29,7 @@ class ConvRotDiffusionModelLoader:
                     "BOOLEAN",
                     {
                         "default": False,
+                        "advanced": True,
                         "tooltip": (
                             "False follows each layer's activation format. "
                             "True forces INT8 GEMM activations."
@@ -45,7 +46,7 @@ class ConvRotDiffusionModelLoader:
                             "Select w8a8, sage, or sdpa. W8A8 uses the bundled sm75+ path with a native cubin "
                             "for the installed GPU; exact-sm75 Sage is bundled and newer GPUs use installed SageAttention. "
                             "Turing BF16 SDPA inputs are stored as FP16 for the attention call. "
-                            "Sol sparse attention is configured with the separate Sol patch node."
+                            "Sparse and H3-specific strategies are configured with Configure Attention Strategy."
                         ),
                     },
                 ),
@@ -55,7 +56,7 @@ class ConvRotDiffusionModelLoader:
     RETURN_TYPES = ("MODEL",)
     RETURN_NAMES = ("model",)
     FUNCTION = "load_diffusion_model"
-    CATEGORY = "Turing Utils/loaders"
+    CATEGORY = "Turing Utils/Models"
     TITLE = "Load ConvRot DiT"
     DESCRIPTION = "Load ConvRot INT8/INT4 and native NVFP4, including mixed checkpoints. NVFP4 retains packed storage and uses paired ConvRot256 with A8/S8 GEMM."
 
@@ -95,6 +96,7 @@ class ConvRotCLIPLoader:
                     "BOOLEAN",
                     {
                         "default": False,
+                        "advanced": True,
                         "tooltip": (
                             "False follows each layer's activation format. "
                             "True forces INT8 GEMM activations."
@@ -112,7 +114,7 @@ class ConvRotCLIPLoader:
     RETURN_TYPES = ("CLIP",)
     RETURN_NAMES = ("clip",)
     FUNCTION = "load_clip"
-    CATEGORY = "Turing Utils/loaders"
+    CATEGORY = "Turing Utils/Models"
     TITLE = "Load ConvRot CLIP"
     DESCRIPTION = "Load ConvRot INT8/INT4 and native NVFP4 text encoders, including mixed checkpoints. NVFP4 uses A8/S8 GEMM on CUDA and dense fallback on CPU."
 

@@ -26,9 +26,9 @@ from comfyui_turing_utils.adapters.minimax.latent_upscaler import (  # noqa: E40
 )
 from comfyui_turing_utils.nodes.latent import SetVideoLatentNoiseMask, VideoLatentCompositeMasked  # noqa: E402
 from comfyui_turing_utils.nodes.minimax import (  # noqa: E402
-    MiniMaxH3LatentUpscaleApply as MiniMaxH3LatentUpscale,
+    _H3UpscaleApply as MiniMaxH3LatentUpscale,
     MiniMaxH3LatentUpscale as UnifiedLatentUpscale,
-    MiniMaxH3LatentUpscaleModelLoader,
+    _H3UpscaleLoader,
 )
 
 
@@ -120,9 +120,9 @@ class MiniMaxH3LatentUpscaleTest(unittest.TestCase):
         return model
 
     def test_schema_exposes_conditioning_and_multiplier(self):
-        loader = MiniMaxH3LatentUpscaleModelLoader.define_schema()
+        loader = _H3UpscaleLoader.define_schema()
         upscale = UnifiedLatentUpscale.define_schema()
-        self.assertEqual(loader.node_id, "TuringUtilsMiniMaxH3LatentUpscaleModelLoader")
+        self.assertEqual(loader.node_id, "_TuringUtilsH3UpscaleLoader")
         self.assertEqual(upscale.node_id, "TuringUtilsMiniMaxH3LatentUpscale")
         self.assertEqual([item.id for item in upscale.inputs], [
             "model_name",
