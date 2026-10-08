@@ -17,6 +17,10 @@ if IS_WINDOWS:
     # Keep MSVC diagnostics in English so PyTorch's compiler probe can decode
     # cl.exe output reliably on non-English Windows installations.
     os.environ.setdefault("VSLANG", "1033")
+    # Large Sage translation units can exhaust host memory when NVCC runs in
+    # parallel on Windows, sometimes exiting without compiler diagnostics.
+    # Keep explicit user overrides, but default to a single build worker.
+    os.environ.setdefault("MAX_JOBS", "1")
 
 import torch
 from setuptools import find_packages, setup
