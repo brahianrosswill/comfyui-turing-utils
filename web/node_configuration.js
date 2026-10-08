@@ -4,7 +4,7 @@ import { migrateNoiseGrid } from "./lib/node_migrations.js";
 app.registerExtension({
   name: "TuringUtils.NodeConfiguration",
   nodeCreated(node) {
-    if (!node.comfyClass?.startsWith("TuringUtils")) return;
+    if (!node.comfyClass?.startsWith("TuringUtils") && !node.comfyClass?.startsWith("TuringCanvas")) return;
     // The legacy canvas reads widget.advanced; Nodes 2.0 reads options.advanced.
     // Bridge the schema flag, keeping the frontend's own toggle and persistence.
     const sync = () => {

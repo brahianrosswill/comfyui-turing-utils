@@ -141,3 +141,11 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TuringUtilsSeCTrackVisualConcept": "SeC Track Visual Concept",
     "_TuringUtilsSeCApply": "SeC Track Visual Concept (Internal)",
 }
+
+from .canvas.nodes import PUBLIC_NODES as CANVAS_NODES
+from .canvas.execution import INTERNAL_NODES as CANVAS_INTERNAL_NODES
+from .canvas.routes import install_canvas_routes
+
+NODE_CLASS_MAPPINGS.update(CANVAS_NODES)
+NODE_CLASS_MAPPINGS.update(CANVAS_INTERNAL_NODES)
+install_canvas_routes()

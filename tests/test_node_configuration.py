@@ -28,7 +28,7 @@ class NodeConfigurationTest(unittest.TestCase):
         for name, node in NODE_CLASS_MAPPINGS.items():
             schema = node.GET_SCHEMA() if hasattr(node, "GET_SCHEMA") else None
             category = schema.category if schema else node.CATEGORY
-            if schema and schema.is_dev_only:
+            if (schema and schema.is_dev_only) or getattr(node, "DEV_ONLY", False):
                 internal += 1
                 self.assertEqual(category, "", name)
             else:
@@ -36,8 +36,8 @@ class NodeConfigurationTest(unittest.TestCase):
                 self.assertEqual(len(category.split("/")), 2, name)
                 self.assertTrue(category.startswith("Turing Utils/"), name)
                 categories.add(category.split("/")[1])
-        self.assertEqual((public, internal), (38, 5))
-        self.assertEqual(categories, {"Models", "Prompt", "Video", "Mask", "MiniMax H3", "Bernini", "Krea2", "Workflow"})
+        self.assertEqual((public, internal), (44, 11))
+        self.assertEqual(categories, {"Models", "Prompt", "Video", "Mask", "MiniMax H3", "Bernini", "Krea2", "Workflow", "Canvas"})
         self.assertEqual(AttentionStrategy.GET_SCHEMA().category, "Turing Utils/Models")
         for name in ("TuringUtilsSeCModelLoader", "TuringUtilsSeCTrackVisualConceptApply",
                      "TuringUtilsMiniMaxH3LatentUpscaleModelLoader", "TuringUtilsMiniMaxH3LatentUpscaleApply"):

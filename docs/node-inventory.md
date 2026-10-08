@@ -1,6 +1,6 @@
 # Turing Utils 节点清单
 
-当前开发工作树有 **38 个公开节点、5 个隐藏内部执行节点**。尚未推送或部署。
+当前开发工作树有 **44 个公开节点、11 个隐藏内部执行节点**。画布模块尚未推送或部署。
 右键菜单只使用 `Turing Utils/分类` 一层子目录，搜索仍可按节点名定位。
 
 ## 完整公开清单
@@ -15,6 +15,7 @@
 | Bernini | 2 | Bernini Context Windows；Bernini Inpaint Condition |
 | Krea2 | 1 | Krea2 Identity Edit Conditioning |
 | Workflow | 3 | Is Input Present；Lazy If / Else；Stage Barrier |
+| Canvas | 6 | Canvas Settings；Canvas Image；Canvas Video；Canvas Audio；Canvas H3 Generate；Canvas Video Mask |
 
 H3 音频保护节点放在 Video，与延续拼接、截断工具相邻。
 Configure Attention Strategy 放在 Models；Sol/SLA/Veda 通过 DynamicCombo 选择，
@@ -35,7 +36,9 @@ Configure Attention Strategy 放在 Models；Sol/SLA/Veda 通过 DynamicCombo �
 
 ## 隐藏执行单元与共享模型
 
-保留五个 dev-only 内部单元：Stage Path、SeC Loader/Apply、H3 Upscale Loader/Apply。
+普通工作流保留五个 dev-only 内部单元：Stage Path、SeC Loader/Apply、H3 Upscale Loader/Apply。
+画布另外使用六个隐藏执行单元，用于素材读取、H3 准备、发布、强制单次采样／分割和 Sol 配置。
+画布独立标签不与普通节点兼容；详见[画布使用说明](material-canvas.md)。
 它们没有菜单分类，不是建议用户连接的节点；开启开发节点显示后可能可见。
 加载/应用使用新的私有 ID，旧加载入口不再注册。
 
@@ -59,9 +62,9 @@ Configure Attention Strategy 放在 Models；Sol/SLA/Veda 通过 DynamicCombo �
 - 文件读写/合并、裁剪/回贴、前缀加噪、截断、mask 获取和采样调度仍独立；
   它们具有不同执行位置、缓存与副作用。
 
-## 后续建议（未实施）
+## 后续建议
 
-先用现有子图确认连线负担，再决定是否需要任务级生成入口。
-优先明确 IMAGE/VIDEO/AUDIO/已编码参考的数据契约、帧率与长度责任，以及
-改变提示词、mask、参考素材或分辨率时应重跑哪些阶段。
-不要为了减少画布节点而丢失独立缓存；暂不继续叠加低收益实验策略。
+普通工作流继续使用可组合节点和子图。新画布使用独立素材标签与任务执行语义，
+不把模型、LoRA 或提示词变更当成素材变更，也不自动使下游失效。
+先验证画布的 H3/SeC 真机生成、片段时间对齐和结果版本操作，再扩展素材管理交互；
+不要为了减少可见节点而丢失内部编码缓存，也暂不继续叠加低收益实验策略。

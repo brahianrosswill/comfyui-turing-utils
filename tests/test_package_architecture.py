@@ -212,6 +212,11 @@ class PackageArchitectureTest(unittest.TestCase):
                 "_TuringUtilsSeCLoader",
                 "TuringUtilsSeCTrackVisualConcept",
                 "_TuringUtilsSeCApply",
+                "TuringCanvasSettings", "TuringCanvasImage", "TuringCanvasVideo",
+                "TuringCanvasAudio", "TuringCanvasH3", "TuringCanvasMask",
+                "_TuringCanvasRead", "_TuringCanvasPrepare", "_TuringCanvasPublish",
+                "_TuringCanvasRunNoise", "_TuringCanvasSol",
+                "_TuringCanvasRunFrames",
             ),
         )
 

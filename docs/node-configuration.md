@@ -78,5 +78,6 @@ relaxed. Do not treat this result as a clean full numerical/kernel regression.
 - Public menus have one level beneath Turing Utils; see the inventory.
 - Keep load/save/merge, crop/stitch, continuation/trim and prefix noise separate.
   Their different workflow positions and independent reuse are intentional.
-- No complete generation facade is proposed yet. Review the
-  [node inventory and recommendations](node-inventory.md) first.
+- Ordinary workflows retain these composable boundaries. The separate
+  [experimental Material Canvas](material-canvas.md) now provides task cards;
+  it deliberately cannot mix with ordinary nodes.
