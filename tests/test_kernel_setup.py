@@ -20,6 +20,15 @@ SETUP_PATH = PLUGIN_ROOT / "kernel" / "setup.py"
 
 
 class KernelSetupTest(unittest.TestCase):
+    def test_veda_preparation_avoids_unrelated_cuda_library_headers(self):
+        source = (PLUGIN_ROOT / "kernel/csrc/turing/sage/veda_prepare.cuh").read_text()
+        for header in ("ATen/cuda/CUDAContext.h", "ATen/cuda/CUDAContextLight.h",
+                       "cusparse.h", "cusolverDn.h"):
+            self.assertNotIn(f"#include <{header}>", source)
+        self.assertIn("#include <c10/cuda/CUDAStream.h>", source)
+        self.assertIn("#include <cublas_v2.h>", source)
+        self.assertIn("TORCH_CUDA_CPP_API cublasHandle_t getCurrentCUDABlasHandle();", source)
+
     @staticmethod
     def _extension(*, name, **kwargs):
         return SimpleNamespace(name=name, kwargs=kwargs)

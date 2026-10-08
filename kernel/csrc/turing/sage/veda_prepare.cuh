@@ -1,10 +1,18 @@
 // Veda preparation is deliberately separate from the attention CTA: no
 // additional attention registers/shared memory, and no architecture > SM75.
-#include <ATen/cuda/CUDAContext.h>
 #include <torch/types.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/macros/Export.h>
 #include <cublas_v2.h>
+
+// Match PyTorch's exported declaration without CUDAContext.h, which also
+// requires unrelated cuSPARSE/cuSOLVER development headers on Windows.
+// Keep using PyTorch's handle so its stream and workspace management apply.
+namespace at::cuda {
+TORCH_CUDA_CPP_API cublasHandle_t getCurrentCUDABlasHandle();
+}
 
 namespace veda_prepare {
 template<class T>
