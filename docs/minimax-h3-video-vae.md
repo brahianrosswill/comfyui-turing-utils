@@ -25,6 +25,10 @@ if an older frontend retains the deleted widgets.
 
 The attention selector applies to every decoder Transformer block:
 
+- `native`: leave the upstream attention forward and backend selection intact.
+  This inherits upstream decoder attention fixes without a plugin override.
+  Turing's scoped linear-operator dispatch and tile progress remain enabled;
+  use the official decode node for a completely unmodified baseline.
 - `sdpa`: PyTorch SDPA; Turing BF16 inputs compute in FP16 to avoid its slow
   math fallback;
 - `sage`: bundled Turing Sage attention;
@@ -68,8 +72,9 @@ DynamicVRAM/aimdo paging, official batching, input/output transfers, dtype and
 OOM recovery. The plugin does not retry allocator or kernel errors on its own.
 Keeping other models resident is not promised; ComfyUI may offload them as needed.
 
-Only attention and eligible FFN forwards are temporarily adapted on the selected
-decoder instance. The official decoder block loop, spatial blending and temporal
+Only attention forwards are temporarily adapted on the selected decoder instance
+(none in `native` mode); linear fusion is selected through operator dispatch.
+The official decoder block loop, spatial blending and temporal
 reconstruction are not replaced. These instance overrides and progress hooks are
 restored on success, errors and cancellation. No process-global attention method
 is patched, and no device tensors are persistently cached on the VAE.
@@ -87,6 +92,35 @@ ComfyUI UI progress hooks are used.
 Regression tests cover direct delegation to the official VAE, native output
 parity, tile/input-batch preservation, dtype handling, official OOM fallback,
 attention/fusion dispatch, and restoration after errors or cancellation.
+
+### Upstream maintenance
+
+Pre-attention RMSNorm weights stay inside ComfyUI's cast context until the fused
+QKV linear returns, including exception cleanup. Newer norm modules own this
+context through `cast_weight`; the current core uses `CastBiasWeightContext`.
+No norm weight or device copy is cached on the model. The tensor form of
+`linear_input_act` remains usable across these core interfaces.
+
+Upstream spatial/temporal blending, encoder kernels and tile batching should
+never be copied into this plugin. Test after core upgrades instead. Attention
+overrides and the custom Kitchen backend still require interface tests: choosing
+a custom kernel intentionally bypasses improvements to the equivalent Kitchen
+kernel. `native` is an explicit upstream-attention path, not silent recovery
+from arbitrary CUDA errors.
+
+The 2026-10-08 upstream audit identified norm offload fixes (#16698), linear
+wrapper changes (#16861), light VAE loading (#16657), and H3 embedding temporary
+release (2d6b73283a). Core/Kitchen upgrades must be tested separately from plugin
+changes; this plugin change does not install those updates. Reduced-layer VAE
+support belongs to the official loader, not a hard-coded plugin layer count.
+
+For long-video regressions, compare actual token counts and model evaluations,
+not seconds alone. Hold checkpoint, LoRAs, resolution, references, sparse ratios,
+seed and sigmas fixed, then test 8/10/12/15-second workloads. Record separate
+encode/text-encode/DiT/decode times, per-step latency, head/row chunk policy,
+VRAM/RAM peaks and PCIe transfer activity. A sudden jump accompanied by smaller
+chunks or weight transfers is different from the smooth quadratic growth of
+fixed-density attention. No universal 10-second threshold is assumed.
 
 Historical operator measurements (before the native-lifecycle simplification):
 on A40/cu128, a synthetic full-width 36-block INT8/FP16/SDPA decoder window

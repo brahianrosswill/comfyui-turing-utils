@@ -19,10 +19,10 @@ class MiniMaxH3VideoVAEDecode:
                 "samples": ("LATENT",),
                 "vae": ("VAE",),
                 "attention": (
-                    ["sdpa", "sage", "w8a8"],
+                    ["sdpa", "sage", "w8a8", "native"],
                     {
                         "default": "w8a8",
-                        "tooltip": "Decoder attention only. On Turing, BF16 SDPA inputs are consumed through containers and computed as FP16 to avoid the slow math fallback. W8A8 refers to QK attention, not VAE weight quantization.",
+                        "tooltip": "Decoder attention only. Native preserves the upstream attention forward and backend selection; eligible linear operators still use Turing Utils. On Turing, BF16 SDPA inputs compute in FP16 to avoid the math fallback. W8A8 does not change VAE weight quantization.",
                     },
                 ),
             },

@@ -216,13 +216,10 @@ def _attention_forward(
     options,
 ):
     batch_size, seq_len, _ = x.shape
-    qkv = comfy.ops.linear_input_act(
-        module.to_qkv,
-        x,
-        "rms_norm",
-        pre_norm.weight,
-        pre_norm.eps,
-    ).view(batch_size, seq_len, -1, 3 * module.dim_head)
+    with _norm_weight_context(pre_norm, x) as weight:
+        qkv = comfy.ops.linear_input_act(
+            module.to_qkv, x, "rms_norm", weight, pre_norm.eps,
+        ).view(batch_size, seq_len, -1, 3 * module.dim_head)
     query, key, value = torch.chunk(qkv, 3, dim=-1)
     out = _projected_attention(
         module, query, key, value, rotary_pos_emb, options
@@ -234,6 +231,23 @@ def _attention_forward(
         residual=residual,
         residual_scale=residual_scale,
     )
+
+
+@contextmanager
+def _norm_weight_context(norm, x):
+    # Keep the cast alive through the fused linear. Passing norm.weight directly
+    # bypasses DynamicVRAM ownership; passing the module requires newer core APIs.
+    if callable(getattr(norm, "cast_weight", None)):
+        with norm.cast_weight(x) as (weight, _):
+            yield weight
+    elif hasattr(norm, "comfy_cast_weights"):
+        with comfy.ops.CastBiasWeightContext(
+            norm if norm.weight is not None else None, x, offloadable=True,
+        ) as (weight, _):
+            yield weight
+    else:
+        # Plain torch operations are also used by upstream decoder tests.
+        yield None if norm.weight is None else comfy.ops.cast_to_input(norm.weight, x)
 
 
 def _attention_options(attention, device):
@@ -263,6 +277,9 @@ def _temporary_forward(module, forward):
 
 @contextmanager
 def _decoder_overrides(decoder, attention, device):
+    if attention == "native":
+        yield
+        return
     options = _attention_options(attention, device)
     with ExitStack() as stack:
         for block in decoder.transformer_blocks:

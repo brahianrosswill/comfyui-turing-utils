@@ -317,6 +317,84 @@ class MiniMaxVideoVAETest(unittest.TestCase):
             for block in decoder.transformer_blocks:
                 self.assertNotIn("forward", block.attn.__dict__)
 
+    def test_native_attention_never_replaces_upstream_forward(self):
+        decoder = make_decoder()
+        original = [block.attn.forward for block in decoder.transformer_blocks]
+        with mock.patch.object(video_vae, "_attention_options", side_effect=AssertionError("no override")):
+            with video_vae._decoder_overrides(decoder, "native", torch.device("cpu")):
+                for block, forward in zip(decoder.transformer_blocks, original):
+                    self.assertEqual(block.attn.forward, forward)
+                    self.assertNotIn("forward", block.attn.__dict__)
+
+    def test_pre_norm_cast_lives_through_fused_linear_and_releases_on_error(self):
+        x = torch.rand(1, 3, 4)
+        norm = SimpleNamespace(weight=torch.ones(4), eps=1e-5, comfy_cast_weights=True)
+        cast_weight = torch.full((4,), 2.)
+        active = []
+
+        @contextmanager
+        def cast(owner, reference, *, offloadable):
+            self.assertIs(owner, norm)
+            self.assertIs(reference, x)
+            self.assertTrue(offloadable)
+            active.append(True)
+            try:
+                yield cast_weight, None
+            finally:
+                active.pop()
+
+        def linear(layer, value, act, weight, eps):
+            self.assertEqual(active, [True])
+            self.assertIs(weight, cast_weight)
+            self.assertEqual(eps, norm.eps)
+            raise RuntimeError("linear failed")
+
+        with (
+            mock.patch.object(video_vae.comfy.ops, "CastBiasWeightContext", cast),
+            mock.patch.object(video_vae.comfy.ops, "linear_input_act", linear),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "linear failed"):
+                video_vae._attention_forward(SimpleNamespace(to_qkv=object()), x, None, norm,
+                                             x, torch.ones(4), options={})
+        self.assertEqual(active, [])
+
+    def test_modern_norm_owns_its_cast_context(self):
+        x = torch.rand(1, 3, 4)
+        cast_weight = torch.ones(4)
+        owner = mock.MagicMock()
+        owner.__enter__.return_value = (cast_weight, None)
+        norm = SimpleNamespace(cast_weight=mock.Mock(return_value=owner))
+        with video_vae._norm_weight_context(norm, x) as weight:
+            self.assertIs(weight, cast_weight)
+        norm.cast_weight.assert_called_once_with(x)
+        owner.__exit__.assert_called_once()
+
+    def test_plain_and_nonaffine_norm_preserve_input_dtype(self):
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            x = torch.rand(1, 3, 4).to(dtype)
+            for affine in (True, False):
+                norm = torch.nn.RMSNorm(4, elementwise_affine=affine)
+                with video_vae._norm_weight_context(norm, x) as weight:
+                    if affine:
+                        self.assertEqual(weight.dtype, dtype)
+                        self.assertEqual(weight.device, x.device)
+                    else:
+                        self.assertIsNone(weight)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_comfy_cpu_norm_weight_is_cast_without_moving_owned_parameter(self):
+        norm = video_vae.comfy.ops.disable_weight_init.RMSNorm(4, eps=1e-5)
+        norm.weight.data.fill_(2.)
+        original = norm.weight
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            x = torch.rand(1, 3, 4, device="cuda", dtype=dtype)
+            with video_vae._norm_weight_context(norm, x) as weight:
+                self.assertEqual(weight.device, x.device)
+                self.assertEqual(weight.dtype, x.dtype)
+                torch.testing.assert_close(weight, torch.full_like(weight, 2.))
+            self.assertIs(norm.weight, original)
+            self.assertEqual(norm.weight.device.type, "cpu")
+
     def test_progress_only_observes_forwards_and_removes_hook(self):
         module = torch.nn.Identity()
         first = torch.rand(4, 3)
